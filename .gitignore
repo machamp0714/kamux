@@ -1,0 +1,7 @@
+# Agent skills — 本体は skills-lock.json から復元する
+# 復元: npx skills experimental_install
+.agents/
+.claude/skills/
+
+# macOS
+.DS_Store
