@@ -91,10 +91,38 @@ describe('setActiveProject', () => {
   });
 
   it('loadSessions の完了を待ってから返る（await 落ちを検出する）', async () => {
-    listSessions.mockResolvedValue([session({ id: 's-in-p2', project_id: 'p2' })]);
+    // listSessions の解決タイミングを手動で制御する。`sessions` の状態を見て判定する形
+    // （前回の実装）だと、マイクロタスクの実行順がたまたま噛み合うことで
+    // `await get().loadSessions(id)` を `void get().loadSessions(id)` に書き換えても
+    // 緑のままになりうる（loadSessions 内部の継続が setActiveProject の返り値の
+    // 解決より先にキューへ積まれるため）。ここでは setActiveProject 自身が返す
+    // Promise が「listSessions が解決するまで settle しない」ことを直接検証する。
+    let resolveListSessions!: (sessions: Session[]) => void;
+    listSessions.mockReturnValue(
+      new Promise<Session[]>((resolve) => {
+        resolveListSessions = resolve;
+      }),
+    );
 
-    await useAppStore.getState().setActiveProject('p2');
+    let settled = false;
+    const pending = useAppStore
+      .getState()
+      .setActiveProject('p2')
+      .then(() => {
+        settled = true;
+      });
 
+    // listSessions が未解決の間、マイクロタスクを何ターン消化しても
+    // setActiveProject の Promise は解決しないはず（await 落ちなら即 settle する）。
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveListSessions([session({ id: 's-in-p2', project_id: 'p2' })]);
+    await pending;
+
+    expect(settled).toBe(true);
     expect(Object.keys(useAppStore.getState().sessions)).toEqual(['s-in-p2']);
   });
 });
