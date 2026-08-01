@@ -42,6 +42,11 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // sessions / sessionOrder を所有する sessionSlice が「これらは常に activeProjectId の
     // ものである」という不変条件も持つ。projectSlice.setActiveProject は
     // activeProjectId を set してから loadSessions を await するので、初回ロードは弾かれない。
+    // 【この行より上で set() しないこと】ガードは「この応答を捨てるかどうか」の判定であり、
+    // ガードより前に set すると、捨てたはずの応答の副作用だけがストアに残る。
+    // 例: 契約 §34.6 で M2-1 が足す予定の seedRuntimeStates(list, true) は、必ずこのガードの
+    // 下（return の後）に置くこと。上に置くと runtimeStates だけ stale なプロジェクトで
+    // seed され、sessions / sessionOrder は現行のまま、という split-brain に戻ってしまう。
     if (get().activeProjectId !== projectId) return;
     set(indexSessions(list));
   },
