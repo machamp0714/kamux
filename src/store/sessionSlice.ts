@@ -7,33 +7,10 @@ import {
   type CreateSessionArgs,
 } from '../ipc/commands';
 import { KANBAN_STATUSES, type KanbanStatus, type Session } from '../types/model';
+import { emptySessionOrder, indexSessions } from './kanbanOrder';
 import type { AppStore } from './index';
 
-export const emptySessionOrder = (): Record<KanbanStatus, string[]> => ({
-  backlog: [],
-  in_progress: [],
-  review: [],
-  done: [],
-});
-
-/** セッション配列を「id 索引」と「列ごとの sort_order 昇順」に畳む。
- * sort_order が同値の場合は Array.prototype.sort の安定性（ES2019+）に頼って入力順を保つ。
- * 入力は Rust 側の list_sessions（ORDER BY kanban_status, sort_order, id）で
- * すでに id 昇順に決着しているため、フロント側で id による再ソートはしない。
- */
-export const indexSessions = (
-  list: Session[],
-): { sessions: Record<string, Session>; sessionOrder: Record<KanbanStatus, string[]> } => {
-  const sessions: Record<string, Session> = {};
-  const sessionOrder = emptySessionOrder();
-
-  for (const s of [...list].sort((a, b) => a.sort_order - b.sort_order)) {
-    sessions[s.id] = s;
-    sessionOrder[s.kanban_status].push(s.id);
-  }
-
-  return { sessions, sessionOrder };
-};
+export { emptySessionOrder, indexSessions } from './kanbanOrder';
 
 // 契約 §7.4 / §44.5: sort_order の採番は M1-2 で move_session（サーバ側・原子的）に移る。
 // M1-1 が中点計算をフロントに置くのは、再起動復元の検証に並びの永続化が要るため。
