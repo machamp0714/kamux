@@ -39,7 +39,9 @@ const session = (over: Partial<Session>): Session => ({
 beforeEach(() => {
   listSessions.mockReset();
   createSession.mockReset();
-  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder() });
+  // activeProjectId は loadSessions のガードが参照するため、前のテストの値が
+  // 漏れないよう毎回リセットする（null はガードの対象外なので既存テストには影響しない）。
+  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: null });
 });
 
 describe('emptySessionOrder', () => {
@@ -115,6 +117,75 @@ describe('loadSessions', () => {
     expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', false);
     expect(Object.keys(useAppStore.getState().sessions)).toEqual(['new']);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['new']);
+  });
+
+  it('切り替え中に後着した古いプロジェクトの応答で盤面を上書きしない', async () => {
+    // A の応答を B より後に解決させる（実際の切り替えで起きる競合そのもの）
+    let resolveA: (v: Session[]) => void = () => {};
+    listSessions.mockImplementation((projectId: string) => {
+      if (projectId === 'pA') {
+        return new Promise<Session[]>((r) => {
+          resolveA = r;
+        });
+      }
+      return Promise.resolve([session({ id: 'b1', project_id: 'pB' })]);
+    });
+
+    const pendingA = useAppStore.getState().loadSessions('pA');
+    useAppStore.setState({ activeProjectId: 'pB' });
+    await useAppStore.getState().loadSessions('pB');
+
+    // ここで A が後着する
+    resolveA([session({ id: 'a1', project_id: 'pA' })]);
+    await pendingA;
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+    expect(useAppStore.getState().sessions.a1).toBeUndefined();
+  });
+
+  it('要求時のプロジェクトが選択されたままなら通常どおり反映する', async () => {
+    useAppStore.setState({ activeProjectId: 'pA' });
+    listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'pA' })]);
+
+    await useAppStore.getState().loadSessions('pA');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a1']);
+  });
+
+  it('activeProjectId が未選択（null）のときは stale 判定の対象外として通常どおり反映する', async () => {
+    // 「現在の選択」が存在しない状態では stale かどうかを判定する根拠が無い。
+    // この分岐が後続フェーズで削られないよう固定する。
+    useAppStore.setState({ activeProjectId: null });
+    listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'pA' })]);
+
+    await useAppStore.getState().loadSessions('pA');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a1']);
+  });
+
+  it('setActiveProject でプロジェクトを切り替えた際も後着応答で上書きしない', async () => {
+    // 実際の呼び出し経路（ProjectBar → setActiveProject → loadSessions）で
+    // 不変条件が守られることを固定する。
+    let resolveA: (v: Session[]) => void = () => {};
+    listSessions.mockImplementation((projectId: string) => {
+      if (projectId === 'pA') {
+        return new Promise<Session[]>((r) => {
+          resolveA = r;
+        });
+      }
+      return Promise.resolve([session({ id: 'b1', project_id: 'pB' })]);
+    });
+
+    const pendingA = useAppStore.getState().setActiveProject('pA');
+    // pA の応答が返る前に pB へ切り替える
+    await useAppStore.getState().setActiveProject('pB');
+
+    // ここで pA が後着する
+    resolveA([session({ id: 'a1', project_id: 'pA' })]);
+    await pendingA;
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+    expect(useAppStore.getState().sessions.a1).toBeUndefined();
   });
 });
 

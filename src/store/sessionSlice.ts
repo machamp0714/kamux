@@ -38,6 +38,14 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
   loadSessions: async (projectId) => {
     // アーカイブ済みは表示しない（復活 UX は M3-4）
     const list = await listSessions(projectId, false);
+    // 応答が返るまでにプロジェクトが切り替わっていたら捨てる（M1-1 からの申し送り）。
+    // sessions / sessionOrder を所有する sessionSlice が「これらは常に activeProjectId の
+    // ものである」という不変条件も持つ。projectSlice.setActiveProject は activeProjectId を
+    // set してから loadSessions を await するので、通常経路は弾かれない。
+    // activeProjectId が null のときは「現在の選択」が存在せず stale と判定する根拠が無いので
+    // 適用する（起動直後の bootstrap 前や、選択を持たない直接呼び出し）。
+    const active = get().activeProjectId;
+    if (active !== null && active !== projectId) return;
     set(indexSessions(list));
   },
 
