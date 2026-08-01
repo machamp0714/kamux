@@ -74,6 +74,19 @@ impl Store {
         let rows = stmt.query_and_then([], row_to_project)?;
         rows.collect()
     }
+
+    /// 契約 §44.2: 影響行数 0 は AppError::NotFound。冪等にしない
+    /// （mark_first_started とは性質が違う）。sessions は契約 §3 の
+    /// ON DELETE CASCADE で消えるので、アプリ側で子行を先に消さない。
+    /// worktree と git ブランチには一切触れない（契約 §7.1）。
+    pub fn delete_project(&self, id: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +189,50 @@ mod tests {
         match err {
             crate::error::AppError::Db(message) => assert!(message.contains("gemini")),
             other => panic!("expected AppError::Db, got {other:?}"),
+        }
+    }
+
+    // 契約 §44.2: 削除は CASCADE で sessions ごと消える。
+    // 子行の挿入は Store::conn() の生 SQL で行う —— test_support::insert_test_session は
+    // Task 8 の産物であり、ここで使うと Task 順の前方参照ができてしまう。
+    #[test]
+    fn delete_project_cascades_to_sessions() {
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
+            .expect("insert");
+
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, title, sort_order, mode, cli_kind, created_at, updated_at)
+                 VALUES ('s1', ?1, 'child', 1.0, 'in_place', 'shell', 1, 1)",
+                [&project.id],
+            )
+            .expect("insert session");
+        }
+
+        store.delete_project(&project.id).expect("delete");
+
+        let conn = store.conn().expect("conn");
+        let projects: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .expect("count projects");
+        assert_eq!(projects, 0);
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .expect("count sessions");
+        assert_eq!(sessions, 0, "ON DELETE CASCADE で子行が消えていない");
+    }
+
+    // 契約 §44.2: 影響行数 0 は Ok(()) にしない（無言で成功しない）
+    #[test]
+    fn delete_project_reports_not_found_for_unknown_id() {
+        let (_dir, store) = open_temp();
+        let err = store.delete_project("nope").expect_err("無い ID");
+        match err {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 }

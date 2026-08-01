@@ -53,7 +53,6 @@ impl Store {
         })
     }
 
-    #[allow(dead_code)] // PR 3 の project_dao / session_dao が呼ぶ
     pub(crate) fn conn(&self) -> AppResult<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
