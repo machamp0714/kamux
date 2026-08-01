@@ -168,6 +168,99 @@ impl Store {
 
         Ok(session)
     }
+
+    /// worktree 作成後に branch / worktree_path を確定させる（M1-4）。
+    pub fn set_worktree(&self, id: &str, branch: &str, worktree_path: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET branch = ?1, worktree_path = ?2, updated_at = ?3 WHERE id = ?4",
+            params![branch, worktree_path, now_ms(), id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// SessionStart hook で捕捉した ID を保存（M2-2）。--continue 経路では上書きになる。
+    pub fn set_claude_session_id(&self, id: &str, claude_session_id: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET claude_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![claude_session_id, now_ms(), id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// runtime_state の表示復元用ヒントを書く（M2-1）。
+    /// DAO は Interrupted を弾かない。付与経路の制限（契約 §2）は SessionManager の責務。
+    /// error 以外へ遷移したら last_runtime_error を NULL に戻す（契約 §17）。
+    /// updated_at は動かさない —— システム導出値であり「最終更新順」を汚さないため（契約 §38.2）。
+    pub fn set_last_runtime_state(&self, id: &str, state: RuntimeState) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            // ?1 を 2 か所で使い回さない(番号付きプレースホルダの再利用は SQLite では
+            // 合法だが、rusqlite の parameter_count と params! の要素数の対応が読みにくい)
+            "UPDATE sessions
+                SET last_runtime_state = ?1,
+                    last_runtime_error = CASE WHEN ?2 = 'error' THEN last_runtime_error ELSE NULL END
+              WHERE id = ?3",
+            params![state.as_db_str(), state.as_db_str(), id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// error 状態への遷移時に生 stderr を保存する（M2-1。契約 §17 / §38.1）。
+    /// last_runtime_state = 'error' と last_runtime_error を 1 文で書くので、
+    /// 「error なのにメッセージが無い」中間状態が観測されない。
+    /// updated_at は動かさない（契約 §38.2）。
+    pub fn set_runtime_error(&self, id: &str, message: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET last_runtime_state = 'error', last_runtime_error = ?1 WHERE id = ?2",
+            params![message, id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// 最初の PTY spawn 成功時刻を 1 度だけ記録する（M2-1。契約 §34.4）。
+    /// 冪等性は SQL 側で担保する。2 度目以降と不在の id はどちらも 0 行更新で Ok(())。
+    /// updated_at は動かさない。
+    pub fn mark_first_started(&self, id: &str, now: i64) -> AppResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE sessions SET first_started_at = ?2
+             WHERE id = ?1 AND first_started_at IS NULL",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// 起動時正規化用（M2-1）。プロジェクトを跨いで全件返す。
+    /// メンテナンス処理なので archived_at で絞らない。
+    pub fn list_sessions_by_last_runtime_state(
+        &self,
+        state: RuntimeState,
+    ) -> AppResult<Vec<Session>> {
+        let conn = self.conn()?;
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions
+             WHERE last_runtime_state = ?1
+             ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_and_then(params![state.as_db_str()], row_to_session)?;
+        rows.collect()
+    }
 }
 
 /// 単体取得。呼び出し側が既に Connection のロックを持っているときに使う。
@@ -197,6 +290,33 @@ mod tests {
 
     fn patch_from_json(json: &str) -> SessionPatch {
         serde_json::from_str(json).expect("deserialize patch")
+    }
+
+    /// created_at / updated_at をセンチネル値 1 に固定した Session を作る。
+    /// `now_ms()`（約 1.7e12）と絶対に衝突しない値にすることで、セッタが
+    /// updated_at を動かすかどうか（契約 §38.2）を `sleep` に頼らず決定的に検証できる。
+    /// `insert_test_session` は `now_ms()` を使うため、この用途には使えない。
+    fn session_with_sentinel_updated_at(project_id: &str, id: &str) -> Session {
+        Session {
+            id: id.to_owned(),
+            project_id: project_id.to_owned(),
+            title: id.to_owned(),
+            description: String::new(),
+            kanban_status: KanbanStatus::Backlog,
+            sort_order: 1.0,
+            mode: SessionMode::InPlace,
+            branch: None,
+            worktree_path: None,
+            cli_kind: CliKind::Shell,
+            cli_command: None,
+            claude_session_id: None,
+            last_runtime_state: RuntimeState::Idle,
+            last_runtime_error: None,
+            first_started_at: None,
+            archived_at: None,
+            created_at: 1,
+            updated_at: 1,
+        }
     }
 
     /// insert_test_session は description が空なので、description の不変性を
@@ -982,5 +1102,297 @@ mod tests {
             2.0,
             "アーカイブ済みでも MAX に含めないと、解除時に同値衝突する（M3-4）"
         );
+    }
+
+    #[test]
+    fn set_worktree_persists_branch_and_path() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-worktree");
+        store.insert_session(&s).expect("insert");
+
+        store
+            .set_worktree(
+                &s.id,
+                "session/fix-login",
+                "/repo/.worktrees/session-fix-login",
+            )
+            .expect("set_worktree");
+
+        let fetched = store.get_session(&s.id).expect("get");
+        assert_eq!(fetched.branch.as_deref(), Some("session/fix-login"));
+        assert_eq!(
+            fetched.worktree_path.as_deref(),
+            Some("/repo/.worktrees/session-fix-login")
+        );
+        // set_worktree はユーザー操作由来の変更なので updated_at を動かす（契約 §38.2）。
+        // 1 は now_ms() と絶対に衝突しないセンチネル値
+        assert!(
+            fetched.updated_at > 1,
+            "updated_at が動いていない（センチネル値 1 のまま）"
+        );
+    }
+
+    #[test]
+    fn set_claude_session_id_persists_and_overwrites() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-claude");
+        store.insert_session(&s).expect("insert");
+
+        store.set_claude_session_id(&s.id, "cc-1").expect("first");
+        let after_first = store.get_session(&s.id).expect("get");
+        assert_eq!(after_first.claude_session_id.as_deref(), Some("cc-1"));
+        // set_claude_session_id はユーザー操作由来の変更なので updated_at を動かす（契約 §38.2）
+        assert!(
+            after_first.updated_at > 1,
+            "updated_at が動いていない（センチネル値 1 のまま）"
+        );
+
+        // --continue 経路では新しい ID で上書きになる（契約 §12.6）
+        store.set_claude_session_id(&s.id, "cc-2").expect("second");
+        assert_eq!(
+            store
+                .get_session(&s.id)
+                .expect("get")
+                .claude_session_id
+                .as_deref(),
+            Some("cc-2")
+        );
+    }
+
+    #[test]
+    fn set_last_runtime_state_persists_every_variant() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-state");
+        store.insert_session(&s).expect("insert");
+
+        for state in [
+            RuntimeState::Running,
+            RuntimeState::WaitingInput,
+            RuntimeState::Exited,
+            // DAO は interrupted を弾かない。不変条件を守るのは M2-1 の SessionManager
+            RuntimeState::Interrupted,
+            RuntimeState::Idle,
+        ] {
+            store.set_last_runtime_state(&s.id, state).expect("set");
+            let after = store.get_session(&s.id).expect("get");
+            assert_eq!(after.last_runtime_state, state);
+            // runtime_state はシステム導出値。updated_at を動かさない（契約 §38.2）。
+            // 1 は now_ms() と絶対に衝突しないセンチネル値
+            assert_eq!(after.updated_at, 1, "{state:?} で updated_at が動いた");
+        }
+    }
+
+    #[test]
+    fn set_runtime_error_writes_state_and_message_together() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-error");
+        store.insert_session(&s).expect("insert");
+
+        store
+            .set_runtime_error(&s.id, "claude: command not found\n")
+            .expect("set_runtime_error");
+        let after = store.get_session(&s.id).expect("get");
+        assert_eq!(after.last_runtime_state, RuntimeState::Error);
+        // 生 stderr をそのまま持つ。整形しない（契約 §4）
+        assert_eq!(
+            after.last_runtime_error.as_deref(),
+            Some("claude: command not found\n")
+        );
+        // runtime_state 系は updated_at を動かさない（契約 §38.2）。
+        // 1 は now_ms() と絶対に衝突しないセンチネル値
+        assert_eq!(after.updated_at, 1);
+    }
+
+    #[test]
+    fn set_last_runtime_state_clears_the_error_message_when_leaving_error() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_test_session(&store, &pid, "a");
+
+        store.set_runtime_error(&s.id, "boom").expect("error");
+        store
+            .set_last_runtime_state(&s.id, RuntimeState::Running)
+            .expect("recover");
+
+        // error 以外へ遷移したら last_runtime_error は NULL に戻る（契約 §17）。
+        // 残すと、復帰したセッションに前回の stderr が貼り付いたままになる
+        let after = store.get_session(&s.id).expect("get");
+        assert_eq!(after.last_runtime_state, RuntimeState::Running);
+        assert_eq!(after.last_runtime_error, None);
+    }
+
+    #[test]
+    fn mark_first_started_writes_once_and_never_overwrites() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-first-started");
+        store.insert_session(&s).expect("insert");
+        assert_eq!(
+            store.get_session(&s.id).expect("get").first_started_at,
+            None
+        );
+
+        store.mark_first_started(&s.id, 1_000).expect("first");
+        let after = store.get_session(&s.id).expect("get");
+        assert_eq!(after.first_started_at, Some(1_000));
+        // updated_at は動かさない（契約 §34.4）。
+        // 1 は now_ms() と絶対に衝突しないセンチネル値
+        assert_eq!(after.updated_at, 1);
+
+        // 2 度目は 0 行更新で Ok。値は変わらない
+        store.mark_first_started(&s.id, 2_000).expect("second");
+        assert_eq!(
+            store.get_session(&s.id).expect("get").first_started_at,
+            Some(1_000)
+        );
+
+        // 不在の id も NotFound にしない（他のセッタと規約が違う）
+        store.mark_first_started("nope", 3_000).expect("unknown id");
+    }
+
+    #[test]
+    fn setters_report_not_found_for_unknown_id() {
+        let (_dir, store) = open_temp();
+
+        // conn.execute は行が無くても Ok(0) を返すので、影響行数を見ないと黙って成功する
+        match store.set_worktree("nope", "b", "/p").expect_err("worktree") {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match store
+            .set_claude_session_id("nope", "cc")
+            .expect_err("claude id")
+        {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match store
+            .set_last_runtime_state("nope", RuntimeState::Running)
+            .expect_err("runtime state")
+        {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match store
+            .set_runtime_error("nope", "boom")
+            .expect_err("runtime error")
+        {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_sessions_by_last_runtime_state_orders_by_created_at_then_id_and_spans_projects_ignoring_archived(
+    ) {
+        // ORDER BY created_at ASC, id ASC（契約 §17）を id の集合一致ではなく完全な
+        // 並びで固定する。created_at をタイにした 2 件は、id 昇順と挿入順がわざと
+        // 逆になるよう仕込む。こうしないと ORDER BY を削っても、あるいは id の
+        // タイブレークを削っても green のまま通ってしまう。
+        let (_dir, store) = open_temp();
+        let p1 = project(&store);
+        let p2 = store
+            .insert_project("other", "/Users/x/repo/other", CliKind::Claude)
+            .expect("p2")
+            .id;
+
+        fn session_with(pid: &str, id: &str, created_at: i64, state: RuntimeState) -> Session {
+            Session {
+                id: id.to_owned(),
+                project_id: pid.to_owned(),
+                title: id.to_owned(),
+                description: String::new(),
+                kanban_status: KanbanStatus::Backlog,
+                sort_order: 1.0,
+                mode: SessionMode::InPlace,
+                branch: None,
+                worktree_path: None,
+                cli_kind: CliKind::Shell,
+                cli_command: None,
+                claude_session_id: None,
+                last_runtime_state: state,
+                last_runtime_error: None,
+                first_started_at: None,
+                archived_at: None,
+                created_at,
+                updated_at: created_at,
+            }
+        }
+
+        let early = session_with(&p1, "b-early", 100, RuntimeState::Running);
+        // created_at がタイの 2 件。挿入順は z → a だが、id ASC では a が先に来る
+        let tie_z = session_with(&p2, "z-tie", 200, RuntimeState::Running);
+        let tie_a = session_with(&p1, "a-tie", 200, RuntimeState::Running);
+        let idle = session_with(&p1, "c-idle", 300, RuntimeState::Idle);
+
+        store.insert_session(&tie_z).expect("insert z");
+        store.insert_session(&tie_a).expect("insert a");
+        store.insert_session(&early).expect("insert early");
+        store.insert_session(&idle).expect("insert idle");
+
+        // 起動時正規化はメンテナンス処理なのでアーカイブ済みも拾う
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute(
+                "UPDATE sessions SET archived_at = 1 WHERE id = ?1",
+                [&tie_z.id],
+            )
+            .expect("archive");
+        }
+
+        let running = store
+            .list_sessions_by_last_runtime_state(RuntimeState::Running)
+            .expect("list");
+        assert_eq!(
+            running.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![
+                "b-early".to_owned(),
+                "a-tie".to_owned(),
+                "z-tie".to_owned(),
+            ],
+            "created_at ASC, id ASC の順で、プロジェクトを跨いでアーカイブ済みも含めて全件返っていない"
+        );
+
+        assert!(store
+            .list_sessions_by_last_runtime_state(RuntimeState::WaitingInput)
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn update_session_does_not_clobber_setter_written_columns() {
+        // update_session は 5 カラムしか書かない。将来「全カラム UPDATE」に
+        // リファクタされると M1-4 と M2-2 の書き込みが消えるので、ここで固定する。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_test_session(&store, &pid, "a");
+
+        store
+            .set_worktree(&s.id, "session/a", "/repo/.worktrees/session-a")
+            .expect("worktree");
+        store
+            .set_claude_session_id(&s.id, "cc-1")
+            .expect("claude id");
+        store
+            .set_last_runtime_state(&s.id, RuntimeState::Running)
+            .expect("state");
+
+        store
+            .update_session(&s.id, &patch_from_json(r#"{"title":"renamed"}"#))
+            .expect("update");
+
+        let fetched = store.get_session(&s.id).expect("get");
+        assert_eq!(fetched.title, "renamed");
+        assert_eq!(fetched.branch.as_deref(), Some("session/a"));
+        assert_eq!(
+            fetched.worktree_path.as_deref(),
+            Some("/repo/.worktrees/session-a")
+        );
+        assert_eq!(fetched.claude_session_id.as_deref(), Some("cc-1"));
+        assert_eq!(fetched.last_runtime_state, RuntimeState::Running);
     }
 }
