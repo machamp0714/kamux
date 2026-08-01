@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BRANCH_PREFIX, SLUG_MAX_LENGTH, proposeBranchName, titleToSlug } from './branchName';
+import { BRANCH_PREFIX, proposeBranchName, titleToSlug } from './branchName';
 
 describe('titleToSlug', () => {
   it('小文字化し、英数字とハイフン以外をハイフンにする', () => {
@@ -19,18 +19,34 @@ describe('titleToSlug', () => {
   });
 
   it('40 文字に切り詰める', () => {
-    expect(titleToSlug('a'.repeat(50))).toHaveLength(SLUG_MAX_LENGTH);
+    // 契約 §13 の 40 をリテラルで固定する（SLUG_MAX_LENGTH の自己参照にしない）
+    expect(titleToSlug('a'.repeat(50))).toHaveLength(40);
   });
 
   it('切り詰めで残った末尾ハイフンも除去する', () => {
-    // 40 文字の 'b' + スペース + 'c' → 41 文字目がハイフンになる
-    expect(titleToSlug(`${'b'.repeat(40)} c`)).toBe('b'.repeat(40));
+    // 'a' を 39 個（index 0〜38）+ 空白（index 39 でハイフンに変換）+ 'zzzz'。
+    // slice(0, 40) は index 0〜39 を含むため、ハイフンがちょうど切り詰め境界の
+    // 末尾（40 文字目）に残る。この末尾ハイフンが .replace(/-+$/, '') で
+    // 除去されることを確認する。
+    expect(titleToSlug(`${'a'.repeat(39)} zzzz`)).toBe('a'.repeat(39));
   });
 
   it('英数字を含まない入力では空文字を返す', () => {
     expect(titleToSlug('日本語タイトル')).toBe('');
     expect(titleToSlug('!!!')).toBe('');
     expect(titleToSlug('')).toBe('');
+  });
+
+  it('絵文字のみでは空文字を返す', () => {
+    expect(titleToSlug('🎉')).toBe('');
+  });
+
+  it('空白のみでは空文字を返す', () => {
+    expect(titleToSlug('   ')).toBe('');
+  });
+
+  it('絵文字を含む混在入力では絵文字を除去する', () => {
+    expect(titleToSlug('Fix 🎉 bug')).toBe('fix-bug');
   });
 });
 
