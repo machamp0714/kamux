@@ -1,8 +1,8 @@
 use rusqlite::{params, Row};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
-use crate::store::Store;
+use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode, SessionPatch};
+use crate::store::{now_ms, Store};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, project_id, title, description, kanban_status, \
      sort_order, mode, branch, worktree_path, cli_kind, cli_command, claude_session_id, \
@@ -122,6 +122,52 @@ impl Store {
         let rows = stmt.query_and_then(params![project_id], row_to_session)?;
         rows.collect()
     }
+
+    /// 部分更新。動的 SQL を組まず「読む → Rust 上で patch を当てる → 5 カラム書く」で行う。
+    /// 単一 Mutex 配下で他の書き手がいないため、この read-modify-write に競合はない。
+    /// branch / worktree_path / claude_session_id / last_runtime_state /
+    /// last_runtime_error / first_started_at には触らない
+    /// （契約 §17 のセッタ群が書いた値を潰さないため。Task 11 に回帰テストがある）。
+    pub fn update_session(&self, id: &str, patch: &SessionPatch) -> AppResult<Session> {
+        let conn = self.conn()?;
+        let mut session = fetch_session(&conn, id)?;
+
+        if let Some(title) = &patch.title {
+            session.title = title.clone();
+        }
+        if let Some(description) = &patch.description {
+            session.description = description.clone();
+        }
+        if let Some(kanban_status) = patch.kanban_status {
+            session.kanban_status = kanban_status;
+        }
+        if let Some(sort_order) = patch.sort_order {
+            session.sort_order = sort_order;
+        }
+        // Some(None) は「null が明示された」＝ アーカイブ解除。None は「不在」＝ 変更しない。
+        if let Some(archived_at) = patch.archived_at {
+            session.archived_at = archived_at;
+        }
+        session.updated_at = now_ms();
+
+        conn.execute(
+            "UPDATE sessions
+             SET title = ?1, description = ?2, kanban_status = ?3, sort_order = ?4,
+                 archived_at = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                session.title,
+                session.description,
+                session.kanban_status.as_db_str(),
+                session.sort_order,
+                session.archived_at,
+                session.updated_at,
+                session.id,
+            ],
+        )?;
+
+        Ok(session)
+    }
 }
 
 /// 単体取得。呼び出し側が既に Connection のロックを持っているときに使う。
@@ -137,16 +183,239 @@ pub(crate) fn fetch_session(conn: &rusqlite::Connection, id: &str) -> AppResult<
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
+    use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode, SessionPatch};
     use crate::store::session_dao::{row_to_session, SESSION_COLUMNS};
     use crate::store::test_support::{insert_test_session, open_temp};
-    use crate::store::Store;
+    use crate::store::{now_ms, Store};
 
     fn project(store: &Store) -> String {
         store
             .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
             .expect("project")
             .id
+    }
+
+    fn patch_from_json(json: &str) -> SessionPatch {
+        serde_json::from_str(json).expect("deserialize patch")
+    }
+
+    /// insert_test_session は description が空なので、description の不変性を
+    /// 検証するテスト専用に中身を指定できるヘルパを用意する。
+    fn insert_session_with_description(
+        store: &Store,
+        project_id: &str,
+        title: &str,
+        description: &str,
+    ) -> Session {
+        let sort_order = store
+            .next_sort_order(project_id, KanbanStatus::Backlog)
+            .expect("next_sort_order");
+        let session = Session::new_backlog(
+            project_id,
+            title,
+            description,
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            sort_order,
+            now_ms(),
+        );
+        store.insert_session(&session).expect("insert_session")
+    }
+
+    #[test]
+    fn update_session_changes_only_the_given_fields() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_session_with_description(&store, &pid, "before", "keep me");
+
+        let updated = store
+            .update_session(&s.id, &patch_from_json(r#"{"title":"after"}"#))
+            .expect("update");
+
+        assert_eq!(updated.title, "after");
+        assert_eq!(
+            updated.description, "keep me",
+            "指定していないフィールドは不変"
+        );
+        assert_eq!(updated.kanban_status, KanbanStatus::Backlog);
+        assert_eq!(updated.sort_order, s.sort_order);
+        assert_eq!(
+            store.get_session(&s.id).expect("get").title,
+            "after",
+            "DB に永続化されている"
+        );
+    }
+
+    #[test]
+    fn update_session_moves_card_between_columns() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_test_session(&store, &pid, "a");
+
+        let updated = store
+            .update_session(
+                &s.id,
+                &patch_from_json(r#"{"kanban_status":"in_progress","sort_order":1.5}"#),
+            )
+            .expect("update");
+
+        assert_eq!(updated.kanban_status, KanbanStatus::InProgress);
+        assert_eq!(updated.sort_order, 1.5);
+    }
+
+    #[test]
+    fn update_session_bumps_updated_at_but_not_created_at() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_test_session(&store, &pid, "a");
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let updated = store
+            .update_session(&s.id, &patch_from_json(r#"{"title":"b"}"#))
+            .expect("update");
+
+        assert_eq!(updated.created_at, s.created_at);
+        assert!(
+            updated.updated_at > s.updated_at,
+            "updated_at が進んでいない"
+        );
+    }
+
+    #[test]
+    fn update_session_handles_archived_at_absent_null_and_value() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_test_session(&store, &pid, "a");
+
+        // 数値 = アーカイブ
+        let archived = store
+            .update_session(&s.id, &patch_from_json(r#"{"archived_at":1700000000000}"#))
+            .expect("archive");
+        assert_eq!(archived.archived_at, Some(1700000000000));
+
+        // 不在 = 変更しない
+        let untouched = store
+            .update_session(&s.id, &patch_from_json(r#"{"title":"b"}"#))
+            .expect("untouched");
+        assert_eq!(
+            untouched.archived_at,
+            Some(1700000000000),
+            "不在で勝手に解除された"
+        );
+
+        // null = アーカイブ解除
+        let restored = store
+            .update_session(&s.id, &patch_from_json(r#"{"archived_at":null}"#))
+            .expect("restore");
+        assert_eq!(restored.archived_at, None);
+    }
+
+    #[test]
+    fn update_session_does_not_overwrite_columns_owned_by_the_runtime_setters() {
+        // update_session が触ってよいのは title / description / kanban_status /
+        // sort_order / archived_at の 5 カラムのみ。branch / worktree_path /
+        // claude_session_id / last_runtime_state / last_runtime_error /
+        // first_started_at は Task 11 のセッタ群が書く値であり、ここで潰すと
+        // それらの回帰テストより先にサイレントにデータが失われる。
+        //
+        // update_session は fetch_session で読んだ Session をそのまま返すため、
+        // 戻り値だけを見ると SQL が誤って書き潰していても検出できない。
+        // 必ず get_session で読み直した結果をアサートする。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session {
+            id: "sid-preserve".to_owned(),
+            project_id: pid,
+            title: "before".to_owned(),
+            description: "before-description".to_owned(),
+            kanban_status: KanbanStatus::Backlog,
+            sort_order: 1.0,
+            mode: SessionMode::Worktree,
+            branch: Some("branch-value".to_owned()),
+            worktree_path: Some("worktree-path-value".to_owned()),
+            cli_kind: CliKind::Custom,
+            cli_command: Some("cli-command-value".to_owned()),
+            claude_session_id: Some("claude-session-id-value".to_owned()),
+            last_runtime_state: RuntimeState::Error,
+            last_runtime_error: Some("last-runtime-error-value".to_owned()),
+            first_started_at: Some(111),
+            archived_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.insert_session(&session).expect("insert");
+
+        store
+            .update_session(
+                &session.id,
+                &patch_from_json(r#"{"title":"after","kanban_status":"in_progress"}"#),
+            )
+            .expect("update");
+
+        let reloaded = store.get_session(&session.id).expect("get");
+        assert_eq!(reloaded.title, "after", "更新対象は反映される");
+        assert_eq!(reloaded.kanban_status, KanbanStatus::InProgress);
+        assert_eq!(
+            reloaded.branch.as_deref(),
+            Some("branch-value"),
+            "branch を潰した"
+        );
+        assert_eq!(
+            reloaded.worktree_path.as_deref(),
+            Some("worktree-path-value"),
+            "worktree_path を潰した"
+        );
+        assert_eq!(
+            reloaded.claude_session_id.as_deref(),
+            Some("claude-session-id-value"),
+            "claude_session_id を潰した"
+        );
+        assert_eq!(
+            reloaded.last_runtime_state,
+            RuntimeState::Error,
+            "last_runtime_state を潰した"
+        );
+        assert_eq!(
+            reloaded.last_runtime_error.as_deref(),
+            Some("last-runtime-error-value"),
+            "last_runtime_error を潰した"
+        );
+        assert_eq!(
+            reloaded.first_started_at,
+            Some(111),
+            "first_started_at を潰した"
+        );
+    }
+
+    #[test]
+    fn update_session_reports_not_found_for_unknown_id() {
+        let (_dir, store) = open_temp();
+        let err = store
+            .update_session("nope", &patch_from_json(r#"{"title":"x"}"#))
+            .expect_err("無い ID");
+        match err {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_session_with_empty_patch_is_a_no_op_except_updated_at() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = insert_session_with_description(&store, &pid, "a", "d");
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let updated = store
+            .update_session(&s.id, &patch_from_json("{}"))
+            .expect("update");
+
+        assert_eq!(updated.title, "a");
+        assert_eq!(updated.description, "d");
+        assert_eq!(updated.kanban_status, s.kanban_status);
+        assert!(updated.updated_at > s.updated_at);
     }
 
     #[test]
