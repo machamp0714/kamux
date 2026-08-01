@@ -310,6 +310,11 @@ mod tests {
             .update_session(&s.id, &patch_from_json(r#"{"archived_at":null}"#))
             .expect("restore");
         assert_eq!(restored.archived_at, None);
+        assert_eq!(
+            store.get_session(&s.id).expect("get").archived_at,
+            None,
+            "DB 上でクリアされていない（戻り値だけでは検出できない）"
+        );
     }
 
     #[test]
@@ -386,6 +391,79 @@ mod tests {
             reloaded.first_started_at,
             Some(111),
             "first_started_at を潰した"
+        );
+    }
+
+    #[test]
+    fn update_session_persists_all_five_patchable_columns_and_bumps_updated_at_in_db() {
+        // 既存テストは各カラムを個別に見ており、`description` の patch 適用経路
+        // （if let Some(description) と SET description = ?2 の両方）や、
+        // `sort_order` / `updated_at` が実際に DB に書かれたことは
+        // どのテストからも検証されていなかった（戻り値は fetch_session 時点の
+        // in-memory Session をそのまま返すため、戻り値だけを見るテストは
+        // SET 句からの脱落を検出できない）。5 カラムを 1 回の patch で同時に
+        // 当て、必ず get_session で DB から読み直して検証する。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session {
+            id: "sid-full-patch".to_owned(),
+            project_id: pid,
+            title: "before-title".to_owned(),
+            description: "before-description".to_owned(),
+            kanban_status: KanbanStatus::Backlog,
+            sort_order: 1.0,
+            mode: SessionMode::InPlace,
+            branch: None,
+            worktree_path: None,
+            cli_kind: CliKind::Shell,
+            cli_command: None,
+            claude_session_id: None,
+            last_runtime_state: RuntimeState::Idle,
+            last_runtime_error: None,
+            first_started_at: None,
+            archived_at: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.insert_session(&session).expect("insert");
+
+        store
+            .update_session(
+                &session.id,
+                &patch_from_json(
+                    r#"{"title":"after-title","description":"after-description",
+                        "kanban_status":"review","sort_order":9.5,
+                        "archived_at":1700000000000}"#,
+                ),
+            )
+            .expect("update");
+
+        let reloaded = store.get_session(&session.id).expect("get");
+        assert_eq!(
+            reloaded.title, "after-title",
+            "title が DB に書かれていない"
+        );
+        assert_eq!(
+            reloaded.description, "after-description",
+            "description が DB に書かれていない"
+        );
+        assert_eq!(
+            reloaded.kanban_status,
+            KanbanStatus::Review,
+            "kanban_status が DB に書かれていない"
+        );
+        assert_eq!(
+            reloaded.sort_order, 9.5,
+            "sort_order が DB に書かれていない"
+        );
+        assert_eq!(
+            reloaded.archived_at,
+            Some(1700000000000),
+            "archived_at が DB に書かれていない"
+        );
+        assert!(
+            reloaded.updated_at > session.updated_at,
+            "updated_at が DB 上で進んでいない"
         );
     }
 
