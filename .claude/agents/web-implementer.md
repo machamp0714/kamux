@@ -46,6 +46,16 @@ React 18 + TypeScript 5 + Vite 5 + Zustand 4 + xterm.js。テストは vitest（
 - 契約に無い名前・型・イベント文字列を**導入しない**
 - **`00-contracts.md` を自分で編集してはならない。** 不足に気づいたら実装を止めて lane-controller に契約変更要求を上げる
 
+## E2E（契約 §26）
+
+`e2e/*.spec.ts` は **Playwright + IPC モック**で動く。基盤は M1-2 Task 17 が作る。
+
+- IPC は `e2e/support/tauriMock.ts` の `tauriMockScript()` を `page.addInitScript()` に渡して差し替える。**`@tauri-apps/api/mocks` の `mockIPC` は使わない**（jsdom 前提で、実ブラウザでは公式が非推奨としている）
+- `addInitScript` に渡す関数はブラウザ側で評価される。**外側の変数を参照するとモックが空になる**
+- **E2E のためだけの `data-testid` を増やさない。** 既存の `data-session-id` / `data-column` などで足りるならそれを使う
+- キー入力は `page.keyboard.press('Meta+n')`。`ControlOrMeta` は使わない（macOS 専用アプリ。契約 §0）
+- **E2E はユニットテストの代替ではない。** 純関数に切り出せるロジックは vitest で検証し、E2E は DOM とライブラリを跨ぐ経路だけを書く
+
 ## パフォーマンス
 
 契約 §0 の「アイドル CPU ほぼ 0%」はフロントにも効く。`setInterval` による定期再描画や、PTY 出力がないときに走るループを作らない。Zustand のセレクタは**プリミティブを返す**形にし、オブジェクト全体を select しない。
