@@ -1,0 +1,328 @@
+use serde::{Deserialize, Serialize};
+
+/// 契約 §2: serde 表現（snake_case 文字列）と DB に格納する文字列を
+/// 1 箇所で定義するためのマクロ。両者がズレるとデータが読めなくなるため、
+/// 一致は model.rs のテストで固定している。
+macro_rules! db_enum {
+    ($name:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($variant),+ }
+
+        impl $name {
+            pub fn as_db_str(self) -> &'static str {
+                match self { $(Self::$variant => $s),+ }
+            }
+
+            pub fn from_db_str(s: &str) -> Option<Self> {
+                match s {
+                    $($s => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+db_enum!(KanbanStatus {
+    Backlog => "backlog",
+    InProgress => "in_progress",
+    Review => "review",
+    Done => "done",
+});
+
+db_enum!(SessionMode {
+    Worktree => "worktree",
+    InPlace => "in_place",
+});
+
+db_enum!(CliKind {
+    Claude => "claude",
+    Codex => "codex",
+    Shell => "shell",
+    Custom => "custom",
+});
+
+// 契約 §2 の 6 値。設計書 §5.3 の 5 値に `error` を加えたものが正典
+// （設計書 §12 の「カードをエラー状態に」を満たす値が §5.3 に無いため）。
+db_enum!(RuntimeState {
+    Running => "running",
+    WaitingInput => "waiting_input",
+    Idle => "idle",
+    Exited => "exited",
+    Interrupted => "interrupted",
+    Error => "error",
+});
+
+db_enum!(SurfaceKind {
+    Agent => "agent",
+    Editor => "editor",
+});
+
+/// 契約 §4
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub repo_path: String,
+    pub default_cli: CliKind,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 契約 §4
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub description: String,
+    pub kanban_status: KanbanStatus,
+    pub sort_order: f64,
+    pub mode: SessionMode,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub cli_kind: CliKind,
+    pub cli_command: Option<String>,
+    pub claude_session_id: Option<String>,
+    pub last_runtime_state: RuntimeState,
+    /// `error` 状態のときの生 stderr。加工しない。error 以外へ遷移したら None に戻す（契約 §4 / §17）
+    pub last_runtime_error: Option<String>,
+    /// 最初に PTY spawn に成功した時刻（epoch ms）。None = 一度も起動していない。
+    /// 一度書いたら上書きしない（契約 §34）。書き手は M2-1 の SessionManager だけ
+    pub first_started_at: Option<i64>,
+    pub archived_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// フィールドが「不在」なのか「null が明示された」のかを区別するためのデシリアライザ。
+/// 不在   -> #[serde(default)] により None
+/// null   -> Some(None)
+/// 値あり -> Some(Some(v))
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
+/// 契約 §7: 部分更新。None のフィールドは変更しない。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionPatch {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub kanban_status: Option<KanbanStatus>,
+    #[serde(default)]
+    pub sort_order: Option<f64>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub archived_at: Option<Option<i64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_roundtrip<T>(value: T, expected: &str)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq + Copy,
+    {
+        let json = serde_json::to_string(&value).expect("serialize");
+        assert_eq!(
+            json,
+            format!("\"{expected}\""),
+            "serde 表現が契約 §2 と違う"
+        );
+        let back: T = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn kanban_status_matches_contract_strings() {
+        assert_roundtrip(KanbanStatus::Backlog, "backlog");
+        assert_roundtrip(KanbanStatus::InProgress, "in_progress");
+        assert_roundtrip(KanbanStatus::Review, "review");
+        assert_roundtrip(KanbanStatus::Done, "done");
+    }
+
+    #[test]
+    fn session_mode_and_cli_kind_match_contract_strings() {
+        assert_roundtrip(SessionMode::Worktree, "worktree");
+        assert_roundtrip(SessionMode::InPlace, "in_place");
+        assert_roundtrip(CliKind::Claude, "claude");
+        assert_roundtrip(CliKind::Codex, "codex");
+        assert_roundtrip(CliKind::Shell, "shell");
+        assert_roundtrip(CliKind::Custom, "custom");
+    }
+
+    #[test]
+    fn runtime_state_and_surface_kind_match_contract_strings() {
+        assert_roundtrip(RuntimeState::Running, "running");
+        assert_roundtrip(RuntimeState::WaitingInput, "waiting_input");
+        assert_roundtrip(RuntimeState::Idle, "idle");
+        assert_roundtrip(RuntimeState::Exited, "exited");
+        assert_roundtrip(RuntimeState::Interrupted, "interrupted");
+        assert_roundtrip(RuntimeState::Error, "error"); // 契約 §2 の 6 値目
+        assert_roundtrip(SurfaceKind::Agent, "agent");
+        assert_roundtrip(SurfaceKind::Editor, "editor");
+    }
+
+    /// serde 表現（`#[serde(rename_all = "snake_case")]` による自動導出）と
+    /// DB 側の文字列（`db_enum!` 呼び出しごとに手書きする `$s` リテラル）は
+    /// マクロが同一性を強制しない独立の source。この macro で、各型ごとに
+    /// 「全 variant で serde 表現 == `as_db_str()`」と「`from_db_str` が
+    /// `as_db_str` の逆変換になっている」ことを検証する。ジェネリックな
+    /// ヘルパにすると `db_enum!` にトレイトを生やす必要が出るため、
+    /// 型ごとにループを展開する素朴な形にしている（`db_enum!` 本体は
+    /// 触らない）。
+    macro_rules! assert_db_str_matches_serde {
+        ($ty:ty, [$($v:expr),+ $(,)?]) => {
+            for v in [$($v),+] {
+                let json = serde_json::to_string(&v).expect("serialize");
+                assert_eq!(
+                    json,
+                    format!("\"{}\"", v.as_db_str()),
+                    "serde 表現と as_db_str がズレている: {v:?}"
+                );
+                assert_eq!(<$ty>::from_db_str(v.as_db_str()), Some(v));
+            }
+        };
+    }
+
+    #[test]
+    fn db_str_equals_serde_representation() {
+        // DB に入れる文字列と serde の文字列がズレたらデータが読めなくなる。
+        // 5 型・全 18 variant を網羅する。
+        assert_db_str_matches_serde!(
+            KanbanStatus,
+            [
+                KanbanStatus::Backlog,
+                KanbanStatus::InProgress,
+                KanbanStatus::Review,
+                KanbanStatus::Done,
+            ]
+        );
+        assert_db_str_matches_serde!(SessionMode, [SessionMode::Worktree, SessionMode::InPlace]);
+        assert_db_str_matches_serde!(
+            CliKind,
+            [
+                CliKind::Claude,
+                CliKind::Codex,
+                CliKind::Shell,
+                CliKind::Custom,
+            ]
+        );
+        assert_db_str_matches_serde!(
+            RuntimeState,
+            [
+                RuntimeState::Running,
+                RuntimeState::WaitingInput,
+                RuntimeState::Idle,
+                RuntimeState::Exited,
+                RuntimeState::Interrupted,
+                RuntimeState::Error,
+            ]
+        );
+        assert_db_str_matches_serde!(SurfaceKind, [SurfaceKind::Agent, SurfaceKind::Editor]);
+    }
+
+    #[test]
+    fn from_db_str_rejects_unknown_values() {
+        assert_eq!(KanbanStatus::from_db_str("archived"), None);
+        assert_eq!(CliKind::from_db_str(""), None);
+        assert_eq!(RuntimeState::from_db_str("Running"), None); // 大文字は別物
+    }
+
+    fn sample_session() -> Session {
+        Session {
+            id: "sid".into(),
+            project_id: "pid".into(),
+            title: "fix login".into(),
+            description: String::new(),
+            kanban_status: KanbanStatus::InProgress,
+            sort_order: 2.5,
+            mode: SessionMode::InPlace,
+            branch: None,
+            worktree_path: None,
+            cli_kind: CliKind::Claude,
+            cli_command: None,
+            claude_session_id: None,
+            last_runtime_state: RuntimeState::Idle,
+            last_runtime_error: None,
+            first_started_at: None,
+            archived_at: None,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn session_serializes_with_snake_case_field_names() {
+        let v = serde_json::to_value(sample_session()).expect("serialize");
+        assert_eq!(v["kanban_status"], "in_progress");
+        assert_eq!(v["last_runtime_state"], "idle");
+        assert_eq!(v["sort_order"], 2.5);
+        assert_eq!(v["worktree_path"], serde_json::Value::Null);
+        assert_eq!(v["claude_session_id"], serde_json::Value::Null);
+        assert_eq!(v["last_runtime_error"], serde_json::Value::Null);
+        assert_eq!(v["archived_at"], serde_json::Value::Null);
+        // 契約 §22: 禁止名が漏れていないこと
+        assert!(v.get("status").is_none());
+        assert!(v.get("state").is_none());
+    }
+
+    #[test]
+    fn project_serializes_with_snake_case_field_names() {
+        let p = Project {
+            id: "pid".into(),
+            name: "kamux".into(),
+            repo_path: "/Users/x/repo/kamux".into(),
+            default_cli: CliKind::Claude,
+            created_at: 10,
+            updated_at: 20,
+        };
+        let v = serde_json::to_value(p).expect("serialize");
+        assert_eq!(v["repo_path"], "/Users/x/repo/kamux");
+        assert_eq!(v["default_cli"], "claude");
+    }
+
+    #[test]
+    fn session_patch_absent_fields_are_none() {
+        let patch: SessionPatch = serde_json::from_str("{}").expect("deserialize");
+        assert!(patch.title.is_none());
+        assert!(patch.kanban_status.is_none());
+        assert!(patch.sort_order.is_none());
+        assert!(patch.archived_at.is_none(), "不在は「変更しない」");
+    }
+
+    #[test]
+    fn session_patch_distinguishes_absent_null_and_value_for_archived_at() {
+        let absent: SessionPatch = serde_json::from_str(r#"{"title":"t"}"#).expect("deserialize");
+        assert_eq!(absent.archived_at, None, "不在 = 変更しない");
+
+        let cleared: SessionPatch =
+            serde_json::from_str(r#"{"archived_at":null}"#).expect("deserialize");
+        assert_eq!(cleared.archived_at, Some(None), "null = アーカイブ解除");
+
+        let set: SessionPatch =
+            serde_json::from_str(r#"{"archived_at":1700000000000}"#).expect("deserialize");
+        assert_eq!(
+            set.archived_at,
+            Some(Some(1700000000000)),
+            "数値 = アーカイブ"
+        );
+    }
+
+    #[test]
+    fn session_patch_reads_snake_case_keys() {
+        let patch: SessionPatch =
+            serde_json::from_str(r#"{"kanban_status":"review","sort_order":1.5}"#)
+                .expect("deserialize");
+        assert_eq!(patch.kanban_status, Some(KanbanStatus::Review));
+        assert_eq!(patch.sort_order, Some(1.5));
+    }
+}
