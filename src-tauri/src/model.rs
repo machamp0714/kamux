@@ -107,25 +107,63 @@ mod tests {
         assert_roundtrip(SurfaceKind::Editor, "editor");
     }
 
+    /// serde 表現（`#[serde(rename_all = "snake_case")]` による自動導出）と
+    /// DB 側の文字列（`db_enum!` 呼び出しごとに手書きする `$s` リテラル）は
+    /// マクロが同一性を強制しない独立の source。この macro で、各型ごとに
+    /// 「全 variant で serde 表現 == `as_db_str()`」と「`from_db_str` が
+    /// `as_db_str` の逆変換になっている」ことを検証する。ジェネリックな
+    /// ヘルパにすると `db_enum!` にトレイトを生やす必要が出るため、
+    /// 型ごとにループを展開する素朴な形にしている（`db_enum!` 本体は
+    /// 触らない）。
+    macro_rules! assert_db_str_matches_serde {
+        ($ty:ty, [$($v:expr),+ $(,)?]) => {
+            for v in [$($v),+] {
+                let json = serde_json::to_string(&v).expect("serialize");
+                assert_eq!(
+                    json,
+                    format!("\"{}\"", v.as_db_str()),
+                    "serde 表現と as_db_str がズレている: {v:?}"
+                );
+                assert_eq!(<$ty>::from_db_str(v.as_db_str()), Some(v));
+            }
+        };
+    }
+
     #[test]
     fn db_str_equals_serde_representation() {
-        // DB に入れる文字列と serde の文字列がズレたらデータが読めなくなる
-        for v in [
-            KanbanStatus::Backlog,
-            KanbanStatus::InProgress,
-            KanbanStatus::Review,
-            KanbanStatus::Done,
-        ] {
-            let json = serde_json::to_string(&v).expect("serialize");
-            assert_eq!(json, format!("\"{}\"", v.as_db_str()));
-            assert_eq!(KanbanStatus::from_db_str(v.as_db_str()), Some(v));
-        }
-        assert_eq!(RuntimeState::WaitingInput.as_db_str(), "waiting_input");
-        assert_eq!(
-            SessionMode::from_db_str("in_place"),
-            Some(SessionMode::InPlace)
+        // DB に入れる文字列と serde の文字列がズレたらデータが読めなくなる。
+        // 5 型・全 18 variant を網羅する。
+        assert_db_str_matches_serde!(
+            KanbanStatus,
+            [
+                KanbanStatus::Backlog,
+                KanbanStatus::InProgress,
+                KanbanStatus::Review,
+                KanbanStatus::Done,
+            ]
         );
-        assert_eq!(CliKind::from_db_str("custom"), Some(CliKind::Custom));
+        assert_db_str_matches_serde!(SessionMode, [SessionMode::Worktree, SessionMode::InPlace]);
+        assert_db_str_matches_serde!(
+            CliKind,
+            [
+                CliKind::Claude,
+                CliKind::Codex,
+                CliKind::Shell,
+                CliKind::Custom,
+            ]
+        );
+        assert_db_str_matches_serde!(
+            RuntimeState,
+            [
+                RuntimeState::Running,
+                RuntimeState::WaitingInput,
+                RuntimeState::Idle,
+                RuntimeState::Exited,
+                RuntimeState::Interrupted,
+                RuntimeState::Error,
+            ]
+        );
+        assert_db_str_matches_serde!(SurfaceKind, [SurfaceKind::Agent, SurfaceKind::Editor]);
     }
 
     #[test]
