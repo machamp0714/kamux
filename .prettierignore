@@ -1,0 +1,15 @@
+dist/
+src-tauri/target/
+playwright-report/
+test-results/
+package-lock.json
+docs/
+.claude/
+.agents/
+.remember/
+CLAUDE.md
+AGENTS.md
+skills-lock.json
+# task brief / report / 進捗台帳（.superpowers/sdd/*/.gitignore で git 管理外）。
+# 他タスクの brief や共有 progress.md を Prettier が書き換えるのを防ぐ。
+.superpowers/

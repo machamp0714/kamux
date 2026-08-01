@@ -7,3 +7,15 @@
 
 # macOS
 .DS_Store
+
+# Node
+node_modules/
+dist/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# CI 生成物
+playwright-report/
+test-results/

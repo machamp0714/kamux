@@ -61,7 +61,7 @@ git log --oneline -5
 | M1-1 | `M1-1-foundation.md` | 20 | `feat/m1-1-foundation` | アプリ再起動後もプロジェクトとセッションが復元される | なし | rust + web |
 | M1-2 | `M1-2-kanban.md` | 17 | `feat/m1-2-kanban` | セッションをカンバン上で管理し、手動で状態を動かせる | M1-1 | web |
 | M1-3 | `M1-3-pty-terminal.md` | 16 | `feat/m1-3-pty-terminal` | shell セッションを起動し、ターミナルで対話できる | M1-1 | rust + web |
-| M1-4 | `M1-4-worktree-cli.md` | 11 | `feat/m1-4-worktree-cli` | カードから claude が選択した作業ツリーで起動し、該当ペインに直行できる | M1-1〜M1-3 | rust + web |
+| M1-4 | `M1-4-worktree-cli.md` | 12 | `feat/m1-4-worktree-cli` | カードから claude が選択した作業ツリーで起動し、該当ペインに直行できる | M1-1〜M1-3 | rust + web |
 | M2-1 | `M2-1-runtime-state.md` | 10 | `feat/m2-1-runtime-state` | カード/タブを見るだけで各セッションの実行状態が分かる | M1-1〜M1-4 | rust + web |
 | M2-2 | `M2-2-hooks-relay.md` | 19 | `feat/m2-2-hooks-relay` | Claude Code の入力待ち・完了・session_id を決定的に捕捉できる | M1-4, M2-1 | rust |
 | M2-3 | `M2-3-macos-notification.md` | 16 | `feat/m2-3-notification` | アプリを見ていなくても要対応セッションに戻れる | M2-1 | rust + web |
@@ -69,13 +69,16 @@ git log --oneline -5
 | M3-1 | `M3-1-nvim-editor.md` | 8 | `feat/m3-1-nvim-editor` | フォーカス中セッションの作業ツリーを nvim で閲覧/編集できる | M1-3 | rust + web |
 | M3-2 | `M3-2-split-layout.md` | 11 | `feat/m3-2-split-layout` | 2 つのエージェントを同時に監視し、片方へ即座に入力できる | M1-3 | web |
 | M3-3 | `M3-3-generic-cli.md` | 19 | `feat/m3-3-generic-cli` | Claude Code 以外の CLI でも最低限の状態把握ができる | M1-3, M2-1, M2-2 | rust + web |
-| M3-4 | `M3-4-ops-ux.md` | 15 | `feat/m3-4-ops-ux` | 要件1〜10 を満たし、日常運用で破綻しない | M1-1〜M3-3 | rust + web |
+| M3-4 | `M3-4-ops-ux.md` | 21 | `feat/m3-4-ops-ux` | 要件1〜10 を満たし、日常運用で破綻しない | M1-1〜M3-3 | rust + web |
 
 計画ファイルはすべて `docs/superpowers/plans/2026-08-01-kamux/` 配下。
 
-**1 フェーズ = 複数 PR。** 区切りとブランチ名は契約 **§27.4**（全 32 本）が正典。lane-controller が PR を作り CI を緑にするところまで担当し、**マージは team-lead が §2 のマージ順に従って行う**。
+**1 フェーズ = 複数 PR。** 区切りとブランチ名は契約 **§27.4**（全 33 本）が正典。**lane-controller が PR の作成から CI 緑・マージまで担当する**（契約 §32 の 5 条件）。あなたはマージ許可を出し、人間検証が必要な PR に対応する。
 
-**M1-1 だけ実行順が特殊**（契約 §27.3）: Task 19（lint）→ Task 20（CI）→ Task 1 → … → Task 18。lint と CI は他の全 PR が乗る土台なので先に入れる。
+**実行順が特殊なフェーズが 2 つある。**
+
+- **M1-1**（契約 §27.3）: Task 19（lint）→ Task 20（CI）→ Task 1 → … → Task 18。lint と CI は他の全 PR が乗る土台なので先に入れる
+- **M3-4**（契約 §27.4 の例外 3）: Task 1〜14 → 16〜21 → **15**。Task 15 は要件 1〜10 の最終スモークなので、スクラッチと shim の後に置く
 
 ---
 
@@ -83,15 +86,15 @@ git log --oneline -5
 
 契約 **§26** により、フロント単体 E2E（Playwright + IPC モック）を採用している。基盤は **M1-2 Task 17** が作り、M1-3 以降は各フェーズが自分のスモーク項目を仕分ける（DOM で検証できるものは `e2e/*.spec.ts` へ）。
 
-下に残るのは **§26.4 の 4 カテゴリ = エージェントには物理的に実行できない検証**だけである。**該当フェーズの dispatch に「BLOCKED で上げること」と明記する。**
+下に残るのは **§26.4 の 5 カテゴリ = エージェントには物理的に実行できない検証**だけである。**該当フェーズの dispatch に「BLOCKED で上げること」と明記する。**
 
 | フェーズ | 内容 | 根拠 |
 |---|---|---|
-| M1-4 | ビルドした `.app` を **Finder からダブルクリック**して PATH 解決を確認 | 契約 §18。`npm run tauri dev` では再現しない |
+| M1-4 | ビルドした `.app` を **Finder からダブルクリック**して PATH 解決を確認（Task 6–11）／**shim ディレクトリが rc 通過後も PATH に残るか**（Task 12、§30.3） | 契約 §18 / §26.4-1・5 |
 | M2-2 | 実 PTY の**対話モード**で `Notification` / `PermissionRequest` の payload をキャプチャ。hook の stdout がターミナル表示を汚さないか実測 | 契約 §12.4 は未確認事実と明記 |
 | M2-3 | 通知の**クリック応答**を実機で確認 | 契約 §21（`notify-rust` を選んだ唯一の理由） |
 | M3-2 | `Cmd+D` / `Cmd+[` / `Cmd+]` が WebView に奪われないか実機確認 | 奪われる場合は `Cmd+Shift+D` / `Cmd+Alt+←→` |
-| M3-4 | 起動 1 秒未満 / セッション 5 個で 300MB 未満 / アイドル CPU の実測 | 契約 §0 |
+| M3-4 | 起動 1 秒未満 / セッション 5 個で 300MB 未満 / アイドル CPU の実測（Task 15）／**`Cmd+W` が macOS 既定メニューに奪われないか**（Task 20、§29.8） | 契約 §0 / §26.4-3・4 |
 
 ---
 
@@ -125,6 +128,8 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 
 <人間ゲートがあれば: 「<内容> は実機確認が必要なので、着手せず BLOCKED で返すこと」>
 
+マージ許可: あり / なし（契約 §32.3。なしの場合は PR をスタックさせ、マージしない）
+
 契約の不足に気づいたら、自分で 00-contracts.md を編集せず、契約変更要求として上げること。
 
 完了したら完了報告フォーマットで返す。
@@ -143,8 +148,18 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 | 進捗を聞かれた | `TaskList` で一覧、`TaskOutput` で途中経過を覗いて要約する |
 | BLOCKED が返った | 人間ゲートならユーザーに提示し、結果を `SendMessage` でレーンへ返す |
 | 契約変更要求が返った | `contract-owner` を起動して裁定させる。**並列中の他レーンにも結果を周知する** |
-| PR が出た | lane-controller が `gh pr checks --watch` まで面倒を見る。**マージはあなた（team-lead）の仕事** |
-| レーンが完了した | §2 のマージ順に従い、**スタックした PR を下から順にマージ** → 下のゲートを実行 → 次のステージへ |
+| PR が出た | **lane-controller がマージまで行う**（契約 §32 の 5 条件）。あなたは介入しない |
+| `needs-human-verification` の PR で BLOCKED が返った | 検証手順をユーザーに提示 → 結果を受けてラベルを外す → `SendMessage` でレーンへ通知 |
+| レーンが完了した | 下のゲートを実行 → 次のステージへ |
+
+### マージ許可（契約 §32.3）—— あなたが出す
+
+| ステージ | 出し方 |
+|---|---|
+| 単独レーン（stage0 / 2 / 5 / 6） | **起動時のプロンプトに「マージ許可あり」と書く。** PR は毎回 `main` から切られ、緑になり次第マージされる |
+| 並列レーン（stage1 / 3 / 4） | **§2 のマージ順で先頭のレーンにだけ「マージ許可あり」と書く。** 後発レーンには「マージ許可なし」と書き、PR をスタックさせる。先頭レーンが全 PR をマージし終えたら、`SendMessage` で次のレーンに許可を出す |
+
+**プロンプトに許可の有無を書き忘れると、lane-controller は「許可なし」として扱い確認を求めてくる。** 並列ステージで両方に許可を出してはならない —— stage1（M1-2 ∥ M1-3）は `App.tsx` / `store/index.ts` / `useKeymap.ts` が重衝突するため、交互にマージすると後発レーンが毎回コンフリクトする。
 
 ### ステージ完了ゲート
 
