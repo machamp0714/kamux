@@ -235,4 +235,132 @@ mod tests {
             other => panic!("expected NotFound, got {other:?}"),
         }
     }
+
+    // 契約 §44.2: delete_project は `WHERE id = ?1` で対象プロジェクトだけを消す。
+    // delete_project_cascades_to_sessions はプロジェクト 1 件、
+    // delete_project_reports_not_found_for_unknown_id は 0 件の DB で走るため、
+    // WHERE 句を丸ごと落として `DELETE FROM projects` になっても両方 green のまま
+    // 通ってしまう。bystander プロジェクト（子セッション付き）を用意し、
+    // 削除後も生き残っていることを DB から数えて確認する。
+    #[test]
+    fn delete_project_leaves_other_projects_and_their_sessions_untouched() {
+        let (_dir, store) = open_temp();
+        let target = store
+            .insert_project("target", "/repo/target", CliKind::Claude)
+            .expect("insert target");
+        let bystander = store
+            .insert_project("bystander", "/repo/bystander", CliKind::Claude)
+            .expect("insert bystander");
+
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, title, sort_order, mode, cli_kind, created_at, updated_at)
+                 VALUES ('s-target', ?1, 'target session', 1.0, 'in_place', 'shell', 1, 1)",
+                [&target.id],
+            )
+            .expect("insert target session");
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, title, sort_order, mode, cli_kind, created_at, updated_at)
+                 VALUES ('s-bystander', ?1, 'bystander session', 1.0, 'in_place', 'shell', 1, 1)",
+                [&bystander.id],
+            )
+            .expect("insert bystander session");
+        }
+
+        store.delete_project(&target.id).expect("delete target");
+
+        {
+            let conn = store.conn().expect("conn");
+            let projects: i64 = conn
+                .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+                .expect("count projects");
+            assert_eq!(projects, 1, "無関係なプロジェクトまで消えた");
+
+            let bystander_sessions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+                    [&bystander.id],
+                    |r| r.get(0),
+                )
+                .expect("count bystander sessions");
+            assert_eq!(
+                bystander_sessions, 1,
+                "無関係なプロジェクトの子セッションまで CASCADE で巻き込まれて消えた"
+            );
+        }
+
+        let survivor = store
+            .get_project(&bystander.id)
+            .expect("bystander プロジェクトが消えている");
+        assert_eq!(survivor.id, bystander.id);
+    }
+
+    // 契約 §17: list_projects_returns_persisted_rows_in_creation_order は
+    // 2 件を挿入順どおりに期待しており、ORDER BY を全部落とした素のテーブル
+    // スキャン（rowid 順）と区別が付かない。id は Uuid::new_v4() 由来のため、
+    // ここでは Store::conn() の生 SQL で id / created_at を固定値にして挿入する。
+    //
+    // タイになる created_at の 2 行を、挿入順と id 昇順が逆転するように入れる。
+    // 期待値はハードコードする（sort() で作ると、id ASC を落としても
+    // 挿入順とたまたま一致してしまう可能性を排除できない）。
+    #[test]
+    fn list_projects_breaks_tied_created_at_by_id_ascending() {
+        let (_dir, store) = open_temp();
+        let conn = store.conn().expect("conn");
+        // 先に大きい id (zzz)、後に小さい id (aaa) を挿入する
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, default_cli, created_at, updated_at)
+             VALUES ('zzz-tie', 'zzz', '/repo/zzz-tie', 'claude', 100, 100)",
+            [],
+        )
+        .expect("insert zzz-tie");
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, default_cli, created_at, updated_at)
+             VALUES ('aaa-tie', 'aaa', '/repo/aaa-tie', 'claude', 100, 100)",
+            [],
+        )
+        .expect("insert aaa-tie");
+        drop(conn);
+
+        let list = store.list_projects().expect("list");
+        assert_eq!(
+            list.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["aaa-tie".to_owned(), "zzz-tie".to_owned()],
+            "created_at 同値時に id ASC でタイブレークされていない"
+        );
+    }
+
+    // created_at が異なる 2 行を、挿入順と created_at 昇順が逆転するように入れる。
+    // id の大小関係もわざと created_at と逆にする（id = "aaa" を created_at が
+    // 大きい行に、id = "zzz" を created_at が小さい行に割り当てる）ことで、
+    // `ORDER BY id ASC` だけが残っても正しい並びと一致しないようにする。
+    // こうしないと、id ASC 単独の結果が偶然正解と一致してテストが機能しない。
+    #[test]
+    fn list_projects_orders_by_created_at_ascending_before_id() {
+        let (_dir, store) = open_temp();
+        let conn = store.conn().expect("conn");
+        // 先に created_at が新しい行 (id = aaa) を挿入する
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, default_cli, created_at, updated_at)
+             VALUES ('aaa-order', 'aaa', '/repo/aaa-order', 'claude', 200, 200)",
+            [],
+        )
+        .expect("insert aaa-order");
+        // 後に created_at が古い行 (id = zzz) を挿入する
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, default_cli, created_at, updated_at)
+             VALUES ('zzz-order', 'zzz', '/repo/zzz-order', 'claude', 100, 100)",
+            [],
+        )
+        .expect("insert zzz-order");
+        drop(conn);
+
+        let list = store.list_projects().expect("list");
+        assert_eq!(
+            list.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["zzz-order".to_owned(), "aaa-order".to_owned()],
+            "created_at ASC が効いていない（id ASC だけでは正解と一致しない配置）"
+        );
+    }
 }

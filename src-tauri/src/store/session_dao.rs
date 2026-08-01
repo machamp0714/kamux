@@ -1486,6 +1486,46 @@ mod tests {
             "mark_first_started が無関係な行の first_started_at を書き換えた"
         );
 
+        // update_session (`WHERE id = ?7`) も同じ規律で検査する。7 本ある
+        // update_session のテストはどれもセッション行が 1 件（または 0 件）の
+        // DB で走っており、WHERE 句を丸ごと落として全行 UPDATE に退行しても
+        // 全 green のまま通ってしまう（コミット 7c537c5 が他の 5 セッタに
+        // 適用した bystander 検査が、この関数だけ抜けていた非対称の是正）。
+        // bystander の初期値（title = "sid-bystander" / Backlog / 1.0 / None）は
+        // ここで書く patch の値と全フィールドで区別できるようにしてある。
+        store
+            .update_session(
+                &target.id,
+                &patch_from_json(
+                    r#"{"title":"target-updated-via-update_session",
+                        "kanban_status":"in_progress","sort_order":99.0,
+                        "archived_at":1700000000000}"#,
+                ),
+            )
+            .expect("update_session");
+        let after_update = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_update.title, "sid-bystander",
+            "update_session が無関係な行の title を書き換えた"
+        );
+        assert_eq!(
+            after_update.kanban_status,
+            KanbanStatus::Backlog,
+            "update_session が無関係な行の kanban_status を書き換えた"
+        );
+        assert_eq!(
+            after_update.sort_order, 1.0,
+            "update_session が無関係な行の sort_order を書き換えた"
+        );
+        assert_eq!(
+            after_update.archived_at, None,
+            "update_session が無関係な行の archived_at を書き換えた"
+        );
+        assert_eq!(
+            after_update.updated_at, 1,
+            "update_session が無関係な行の updated_at を書き換えた"
+        );
+
         // bystander が無変化なだけでなく、target 側が実際に正しく書けていることも確認する
         let target_after = store.get_session(&target.id).expect("get");
         assert_eq!(target_after.branch.as_deref(), Some("session/target"));
@@ -1497,5 +1537,12 @@ mod tests {
         assert_eq!(target_after.last_runtime_state, RuntimeState::Error);
         assert_eq!(target_after.last_runtime_error.as_deref(), Some("boom"));
         assert_eq!(target_after.first_started_at, Some(999));
+        assert_eq!(
+            target_after.title, "target-updated-via-update_session",
+            "update_session が対象行の title を書いていない"
+        );
+        assert_eq!(target_after.kanban_status, KanbanStatus::InProgress);
+        assert_eq!(target_after.sort_order, 99.0);
+        assert_eq!(target_after.archived_at, Some(1700000000000));
     }
 }
