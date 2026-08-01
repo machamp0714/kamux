@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const updateSession = vi.fn();
 const listSessions = vi.fn();
+const moveSession = vi.fn();
 vi.mock('../ipc/commands', () => ({
   updateSession: (...args: unknown[]) => updateSession(...args),
   listSessions: (...args: unknown[]) => listSessions(...args),
+  moveSession: (...args: unknown[]) => moveSession(...args),
   createSession: vi.fn(),
   listProjects: vi.fn(),
   createProject: vi.fn(),
@@ -12,7 +14,7 @@ vi.mock('../ipc/commands', () => ({
 
 import type { Session } from '../types/model';
 import { useAppStore } from './index';
-import { computeSortOrder, emptySessionOrder } from './sessionSlice';
+import { emptySessionOrder } from './sessionSlice';
 
 const session = (id: string, status: Session['kanban_status'], sortOrder: number): Session => ({
   id,
@@ -38,134 +40,140 @@ const session = (id: string, status: Session['kanban_status'], sortOrder: number
 beforeEach(() => {
   updateSession.mockReset();
   listSessions.mockReset();
+  moveSession.mockReset();
   useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder() });
 });
 
-describe('computeSortOrder', () => {
-  it('空の列に入れると 1', () => {
-    expect(computeSortOrder([], 0)).toBe(1);
-  });
-
-  it('先頭に入れると最小 - 1', () => {
-    expect(computeSortOrder([3, 4], 0)).toBe(2);
-  });
-
-  it('末尾に入れると最大 + 1', () => {
-    expect(computeSortOrder([1, 2], 2)).toBe(3);
-    // 「最大 + 1」であることを、末尾の値そのものや配列長と区別できる値で確認する
-    expect(computeSortOrder([5, 10], 2)).toBe(11);
-  });
-
-  it('間に入れると両隣の中点', () => {
-    expect(computeSortOrder([1, 2], 1)).toBe(1.5);
-    expect(computeSortOrder([1, 1.5], 1)).toBe(1.25);
-  });
-
-  it('負の値でも中点規則が成り立つ', () => {
-    expect(computeSortOrder([-2, 0], 1)).toBe(-1);
-    expect(computeSortOrder([-2], 0)).toBe(-3);
-  });
-});
-
 describe('moveCard', () => {
-  const seed = () => {
+  /** review 列が x(10), y(20) で埋まっていて backlog に a(1) がある盤面 */
+  function seed() {
     useAppStore.setState({
       sessions: {
         a: session('a', 'backlog', 1),
-        b: session('b', 'backlog', 2),
-        c: session('c', 'in_progress', 1),
+        x: session('x', 'review', 10),
+        y: session('y', 'review', 20),
       },
-      sessionOrder: { backlog: ['a', 'b'], in_progress: ['c'], review: [], done: [] },
+      sessionOrder: { backlog: ['a'], in_progress: [], review: ['x', 'y'], done: [] },
     });
-  };
+  }
 
-  it('別の列へ移すと両方の列の並びが更新される', async () => {
+  it('move_session を id / to_status / to_index の 3 引数で 1 回だけ呼ぶ', async () => {
     seed();
-    updateSession.mockResolvedValue(session('a', 'in_progress', 0));
+    moveSession.mockResolvedValue([
+      session('x', 'review', 10),
+      session('a', 'review', 15),
+      session('y', 'review', 20),
+    ]);
 
-    await useAppStore.getState().moveCard('a', 'in_progress', 0);
+    await useAppStore.getState().moveCard('a', 'review', 1);
 
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b']);
-    expect(useAppStore.getState().sessionOrder.in_progress).toEqual(['a', 'c']);
-    expect(updateSession).toHaveBeenCalledWith('a', {
-      kanban_status: 'in_progress',
-      sort_order: 0,
-    });
+    expect(moveSession).toHaveBeenCalledTimes(1);
+    expect(moveSession).toHaveBeenCalledWith('a', 'review', 1);
+    // フロントは sort_order を算出しない（契約 §7.4）
+    expect(updateSession).not.toHaveBeenCalled();
   });
 
-  it('同じ列の中で末尾へ並べ替えると、自分を除いた最大 + 1 になる', async () => {
+  it('戻り値で移動先の列を丸ごと置き換える（サーバの順を正とする）', async () => {
+    seed();
+    // サーバが楽観更新と違う順を返しても、サーバ側が勝つこと
+    moveSession.mockResolvedValue([
+      session('y', 'review', 5),
+      session('x', 'review', 10),
+      session('a', 'review', 15),
+    ]);
+
+    await useAppStore.getState().moveCard('a', 'review', 1);
+
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['y', 'x', 'a']);
+    expect(useAppStore.getState().sessions.a.sort_order).toBe(15);
+    expect(useAppStore.getState().sessions.a.kanban_status).toBe('review');
+    expect(useAppStore.getState().sessions.y.sort_order).toBe(5);
+  });
+
+  it('移動元の列は戻り値に含まれないが、楽観更新の除去がそのまま残る', async () => {
+    seed();
+    moveSession.mockResolvedValue([
+      session('x', 'review', 10),
+      session('a', 'review', 15),
+      session('y', 'review', 20),
+    ]);
+
+    await useAppStore.getState().moveCard('a', 'review', 1);
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
+  });
+
+  it('同じ列の中の移動では 1 つの列が返り、それで置き換える', async () => {
     useAppStore.setState({
       sessions: {
-        a: session('a', 'backlog', 1),
-        b: session('b', 'backlog', 2),
-        c: session('c', 'backlog', 3),
+        x: session('x', 'review', 10),
+        y: session('y', 'review', 20),
+        z: session('z', 'review', 30),
       },
-      sessionOrder: { backlog: ['a', 'b', 'c'], in_progress: [], review: [], done: [] },
+      sessionOrder: { backlog: [], in_progress: [], review: ['x', 'y', 'z'], done: [] },
     });
-    updateSession.mockResolvedValue(session('a', 'backlog', 2.5));
+    moveSession.mockResolvedValue([
+      session('y', 'review', 20),
+      session('z', 'review', 30),
+      session('x', 'review', 31),
+    ]);
 
-    await useAppStore.getState().moveCard('a', 'backlog', 2);
+    await useAppStore.getState().moveCard('x', 'review', 2);
 
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b', 'c', 'a']);
-    expect(updateSession).toHaveBeenCalledWith('a', { kanban_status: 'backlog', sort_order: 4 });
+    expect(moveSession).toHaveBeenCalledWith('x', 'review', 2);
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['y', 'z', 'x']);
   });
 
-  it('同じ列の中で中間へ並べ替えると、両隣の中点になる', async () => {
-    useAppStore.setState({
-      sessions: {
-        a: session('a', 'backlog', 1),
-        b: session('b', 'backlog', 2),
-        c: session('c', 'backlog', 3),
-      },
-      sessionOrder: { backlog: ['a', 'b', 'c'], in_progress: [], review: [], done: [] },
-    });
-    // 移動対象を 'a'（先頭）にすることで、自分自身を neighbors から除外しているかを
-    // 「たまたま同じ中点になる」ケース（'c' を動かす場合）と区別できるようにする。
-    updateSession.mockResolvedValue(session('a', 'backlog', 2.5));
-
-    await useAppStore.getState().moveCard('a', 'backlog', 1);
-
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b', 'a', 'c']);
-    expect(updateSession).toHaveBeenCalledWith('a', { kanban_status: 'backlog', sort_order: 2.5 });
-  });
-
-  it('空の列に移すと sort_order は 1 になる', async () => {
+  it('空の列へ移せる', async () => {
     seed();
-    updateSession.mockResolvedValue(session('a', 'review', 9));
+    moveSession.mockResolvedValue([session('a', 'done', 1)]);
 
-    await useAppStore.getState().moveCard('a', 'review', 0);
+    await useAppStore.getState().moveCard('a', 'done', 0);
 
-    expect(updateSession).toHaveBeenCalledWith('a', { kanban_status: 'review', sort_order: 1 });
+    expect(moveSession).toHaveBeenCalledWith('a', 'done', 0);
+    expect(useAppStore.getState().sessionOrder.done).toEqual(['a']);
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
   });
 
-  it('サーバが返した行でストアを確定させる', async () => {
+  it('ドロップ直後に楽観更新が反映される（サーバ応答を待たない）', async () => {
     seed();
-    updateSession.mockResolvedValue({ ...session('a', 'review', 9), title: 'server wins' });
+    let resolve!: (v: Session[]) => void;
+    moveSession.mockReturnValue(
+      new Promise<Session[]>((r) => {
+        resolve = r;
+      }),
+    );
 
-    await useAppStore.getState().moveCard('a', 'review', 0);
+    const pending = useAppStore.getState().moveCard('a', 'review', 1);
 
-    expect(useAppStore.getState().sessions.a.title).toBe('server wins');
-    expect(useAppStore.getState().sessions.a.sort_order).toBe(9);
+    // await していない時点で既に並べ替わっていること
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'a', 'y']);
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
+
+    resolve([session('x', 'review', 10), session('a', 'review', 15), session('y', 'review', 20)]);
+    await pending;
   });
 
   it('存在しない id なら何もしない', async () => {
     seed();
-    await useAppStore.getState().moveCard('nope', 'done', 0);
-    expect(updateSession).not.toHaveBeenCalled();
-    expect(useAppStore.getState().sessionOrder.done).toEqual([]);
+
+    await useAppStore.getState().moveCard('nope', 'review', 0);
+
+    expect(moveSession).not.toHaveBeenCalled();
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a']);
   });
 
   it('保存に失敗したら楽観更新を巻き戻してからエラーを投げる', async () => {
     seed();
-    const before = useAppStore.getState().sessionOrder;
-    updateSession.mockRejectedValue({ code: 'db', message: 'disk I/O error' });
+    moveSession.mockRejectedValue({ code: 'db', message: 'boom' });
 
-    await expect(useAppStore.getState().moveCard('a', 'done', 0)).rejects.toMatchObject({
+    await expect(useAppStore.getState().moveCard('a', 'review', 1)).rejects.toEqual({
       code: 'db',
+      message: 'boom',
     });
 
-    expect(useAppStore.getState().sessionOrder).toEqual(before);
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a']);
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'y']);
     expect(useAppStore.getState().sessions.a.kanban_status).toBe('backlog');
-    expect(useAppStore.getState().sessions.a.sort_order).toBe(1);
   });
 });
