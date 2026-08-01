@@ -133,6 +133,9 @@ describe('moveCard', () => {
     expect(moveSession).toHaveBeenCalledWith('a', 'done', 0);
     expect(useAppStore.getState().sessionOrder.done).toEqual(['a']);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
+    // 移動元でも移動先でもない列は手を付けない（丸ごと置換に書き換えると x が消える）
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'y']);
+    expect(useAppStore.getState().sessions.x).toEqual(session('x', 'review', 10));
   });
 
   it('ドロップ直後に楽観更新が反映される（サーバ応答を待たない）', async () => {
@@ -172,8 +175,12 @@ describe('moveCard', () => {
       message: 'boom',
     });
 
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a']);
-    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'y']);
+    expect(useAppStore.getState().sessionOrder).toEqual({
+      backlog: ['a'],
+      in_progress: [],
+      review: ['x', 'y'],
+      done: [],
+    });
     expect(useAppStore.getState().sessions.a.kanban_status).toBe('backlog');
   });
 });

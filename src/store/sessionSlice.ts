@@ -1,7 +1,13 @@
 import type { StateCreator } from 'zustand';
 
-import { createSession, listSessions, moveSession, type CreateSessionArgs } from '../ipc/commands';
-import type { KanbanStatus, Session } from '../types/model';
+import {
+  createSession,
+  listSessions,
+  moveSession,
+  updateSession as updateSessionCmd,
+  type CreateSessionArgs,
+} from '../ipc/commands';
+import type { KanbanStatus, RuntimeState, Session, SessionPatch } from '../types/model';
 import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
 
@@ -10,14 +16,24 @@ export { emptySessionOrder, indexSessions } from './kanbanOrder';
 export interface SessionSlice {
   sessions: Record<string, Session>;
   sessionOrder: Record<KanbanStatus, string[]>;
+
+  /**
+   * runtime バッジの表示枠。M1-2 は型と初期値だけを置き、書き換えない。
+   * 値の導出（applyStateEvent）は M2-1 の担当（契約 §2 / §10）。
+   */
+  runtimeStates: Record<string, RuntimeState>;
+
   loadSessions: (projectId: string) => Promise<void>;
   addSession: (args: CreateSessionArgs) => Promise<Session>;
   moveCard: (sessionId: string, to: KanbanStatus, index: number) => Promise<void>;
+  editSession: (id: string, patch: SessionPatch) => Promise<Session>;
+  archiveSession: (id: string) => Promise<void>;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
   sessions: {},
   sessionOrder: emptySessionOrder(),
+  runtimeStates: {},
 
   loadSessions: async (projectId) => {
     // アーカイブ済みは表示しない（復活 UX は M3-4）
@@ -62,6 +78,40 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     } catch (e) {
       // DB が受け付けなかった位置にカードを残さない
       set({ sessions, sessionOrder });
+      throw e;
+    }
+  },
+
+  editSession: async (id, patch) => {
+    // title / description しか変えない想定（判断 10）。並びに影響しないので
+    // sessionOrder は触らず、sessions の当該エントリだけを差し替える。
+    const saved = await updateSessionCmd(id, patch);
+    set({ sessions: { ...get().sessions, [saved.id]: saved } });
+    return saved;
+  },
+
+  archiveSession: async (id) => {
+    const snapshot = get().sessions;
+    const prevOrder = get().sessionOrder;
+    const target = snapshot[id];
+    if (target === undefined) return;
+
+    // 楽観更新: 盤面からは当該列だけ除去する（buildSessionOrder による全列再構築は
+    // moveCard の in-flight 中と重なると、移動中のカードが古い sort_order の位置へ
+    // 吸着して見えるおそれがあるため避ける）。
+    const archivedAt = Date.now();
+    const optimisticSessions = { ...snapshot, [id]: { ...target, archived_at: archivedAt } };
+    const optimisticOrder = {
+      ...prevOrder,
+      [target.kanban_status]: prevOrder[target.kanban_status].filter((sid) => sid !== id),
+    };
+    set({ sessions: optimisticSessions, sessionOrder: optimisticOrder });
+
+    try {
+      const saved = await updateSessionCmd(id, { archived_at: archivedAt });
+      set({ sessions: { ...get().sessions, [saved.id]: saved } });
+    } catch (e) {
+      set({ sessions: snapshot, sessionOrder: prevOrder });
       throw e;
     }
   },
