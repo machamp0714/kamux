@@ -17,8 +17,8 @@ import { emptySessionOrder } from './sessionSlice';
 
 const project = (id: string): Project => ({
   id,
-  name: id,
-  repo_path: `/repo/${id}`,
+  name: `name-${id}`,
+  repo_path: `/repo-path/${id}`,
   default_cli: 'claude',
   created_at: 1,
   updated_at: 1,
