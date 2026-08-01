@@ -1,6 +1,11 @@
 use crate::model::SurfaceKind;
 
 pub mod backpressure;
+pub mod surface;
+
+// 契約 §15 は `crate::pty::SpawnSpec` というパスを前提にする。実体は surface.rs に
+// あるため、ここで再エクスポートしてそのパス解決を成立させる。
+pub use surface::SpawnSpec;
 
 /// イベントトピックに埋め込む決定的な ID（契約 §5）。
 /// 文字列表現は `SurfaceKind::as_db_str`（model.rs の `db_enum!`）を単一の情報源として使う。
