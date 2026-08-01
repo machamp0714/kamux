@@ -32,6 +32,7 @@ pub fn now_ms() -> i64 {
 
 pub mod project_dao;
 pub mod schema;
+pub mod session_dao;
 
 /// SQLite 接続の唯一の持ち主。全 DAO メソッドは同期で、
 /// MutexGuard を .await を跨いで保持しない（Tauri の async コマンドが Send を要求するため）。
@@ -62,7 +63,8 @@ impl Store {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::Store;
+    use super::{now_ms, Store};
+    use crate::model::{CliKind, KanbanStatus, Session, SessionMode};
     use tempfile::TempDir;
 
     /// テンポラリディレクトリ上に初期化済みの Store を作る。
@@ -71,6 +73,27 @@ pub(crate) mod test_support {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(&dir.path().join("app.db")).expect("open store");
         (dir, store)
+    }
+
+    /// 「採番 → 構築 → 挿入」の 3 手をまとめたテスト用ヘルパ。
+    /// in_place / shell / branch なしの最小構成。worktree や cli_command を
+    /// 検証したいテストは Session::new_backlog を直接使うこと。
+    pub(crate) fn insert_test_session(store: &Store, project_id: &str, title: &str) -> Session {
+        let sort_order = store
+            .next_sort_order(project_id, KanbanStatus::Backlog)
+            .expect("next_sort_order");
+        let session = Session::new_backlog(
+            project_id,
+            title,
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            sort_order,
+            now_ms(),
+        );
+        store.insert_session(&session).expect("insert_session")
     }
 }
 

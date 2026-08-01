@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// 契約 §2: serde 表現（snake_case 文字列）と DB に格納する文字列を
 /// 1 箇所で定義するためのマクロ。両者がズレるとデータが読めなくなるため、
@@ -94,6 +95,46 @@ pub struct Session {
     pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl Session {
+    /// 新規セッションの初期値。`now` を引数で受けるのは、`now_ms()` が store 側にあり
+    /// model -> store の依存を作りたくないため。純関数なのでテストしやすい。
+    // 引数 9 個は契約 §17 のシグネチャそのもの。分割すると DAO 境界（呼び出し側での
+    // 組み立てという契約 §17 の構造）が変わるため、まとめずそのまま許可する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_backlog(
+        project_id: &str,
+        title: &str,
+        description: &str,
+        mode: SessionMode,
+        branch: Option<String>,
+        cli_kind: CliKind,
+        cli_command: Option<String>,
+        sort_order: f64,
+        now: i64,
+    ) -> Session {
+        Session {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_owned(),
+            title: title.to_owned(),
+            description: description.to_owned(),
+            kanban_status: KanbanStatus::Backlog,
+            sort_order,
+            mode,
+            branch,
+            worktree_path: None,
+            cli_kind,
+            cli_command,
+            claude_session_id: None,
+            last_runtime_state: RuntimeState::Idle,
+            last_runtime_error: None,
+            first_started_at: None,
+            archived_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 /// フィールドが「不在」なのか「null が明示された」のかを区別するためのデシリアライザ。
@@ -324,5 +365,85 @@ mod tests {
                 .expect("deserialize");
         assert_eq!(patch.kanban_status, Some(KanbanStatus::Review));
         assert_eq!(patch.sort_order, Some(1.5));
+    }
+
+    #[test]
+    fn new_backlog_fills_the_creation_time_defaults() {
+        let s = Session::new_backlog(
+            "pid",
+            "fix login",
+            "壊れたログインを直す",
+            SessionMode::InPlace,
+            None,
+            CliKind::Claude,
+            None,
+            3.0,
+            1700000000000,
+        );
+
+        assert_eq!(s.project_id, "pid");
+        assert_eq!(s.title, "fix login");
+        assert_eq!(s.description, "壊れたログインを直す");
+        assert_eq!(s.kanban_status, KanbanStatus::Backlog);
+        assert_eq!(s.last_runtime_state, RuntimeState::Idle);
+        assert_eq!(s.sort_order, 3.0);
+        assert_eq!(s.mode, SessionMode::InPlace);
+        assert_eq!(s.branch, None);
+        assert_eq!(s.worktree_path, None, "worktree 作成は M1-4");
+        assert_eq!(s.claude_session_id, None, "session_id 捕捉は M2-2");
+        assert_eq!(s.archived_at, None);
+        assert_eq!(s.id.len(), 36, "UUID v4 のハイフン付き文字列");
+        assert_eq!(s.created_at, 1700000000000);
+        assert_eq!(s.updated_at, 1700000000000, "作成時は両方同じ");
+    }
+
+    #[test]
+    fn new_backlog_generates_a_unique_id_each_call() {
+        let a = Session::new_backlog(
+            "p",
+            "t",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            1.0,
+            1,
+        );
+        let b = Session::new_backlog(
+            "p",
+            "t",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            1.0,
+            1,
+        );
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn new_backlog_carries_worktree_and_custom_cli_fields() {
+        let s = Session::new_backlog(
+            "pid",
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/fix-login".to_owned()),
+            CliKind::Custom,
+            Some("bun run agent".to_owned()),
+            1.0,
+            1,
+        );
+
+        assert_eq!(s.mode, SessionMode::Worktree);
+        assert_eq!(s.branch.as_deref(), Some("session/fix-login"));
+        assert_eq!(s.cli_command.as_deref(), Some("bun run agent"));
+        assert_eq!(
+            s.worktree_path, None,
+            "worktree_path は set_worktree（M1-4）で入る"
+        );
     }
 }
