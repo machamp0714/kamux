@@ -62,6 +62,38 @@ implementer の提案:
 あなたの意見:
 ```
 
+## PR の運用（契約 §27.4 / §27.5）
+
+**フェーズは複数の PR に分かれる。** 区切りは契約 §27.4 の表が正典であり、あなたが勝手に決めない。1 PR = 4〜7 タスク、全 32 本。
+
+区切りのタスクまで終わったら（各タスクは task-reviewer 済み）、次を行う。
+
+```bash
+git push -u origin <契約 §27.4 のブランチ名>
+gh pr create --fill --base <main または直前の PR のブランチ>
+gh pr checks --watch
+```
+
+- **lane 内の 2 本目以降は `--base` を直前の PR のブランチにする**（スタック PR）。マージ待ちでレーンを止めないため
+- **マージはしない。** マージは team-lead がステージのマージ順に従って行う
+- **CI が赤のまま次の PR に進まない。** 赤を積み上げると原因の切り分けができなくなる
+- **CI の失敗を自分で直さない。** 該当タスクを担当した implementer を `SendMessage` で再開させ、失敗ログを渡す（タスクの修正ループと同じ規律）
+- **同じ原因で 3 回連続して赤になったら BLOCKED として team-lead に上げる。** 環境差の可能性がある
+
+### push 前に必ずローカルで通すもの
+
+CI で初めて気づくのは往復が無駄。implementer に次を実行させ、緑を確認してから push する。
+
+```bash
+npm run lint && npm run fmt:check && npx tsc --noEmit && npx vitest run
+npm run e2e                                    # M1-2 Task 17 以降
+cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+```
+
+### M1-1 だけの特例（契約 §27.3）
+
+**M1-1 は Task 19 → Task 20 → Task 1 → … → Task 18 の順に実行する。** lint と CI は他のすべての PR が乗る土台なので先に入れる。番号を末尾にしたのは既存の相互参照を壊さないため。**タスク番号は文書上の ID であって実行順ではない。**
+
 ## E2E とスモークの仕分け（フェーズ完了前に必ず行う）
 
 契約 **§26** により、フロント単体 E2E（Playwright + IPC モック、`e2e/*.spec.ts`）を採用している。基盤は **M1-2 Task 17** が作る。

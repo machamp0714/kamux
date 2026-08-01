@@ -58,7 +58,7 @@ git log --oneline -5
 
 | ID | 計画ファイル | タスク | ブランチ | ゴール | 前提 | 主な実装者 |
 |---|---|---|---|---|---|---|
-| M1-1 | `M1-1-foundation.md` | 18 | `feat/m1-1-foundation` | アプリ再起動後もプロジェクトとセッションが復元される | なし | rust + web |
+| M1-1 | `M1-1-foundation.md` | 20 | `feat/m1-1-foundation` | アプリ再起動後もプロジェクトとセッションが復元される | なし | rust + web |
 | M1-2 | `M1-2-kanban.md` | 17 | `feat/m1-2-kanban` | セッションをカンバン上で管理し、手動で状態を動かせる | M1-1 | web |
 | M1-3 | `M1-3-pty-terminal.md` | 16 | `feat/m1-3-pty-terminal` | shell セッションを起動し、ターミナルで対話できる | M1-1 | rust + web |
 | M1-4 | `M1-4-worktree-cli.md` | 11 | `feat/m1-4-worktree-cli` | カードから claude が選択した作業ツリーで起動し、該当ペインに直行できる | M1-1〜M1-3 | rust + web |
@@ -72,6 +72,10 @@ git log --oneline -5
 | M3-4 | `M3-4-ops-ux.md` | 15 | `feat/m3-4-ops-ux` | 要件1〜10 を満たし、日常運用で破綻しない | M1-1〜M3-3 | rust + web |
 
 計画ファイルはすべて `docs/superpowers/plans/2026-08-01-kamux/` 配下。
+
+**1 フェーズ = 複数 PR。** 区切りとブランチ名は契約 **§27.4**（全 32 本）が正典。lane-controller が PR を作り CI を緑にするところまで担当し、**マージは team-lead が §2 のマージ順に従って行う**。
+
+**M1-1 だけ実行順が特殊**（契約 §27.3）: Task 19（lint）→ Task 20（CI）→ Task 1 → … → Task 18。lint と CI は他の全 PR が乗る土台なので先に入れる。
 
 ---
 
@@ -139,15 +143,18 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 | 進捗を聞かれた | `TaskList` で一覧、`TaskOutput` で途中経過を覗いて要約する |
 | BLOCKED が返った | 人間ゲートならユーザーに提示し、結果を `SendMessage` でレーンへ返す |
 | 契約変更要求が返った | `contract-owner` を起動して裁定させる。**並列中の他レーンにも結果を周知する** |
-| レーンが完了した | §2 のマージ順に従ってマージ → 下のゲートを実行 → 次のステージへ |
+| PR が出た | lane-controller が `gh pr checks --watch` まで面倒を見る。**マージはあなた（team-lead）の仕事** |
+| レーンが完了した | §2 のマージ順に従い、**スタックした PR を下から順にマージ** → 下のゲートを実行 → 次のステージへ |
 
 ### ステージ完了ゲート
 
 ```bash
-cd src-tauri && cargo test && cd ..
-npx vitest run && npx tsc --noEmit
+npm run lint && npm run fmt:check && npx tsc --noEmit && npx vitest run
 npm run e2e            # M1-2 Task 17 以降
+cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cd ..
 ```
+
+**マージ前に、そのステージの PR がすべて CI 緑であること**を `gh pr checks` で確認する（契約 §27.5）。
 
 加えて次の 2 つを確認してから次のステージに進む。
 

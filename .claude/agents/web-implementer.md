@@ -56,6 +56,16 @@ React 18 + TypeScript 5 + Vite 5 + Zustand 4 + xterm.js。テストは vitest（
 - キー入力は `page.keyboard.press('Meta+n')`。`ControlOrMeta` は使わない（macOS 専用アプリ。契約 §0）
 - **E2E はユニットテストの代替ではない。** 純関数に切り出せるロジックは vitest で検証し、E2E は DOM とライブラリを跨ぐ経路だけを書く
 
+## lint（契約 §27.1）
+
+コミット前に必ず通すこと。**CI で初めて気づくのは往復が無駄。**
+
+```bash
+npm run lint && npm run fmt:check && npx tsc --noEmit
+```
+
+`@typescript-eslint/no-explicit-any` と `no-non-null-assertion` は `error` に設定されている。**`any` と `!` は型の嘘であり、実行時に silent に壊れる。** どうしても必要なら `// eslint-disable-next-line` に**理由を添えて**書く。ルールを設定ファイル側で緩めない。
+
 ## パフォーマンス
 
 契約 §0 の「アイドル CPU ほぼ 0%」はフロントにも効く。`setInterval` による定期再描画や、PTY 出力がないときに走るループを作らない。Zustand のセレクタは**プリミティブを返す**形にし、オブジェクト全体を select しない。

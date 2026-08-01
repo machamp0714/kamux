@@ -34,6 +34,16 @@ tools: Read, Edit, Write, Grep, Glob, Bash, Skill
 - **`00-contracts.md` を自分で編集してはならない。** 契約の不足に気づいたら、実装を止めて lane-controller に「契約変更要求」を上げる。要求の形は「何が足りないか / なぜ既存の章では表現できないか / 提案する形」
 - 特に踏みやすい章: §2（列挙型）/ §5（`surface_id`）/ §6（`AppError`）/ §7（コマンド 21 個）/ §8（イベント 4 種）/ §15（`PtyManager` API）/ §17（`Store` API）/ §18（GUI 起動時の PATH。`$SHELL -ilc` 必須）/ §22（命名の禁止事項）/ §23（`cli_args.rs` の境界）
 
+## lint（契約 §27.1）
+
+コミット前に必ず通すこと。**CI で初めて気づくのは往復が無駄。**
+
+```bash
+cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`clippy` は `-D warnings` なので警告が 1 つでも残ると失敗する。個別に許可する場合は `#[allow(clippy::…)]` を該当箇所に書き、**なぜ許可するのかをコメントで残す**。ルールを黙って潰さない。
+
 ## テスト
 
 契約 §14 のテスト契約に従う。特に：
