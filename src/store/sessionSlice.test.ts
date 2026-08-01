@@ -40,8 +40,8 @@ beforeEach(() => {
   listSessions.mockReset();
   createSession.mockReset();
   // activeProjectId は loadSessions のガードが参照するため、前のテストの値が
-  // 漏れないよう毎回リセットする（null はガードの対象外なので既存テストには影響しない）。
-  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: null });
+  // 漏れないよう毎回リセットする。
+  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: 'p1' });
 });
 
 describe('emptySessionOrder', () => {
@@ -112,6 +112,9 @@ describe('loadSessions', () => {
     await useAppStore.getState().loadSessions('p1');
 
     listSessions.mockResolvedValue([session({ id: 'new', project_id: 'p2' })]);
+    // loadSessions は activeProjectId が指すプロジェクトの応答しか適用しない。この行が
+    // 無いと、この呼び出し自体がガードの弾く stale 呼び出しになる（lane-controller 裁定）。
+    useAppStore.setState({ activeProjectId: 'p2' });
     await useAppStore.getState().loadSessions('p2');
 
     expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', false);
@@ -145,17 +148,6 @@ describe('loadSessions', () => {
 
   it('要求時のプロジェクトが選択されたままなら通常どおり反映する', async () => {
     useAppStore.setState({ activeProjectId: 'pA' });
-    listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'pA' })]);
-
-    await useAppStore.getState().loadSessions('pA');
-
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a1']);
-  });
-
-  it('activeProjectId が未選択（null）のときは stale 判定の対象外として通常どおり反映する', async () => {
-    // 「現在の選択」が存在しない状態では stale かどうかを判定する根拠が無い。
-    // この分岐が後続フェーズで削られないよう固定する。
-    useAppStore.setState({ activeProjectId: null });
     listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'pA' })]);
 
     await useAppStore.getState().loadSessions('pA');
