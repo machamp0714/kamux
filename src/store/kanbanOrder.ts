@@ -41,7 +41,7 @@ export const buildSessionOrder = (sessions: Record<string, Session>): SessionOrd
 /** セッション配列を「id 索引」と「列ごとの sort_order 昇順（同値は id 辞書順）」に畳む。 */
 export const indexSessions = (
   list: Session[],
-): { sessions: Record<string, Session>; sessionOrder: Record<KanbanStatus, string[]> } => {
+): { sessions: Record<string, Session>; sessionOrder: SessionOrder } => {
   const sessions = Object.fromEntries(list.map((s) => [s.id, s]));
   return { sessions, sessionOrder: buildSessionOrder(sessions) };
 };
