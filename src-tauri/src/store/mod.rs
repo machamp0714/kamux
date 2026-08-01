@@ -51,7 +51,7 @@ impl Store {
         })
     }
 
-    pub(crate) fn conn(&self) -> AppResult<MutexGuard<'_, Connection>> {
+    pub fn conn(&self) -> AppResult<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| AppError::Db("store mutex is poisoned".to_owned()))
