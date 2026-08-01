@@ -4,11 +4,15 @@
 
 クラス名は契約 `00-contracts.md` §25.3 が正典。ここに書いてある名前と食い違ったら**契約が勝つ**。
 
+§25.3 に載っていない新規部品は、**ファイル名を kebab-case にしたものを block 名**にし、`__` で子要素、`--` で修飾子を書く（`StopSessionDialog.tsx` → `stop-session-dialog__footer`）。**2 つ以上のビューから使うようになった時点で §25.3 への登録を契約側に要求する。** 自分で §25.3 を編集しない。
+
+**アイコンのサイズ**は 11 / 12 / 13 / 14 / 16 / 20 / 28px の 7 段。行内のメタ情報に添えるものが 11〜13、ボタンやヘッダが 14〜16、空状態の主アイコンが 28。トークンにはしない（尺度ではなく部品の寸法）。
+
 ---
 
 ## カード（`kanban-card`）
 
-縦積み。`gap: var(--space-4)` / `padding: var(--space-6)` / `background: var(--bg-elevated)` / `border: 1px solid var(--border)` / `border-radius: 8px`。
+縦積み。`gap: var(--space-4)` / `padding: var(--space-6)` / `background: var(--bg-elevated)` / `border: 1px solid var(--border)` / `border-radius: var(--radius-card)`。
 
 | 子要素 | 中身 | トークン |
 |---|---|---|
@@ -37,12 +41,14 @@
 
 | 状態 | トークン | ラベル |
 |---|---|---|
-| `running` | `--state-running` | `running` |
-| `waiting_input` | `--state-waiting` | `waiting` |
-| `idle` | `--state-idle` | `idle` |
-| `exited` | `--state-exited` | `exited` |
-| `interrupted` | `--state-interrupted` | `interrupted` |
-| `error` | `--state-error` | `error` |
+| `running` | `--state-running` | `実行中` |
+| `waiting_input` | `--state-waiting` | `入力待ち` |
+| `idle` | `--state-idle` | `アイドル` |
+| `exited` | `--state-exited` | `終了` |
+| `interrupted` | `--state-interrupted` | `中断` |
+| `error` | `--state-error` | `エラー` |
+
+**ラベルの正典は契約 §33.5。** `.pen` 上では英語（`running` / `waiting` …）で描かれているが、これは Pencil が CJK グリフを描画できないための表示上の制約であって設計判断ではない。**実装は日本語ラベルを出す。**
 
 `runtime-badge--estimated`: ドットを中空（`background: transparent` + `border: 1.5px solid var(--state-*)`）にし、ラベルに `~` を前置。**色は変えない。** アニメーションは付けない（契約 §0「アイドル時 CPU ほぼ 0%」）。
 
@@ -94,9 +100,9 @@
 
 ## モーダル・ダイアログ
 
-スクリム: `#0a0b12b3`（テーマ非依存）。
+スクリム: `background: var(--scrim)`（テーマ非依存）。
 
-パネル: `background: var(--bg-elevated)` / `border: 1px solid var(--border-strong)` / `border-radius: 12px` / `box-shadow: var(--shadow-modal)`。幅は 500〜600px。
+パネル: `background: var(--bg-elevated)` / `border: 1px solid var(--border-strong)` / `border-radius: var(--radius-modal)` / `box-shadow: var(--shadow-modal)`。幅は 500〜600px。
 
 3 段構成。
 
@@ -106,7 +112,7 @@
 | body | `padding: var(--space-9)` / `gap: var(--space-9)` |
 | footer | `padding: var(--space-7) var(--space-9)` / `background: var(--bg-surface)` / 上に `1px solid var(--border)` / ボタンは右寄せ `gap: var(--space-4)` |
 
-**破壊的な確認ダイアログ**: 左肩に 32×32 のアイコン枠（`--bg-app` / `1px solid var(--state-error)` / `--radius-md`、アイコンは `--state-error`）。危険の内訳は `--bg-app` 背景 + `1px solid var(--state-error)` のブロックに入れる。
+**破壊的な確認ダイアログ**: 左肩に 32×32 のアイコン枠（`--bg-app` / `1px solid var(--state-error)` / `--radius-md`、アイコンは `--state-error`）。危険の内訳は `--bg-app` 背景 + `1px solid var(--state-error)` のブロックに入れる。**このブロックの本文は `--text-primary`**（読ませたい情報なので沈めない）。`--state-error` を使うのは枠・アイコン・箇条書きの記号までで、本文まで赤くしない。
 「安心情報」を緑で出さない（`--state-running` と衝突する）。`--text-muted` の通常テキストで足りる。
 不可逆操作は明示的なチェックボックスを通す。チェックが入るまで実行ボタンは無効。
 

@@ -12,7 +12,7 @@ tools: Read, Edit, Write, Grep, Glob, Bash, Skill
 
 1. `Skill` ツールで **`superpowers:test-driven-development`** を起動する。以降はこのスキルの手順に従う
 2. `Skill` ツールで **`vercel-react-best-practices`** を起動する
-3. UI の見た目を作るタスクなら、加えて `Skill` ツールで **`frontend-design`** を起動する
+3. UI の見た目を作るタスクなら、`Skill` ツールで **`kamux-design-system`** を起動する。**`frontend-design` より優先する** —— kamux の色・余白・文字サイズ・角丸は `docs/design/kamux-ui.pen` で確定済みで、汎用の美意識を持ち込む余地が無いため
 4. 渡された **task brief ファイル**を読む。これが要件の唯一の出典である。数値・文字列・シグネチャは**そのまま使う**
 5. `docs/superpowers/plans/2026-08-01-kamux/00-contracts.md` の**該当章だけ**を読む
 

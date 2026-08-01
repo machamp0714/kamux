@@ -26,7 +26,7 @@ CSS を書く前に `tokens.css` を読む。**色・余白・文字サイズ・
   padding: var(--space-6);
   background: var(--bg-elevated);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-card);
   color: var(--text-primary);
   font-family: var(--font-ui);
 }
@@ -60,7 +60,9 @@ CSS を書く前に `tokens.css` を読む。**色・余白・文字サイズ・
 | ターミナル面（テーマ非依存） | `--bg-terminal` `--text-term` `--text-term-dim` `--term-*` |
 | 余白 | `--space-1`(2px) 〜 `--space-10`(24px) |
 | 文字 | `--text-2xs`(10) 〜 `--text-2xl`(22)、`--leading-tight/normal/term` |
-| 角丸 | `--radius-sm`(4) `--radius-md`(6) `--radius-lg`(10)。カードだけ 8px |
+| 角丸 | `--radius-sm`(4) `--radius-md`(6) `--radius-lg`(10) `--radius-card`(8) `--radius-modal`(12) |
+| モーダルの背面 | `--scrim` |
+| 重なり順 | `--z-scrim` `--z-toast` `--z-tooltip`。`z-index` に数値を直接書かない |
 
 **色の系統は 2 つしかない —— 実行状態（6 色）と accent。3 つ目を作らない。**
 CLI 種別ごとの色分け、成功/注意を表す緑や黄、破壊的操作専用の赤を新設すると、必ず実行状態の 6 色と衝突する。破壊的操作は `--state-error` を使う。
@@ -100,7 +102,12 @@ grep -rnE '#[0-9a-fA-F]{3,8}|rgba?\(|[0-9]+px|[0-9.]+rem' src --include='*.css' 
 node .claude/skills/kamux-design-system/verify-contrast.mjs
 ```
 
-1 は `border-radius: 8px`（カード）と `1px` のボーダー幅以外がヒットしたら直す。2 は全 88 組み合わせが 4.5:1（UI 要素は 3:1）を満たすことを確認する。
+1 でヒットしてよいのは次の 2 つだけ。**色は 1 つも残らない。**
+
+- `border` / `outline` プロパティ上の幅（`1px` `1.5px` `2px`）。線の太さは尺度ではないのでトークン化しない
+- `components.md` が px で直接指定している部品固有の寸法（アイコン枠 32×32、パネル幅 520px、ペインヘッダ高さ 38px など）。これらも尺度ではなく部品の寸法
+
+角丸・スクリム・余白・文字サイズがヒットしたら、対応するトークンがある。2 は全 88 組み合わせが 4.5:1（UI 要素は 3:1）を満たすことを確認する。
 
 ## やってしまいがちなこと
 
