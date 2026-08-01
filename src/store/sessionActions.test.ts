@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Session, SessionPatch } from '../types/model';
 import { useAppStore } from './index';
-import { buildSessionOrder } from './kanbanOrder';
+import { buildSessionOrder, emptySessionOrder } from './kanbanOrder';
 
 vi.mock('../ipc/commands', () => ({
   createProject: vi.fn(),
@@ -146,5 +146,72 @@ describe('archiveSession', () => {
     seed([]);
     await useAppStore.getState().archiveSession('missing');
     expect(updateSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('局所更新であることの判別テスト（buildSessionOrder による全列再構築との区別）', () => {
+  /**
+   * seed() は sessionOrder を buildSessionOrder(sessions) から作るため、局所更新でも
+   * 全列再構築でも sessionOrder が最初から sort_order 昇順と一致してしまい、
+   * どちらの実装でも同じ結果になって区別できない（PR 5 のレビューが指摘したのと
+   * 同型の穴）。ここでは seed() を使わず、sessionOrder が sort_order の昇順と
+   * わざと食い違う状態を直接 setState で再現する。これは架空の状態ではなく、
+   * moveCard の楽観更新（契約 §7.4）が in-flight 中に残す実在の状態そのもの——
+   * moveCard は列の並べ替えだけを行い、sort_order の確定値はサーバ応答を待つため、
+   * 応答が返るまでは sessionOrder と sort_order がずれたままになる。
+   *
+   * editSession / archiveSession を将来 buildSessionOrder ベースへ「単純化」すると、
+   * このずれが全列再構築で矯正されてしまい、moveCard の in-flight 中にカードが
+   * 古い sort_order の位置へ吸着して見える不具合が戻る。このテストはそれを防ぐ。
+   */
+  function seedStale(sessions: Session[], staleReviewOrder: string[]) {
+    const byId = Object.fromEntries(sessions.map((s) => [s.id, s]));
+    useAppStore.setState({
+      sessions: byId,
+      sessionOrder: { ...emptySessionOrder(), review: staleReviewOrder },
+      activeProjectId: 'p1',
+    });
+  }
+
+  it('editSession は sort_order 順とずれた sessionOrder を並べ直さない', async () => {
+    seedStale(
+      [
+        makeSession({ id: 'a', kanban_status: 'review', sort_order: 2 }),
+        makeSession({ id: 'b', kanban_status: 'review', sort_order: 1 }),
+      ],
+      ['a', 'b'], // sort_order 昇順なら ['b', 'a'] のはずが、意図的にずらしてある
+    );
+    vi.mocked(updateSession).mockResolvedValue(
+      makeSession({ id: 'a', kanban_status: 'review', sort_order: 2, title: '新' }),
+    );
+
+    await useAppStore.getState().editSession('a', { title: '新' });
+
+    // 全列再構築（buildSessionOrder）なら sort_order 順の ['b', 'a'] に矯正されてしまう
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['a', 'b']);
+  });
+
+  it('archiveSession は残ったカードの stale な並びを保ったまま対象 id だけ除く', async () => {
+    seedStale(
+      [
+        makeSession({ id: 'a', kanban_status: 'review', sort_order: 2 }),
+        makeSession({ id: 'b', kanban_status: 'review', sort_order: 1 }),
+        makeSession({ id: 'c', kanban_status: 'review', sort_order: 3 }),
+      ],
+      ['a', 'b', 'c'], // sort_order 昇順なら ['b', 'a', 'c']
+    );
+    vi.mocked(updateSession).mockImplementation(
+      async (id, patch: SessionPatch) =>
+        ({
+          ...useAppStore.getState().sessions[id],
+          ...patch,
+        }) as Session,
+    );
+
+    // 第 3 のカード c をアーカイブする。a・b はどちらもこのテストの操作対象ではない
+    await useAppStore.getState().archiveSession('c');
+
+    // 全列再構築なら残った a・b が sort_order 順の ['b', 'a'] に矯正されてしまう
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['a', 'b']);
   });
 });
