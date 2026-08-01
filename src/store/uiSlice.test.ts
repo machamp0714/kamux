@@ -33,12 +33,19 @@ describe('uiSlice', () => {
     expect(useAppStore.getState().view).toBe('editor');
   });
 
-  it('focusSession は既定でビューを変えずにフォーカスだけ動かす', () => {
-    useAppStore.getState().setView('terminal');
-    useAppStore.getState().focusSession('s1');
-    expect(useAppStore.getState().focusedSessionId).toBe('s1');
-    expect(useAppStore.getState().view).toBe('terminal');
-  });
+  // 始点を 'terminal' と 'editor' の 2 通り検証する。1 つの始点だけだと
+  // 「view を特定の固定値にすり替える」変異体（例: view ?? 'terminal'）を
+  // その固定値と始点が一致した場合に見逃す。2 通りあれば、変異体が書ける
+  // 固定値は 1 つしかないため、必ずどちらか一方で赤くなる。
+  it.each(['terminal', 'editor'] as const)(
+    'focusSession は既定でビューを変えずにフォーカスだけ動かす（始点: %s）',
+    (startView) => {
+      useAppStore.getState().setView(startView);
+      useAppStore.getState().focusSession('s1');
+      expect(useAppStore.getState().focusedSessionId).toBe('s1');
+      expect(useAppStore.getState().view).toBe(startView);
+    },
+  );
 
   it('focusSession に view を渡すと同時に切り替える（カードクリックの経路）', () => {
     useAppStore.getState().focusSession('s1', 'terminal');
