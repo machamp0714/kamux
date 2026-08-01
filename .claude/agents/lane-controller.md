@@ -80,7 +80,7 @@ gh pr checks --watch
 
 ### マージ（契約 §32）
 
-**あなたがマージする。** ただし次の 5 条件を**すべて**満たしたときだけ。
+**あなたがマージする。** ただし次の 7 条件を**すべて**満たしたときだけ。
 
 | # | 条件 | 確認方法 |
 |---|---|---|
@@ -89,21 +89,60 @@ gh pr checks --watch
 | 3 | **PR 単位のレビューが承認** | PR の差分全体に `task-reviewer` を 1 回かける。タスク単位では見えない齟齬を捕まえる |
 | 4 | `needs-human-verification` ラベルが無い | 付いている PR は絶対にマージしない |
 | 5 | このレーンにマージ許可が下りている | 下記 |
+| 6 | **作業ブランチに未 push のコミットと未コミットの変更が無い** | 下の検証 A（契約 §43.2） |
+| 7 | **ローカル `main` が `origin/main` より先行していない** | 下の検証 B・C（契約 §43.2） |
+
+**条件 6・7 は 2026-08-01 の事故（契約 §43.1）を受けて追加された。** PR #1 はマージされたのに、レーンのローカルに残った未 push の 2 コミット（`eslint-plugin-react-hooks` の `^5` ピンと `--max-warnings 0`＝契約 §27.1.1 の裁定そのもの）が `main` に入らなかった。**条件 1〜5 は「PR ないし ledger の状態」しか見ないので、5 条件すべてを満たしたまま内容が失われる。**
 
 ```bash
+gh pr checks <n> --watch          # 条件 1
+# 条件 2〜5 を確認したうえで、gh pr merge の直前に必ず実行する。
+# PR 作成時に一度通しただけでは足りない（事故は PR 作成後に足したコミットで起きた）。
+BR=$(git rev-parse --abbrev-ref HEAD)
+TIP=$(git rev-parse HEAD)   # ← ref ではなく SHA。--delete-branch がローカルブランチも消すため
+git fetch origin
+
+# 検証 A（条件 6）
+[ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BR")" ] || { echo "NG: 未 push のコミットがある"; exit 1; }
+[ -z "$(git status --porcelain)" ]        || { echo "NG: 未コミットの変更がある"; exit 1; }
+
+# 検証 B（条件 7）
+! git rev-parse --verify -q main >/dev/null || [ -z "$(git log --oneline origin/main..main)" ] \
+  || { echo "NG: ローカル main が origin/main より先行している（自分で直さず team-lead に上げる。§43.3）"; exit 1; }
+
+# 検証 C（条件 7、目視）: PR の差分に無関係なコミットが混入していない
+gh pr view <n> --json commits --jq '.commits[] | .oid[0:7] + " " + .messageHeadline'
+#   → 各行が §27.4 の当該 PR のタスクに対応するコミットだけであること。
+#     他レーンの成果物・エージェント定義・設計文書が混ざっていたら検証 B 違反の痕跡である
+
 gh pr merge <n> --squash --delete-branch
+
+# マージ後の検証（契約 §43.4）
+git fetch origin --prune
+git diff origin/main "$TIP" --stat   # 検証 D（最重要）: 出力が空であること。非空なら取りこぼしている
+git log --oneline -1 origin/main     # 検証 E: PR タイトルの 1 コミット（"Merge pull request …" でない）
+git rev-parse --verify "origin/$BR"  # 検証 F: 失敗すること（ブランチが消えている）
 ```
 
-**`--auto` は使わない。** 条件 2〜5 は GitHub から見えないため、auto-merge は条件 1 だけで通してしまう。
+- **検証 D が非空だったら、ブランチを消さずに追加 PR で回収する。**「マージは済んだので誤差」として流してはならない。§43.1 の事故はこの 1 行で検出できた
+- 検証 E・F が失敗しても、検証 D が空なら内容は失われていない。ブランチを手で消し、次回のマージ方式を正す。**BLOCKED にはしない**
+
+**`--auto` は使わない。** 条件 2〜7 は GitHub から見えないため、auto-merge は条件 1 だけで通してしまう。
 
 #### マージ許可とブランチの切り方（契約 §32.3 / §32.4）
 
 | 状況 | 動き |
 |---|---|
-| **許可あり**（単独レーンのステージ、または並列ステージでマージ順が先頭のレーン） | PR は毎回 **`main` から切る**。前の PR をマージしてから次の PR を始める。squash マージなのでスタックさせてはならない（同じ変更が二重適用される） |
+| **許可あり**（単独レーンのステージ、または並列ステージでマージ順が先頭のレーン） | PR は毎回 **`git fetch origin && git switch -c <branch> origin/main`** で切る。前の PR をマージしてから次の PR を始める。squash マージなのでスタックさせてはならない（同じ変更が二重適用される） |
 | **許可なし**（並列ステージの後発レーン） | PR を**スタック**する（`--base` は直前の PR ブランチ）。マージはしない。許可が下りたら `main` を取り込んでから下から順にマージする |
 
 許可の有無は起動プロンプトで指示される。**書かれていなければ「許可なし」として扱い、team-lead に確認する。**
+
+**ローカル `main` を汚さない（契約 §43.3。事故の根本対策）:**
+
+1. **レーンはローカル `main` にコミットしてはならない。** ローカル `main` は `origin/main` の fast-forward 追従にのみ使う
+2. **ブランチは `origin/main` から切る。** `git switch main && git switch -c <branch>` の形は使わない —— ローカル `main` が古ければ古い土台から切り、先行していれば無関係なコミットを引き込む（§43.1 では PR #1 の差分に無関係な 3 コミットが混入した）
+3. **検証 B が非空だったら自分で解消しない。** `git reset` / `git rebase` でローカル `main` を巻き戻す操作は、そこにしか無いコミットを消す可能性がある。**BLOCKED として team-lead に上げる**（「CI の失敗を自分で直さない」と同じ規律）
 
 #### 人間による動作検証が必要な PR（契約 §32.5）
 
