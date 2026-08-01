@@ -564,24 +564,30 @@ mod tests {
         )
         .expect("spawn waiter thread");
 
-        // `on_data` が実際に渡してきた seq で ack する
+        // `on_data` が実際に渡してきた seq で ack する。この時点ではまだ子プロセスの
+        // 終了を発火していない(exit を先に送ると、waiter が close() を呼ぶタイミング
+        // と reader が cv から目覚めて再開するタイミングとの間にレースが生まれ、
+        // ack が正しく効いていても Exit が先に届いてしまう場合があるため)。
         backpressure.ack(last_seq);
-        // reader が再開する猶予を与えてから子プロセスの終了を発火する。join() は
-        // reader が読み切るまで返らないため、Exit は追加の Data より後にしか
-        // 送られ得ない設計だが、ack が効いていなければ reader は park したままで
-        // Exit は Data 無しに直接届く
-        exit_tx.send(()).expect("signal fake process exit");
-
+        // ここは意図的に Backpressure::new() の既定 stall_timeout(5秒。
+        // BACKPRESSURE_STALL_TIMEOUT)より短いタイムアウトにする。もし ack が
+        // 効いていなくても、stall_timeout の安全弁が5秒後に会計を諦めて reader を
+        // 再開させてしまい、seq 配線の変異(seq を定数0にする等)を検出できなく
+        // なる(実測: 5秒のタイムアウトだと変異時も安全弁の再開で green になって
+        // しまった)。2秒なら安全弁より確実に先にタイムアウトし、ack 由来の
+        // 再開だけを弁別できる。
         let event = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("ack 後に何も届かなかった: on_data に渡す seq の配線が壊れている疑いがある");
         assert!(
             matches!(event, Ev::Data { .. }),
-            "追加の Data より先に Exit(または何も無し)が届いた: seq の配線が \
-             壊れている疑いがある (actual event: {event:?})"
+            "ack 後に追加の Data が届かなかった: seq の配線が壊れている疑いがある \
+             (actual event: {event:?})"
         );
 
-        // 後片付け: Exit まで読み飛ばしてスレッドを回収する
+        // ここまでで seq の配線は弁別済み。後片付けとして子プロセスの終了を発火し、
+        // Exit まで読み飛ばしてスレッドを回収する
+        exit_tx.send(()).expect("signal fake process exit");
         loop {
             match rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Ev::Exit(_)) => break,
