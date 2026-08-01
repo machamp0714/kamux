@@ -261,6 +261,113 @@ impl Store {
         let rows = stmt.query_and_then(params![state.as_db_str()], row_to_session)?;
         rows.collect()
     }
+
+    /// 契約 §7.4 / §49.3〜§49.5: DnD の並び替えを 1 トランザクションで原子的に行う。
+    /// to_index は「移動対象自身を除いた移動先列 L」への挿入位置（契約 §49.3.2）。
+    /// 戻り値は移動先の列のみ（契約 §49.4）。移動元の列は 1 行も変化しないので返さない。
+    pub fn move_session(
+        &self,
+        id: &str,
+        to_status: KanbanStatus,
+        to_index: usize,
+    ) -> AppResult<Vec<Session>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        // 1. 対象行を取る（無ければ NotFound。列の走査より先に判定する）。
+        //    project_id はこれでしか得られない —— カンバンの列はプロジェクト単位なので、
+        //    L と戻り値のクエリを project_id で絞らないと他プロジェクトの行が混ざる
+        //    （next_sort_order / list_sessions と同じ絞り込み。§29.4 の is_scratch と
+        //    同じ論法の導出）。
+        let project_id = fetch_session(&tx, id)?.project_id;
+
+        // 2. L = 移動先の列（対象自身とアーカイブ済みを除く）の (id, sort_order) を
+        //    sort_order ASC, id ASC で読む
+        let l: Vec<(String, f64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, sort_order FROM sessions
+                 WHERE project_id = ?1 AND kanban_status = ?2
+                       AND archived_at IS NULL AND id != ?3
+                 ORDER BY sort_order ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id, to_status.as_db_str(), id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let clamped_index = to_index.min(l.len());
+
+        // 3. mid を採番する（契約 §7.4 の 3 分岐）
+        let mut mid = compute_mid(&l, clamped_index);
+
+        // 4. 枯渇（mid が両隣のどちらかと厳密に等しい。契約 §49.3.1）なら、
+        //    「target を挿入した後の移動先の列」全体を 1.0, 2.0, 3.0, ... へ振り直す
+        //    （M1-2-kanban.md:222 の旧 TS 実装をサーバへ移した形）。**L だけを
+        //    1..L.len() に振り直してから中点を取り直す読み方は誤り**（このケースだと
+        //    中点が 1.5 になり、決定的テストの期待値 2.0 と食い違う）。
+        //    sort_order だけを UPDATE する。updated_at は動かさない（契約 §49.5）。
+        //    枯渇は to_index が中間（0 < clamped_index < L.len()）のときにしか起きない
+        //    —— 端への挿入は常に ±1.0 で新しい値を作れる。
+        if clamped_index > 0 && clamped_index < l.len() {
+            let prev = l[clamped_index - 1].1;
+            let next = l[clamped_index].1;
+            if mid == prev || mid == next {
+                for (i, (row_id, _)) in l.iter().enumerate() {
+                    let new_value = if i < clamped_index {
+                        (i + 1) as f64
+                    } else {
+                        (i + 2) as f64
+                    };
+                    tx.execute(
+                        "UPDATE sessions SET sort_order = ?1 WHERE id = ?2",
+                        params![new_value, row_id],
+                    )?;
+                }
+                mid = (clamped_index + 1) as f64;
+            }
+        }
+
+        // 5. 対象行を UPDATE（kanban_status / sort_order / updated_at = now_ms()）
+        let now = now_ms();
+        tx.execute(
+            "UPDATE sessions
+             SET kanban_status = ?1, sort_order = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![to_status.as_db_str(), mid, now, id],
+        )?;
+
+        // 6. 移動先の列を SELECT して返す（ORDER BY sort_order ASC, id ASC）。
+        //    アーカイブ済みは含めない
+        let column: Vec<Session> = {
+            let sql = format!(
+                "SELECT {SESSION_COLUMNS} FROM sessions
+                 WHERE project_id = ?1 AND kanban_status = ?2 AND archived_at IS NULL
+                 ORDER BY sort_order ASC, id ASC"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let rows =
+                stmt.query_and_then(params![project_id, to_status.as_db_str()], row_to_session)?;
+            rows.collect::<AppResult<Vec<_>>>()?
+        };
+
+        tx.commit()?;
+        Ok(column)
+    }
+}
+
+/// 契約 §7.4 の採番アルゴリズム本体。l は移動先列の (id, sort_order) を
+/// sort_order ASC, id ASC で並べたもの（移動対象自身とアーカイブ済みを除く）。
+fn compute_mid(l: &[(String, f64)], to_index: usize) -> f64 {
+    if l.is_empty() {
+        1.0
+    } else if to_index == 0 {
+        l[0].1 - 1.0
+    } else if to_index >= l.len() {
+        l[l.len() - 1].1 + 1.0
+    } else {
+        (l[to_index - 1].1 + l[to_index].1) / 2.0
+    }
 }
 
 /// 単体取得。呼び出し側が既に Connection のロックを持っているときに使う。
@@ -1544,5 +1651,458 @@ mod tests {
         assert_eq!(target_after.kanban_status, KanbanStatus::InProgress);
         assert_eq!(target_after.sort_order, 99.0);
         assert_eq!(target_after.archived_at, Some(1700000000000));
+    }
+
+    #[test]
+    fn move_session_into_empty_column_assigns_sort_order_one() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        assert_eq!(column.len(), 1, "移動先の列だけが返る");
+        assert_eq!(column[0].id, target.id);
+        assert_eq!(column[0].sort_order, 1.0, "空の列への挿入は 1.0");
+    }
+
+    #[test]
+    fn move_session_to_index_zero_places_before_the_first_row() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let existing = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "existing")
+        };
+        store.insert_session(&existing).expect("insert existing");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(moved.sort_order, 4.0, "L[0] - 1.0");
+    }
+
+    #[test]
+    fn move_session_to_index_at_end_places_after_the_last_row() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let existing = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "existing")
+        };
+        store.insert_session(&existing).expect("insert existing");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 1)
+            .expect("move_session");
+
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(moved.sort_order, 6.0, "L[last] + 1.0");
+    }
+
+    #[test]
+    fn move_session_to_a_middle_index_uses_the_midpoint_of_its_neighbors() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let low = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "low")
+        };
+        let high = Session {
+            sort_order: 10.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "high")
+        };
+        store.insert_session(&low).expect("insert low");
+        store.insert_session(&high).expect("insert high");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 1)
+            .expect("move_session");
+
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(moved.sort_order, 7.5, "(5.0 + 10.0) / 2.0");
+    }
+
+    #[test]
+    fn move_session_renumbers_the_whole_column_when_the_midpoint_is_exhausted() {
+        // 契約 §49.3.1: 枯渇判定は厳密比較。振り直す対象は「target を挿入した後の
+        // 移動先の列」全体（1.0, 2.0, 3.0, ...）である。L だけを 1..L.len() に振り直して
+        // から中点を取り直す読み方は誤り（このケースだと中点が 1.5 になり、
+        // 期待値の「移動した行は 2.0」と食い違う）。M1-2-kanban.md:222 の旧 TS 実装
+        // （移動先の列を丸ごと 1.0, 2.0, 3.0, ... に振り直す）を Rust 側へ移した形。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let low = Session {
+            sort_order: 1.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "low")
+        };
+        let high = Session {
+            // low の次に表現できる値。中点が丸めでどちらかに潰れる（決定的な枯渇ケース）
+            sort_order: 1.0 + 2f64.powi(-52),
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "high")
+        };
+        store.insert_session(&low).expect("insert low");
+        store.insert_session(&high).expect("insert high");
+        assert_ne!(
+            store.get_session(&low.id).expect("get low").sort_order,
+            store.get_session(&high.id).expect("get high").sort_order,
+            "SQLite REAL の往復で 2 値が潰れていたら、このテストは枯渇を検証できていない"
+        );
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 1)
+            .expect("move_session");
+
+        let sort_orders: Vec<f64> = column.iter().map(|s| s.sort_order).collect();
+        assert_eq!(
+            sort_orders,
+            vec![1.0, 2.0, 3.0],
+            "列全体が 1.0 刻みに振り直される"
+        );
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(moved.sort_order, 2.0, "移動した行は挿入位置の整数を得る");
+    }
+
+    #[test]
+    fn move_session_to_another_column_leaves_the_source_column_untouched() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let sibling = session_with_sentinel_updated_at(&pid, "sibling");
+        store.insert_session(&sibling).expect("insert sibling");
+        let target = Session {
+            sort_order: 2.0,
+            ..session_with_sentinel_updated_at(&pid, "target")
+        };
+        store.insert_session(&target).expect("insert target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        assert_eq!(column.len(), 1, "移動先の列だけが返る");
+        assert_eq!(column[0].id, target.id);
+        assert!(
+            column.iter().all(|s| s.id != sibling.id),
+            "移動元の行が戻り値に混ざっている"
+        );
+
+        let sibling_after = store.get_session(&sibling.id).expect("get sibling");
+        assert_eq!(
+            sibling_after.sort_order, 1.0,
+            "移動元の行の sort_order が動いた"
+        );
+        assert_eq!(
+            sibling_after.updated_at, 1,
+            "移動元の行の updated_at が動いた"
+        );
+    }
+
+    #[test]
+    fn move_session_within_the_same_column_can_move_a_card_earlier() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let a = Session {
+            sort_order: 1.0,
+            ..session_with_sentinel_updated_at(&pid, "a")
+        };
+        let b = Session {
+            sort_order: 2.0,
+            ..session_with_sentinel_updated_at(&pid, "b")
+        };
+        let c = Session {
+            sort_order: 3.0,
+            ..session_with_sentinel_updated_at(&pid, "c")
+        };
+        store.insert_session(&a).expect("insert a");
+        store.insert_session(&b).expect("insert b");
+        store.insert_session(&c).expect("insert c");
+
+        // b を先頭へ。L（b を除く）= [a=1.0, c=3.0] なので to_index=0 → 0.0
+        let column = store
+            .move_session(&b.id, KanbanStatus::Backlog, 0)
+            .expect("move_session");
+
+        assert_eq!(
+            column.len(),
+            3,
+            "同一列内の移動では移動先 = 移動元で 1 つの列が返る"
+        );
+        let ids: Vec<&str> = column.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+        assert_eq!(column[0].sort_order, 0.0, "L[0] - 1.0");
+    }
+
+    #[test]
+    fn move_session_within_the_same_column_can_move_a_card_later() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let a = Session {
+            sort_order: 1.0,
+            ..session_with_sentinel_updated_at(&pid, "a")
+        };
+        let b = Session {
+            sort_order: 2.0,
+            ..session_with_sentinel_updated_at(&pid, "b")
+        };
+        let c = Session {
+            sort_order: 3.0,
+            ..session_with_sentinel_updated_at(&pid, "c")
+        };
+        store.insert_session(&a).expect("insert a");
+        store.insert_session(&b).expect("insert b");
+        store.insert_session(&c).expect("insert c");
+
+        // a を末尾へ。L（a を除く）= [b=2.0, c=3.0] なので to_index=2(=L.len()) → 4.0
+        let column = store
+            .move_session(&a.id, KanbanStatus::Backlog, 2)
+            .expect("move_session");
+
+        let ids: Vec<&str> = column.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+        assert_eq!(column[2].sort_order, 4.0, "L[last] + 1.0");
+    }
+
+    #[test]
+    fn move_session_clamps_to_index_beyond_the_column_length() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let existing = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "existing")
+        };
+        store.insert_session(&existing).expect("insert existing");
+        let target = insert_test_session(&store, &pid, "target");
+
+        // L.len() == 1 なのに to_index = 99 を渡す。resolveDragEnd が「自分の列の
+        // 背景」に落としたときに送る値を模す（契約 §49.3.2）
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 99)
+            .expect("move_session");
+
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(
+            moved.sort_order, 6.0,
+            "L.len() にクランプされ、末尾（L[last]+1.0）になる"
+        );
+    }
+
+    #[test]
+    fn move_session_reports_not_found_for_unknown_id() {
+        let (_dir, store) = open_temp();
+        let err = store
+            .move_session("nope", KanbanStatus::Review, 0)
+            .expect_err("無い ID");
+        match err {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_session_bumps_updated_at_only_for_the_moved_row() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let low = Session {
+            sort_order: 1.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "low")
+        };
+        let high = Session {
+            sort_order: 1.0 + 2f64.powi(-52),
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "high")
+        };
+        store.insert_session(&low).expect("insert low");
+        store.insert_session(&high).expect("insert high");
+        let target = Session {
+            sort_order: 1.0,
+            ..session_with_sentinel_updated_at(&pid, "target")
+        };
+        store.insert_session(&target).expect("insert target");
+
+        store
+            .move_session(&target.id, KanbanStatus::Review, 1)
+            .expect("move_session");
+
+        let moved_after = store.get_session(&target.id).expect("get target");
+        assert!(
+            moved_after.updated_at > 1,
+            "移動した行の updated_at が進んでいない"
+        );
+
+        let low_after = store.get_session(&low.id).expect("get low");
+        let high_after = store.get_session(&high.id).expect("get high");
+        assert_eq!(
+            low_after.updated_at, 1,
+            "再採番で sort_order だけ動いた行の updated_at が動いた"
+        );
+        assert_eq!(
+            high_after.updated_at, 1,
+            "再採番で sort_order だけ動いた行の updated_at が動いた"
+        );
+    }
+
+    #[test]
+    fn move_session_breaks_sort_order_ties_in_the_returned_column_by_id() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        // sort_order が同値の 2 行を仕込む。id は挿入順と昇順がわざと逆になるように
+        // する（list_sessions_breaks_sort_order_ties_by_id と同じ作法）
+        let zzz = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "zzz-tie")
+        };
+        let aaa = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "aaa-tie")
+        };
+        store.insert_session(&zzz).expect("insert zzz");
+        store.insert_session(&aaa).expect("insert aaa");
+        let target = insert_test_session(&store, &pid, "target");
+
+        // L.len() == 2 の末尾へ挿入。mid = 5.0 + 1.0 = 6.0 で枯渇しない
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 2)
+            .expect("move_session");
+
+        let ids: Vec<&str> = column.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa-tie", "zzz-tie", target.id.as_str()]);
+    }
+
+    #[test]
+    fn move_session_excludes_archived_rows_from_the_column_and_the_result() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let active = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&pid, "active")
+        };
+        let archived = Session {
+            sort_order: 3.0,
+            kanban_status: KanbanStatus::Review,
+            archived_at: Some(1),
+            ..session_with_sentinel_updated_at(&pid, "archived")
+        };
+        store.insert_session(&active).expect("insert active");
+        store.insert_session(&archived).expect("insert archived");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        assert_eq!(column.len(), 2, "アーカイブ済みは戻り値に含まれない");
+        assert!(column.iter().all(|s| s.id != archived.id));
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(
+            moved.sort_order, 4.0,
+            "L はアーカイブ済みを除くので active(5.0) の前 = 4.0。\
+             archived(3.0) を数えていたら値がずれる"
+        );
+    }
+
+    #[test]
+    fn move_session_updates_kanban_status_to_the_destination_column() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Done, 0)
+            .expect("move_session");
+
+        assert_eq!(column[0].kanban_status, KanbanStatus::Done);
+        let reloaded = store.get_session(&target.id).expect("get");
+        assert_eq!(reloaded.kanban_status, KanbanStatus::Done);
+    }
+
+    #[test]
+    fn move_session_scopes_the_column_to_the_moved_rows_project() {
+        // カンバンの列はプロジェクト単位（next_sort_order / list_sessions と同じ絞り込み）。
+        // これを落とすと他プロジェクトの行が L に混ざって to_index がずれ、
+        // 戻り値が他プロジェクトの id で汚染される（§29.4 の is_scratch と同じ論法。導出）。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let other_pid = store
+            .insert_project("other", "/Users/x/repo/other", CliKind::Claude)
+            .expect("other project")
+            .id;
+
+        let other_low = Session {
+            sort_order: 1.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&other_pid, "other-low")
+        };
+        let other_high = Session {
+            sort_order: 2.0,
+            kanban_status: KanbanStatus::Review,
+            ..session_with_sentinel_updated_at(&other_pid, "other-high")
+        };
+        store.insert_session(&other_low).expect("insert other-low");
+        store
+            .insert_session(&other_high)
+            .expect("insert other-high");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        assert_eq!(
+            column.len(),
+            1,
+            "他プロジェクトの行が L や戻り値に混ざっている"
+        );
+        assert_eq!(
+            column[0].sort_order, 1.0,
+            "他プロジェクトの sort_order を L に数えている（空の列として扱われていない）"
+        );
+
+        let other_low_after = store.get_session(&other_low.id).expect("get");
+        let other_high_after = store.get_session(&other_high.id).expect("get");
+        assert_eq!(
+            other_low_after.sort_order, 1.0,
+            "他プロジェクトの行の sort_order が動いた"
+        );
+        assert_eq!(
+            other_high_after.sort_order, 2.0,
+            "他プロジェクトの行の sort_order が動いた"
+        );
     }
 }
