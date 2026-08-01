@@ -34,9 +34,10 @@ describe('uiSlice', () => {
   });
 
   it('focusSession は既定でビューを変えずにフォーカスだけ動かす', () => {
+    useAppStore.getState().setView('terminal');
     useAppStore.getState().focusSession('s1');
     expect(useAppStore.getState().focusedSessionId).toBe('s1');
-    expect(useAppStore.getState().view).toBe('kanban');
+    expect(useAppStore.getState().view).toBe('terminal');
   });
 
   it('focusSession に view を渡すと同時に切り替える（カードクリックの経路）', () => {
