@@ -93,10 +93,52 @@ impl Store {
 
         Ok(session.clone())
     }
+
+    /// 契約 §17: 不在は Option ではなく AppError::NotFound で表す。
+    pub fn get_session(&self, id: &str) -> AppResult<Session> {
+        let conn = self.conn()?;
+        fetch_session(&conn, id)
+    }
+
+    /// 契約 §17: 表示順は kanban_status, sort_order, id の順で確定させる。
+    /// sort_order に一意制約が無いため、id までタイブレークに含める。
+    pub fn list_sessions(
+        &self,
+        project_id: &str,
+        include_archived: bool,
+    ) -> AppResult<Vec<Session>> {
+        let conn = self.conn()?;
+        let archived_filter = if include_archived {
+            ""
+        } else {
+            "AND archived_at IS NULL"
+        };
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions
+             WHERE project_id = ?1 {archived_filter}
+             ORDER BY kanban_status ASC, sort_order ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_and_then(params![project_id], row_to_session)?;
+        rows.collect()
+    }
+}
+
+/// 単体取得。呼び出し側が既に Connection のロックを持っているときに使う。
+pub(crate) fn fetch_session(conn: &rusqlite::Connection, id: &str) -> AppResult<Session> {
+    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_and_then(params![id], row_to_session)?;
+    match rows.next() {
+        Some(session) => session,
+        None => Err(AppError::NotFound(id.to_owned())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::params;
+
     use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
     use crate::store::session_dao::{row_to_session, SESSION_COLUMNS};
     use crate::store::test_support::{insert_test_session, open_temp};
@@ -431,6 +473,126 @@ mod tests {
             crate::error::AppError::Db(message) => assert!(message.contains("archived")),
             other => panic!("expected AppError::Db, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_session_returns_the_row_or_not_found() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let created = insert_test_session(&store, &pid, "a");
+
+        let fetched = store.get_session(&created.id).expect("get");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.title, "a");
+        assert_eq!(fetched.description, "");
+        assert_eq!(fetched.sort_order, created.sort_order);
+        assert_eq!(fetched.cli_kind, CliKind::Shell, "列挙型が往復している");
+
+        let err = store.get_session("nope").expect_err("無い ID");
+        match err {
+            crate::error::AppError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_sessions_is_scoped_to_project_and_ordered_by_sort_order() {
+        let (_dir, store) = open_temp();
+        let p1 = project(&store);
+        let p2 = store
+            .insert_project("other", "/Users/x/repo/other", CliKind::Claude)
+            .expect("p2")
+            .id;
+
+        let a = insert_test_session(&store, &p1, "a");
+        let b = insert_test_session(&store, &p1, "b");
+        insert_test_session(&store, &p2, "other");
+
+        let list = store.list_sessions(&p1, false).expect("list");
+        assert_eq!(list.len(), 2, "他プロジェクトのセッションが混ざっている");
+        assert_eq!(list[0].id, a.id);
+        assert_eq!(list[1].id, b.id);
+    }
+
+    #[test]
+    fn list_sessions_orders_by_sort_order_not_insertion_order() {
+        // 3 番目に挿入した行の sort_order を最小に書き換え、それが先頭に来ることを見て
+        // ORDER BY sort_order が効いていることを確認する。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let a = insert_test_session(&store, &pid, "a");
+        let b = insert_test_session(&store, &pid, "b");
+        let c = insert_test_session(&store, &pid, "c");
+
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute(
+                "UPDATE sessions SET sort_order = 0.5 WHERE id = ?1",
+                [&c.id],
+            )
+            .expect("reorder");
+        }
+
+        let list = store.list_sessions(&pid, false).expect("list");
+        assert_eq!(
+            list.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![c.id, a.id, b.id],
+            "sort_order の昇順になっていない"
+        );
+    }
+
+    #[test]
+    fn list_sessions_breaks_sort_order_ties_by_id() {
+        // 契約 §17: sort_order に一意制約は無いため、同値になったときは id で
+        // タイブレークする。(project_id, kanban_status, sort_order) の複合インデックスは
+        // sort_order までしかカバーしないため、id ASC を明示しないとこの並びは
+        // 保証されない。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let a = insert_test_session(&store, &pid, "a");
+        let b = insert_test_session(&store, &pid, "b");
+
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute(
+                "UPDATE sessions SET sort_order = ?1 WHERE id = ?2",
+                params![a.sort_order, &b.id],
+            )
+            .expect("tie sort_order");
+        }
+
+        let mut expected_ids = vec![a.id.clone(), b.id.clone()];
+        expected_ids.sort();
+
+        let list = store.list_sessions(&pid, false).expect("list");
+        assert_eq!(
+            list.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            expected_ids,
+            "sort_order 同値時に id でタイブレークされていない"
+        );
+    }
+
+    #[test]
+    fn list_sessions_hides_archived_unless_requested() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let a = insert_test_session(&store, &pid, "a");
+        insert_test_session(&store, &pid, "b");
+
+        {
+            let conn = store.conn().expect("conn");
+            conn.execute("UPDATE sessions SET archived_at = 1 WHERE id = ?1", [&a.id])
+                .expect("archive");
+        }
+
+        assert_eq!(store.list_sessions(&pid, false).expect("list").len(), 1);
+        assert_eq!(store.list_sessions(&pid, true).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn list_sessions_returns_empty_for_unknown_project() {
+        let (_dir, store) = open_temp();
+        assert!(store.list_sessions("nope", false).expect("list").is_empty());
     }
 
     #[test]
