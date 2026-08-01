@@ -73,18 +73,21 @@ describe('indexSessions', () => {
     expect(indexSessions([]).sessionOrder).toEqual(emptySessionOrder());
   });
 
-  it('sort_order 同値なら入力配列の順を保つ（フロントで id 再ソートしない）', () => {
-    // Rust 側の list_sessions は ORDER BY kanban_status, sort_order, id で返すため、
-    // バックエンドが渡した配列はすでに id で決着済み。フロント側が改めて id で
-    // 再ソートすると、たまたま一致するだけの実装になり退行を検出できなくなる。
-    // ここではあえて id 降順（'z' → 'a'）で渡し、indexSessions が入力順をそのまま
-    // 保持する（= 黙って id 昇順に並べ替えない）ことを固定する。
+  it('sort_order 同値なら id の辞書順にタイブレークする（Task 3 の裁定で委譲）', () => {
+    // indexSessions は buildSessionOrder（src/store/kanbanOrder.ts）に委譲している。
+    // moveCard の巻き戻し・editSession・archiveSession など sessions マップから
+    // 並びを作り直す経路はすべて同じ関数を通るため、id タイブレークが無いと
+    // 「リロード直後」と「ローカル再構築後」で同値行の並びが変わり、ユーザーに
+    // 見えるちらつきになる（契約 §8.3: create_session の非原子的な採番で同値は
+    // 実データに到達する）。ORDER BY の退行検出は Rust 側テストの責務であり
+    // （list_sessions の ORDER BY kanban_status, sort_order, id は契約 §17 が固定）、
+    // フロントはここで独自にタイブレーク規則を明示して両者を構造で一致させる。
     const { sessionOrder } = indexSessions([
       session({ id: 'z', kanban_status: 'backlog', sort_order: 1 }),
       session({ id: 'a', kanban_status: 'backlog', sort_order: 1 }),
     ]);
 
-    expect(sessionOrder.backlog).toEqual(['z', 'a']);
+    expect(sessionOrder.backlog).toEqual(['a', 'z']);
   });
 });
 

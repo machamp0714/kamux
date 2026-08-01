@@ -8,6 +8,7 @@ import {
   createSession,
   listProjects,
   listSessions,
+  moveSession,
   updateSession,
 } from './commands';
 
@@ -73,6 +74,15 @@ describe('ipc/commands', () => {
     expect(invoke).toHaveBeenCalledWith('list_sessions', {
       projectId: 'p1',
       includeArchived: false,
+    });
+  });
+
+  it('moveSession が id / toStatus / toIndex を camelCase で渡す', async () => {
+    await moveSession('s1', 'review', 1);
+    expect(invoke).toHaveBeenCalledWith('move_session', {
+      id: 's1',
+      toStatus: 'review',
+      toIndex: 1,
     });
   });
 });

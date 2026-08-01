@@ -95,6 +95,17 @@ async fn delete_project(state: State<'_, AppState>, id: String) -> AppResult<()>
     state.store.delete_project(&id)
 }
 
+// カンバン DnD 専用（契約 §7.1 / §7.4 / §49.1）。sort_order の採番をサーバ側で原子的に行う。
+#[tauri::command]
+async fn move_session(
+    state: State<'_, AppState>,
+    id: String,
+    to_status: KanbanStatus,
+    to_index: usize,
+) -> AppResult<Vec<Session>> {
+    state.store.move_session(&id, to_status, to_index)
+}
+
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
@@ -111,6 +122,7 @@ pub fn run() {
             update_session,
             list_sessions,
             delete_project,
+            move_session,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run kamux");
@@ -313,6 +325,7 @@ mod tests {
                     super::super::update_session,
                     super::super::list_sessions,
                     super::super::delete_project,
+                    super::super::move_session,
                 ])
                 .build(mock_context(noop_assets()))
                 .expect("build mock app")
@@ -487,6 +500,82 @@ mod tests {
 
             assert_eq!(session_1["sort_order"], json!(1.0));
             assert_eq!(session_2["sort_order"], json!(2.0));
+        }
+
+        // 変異 4: move_session の toStatus / toIndex が正しくバインドされているか。
+        // 契約 §7.3 の落とし穴（camelCase 変換はコマンド引数名にしか効かない）は
+        // move_session の引数がネスト構造を持たないため再現しないが、
+        // 「toIndex を無視して末尾固定にしていないか」は実測しないと分からない。
+        // review 列に既存 1 件を作った上で toIndex: 0 を渡し、末尾（sort_order 6.0
+        // 相当）ではなく先頭（既存より小さい値）に入ることで toIndex の実効性を固定する。
+        #[test]
+        fn move_session_binds_camel_case_to_status_and_to_index() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let existing = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "existing",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let existing_id = existing["id"].as_str().expect("session id").to_owned();
+            invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": existing_id, "patch": {"kanban_status": "review"}}),
+            );
+
+            let target = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "target",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let target_id = target["id"].as_str().expect("session id").to_owned();
+
+            let column = invoke_ok(
+                &webview,
+                "move_session",
+                json!({"id": target_id, "toStatus": "review", "toIndex": 0}),
+            );
+
+            let column = column.as_array().expect("array");
+            assert_eq!(
+                column.len(),
+                2,
+                "toStatus: review が review 列に反映されていない"
+            );
+            assert!(
+                column
+                    .iter()
+                    .any(|s| s["id"] == json!(target_id) && s["sort_order"] == json!(0.0)),
+                "toIndex: 0 が無視されて先頭挿入（既存より小さい値）になっていない"
+            );
         }
     }
 }
