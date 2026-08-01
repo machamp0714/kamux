@@ -120,9 +120,12 @@ describe('addSession', () => {
     listSessions.mockResolvedValue([session({ id: 'a', sort_order: 1 })]);
     await useAppStore.getState().loadSessions('p1');
 
-    // 実際の createSession コマンドはバックエンドが保存した title を返すため、
-    // モックの戻り値も渡した title を反映させる（呼び出し引数と戻り値の整合を保つ）。
-    createSession.mockResolvedValue(session({ id: 'b', sort_order: 2, title: 'new' }));
+    // サーバ応答の title を args とあえて異なる値にする。
+    // `sessions[created.id]` が「サーバ応答（createSession の戻り値）をそのまま格納」
+    // しているのか「args から Session を再構成」しているのかを、この差異で区別できる
+    // ようにする（args を転記しただけの実装では created と一致しなくなる）。
+    const serverSession = session({ id: 'b', sort_order: 2, title: 'new-from-server' });
+    createSession.mockResolvedValue(serverSession);
     const args = {
       projectId: 'p1',
       title: 'new',
@@ -135,13 +138,15 @@ describe('addSession', () => {
     const created = await useAppStore.getState().addSession(args);
 
     expect(createSession).toHaveBeenCalledWith(args);
-    expect(created.id).toBe('b');
+    expect(created).toEqual(serverSession);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a', 'b']);
-    expect(useAppStore.getState().sessions.b.title).toBe('new');
+    // sessions（id 索引）にサーバ応答そのものが格納されていることを検証する。
+    expect(useAppStore.getState().sessions.b).toEqual(created);
   });
 
   it('backlog 以外の列で作られたセッションはその列に足す（backlog 決め打ちを検出する）', async () => {
-    createSession.mockResolvedValue(session({ id: 'r', kanban_status: 'review', sort_order: 1 }));
+    const serverSession = session({ id: 'r', kanban_status: 'review', sort_order: 1 });
+    createSession.mockResolvedValue(serverSession);
 
     await useAppStore.getState().addSession({
       projectId: 'p1',
@@ -155,5 +160,8 @@ describe('addSession', () => {
 
     expect(useAppStore.getState().sessionOrder.review).toEqual(['r']);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
+    // sessions（id 索引）側にも review 列のセッションが入っていることを検証する。
+    // sessionOrder だけ更新して sessions を更新し忘れる退行を拾う。
+    expect(useAppStore.getState().sessions.r).toEqual(serverSession);
   });
 });
