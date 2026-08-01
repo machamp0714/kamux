@@ -1,15 +1,9 @@
 use crate::model::SurfaceKind;
 
-/// イベントトピックに埋め込む決定的な ID（契約 §5）
+/// イベントトピックに埋め込む決定的な ID（契約 §5）。
+/// 文字列表現は `SurfaceKind::as_db_str`（model.rs の `db_enum!`）を単一の情報源として使う。
 pub fn surface_id(session_id: &str, kind: SurfaceKind) -> String {
-    format!(
-        "{}:{}",
-        session_id,
-        match kind {
-            SurfaceKind::Agent => "agent",
-            SurfaceKind::Editor => "editor",
-        }
-    )
+    format!("{}:{}", session_id, kind.as_db_str())
 }
 
 #[cfg(test)]
