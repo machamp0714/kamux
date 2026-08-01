@@ -1,11 +1,10 @@
 use rusqlite::Connection;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 
-/// M1-1 で確定するスキーマ版。以降のフェーズでスキーマを変えるときは
-/// この値を +1 し、migrate() に差分 SQL の分岐を追加する。
-/// 次の変更は契約 §20（M3-3 が version 2 で heuristics_enabled /
-/// silence_timeout_secs を ALTER TABLE で追加）。
+/// M1-1 で確定するスキーマ版。以降のフェーズは +1 して match に 1 アーム足すだけでよい。
+/// 2 = §20（M3-3: heuristics_enabled / silence_timeout_secs）
+/// 3 = §29.1（M3-4: is_scratch）。この順序を入れ替えないこと（§34.1）
 pub const SCHEMA_VERSION: i64 = 1;
 
 const DDL_V1: &str = r#"
@@ -51,7 +50,10 @@ pub fn apply_pragmas(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-pub fn migrate(conn: &Connection) -> AppResult<()> {
+/// PRAGMA はトランザクションの外で適用済みであること（§46.3 の落とし穴 2）。
+/// `&mut Connection` を取るのは Connection::transaction() が要求するため。
+pub fn migrate(conn: &mut Connection) -> AppResult<()> {
+    // 現行版を読むために、schema_version だけは版に依らず先に作る
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY NOT NULL);",
     )?;
@@ -61,13 +63,20 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         |r| r.get(0),
     )?;
 
-    if current < 1 {
-        conn.execute_batch(DDL_V1)?;
-        conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [1i64])?;
+    // 1 版 = 1 トランザクション。途中でクラッシュしても、適用済みの版までは確定し、
+    // 未適用の版は次回の open でやり直せる（§46.3 の落とし穴 1）
+    for v in (current + 1)..=SCHEMA_VERSION {
+        let tx = conn.transaction()?;
+        match v {
+            1 => tx.execute_batch(DDL_V1)?,
+            // 2 => tx.execute_batch(MIGRATION_V2)?,   // §20（M3-3 が足す）
+            // 3 => tx.execute_batch(MIGRATION_V3)?,   // §29.1（M3-4 が足す）
+            other => return Err(AppError::Db(format!("unknown schema version {other}"))),
+        }
+        // 単一行を保つ。INSERT OR REPLACE は使えない（§46.3 の落とし穴 3）
+        tx.execute("DELETE FROM schema_version", [])?;
+        tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [v])?;
+        tx.commit()?;
     }
-
-    // 次の版はここに `if current < 2 { ... }` を足す（契約 §20 / M3-3）。
-    // 分岐は累積適用なので、古い DB でも 1 -> 2 と順に流れる。
-
     Ok(())
 }

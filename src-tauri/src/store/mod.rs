@@ -43,9 +43,9 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         schema::apply_pragmas(&conn)?;
-        schema::migrate(&conn)?;
+        schema::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
