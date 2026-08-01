@@ -1323,16 +1323,31 @@ mod tests {
             }
         }
 
-        let early = session_with(&p1, "b-early", 100, RuntimeState::Running);
+        // すべて Idle で挿入し、set_last_runtime_state で Running に昇格させる
+        // （直接 Running で INSERT すると、セッタの WHERE id を丸ごと落として
+        // 全行 UPDATE にする退行がこのテストをすり抜けてしまう。idle 行が
+        // 巻き込まれずに残ることを検証する意味も兼ねる）。
+        let early = session_with(&p1, "b-early", 100, RuntimeState::Idle);
         // created_at がタイの 2 件。挿入順は z → a だが、id ASC では a が先に来る
-        let tie_z = session_with(&p2, "z-tie", 200, RuntimeState::Running);
-        let tie_a = session_with(&p1, "a-tie", 200, RuntimeState::Running);
+        let tie_z = session_with(&p2, "z-tie", 200, RuntimeState::Idle);
+        let tie_a = session_with(&p1, "a-tie", 200, RuntimeState::Idle);
         let idle = session_with(&p1, "c-idle", 300, RuntimeState::Idle);
 
         store.insert_session(&tie_z).expect("insert z");
         store.insert_session(&tie_a).expect("insert a");
         store.insert_session(&early).expect("insert early");
         store.insert_session(&idle).expect("insert idle");
+
+        store
+            .set_last_runtime_state(&early.id, RuntimeState::Running)
+            .expect("early -> running");
+        store
+            .set_last_runtime_state(&tie_z.id, RuntimeState::Running)
+            .expect("tie_z -> running");
+        store
+            .set_last_runtime_state(&tie_a.id, RuntimeState::Running)
+            .expect("tie_a -> running");
+        // idle は意図的に Running へ上げない。無関係な行が巻き込まれていないことの検証
 
         // 起動時正規化はメンテナンス処理なのでアーカイブ済みも拾う
         {
@@ -1394,5 +1409,93 @@ mod tests {
         );
         assert_eq!(fetched.claude_session_id.as_deref(), Some("cc-1"));
         assert_eq!(fetched.last_runtime_state, RuntimeState::Running);
+    }
+
+    #[test]
+    fn setters_only_modify_the_targeted_session_row() {
+        // 5 つのセッタ（set_worktree / set_claude_session_id / set_last_runtime_state /
+        // set_runtime_error / mark_first_started）はどれも `WHERE id = ?1` で
+        // 対象行を絞っている。DB に 1 行しかないテストでは、この WHERE 句を
+        // 丸ごと落として「全行 UPDATE」に退行しても、対象行と全行の結果が
+        // 一致してしまい検出できない。2 行目（bystander）を用意し、
+        // 各セッタを呼ぶたびに bystander が無変化のままであることを
+        // get_session で読み直して確認する。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let target = session_with_sentinel_updated_at(&pid, "sid-target");
+        let bystander = session_with_sentinel_updated_at(&pid, "sid-bystander");
+        store.insert_session(&target).expect("insert target");
+        store.insert_session(&bystander).expect("insert bystander");
+
+        store
+            .set_worktree(&target.id, "session/target", "/repo/.worktrees/target")
+            .expect("set_worktree");
+        let after_worktree = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_worktree.branch, None,
+            "set_worktree が無関係な行の branch を書き換えた"
+        );
+        assert_eq!(
+            after_worktree.worktree_path, None,
+            "set_worktree が無関係な行の worktree_path を書き換えた"
+        );
+        assert_eq!(
+            after_worktree.updated_at, 1,
+            "set_worktree が無関係な行の updated_at を書き換えた"
+        );
+
+        store
+            .set_claude_session_id(&target.id, "cc-target")
+            .expect("set_claude_session_id");
+        let after_claude = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_claude.claude_session_id, None,
+            "set_claude_session_id が無関係な行の claude_session_id を書き換えた"
+        );
+
+        store
+            .set_last_runtime_state(&target.id, RuntimeState::Running)
+            .expect("set_last_runtime_state");
+        let after_state = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_state.last_runtime_state,
+            RuntimeState::Idle,
+            "set_last_runtime_state が無関係な行の last_runtime_state を書き換えた"
+        );
+
+        store
+            .set_runtime_error(&target.id, "boom")
+            .expect("set_runtime_error");
+        let after_error = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_error.last_runtime_state,
+            RuntimeState::Idle,
+            "set_runtime_error が無関係な行の last_runtime_state を error に巻き込んだ"
+        );
+        assert_eq!(
+            after_error.last_runtime_error, None,
+            "set_runtime_error が無関係な行の last_runtime_error を書き換えた"
+        );
+
+        store
+            .mark_first_started(&target.id, 999)
+            .expect("mark_first_started");
+        let after_first_started = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_first_started.first_started_at, None,
+            "mark_first_started が無関係な行の first_started_at を書き換えた"
+        );
+
+        // bystander が無変化なだけでなく、target 側が実際に正しく書けていることも確認する
+        let target_after = store.get_session(&target.id).expect("get");
+        assert_eq!(target_after.branch.as_deref(), Some("session/target"));
+        assert_eq!(
+            target_after.worktree_path.as_deref(),
+            Some("/repo/.worktrees/target")
+        );
+        assert_eq!(target_after.claude_session_id.as_deref(), Some("cc-target"));
+        assert_eq!(target_after.last_runtime_state, RuntimeState::Error);
+        assert_eq!(target_after.last_runtime_error.as_deref(), Some("boom"));
+        assert_eq!(target_after.first_started_at, Some(999));
     }
 }
