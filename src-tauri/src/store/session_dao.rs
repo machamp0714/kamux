@@ -244,7 +244,15 @@ mod tests {
         let err = store
             .insert_session(&session)
             .expect_err("FK 制約で失敗するはず");
-        assert!(matches!(err, crate::error::AppError::Db(_)));
+        match err {
+            crate::error::AppError::Db(message) => {
+                assert!(
+                    message.to_lowercase().contains("foreign key"),
+                    "FK 違反以外の理由で失敗している可能性がある: {message}"
+                );
+            }
+            other => panic!("expected AppError::Db, got {other:?}"),
+        }
     }
 
     #[test]
@@ -323,6 +331,79 @@ mod tests {
         assert_eq!(fetched.first_started_at, Some(1700000001000));
         assert_eq!(fetched.archived_at, Some(1700000002000));
         assert_eq!(fetched.created_at, 1700000000000);
+    }
+
+    #[test]
+    fn insert_session_writes_every_field_to_its_own_bound_position() {
+        // `new_backlog` は 5 フィールドを常に None に固定するため使わない。
+        // INSERT 列 <-> params! の対応が 1 か所でもズレたら必ず落ちるよう、
+        // 18 フィールド全部に相互に区別できる非 NULL 値を入れる
+        // （特に created_at != updated_at）。往復テスト
+        // (row_to_session_round_trips_...) は生 UPDATE で値を入れており
+        // insert_session の位置ズレは検出できないため、これで補う。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+
+        let session = Session {
+            id: "sid-value".to_owned(),
+            project_id: pid.clone(),
+            title: "title-value".to_owned(),
+            description: "description-value".to_owned(),
+            kanban_status: KanbanStatus::Review,
+            sort_order: 7.5,
+            mode: SessionMode::Worktree,
+            branch: Some("branch-value".to_owned()),
+            worktree_path: Some("worktree-path-value".to_owned()),
+            cli_kind: CliKind::Custom,
+            cli_command: Some("cli-command-value".to_owned()),
+            claude_session_id: Some("claude-session-id-value".to_owned()),
+            last_runtime_state: RuntimeState::Error,
+            last_runtime_error: Some("last-runtime-error-value".to_owned()),
+            first_started_at: Some(111),
+            archived_at: Some(222),
+            created_at: 333,
+            updated_at: 444,
+        };
+        store.insert_session(&session).expect("insert");
+
+        let conn = store.conn().expect("conn");
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
+        let mut stmt = conn.prepare(&sql).expect("prepare");
+        let mut rows = stmt
+            .query_and_then(["sid-value"], row_to_session)
+            .expect("query");
+        let fetched = rows.next().expect("row").expect("row_to_session");
+
+        assert_eq!(fetched.id, "sid-value");
+        assert_eq!(fetched.project_id, pid);
+        assert_eq!(fetched.title, "title-value");
+        assert_eq!(fetched.description, "description-value");
+        assert_eq!(fetched.kanban_status, KanbanStatus::Review);
+        assert_eq!(fetched.sort_order, 7.5);
+        assert_eq!(fetched.mode, SessionMode::Worktree);
+        assert_eq!(fetched.branch.as_deref(), Some("branch-value"));
+        assert_eq!(
+            fetched.worktree_path.as_deref(),
+            Some("worktree-path-value")
+        );
+        assert_eq!(fetched.cli_kind, CliKind::Custom);
+        assert_eq!(fetched.cli_command.as_deref(), Some("cli-command-value"));
+        assert_eq!(
+            fetched.claude_session_id.as_deref(),
+            Some("claude-session-id-value")
+        );
+        assert_eq!(fetched.last_runtime_state, RuntimeState::Error);
+        assert_eq!(
+            fetched.last_runtime_error.as_deref(),
+            Some("last-runtime-error-value")
+        );
+        assert_eq!(fetched.first_started_at, Some(111));
+        assert_eq!(fetched.archived_at, Some(222));
+        assert_eq!(fetched.created_at, 333);
+        assert_eq!(
+            fetched.updated_at, 444,
+            "created_at と入れ替わっていないこと"
+        );
     }
 
     #[test]
