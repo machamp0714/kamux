@@ -501,4 +501,134 @@ mod tests {
             "on_exit の到着が遅すぎる ({elapsed:?}): stall_timeout 待ちの疑いがある"
         );
     }
+
+    #[test]
+    fn ack_using_the_seq_on_data_actually_passed_unparks_reader_before_exit() {
+        // Important A の弁別: `on_data` に渡す seq が `record` の戻り値そのもの
+        // であることを検証する。もし seq が定数 0 や別カウンタに変異していると、
+        // ここで捕まえた seq を ack しても Backpressure 内部の inflight は
+        // 消化されず、park した reader は再開できない。
+        //
+        // 手順: 高水位を超えるまで Data を消費して park させる → `on_data` が
+        // 実際に渡してきた最後の seq を ack する → reader が再開し、まだ Exit を
+        // 発火していない waiter より先に「追加の Data」が届くことを確認する。
+        // Exit は reader が完全に読み切って join() が返るまで送られない設計
+        // (`waiter_closes_backpressure_before_joining_a_reader_parked_on_high_water`
+        // が保証済み)なので、park から再開できたかどうかがこのテストの唯一の
+        // 弁別点になる。
+        use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
+
+        let (tx, rx) = channel::<Ev>();
+        let sink: Arc<dyn PtySink> = Arc::new(ChannelSink { tx });
+        let backpressure = Arc::new(Backpressure::new());
+        let alive = Arc::new(AtomicBool::new(true));
+
+        // park した後もまだ読み切っていないデータを残しておく(再開後の
+        // 「追加の Data」を観測するため)
+        let reader = FakeReader {
+            remaining: BACKPRESSURE_HIGH_WATER + PTY_READ_CHUNK * 8,
+        };
+        let reader_handle = spawn_reader_thread(
+            "surf".to_string(),
+            Box::new(reader),
+            Arc::clone(&backpressure),
+            Arc::clone(&sink),
+        )
+        .expect("spawn reader thread");
+
+        // park するまで Data を消費する。ack はせず、`on_data` が渡してきた最後の
+        // seq を park 検知時点の値として受け取る
+        let last_seq = loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ev::Data { seq, .. }) => {
+                    if backpressure.pending() >= BACKPRESSURE_HIGH_WATER {
+                        break seq;
+                    }
+                }
+                other => panic!("unexpected event while pausing the reader: {other:?}"),
+            }
+        };
+        assert!(backpressure.is_paused());
+
+        let (exit_tx, exit_rx) = channel::<()>();
+        let fake_child = FakeChild {
+            exit_gate: Mutex::new(exit_rx),
+        };
+        spawn_waiter_thread(
+            "surf".to_string(),
+            Box::new(fake_child),
+            reader_handle,
+            Arc::clone(&backpressure),
+            Arc::clone(&alive),
+            sink,
+        )
+        .expect("spawn waiter thread");
+
+        // `on_data` が実際に渡してきた seq で ack する
+        backpressure.ack(last_seq);
+        // reader が再開する猶予を与えてから子プロセスの終了を発火する。join() は
+        // reader が読み切るまで返らないため、Exit は追加の Data より後にしか
+        // 送られ得ない設計だが、ack が効いていなければ reader は park したままで
+        // Exit は Data 無しに直接届く
+        exit_tx.send(()).expect("signal fake process exit");
+
+        let event = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ack 後に何も届かなかった: on_data に渡す seq の配線が壊れている疑いがある");
+        assert!(
+            matches!(event, Ev::Data { .. }),
+            "追加の Data より先に Exit(または何も無し)が届いた: seq の配線が \
+             壊れている疑いがある (actual event: {event:?})"
+        );
+
+        // 後片付け: Exit まで読み飛ばしてスレッドを回収する
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ev::Exit(_)) => break,
+                Ok(Ev::Data { .. }) => continue,
+                Err(err) => panic!("timed out waiting for exit: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_starts_the_child_process_in_the_given_cwd() {
+        // Important B の弁別: `cmd.cwd(&spec.cwd)` を削除する変異が生存しないことを
+        // 確認するテスト。子プロセス自身に `pwd -P` を実行させ、実際の作業
+        // ディレクトリを報告させる。macOS の /tmp は /private/tmp へのシンボリック
+        // リンクなので、tempfile が返すパスをそのまま文字列比較するとフレークする
+        // 恐れがある。`std::fs::canonicalize` で解決した値と比較する
+        // (`pwd -P` も物理パスを返すため、両辺とも symlink 解決済みで揃う)。
+        let (tx, rx) = channel();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut s = spec("/bin/sh", &["-c", "pwd -P"]);
+        s.cwd = dir.path().to_path_buf();
+        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let (out, code) = drain(&rx, &surface);
+        let expected = std::fs::canonicalize(dir.path())
+            .expect("canonicalize temp dir")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(out.trim(), expected, "actual output: {out:?}");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn spawn_creates_the_pty_with_the_given_cols_and_rows() {
+        // Important B の弁別: `PtySize { cols, rows, .. }` の配線を定数
+        // (DEFAULT_COLS/DEFAULT_ROWS = 80x24) に変異させる変異が生存しないことを
+        // 確認するテスト。既定値と明確に異なる cols/rows を渡し、子プロセスの
+        // `stty size`(macOS では "rows cols" の順で出力)がその値を報告する
+        // ことを確認する。
+        let (tx, rx) = channel();
+        let mut s = spec("/bin/stty", &["size"]);
+        s.cols = 100;
+        s.rows = 40;
+        assert_ne!(s.cols, DEFAULT_COLS);
+        assert_ne!(s.rows, DEFAULT_ROWS);
+        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/stty");
+        let (out, code) = drain(&rx, &surface);
+        assert_eq!(out.trim(), "40 100", "actual output: {out:?}");
+        assert_eq!(code, Some(0));
+    }
 }
