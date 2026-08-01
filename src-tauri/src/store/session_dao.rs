@@ -137,8 +137,6 @@ pub(crate) fn fetch_session(conn: &rusqlite::Connection, id: &str) -> AppResult<
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::params;
-
     use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
     use crate::store::session_dao::{row_to_session, SESSION_COLUMNS};
     use crate::store::test_support::{insert_test_session, open_temp};
@@ -547,27 +545,47 @@ mod tests {
         // タイブレークする。(project_id, kanban_status, sort_order) の複合インデックスは
         // sort_order までしかカバーしないため、id ASC を明示しないとこの並びは
         // 保証されない。
+        //
+        // id は UUID ではなく固定文字列で直接構築する（Session::new_backlog は
+        // Uuid::new_v4() で埋めてしまい大小関係を制御できないため）。
+        // 挿入順（rowid 順）と id の昇順が必ず逆になるよう、id が大きい行を先に、
+        // 小さい行を後に挿入する。こうしないと UUID の偶然の大小関係次第で
+        // 「挿入順 = id 昇順」になり、id ASC を消してもテストが green のままになりうる。
         let (_dir, store) = open_temp();
         let pid = project(&store);
-        let a = insert_test_session(&store, &pid, "a");
-        let b = insert_test_session(&store, &pid, "b");
 
-        {
-            let conn = store.conn().expect("conn");
-            conn.execute(
-                "UPDATE sessions SET sort_order = ?1 WHERE id = ?2",
-                params![a.sort_order, &b.id],
-            )
-            .expect("tie sort_order");
+        fn session_with_id(pid: &str, id: &str, sort_order: f64) -> Session {
+            Session {
+                id: id.to_owned(),
+                project_id: pid.to_owned(),
+                title: id.to_owned(),
+                description: String::new(),
+                kanban_status: KanbanStatus::Backlog,
+                sort_order,
+                mode: SessionMode::InPlace,
+                branch: None,
+                worktree_path: None,
+                cli_kind: CliKind::Shell,
+                cli_command: None,
+                claude_session_id: None,
+                last_runtime_state: RuntimeState::Idle,
+                last_runtime_error: None,
+                first_started_at: None,
+                archived_at: None,
+                created_at: 1,
+                updated_at: 1,
+            }
         }
 
-        let mut expected_ids = vec![a.id.clone(), b.id.clone()];
-        expected_ids.sort();
+        let zzz = session_with_id(&pid, "zzz-tie-break", 1.0);
+        store.insert_session(&zzz).expect("insert zzz");
+        let aaa = session_with_id(&pid, "aaa-tie-break", 1.0);
+        store.insert_session(&aaa).expect("insert aaa");
 
         let list = store.list_sessions(&pid, false).expect("list");
         assert_eq!(
             list.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
-            expected_ids,
+            vec!["aaa-tie-break".to_owned(), "zzz-tie-break".to_owned()],
             "sort_order 同値時に id でタイブレークされていない"
         );
     }
