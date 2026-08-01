@@ -57,4 +57,24 @@ describe('handleKeymapKeyDown', () => {
     expect(event.defaultPrevented).toBe(false);
     expect(useAppStore.getState().modal).toBeNull();
   });
+
+  it('IME 変換中（isComposing）の Escape はモーダルを閉じない（変換キャンセルを奪わない）', () => {
+    useAppStore.setState({ modal: { kind: 'create_session' } });
+    const event = dispatch({ key: 'Escape', metaKey: false, isComposing: true });
+    expect(event.defaultPrevented).toBe(false);
+    expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
+  });
+
+  it('IME 変換中（keyCode 229 フォールバック）の Escape もモーダルを閉じない', () => {
+    useAppStore.setState({ modal: { kind: 'create_session' } });
+    const event = dispatch({ key: 'Escape', metaKey: false, keyCode: 229 });
+    expect(event.defaultPrevented).toBe(false);
+    expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
+  });
+
+  it('IME 変換中でも Cmd+N は効く（契約 §11 の Cmd 系は奪う）', () => {
+    const event = dispatch({ key: 'n', metaKey: true, isComposing: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
+  });
 });

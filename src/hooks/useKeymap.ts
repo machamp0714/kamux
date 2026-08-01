@@ -4,11 +4,26 @@ import { useAppStore } from '../store';
 import { resolveKeymap } from './keymap';
 
 /**
+ * IME 変換確定前の Escape（変換キャンセル）かどうかを DOM イベントから判定する。
+ * isComposing が立たないブラウザ経路向けに keyCode 229 のレガシー判定も併用する
+ * （OS 分岐ではなく、あくまで IME 変換中かどうかの判定）。
+ */
+function isImeCancelEscape(event: KeyboardEvent): boolean {
+  return event.key === 'Escape' && (event.isComposing || event.keyCode === 229);
+}
+
+/**
  * keydown 1 件を resolveKeymap で判定し、ヒットした分だけ store に反映する。
  * useKeymap から window リスナとして直接張れるよう named export にしてある
  * （テストは window に KeyboardEvent を dispatch して検証する）。
+ *
+ * IME 変換中の Escape（変換キャンセル）はモーダルを閉じる Escape として扱わない。
+ * この判定は DOM の KeyboardEvent が持つ isComposing / keyCode に依存するため、
+ * 純関数の resolveKeymap ではなくここ（DOM 側）に置く。Cmd+N / Cmd+1 は
+ * 変換中でも奪う（契約 §11）ので、ガードは Escape の分岐にだけ効かせる。
  */
 export function handleKeymapKeyDown(event: KeyboardEvent): void {
+  if (isImeCancelEscape(event)) return;
   const store = useAppStore.getState();
   const action = resolveKeymap(
     { key: event.key, metaKey: event.metaKey },
