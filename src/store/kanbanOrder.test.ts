@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { Session } from '../types/model';
-import { buildSessionOrder, emptySessionOrder, indexSessions } from './kanbanOrder';
+import {
+  buildSessionOrder,
+  emptySessionOrder,
+  indexSessions,
+  moveCardInOrder,
+} from './kanbanOrder';
 
 export function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
@@ -90,5 +95,73 @@ describe('indexSessions', () => {
       makeSession({ id: 'x', kanban_status: 'review', sort_order: 1 }),
     ];
     expect(indexSessions(list).sessionOrder).toEqual(buildSessionOrder(toMap(list)));
+  });
+});
+
+function order(partial: Partial<Record<string, string[]>>) {
+  return {
+    backlog: partial.backlog ?? [],
+    in_progress: partial.in_progress ?? [],
+    review: partial.review ?? [],
+    done: partial.done ?? [],
+  };
+}
+
+describe('moveCardInOrder', () => {
+  it('同じ列で下方向へ動かす（arrayMove と同じ結果になる）', () => {
+    const next = moveCardInOrder(order({ backlog: ['a', 'b', 'c'] }), 'a', 'backlog', 2);
+    expect(next.backlog).toEqual(['b', 'c', 'a']);
+  });
+
+  it('同じ列で上方向へ動かす', () => {
+    const next = moveCardInOrder(order({ backlog: ['a', 'b', 'c'] }), 'c', 'backlog', 0);
+    expect(next.backlog).toEqual(['c', 'a', 'b']);
+  });
+
+  it('同じ列で 1 つだけ下へ動かす（off-by-one の回帰テスト）', () => {
+    const next = moveCardInOrder(order({ backlog: ['a', 'b', 'c'] }), 'a', 'backlog', 1);
+    expect(next.backlog).toEqual(['b', 'a', 'c']);
+  });
+
+  it('列をまたいで動かす', () => {
+    const next = moveCardInOrder(
+      order({ backlog: ['a', 'b'], in_progress: ['x', 'y'] }),
+      'a',
+      'in_progress',
+      1,
+    );
+    expect(next.backlog).toEqual(['b']);
+    expect(next.in_progress).toEqual(['x', 'a', 'y']);
+  });
+
+  it('末尾より大きい index は末尾にクランプする', () => {
+    const next = moveCardInOrder(order({ backlog: ['a', 'b', 'c'] }), 'a', 'backlog', 99);
+    expect(next.backlog).toEqual(['b', 'c', 'a']);
+  });
+
+  it('空の列へ動かせる', () => {
+    const next = moveCardInOrder(order({ backlog: ['a'] }), 'a', 'done', 0);
+    expect(next.backlog).toEqual([]);
+    expect(next.done).toEqual(['a']);
+  });
+
+  it('全列から id を除去する（M1-1 の防御的挙動を維持）', () => {
+    // 何らかの理由で 2 列に同じ id が入っていても、移動後に重複が残らないこと
+    const next = moveCardInOrder(
+      order({ backlog: ['a', 'b'], review: ['a'], done: ['c'] }),
+      'a',
+      'done',
+      0,
+    );
+    expect(next.backlog).toEqual(['b']);
+    expect(next.review).toEqual([]);
+    expect(next.done).toEqual(['a', 'c']);
+  });
+
+  it('入力の SessionOrder を破壊しない', () => {
+    const before = order({ backlog: ['a', 'b'] });
+    moveCardInOrder(before, 'a', 'review', 0);
+    expect(before.backlog).toEqual(['a', 'b']);
+    expect(before.review).toEqual([]);
   });
 });

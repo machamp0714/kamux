@@ -45,3 +45,36 @@ export const indexSessions = (
   const sessions = Object.fromEntries(list.map((s) => [s.id, s]));
   return { sessions, sessionOrder: buildSessionOrder(sessions) };
 };
+
+/**
+ * 列間・列内の移動後の SessionOrder を返す。入力は破壊しない。
+ *
+ * index の意味は「移動前の配列における over カードの位置」。remove → insert の順で
+ * 処理するため、この規約のもとで dnd-kit の arrayMove(items, from, to) と一致する。
+ *
+ * 除去は移動元の列だけでなく **全列** を走査する。M1-1 の moveCard が防御的に
+ * そうしていたので挙動を落とさない（何らかの理由で 2 列に同じ id が入っていても
+ * 移動後に重複が残らない）。移動元の列は id から一意に決まるので引数に取らない。
+ */
+export function moveCardInOrder(
+  order: SessionOrder,
+  sessionId: string,
+  to: KanbanStatus,
+  index: number,
+): SessionOrder {
+  const next: SessionOrder = {
+    backlog: [...order.backlog],
+    in_progress: [...order.in_progress],
+    review: [...order.review],
+    done: [...order.done],
+  };
+  for (const status of KANBAN_STATUSES) {
+    const at = next[status].indexOf(sessionId);
+    if (at !== -1) next[status].splice(at, 1);
+  }
+  // 契約 §49.3.2: index が L.len() を超えたら末尾へクランプする。
+  // サーバ側（契約 §7.4 の `to_index >= L.len()` の枝）も独立に同じクランプを行う。
+  const insertAt = Math.max(0, Math.min(index, next[to].length));
+  next[to].splice(insertAt, 0, sessionId);
+  return next;
+}

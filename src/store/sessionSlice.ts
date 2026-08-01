@@ -6,8 +6,8 @@ import {
   updateSession,
   type CreateSessionArgs,
 } from '../ipc/commands';
-import { KANBAN_STATUSES, type KanbanStatus, type Session } from '../types/model';
-import { emptySessionOrder, indexSessions } from './kanbanOrder';
+import type { KanbanStatus, Session } from '../types/model';
+import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
 
 export { emptySessionOrder, indexSessions } from './kanbanOrder';
@@ -69,11 +69,7 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     const sortOrder = computeSortOrder(neighbors, index);
 
     // 楽観更新: DnD の手応えを IPC の往復で待たせない
-    const nextOrder = emptySessionOrder();
-    for (const status of KANBAN_STATUSES) {
-      nextOrder[status] = sessionOrder[status].filter((id) => id !== sessionId);
-    }
-    nextOrder[to] = [...nextOrder[to].slice(0, index), sessionId, ...nextOrder[to].slice(index)];
+    const nextOrder = moveCardInOrder(sessionOrder, sessionId, to, index);
 
     set({
       sessions: {
