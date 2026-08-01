@@ -311,4 +311,65 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(110));
         assert_eq!(bp.pending(), 0);
     }
+
+    #[test]
+    fn wait_until_drained_stall_safety_valve_survives_a_single_partial_ack_then_total_silence() {
+        // 再レビュー Important の弁別: 進捗が1回だけ起きた後、ack が完全に停止する
+        // ケース。ループ本体内で `last_pending` を毎周更新しないと、この1回の
+        // 進捗によって deadline が(以後 ack が来なくても)周回のたびに際限なく
+        // 延長され続け、安全弁(stall_timeout)が永久に発火しなくなる
+        // (`stalled_waiter_gives_up_backpressure_after_stall_timeout` は ack が
+        // 一度も来ないケースしか検証しておらず、この罠を弁別できない)。
+        //
+        // `wait_until_drained` は別スレッドで呼び、結果を mpsc channel 経由で
+        // 受け取る。変異でこの安全弁が壊れると呼び出しは無期限にハングするため、
+        // `recv_timeout` で明示的にタイムアウトさせて red にする(ハングさせない)。
+        let stall_timeout = Duration::from_millis(120);
+        let bp = Arc::new(Backpressure::with_stall_timeout(stall_timeout));
+        // 低水位までは戻らない小さな1チャンクと、大部分を占める残りチャンクに
+        // 分ける。前者だけを ack することで「進捗はあるが低水位には遠く及ばない」
+        // 状態を作る(低水位まで戻ると notify_all で即座に起床してしまい、
+        // この安全弁の検証にならない)。
+        let small_chunk = 50_000;
+        let seq1 = bp.record(small_chunk);
+        bp.record(BACKPRESSURE_HIGH_WATER - small_chunk);
+
+        let waiter = Arc::clone(&bp);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let result = waiter.wait_until_drained();
+            // 受信側が recv_timeout で先に諦めていても send の失敗で panic しない
+            let _ = tx.send(result);
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        bp.ack(seq1); // 進捗は1回だけ。以後 ack は一切送らない
+
+        let result = rx.recv_timeout(Duration::from_millis(1500)).expect(
+            "wait_until_drained が 1500ms 以内に返らなかった: stall safety valve が \
+             機能していないか、deadline が際限なく延長されている疑いがある",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            result,
+            "安全弁は読み取りを再開する(true)はずが、closed 相当(false)を返した"
+        );
+        assert_eq!(
+            bp.pending(),
+            0,
+            "安全弁発火後は滞留を捨てて pending が 0 になるはず"
+        );
+        assert!(
+            elapsed > stall_timeout,
+            "deadline は進捗により少なくとも1回延長されるはずなので、単純に \
+             1回の stall_timeout では発火しないはず: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "安全弁は概ね 2 x stall_timeout 付近で発火するはずが、それを大きく \
+             超えている(deadline が際限なく延長されている疑い): elapsed={elapsed:?}"
+        );
+    }
 }
