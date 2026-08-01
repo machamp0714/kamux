@@ -1,5 +1,7 @@
 use crate::model::SurfaceKind;
 
+pub mod backpressure;
+
 /// イベントトピックに埋め込む決定的な ID（契約 §5）。
 /// 文字列表現は `SurfaceKind::as_db_str`（model.rs の `db_enum!`）を単一の情報源として使う。
 pub fn surface_id(session_id: &str, kind: SurfaceKind) -> String {
