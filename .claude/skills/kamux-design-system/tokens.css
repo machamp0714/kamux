@@ -1,0 +1,167 @@
+/*
+ * kamux design tokens
+ *
+ * 出典: docs/design/kamux-ui.pen の変数 34 個（テーマ付き 17 / 非テーマ 17）。
+ * 更新手順: SKILL.md の「トークンを更新する」節を見ること。手で書き換えない。
+ *
+ * この内容は src/styles/tokens.css として配置され、main.tsx から 1 度だけ import される。
+ * ここ以外の場所で色・角丸・フォント・余白・文字サイズの literal を書かない。
+ *
+ * テーマ:
+ *   既定はダーク。ライトは :root[data-theme="light"] で明示指定するか、
+ *   data-theme が無いときに OS 設定へ自動追従する。
+ */
+
+:root {
+  /* ---- surfaces ---------------------------------------------------- */
+  --bg-app: #13141c;
+  --bg-surface: #1a1b26;
+  --bg-elevated: #1f2130;
+  --bg-hover: #262838;
+
+  /* ---- lines ------------------------------------------------------- */
+  --border: #2a2c3d;
+  --border-strong: #3b4261;
+  --border-input: #5e699a;
+
+  /* ---- text -------------------------------------------------------- */
+  --text-primary: #c0caf5;
+  --text-secondary: #a9b1d6;
+  --text-muted: #8a8fad;
+
+  /* ---- accent ------------------------------------------------------ */
+  --accent: #7aa2f7;
+  --accent-soft: #253356;
+
+  /* ---- runtime state (契約 §2 の 6 値と 1:1) ------------------------ */
+  --state-running: #9ece6a;
+  --state-waiting: #e0af68;
+  --state-idle: #868eb1;
+  --state-exited: #ff9e64;
+  --state-interrupted: #bb9af7;
+  --state-error: #f7768e;
+
+  /* ---- terminal (テーマ非依存。xterm 面は常にダーク) ---------------- */
+  --bg-terminal: #16161e;
+  --text-term: #c0caf5;
+  --text-term-dim: #7f87b4;
+  --term-blue: #7aa2f7;
+  --term-cyan: #7dcfff;
+  --term-green: #9ece6a;
+  --term-yellow: #e0af68;
+  --term-orange: #ff9e64;
+  --term-magenta: #bb9af7;
+  --term-red: #f7768e;
+  --term-comment: #565f89;
+
+  /* ---- radius ------------------------------------------------------ */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  /* ---- font family -------------------------------------------------- *
+   * .pen の font-ui / font-mono / font-mono-jp を実アプリ用のスタックに
+   * 展開したもの。Pencil は CJK を描画できないため .pen 上では日本語が
+   * 確認できないが、実アプリは日本語を出す。JP フォールバックは必須。   */
+  --font-ui: 'Inter', 'Noto Sans JP', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'M PLUS 1 Code', ui-monospace, 'SF Mono', monospace;
+
+  /* ---- type scale --------------------------------------------------- *
+   * .pen で実際に使われている文字サイズを 7 段に集約したもの。
+   * 機械的なエクスポートではなく設計判断（SKILL.md「型と余白の由来」参照）。 */
+  --text-2xs: 10px;   /* mono のメタ情報・キーヒント・件数チップ */
+  --text-xs: 11px;    /* バッジのラベル・ヒント・表の副次セル */
+  --text-sm: 12px;    /* 本文・タブ名・表のセル・列見出し */
+  --text-md: 13px;    /* ペイン名・入力値・一覧の行 */
+  --text-lg: 14px;    /* カード名 */
+  --text-xl: 16px;    /* 設定のセクション見出し */
+  --text-2xl: 22px;   /* ページ見出し */
+
+  --leading-tight: 1.35; /* 見出し・カード名 */
+  --leading-normal: 1.5; /* 本文・表のセル */
+  --leading-term: 1.65;  /* ターミナルとコード */
+
+  /* ---- spacing scale ------------------------------------------------ *
+   * 同上。2px 刻みの 8 段。これ以外の余白を使わない。                    */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-7: 14px;
+  --space-8: 16px;
+  --space-9: 20px;
+  --space-10: 24px;
+
+  /* ---- elevation ---------------------------------------------------- */
+  --shadow-modal: 0 24px 64px -12px rgb(0 0 0 / 0.6);
+  --shadow-toast: 0 12px 36px -8px rgb(0 0 0 / 0.6);
+
+  /* ---- motion ------------------------------------------------------- */
+  --dur-fast: 120ms;
+  --dur-normal: 150ms;
+  --ease: ease-out;
+}
+
+/* ---- light theme ---------------------------------------------------- *
+ * 明示指定。ターミナル系トークンは意図的に据え置く（xterm 面は常にダーク）。 */
+:root[data-theme='light'] {
+  --bg-app: #e9eaee;
+  --bg-surface: #f5f6f8;
+  --bg-elevated: #ffffff;
+  --bg-hover: #e3e5ea;
+
+  --border: #d0d3dc;
+  --border-strong: #b4b9c8;
+  --border-input: #868ea7;
+
+  --text-primary: #232433;
+  --text-secondary: #4c4f69;
+  --text-muted: #62667a;
+
+  --accent: #1663cd;
+  --accent-soft: #dbe7fb;
+
+  --state-running: #536f36;
+  --state-waiting: #81621c;
+  --state-idle: #5f6585;
+  --state-exited: #9b5511;
+  --state-interrupted: #7847bd;
+  --state-error: #b93838;
+
+  --shadow-modal: 0 24px 64px -12px rgb(15 23 42 / 0.18);
+  --shadow-toast: 0 12px 36px -8px rgb(15 23 42 / 0.18);
+}
+
+/* data-theme が付いていないときだけ OS 設定に追従する。
+ * 明示指定（data-theme="dark" / "light"）は常にこれに勝つ。 */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg-app: #e9eaee;
+    --bg-surface: #f5f6f8;
+    --bg-elevated: #ffffff;
+    --bg-hover: #e3e5ea;
+
+    --border: #d0d3dc;
+    --border-strong: #b4b9c8;
+    --border-input: #868ea7;
+
+    --text-primary: #232433;
+    --text-secondary: #4c4f69;
+    --text-muted: #62667a;
+
+    --accent: #1663cd;
+    --accent-soft: #dbe7fb;
+
+    --state-running: #536f36;
+    --state-waiting: #81621c;
+    --state-idle: #5f6585;
+    --state-exited: #9b5511;
+    --state-interrupted: #7847bd;
+    --state-error: #b93838;
+
+    --shadow-modal: 0 24px 64px -12px rgb(15 23 42 / 0.18);
+    --shadow-toast: 0 12px 36px -8px rgb(15 23 42 / 0.18);
+  }
+}
