@@ -1,5 +1,6 @@
 mod error;
 mod model;
+mod store;
 
 fn main() {
     tauri::Builder::default()
