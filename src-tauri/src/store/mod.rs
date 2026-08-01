@@ -192,4 +192,202 @@ mod tests {
         );
         assert!(result.is_err(), "存在しない project_id を弾いていない");
     }
+
+    // COALESCE(MAX(version), 0) は「空テーブル」と「version = 0 の行が 1 本ある」を
+    // 区別できない。version 1 しか存在しない現状では 2 回目の open のループ本体が
+    // 空範囲になり素通りしてしまうので、意図的に「version = 0 の迷子行」を作って
+    // ループ本体（DELETE → INSERT）を強制的に再実行させる（契約 §46.3 落とし穴 3）。
+    #[test]
+    fn migrate_keeps_schema_version_as_a_single_row_after_reapplication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.db");
+
+        {
+            let store = Store::open(&path).expect("first open");
+            let conn = store.conn().expect("conn");
+            conn.execute("DELETE FROM schema_version", [])
+                .expect("clear schema_version");
+            conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])
+                .expect("seed a stray version 0 row");
+        }
+
+        let store = Store::open(&path).expect("second open re-runs migrate for version 1");
+        let conn = store.conn().expect("conn");
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, schema::SCHEMA_VERSION);
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(
+            rows, 1,
+            "DELETE を伴わない更新（INSERT OR REPLACE 相当）だと version = 0 の迷子行が残る"
+        );
+    }
+
+    // 期待値は契約 §3（行 218-266）の DDL からそのまま書き写す。実装の DDL_V1 は
+    // 参照しない —— 実装から期待値を作ると、実装が契約からずれても一緒にずれて
+    // 検出できなくなる（契約 §37.2 の last_runtime_error 事故の再発防止）。
+    #[test]
+    fn projects_table_matches_contract_ddl_columns_notnull_and_defaults() {
+        use crate::model::CliKind;
+
+        let (_dir, store) = test_support::open_temp();
+        let conn = store.conn().expect("conn");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(projects)")
+            .expect("prepare");
+        let rows: Vec<(i64, String, String, i64, Option<String>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        // dflt_value は SQLite が文字列リテラルをクォート込みで返す（実測で確認済み）。
+        let claude = format!("'{}'", CliKind::Claude.as_db_str());
+        let expected = vec![
+            (0, "id".to_owned(), "TEXT".to_owned(), 1, None, 1),
+            (1, "name".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (2, "repo_path".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (
+                3,
+                "default_cli".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                Some(claude),
+                0,
+            ),
+            (4, "created_at".to_owned(), "INTEGER".to_owned(), 1, None, 0),
+            (5, "updated_at".to_owned(), "INTEGER".to_owned(), 1, None, 0),
+        ];
+
+        assert_eq!(rows, expected);
+    }
+
+    // 期待値は契約 §34.2（行 2444-2465）の DDL からそのまま書き写す（理由は上のテストと同じ）。
+    #[test]
+    fn sessions_table_matches_contract_ddl_columns_notnull_and_defaults() {
+        use crate::model::{KanbanStatus, RuntimeState};
+
+        let (_dir, store) = test_support::open_temp();
+        let conn = store.conn().expect("conn");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("prepare");
+        let rows: Vec<(i64, String, String, i64, Option<String>, i64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        let backlog = format!("'{}'", KanbanStatus::Backlog.as_db_str());
+        let idle = format!("'{}'", RuntimeState::Idle.as_db_str());
+        let expected = vec![
+            (0, "id".to_owned(), "TEXT".to_owned(), 1, None, 1),
+            (1, "project_id".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (2, "title".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (
+                3,
+                "description".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                Some("''".to_owned()),
+                0,
+            ),
+            (
+                4,
+                "kanban_status".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                Some(backlog),
+                0,
+            ),
+            (5, "sort_order".to_owned(), "REAL".to_owned(), 1, None, 0),
+            (6, "mode".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (7, "branch".to_owned(), "TEXT".to_owned(), 0, None, 0),
+            (8, "worktree_path".to_owned(), "TEXT".to_owned(), 0, None, 0),
+            (9, "cli_kind".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            (10, "cli_command".to_owned(), "TEXT".to_owned(), 0, None, 0),
+            (
+                11,
+                "claude_session_id".to_owned(),
+                "TEXT".to_owned(),
+                0,
+                None,
+                0,
+            ),
+            (
+                12,
+                "last_runtime_state".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                Some(idle),
+                0,
+            ),
+            (
+                13,
+                "last_runtime_error".to_owned(),
+                "TEXT".to_owned(),
+                0,
+                None,
+                0,
+            ),
+            (
+                14,
+                "first_started_at".to_owned(),
+                "INTEGER".to_owned(),
+                0,
+                None,
+                0,
+            ),
+            (
+                15,
+                "archived_at".to_owned(),
+                "INTEGER".to_owned(),
+                0,
+                None,
+                0,
+            ),
+            (
+                16,
+                "created_at".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                None,
+                0,
+            ),
+            (
+                17,
+                "updated_at".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                None,
+                0,
+            ),
+        ];
+
+        assert_eq!(rows, expected);
+    }
 }
