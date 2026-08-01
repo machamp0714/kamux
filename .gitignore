@@ -1,7 +1,9 @@
-# Agent skills — 本体は skills-lock.json から復元する
+# Agent skills — 外部から入れたものは skills-lock.json から復元する
 # 復元: npx skills experimental_install
 .agents/
-.claude/skills/
+.claude/skills/*
+# 自作スキル（kamux-*）はリポジトリで管理する
+!.claude/skills/kamux-*/
 
 # macOS
 .DS_Store
