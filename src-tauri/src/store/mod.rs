@@ -51,7 +51,8 @@ impl Store {
         })
     }
 
-    pub fn conn(&self) -> AppResult<MutexGuard<'_, Connection>> {
+    #[allow(dead_code)] // PR 3 の project_dao / session_dao が呼ぶ
+    pub(crate) fn conn(&self) -> AppResult<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| AppError::Db("store mutex is poisoned".to_owned()))
