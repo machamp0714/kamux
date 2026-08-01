@@ -282,4 +282,211 @@ mod tests {
 
         assert_eq!(handle.join().expect("join"), "kamux");
     }
+
+    // ここから下は IPC 境界を実際に越えるテスト。上のテストは AppState -> Store の経路を
+    // 直叩きしているだけでコマンド本体（#[tauri::command] fn）を 1 行も実行していないため、
+    // 次の 3 つの変異がどれも緑のまま残ってしまう:
+    //   1. create_project(name, repo_path) の引数を入れ替えてもコンパイルが通る（両方 &str）
+    //   2. list_sessions の include_archived を無視して false 固定にしても緑
+    //   3. create_session の sort_order を next_sort_order から取らず定数にしても緑
+    // JS が実際に送るのと同じ camelCase キーの JSON を tauri::test::get_ipc_response で
+    // 投げることで、コマンド本体の引数バインディングそのものを検証する。
+    mod ipc {
+        use std::sync::Arc;
+
+        use serde_json::{json, Value};
+        use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
+        use tauri::{ipc::CallbackFn, webview::InvokeRequest, WebviewWindowBuilder};
+
+        use crate::state::AppState;
+        use crate::store::test_support::open_temp;
+
+        fn build_app(store: crate::store::Store) -> tauri::App<MockRuntime> {
+            mock_builder()
+                .manage(AppState {
+                    store: Arc::new(store),
+                })
+                .invoke_handler(tauri::generate_handler![
+                    super::super::create_project,
+                    super::super::list_projects,
+                    super::super::create_session,
+                    super::super::update_session,
+                    super::super::list_sessions,
+                    super::super::delete_project,
+                ])
+                .build(mock_context(noop_assets()))
+                .expect("build mock app")
+        }
+
+        /// JS の `invoke(cmd, args)` と同じ形（camelCase キーの JSON オブジェクト）で
+        /// コマンドを叩き、成功時は返り値の JSON を返す。失敗時はテストを panic させる。
+        fn invoke_ok(webview: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body: Value) -> Value {
+            let response = get_ipc_response(
+                webview,
+                InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: "tauri://localhost".parse().expect("url"),
+                    body: body.into(),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_string(),
+                },
+            );
+            match response {
+                Ok(b) => b.deserialize::<Value>().expect("deserialize response"),
+                Err(e) => panic!("{cmd} returned an error over IPC: {e}"),
+            }
+        }
+
+        // 変異 1: insert_project(&name, &repo_path, ...) の引数入れ替え検出。
+        // name と repo_path を区別できる値にして、返ってきた Project の各フィールドが
+        // 正しい方に入っていることを確認する。
+        #[test]
+        fn create_project_binds_name_and_repo_path_to_the_correct_fields() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({
+                    "name": "kamux",
+                    "repoPath": "/Users/x/repo/kamux",
+                    "defaultCli": "claude",
+                }),
+            );
+
+            assert_eq!(project["name"], json!("kamux"));
+            assert_eq!(project["repo_path"], json!("/Users/x/repo/kamux"));
+        }
+
+        // 変異 2: list_sessions が include_archived を無視して false 固定になっていないか。
+        // 同じ project に非アーカイブ 1 件・アーカイブ 1 件を作り、includeArchived: true を
+        // 実際に渡した場合だけ両方返ることを確認する（このレーンのどのテストも true を
+        // 渡していなかった穴を塞ぐ）。
+        #[test]
+        fn list_sessions_honors_include_archived_true() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let session_1 = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "archived one",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let session_1_id = session_1["id"].as_str().expect("session id").to_owned();
+
+            invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "active one",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+
+            invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_1_id, "patch": {"archived_at": 1_700_000_000_000_i64}}),
+            );
+
+            let excluding_archived = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": false}),
+            );
+            assert_eq!(
+                excluding_archived.as_array().expect("array").len(),
+                1,
+                "includeArchived: false ではアーカイブ済みを除いた 1 件だけが返る"
+            );
+
+            let including_archived = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": true}),
+            );
+            assert_eq!(
+                including_archived.as_array().expect("array").len(),
+                2,
+                "includeArchived: true を実際に渡した場合はアーカイブ済みも含めて 2 件返る"
+            );
+        }
+
+        // 変異 3: create_session が next_sort_order を使わず sort_order を定数にしていないか。
+        // 同じ project に 2 件作って sort_order が採番どおり 1.0 -> 2.0 と増えることを見る。
+        #[test]
+        fn create_session_assigns_sort_order_from_next_sort_order() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let session_1 = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "first",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let session_2 = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "second",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+
+            assert_eq!(session_1["sort_order"], json!(1.0));
+            assert_eq!(session_2["sort_order"], json!(2.0));
+        }
+    }
 }
