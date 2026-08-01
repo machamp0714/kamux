@@ -30,6 +30,7 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+pub mod project_dao;
 pub mod schema;
 
 /// SQLite 接続の唯一の持ち主。全 DAO メソッドは同期で、
