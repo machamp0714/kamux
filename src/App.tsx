@@ -4,17 +4,19 @@ import { ErrorToast } from './components/ErrorToast';
 import { ProjectBar } from './components/ProjectBar';
 import { useKeymap } from './hooks/useKeymap';
 import { bootstrap, useAppStore } from './store';
+import { toAppError } from './store/uiSlice';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
 
 export default function App() {
   const view = useAppStore((s) => s.view);
+  const setError = useAppStore((s) => s.setError);
 
   useKeymap();
 
   useEffect(() => {
-    void bootstrap();
-  }, []);
+    bootstrap().catch((e: unknown) => setError(toAppError(e)));
+  }, [setError]);
 
   return (
     <div className="app">

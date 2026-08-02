@@ -59,7 +59,7 @@ export function ProjectBar() {
                   : 'project-bar__item'
               }
               onClick={() => {
-                void setActiveProject(p.id);
+                setActiveProject(p.id).catch((e: unknown) => setError(toAppError(e)));
               }}
             >
               {p.name}
