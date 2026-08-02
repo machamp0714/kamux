@@ -533,16 +533,109 @@ mod tests {
         }
     }
 
+    /// `predicate` が真になるまで Data を蓄積して ack し続け、蓄積した文字列を
+    /// 返す。子プロセスを生かしたまま観測するための共通ヘルパー。
+    ///
+    /// # なぜこの形にするか(fix round 1)
+    ///
+    /// 「短命プロセスを spawn して、その出力内容をアサートする」形のテストは
+    /// macOS の ttywait/ttyclose により構造的にフレークする: 最後の slave fd
+    /// が閉じるとき、カーネルは master 側が読み切るまで子プロセスの終了自体を
+    /// 最大 ~600ms ブロックし、それでも読み切られなければ未読バッファを
+    /// 破棄してから `child.wait()` が返る(詳細は `PTY_JOIN_DEADLINE` の
+    /// ドキュメントコメント参照)。この欠陥自体は lane-controller の裁定で
+    /// 受容済みであり、直すのは「テストの作り方」だけである。子プロセスを
+    /// 生かしたまま出力を観測し終えてから `kill()` すれば、この欠陥の窓に
+    /// 構造的に入らない。
+    ///
+    /// 待ちは `recv_timeout` を Data 受信のたびにリセットし続けるだけだと
+    /// 総経過時間に上限が無いため、`overall_timeout` で総経過時間にも
+    /// 別枠で上限を設け、超えたら明示的に panic する。
+    pub(super) fn observe_while_alive(
+        rx: &Receiver<Ev>,
+        surface: &PtySurface,
+        overall_timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> String {
+        let started = std::time::Instant::now();
+        let mut out = String::new();
+        loop {
+            if predicate(&out) {
+                return out;
+            }
+            if started.elapsed() >= overall_timeout {
+                panic!(
+                    "timed out after {overall_timeout:?} waiting for expected output; \
+                     actual output so far: {out:?}"
+                );
+            }
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ev::Data { base64, seq }) => {
+                    out.push_str(&String::from_utf8_lossy(
+                        &BASE64.decode(base64).expect("valid base64"),
+                    ));
+                    surface.ack(seq);
+                }
+                Ok(Ev::Exit(code)) => panic!(
+                    "child exited (code={code:?}) before expected output arrived; \
+                     actual output: {out:?}"
+                ),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "channel disconnected before expected output arrived; actual output: {out:?}"
+                ),
+            }
+        }
+    }
+
+    /// `kill()` 済みの surface から Exit イベントが届くまで Data を読み飛ばして
+    /// ack する。SIGKILL 後なので exit code はアサートしない(契約: kill() で
+    /// 終了させたテストで exit_code == Some(0) をアサートしてはならない)。
+    pub(super) fn drain_until_exit_after_kill(rx: &Receiver<Ev>, surface: &PtySurface) {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { seq, .. }) => surface.ack(seq),
+                Ok(Ev::Exit(_)) => break,
+                Err(err) => panic!("timed out waiting for exit after kill: {err}"),
+            }
+        }
+    }
+
     #[test]
-    fn echo_emits_its_output_then_exits_with_zero() {
+    fn echo_emits_its_output_while_the_child_stays_alive() {
+        // fix round 1: 子プロセスを生かしたまま観測してから kill() する形に
+        // 変更(理由は observe_while_alive のドキュメントコメント参照)。
+        // `/bin/echo` 単体だと直後に自然終了してしまうため、`/bin/sh -c` で
+        // 出力の後に `sleep 30` を残す。
         let (tx, rx) = channel();
         let surface = PtySurface::spawn(
-            spec("/bin/echo", &["hello-kamux"]),
+            spec("/bin/sh", &["-c", "printf '%s\\n' 'hello-kamux'; sleep 30"]),
             Arc::new(ChannelSink { tx }),
         )
-        .expect("spawn /bin/echo");
-        let (out, code) = drain(&rx, &surface);
+        .expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("hello-kamux")
+        });
         assert!(out.contains("hello-kamux"), "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
+        assert!(!surface.is_alive());
+    }
+
+    #[test]
+    fn spawn_reports_exit_code_zero_when_the_child_exits_successfully() {
+        // fix round 1: exit code の到達だけを検証する(出力内容は見ない)。
+        // 出力を伴わない即終了プロセスなので、ttywait/ttyclose が破棄しうる
+        // 「内容」自体が存在せず、短命プロセスのままでも構造的にフレークしない
+        // (破棄されるのは未読の出力バッファであって、child.wait() が返す
+        // exit code そのものではない)。
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec("/bin/sh", &["-c", "exit 0"]),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /bin/sh");
+        let (_out, code) = drain(&rx, &surface);
         assert_eq!(code, Some(0));
         assert!(!surface.is_alive());
     }
@@ -563,14 +656,23 @@ mod tests {
 
     #[test]
     fn multibyte_output_survives_base64_round_trip() {
+        // fix round 1: 子プロセスを生かしたまま観測してから kill() する形に
+        // 変更(理由は observe_while_alive のドキュメントコメント参照)。
         let (tx, rx) = channel();
         let surface = PtySurface::spawn(
-            spec("/bin/echo", &["あいうえお-🍣"]),
+            spec(
+                "/bin/sh",
+                &["-c", "printf '%s\\n' 'あいうえお-🍣'; sleep 30"],
+            ),
             Arc::new(ChannelSink { tx }),
         )
-        .expect("spawn /bin/echo");
-        let (out, _code) = drain(&rx, &surface);
+        .expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("あいうえお-🍣")
+        });
         assert!(out.contains("あいうえお-🍣"), "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
     }
 
     #[test]
@@ -589,13 +691,24 @@ mod tests {
         // なる(実験で確認済み)。Task 4 の kill() であれば SIGKILL で出力量に
         // 依存せず子プロセスを即座に終了させられるため、その決定的なテストは
         // Task 4 側に委ねる。
+        //
+        // fix round 1: `head -n 5000` の後ろに `sleep 30` を残し、5000 行が
+        // 全て届いた時点で観測を打ち切って kill() する形に変更(理由は
+        // observe_while_alive のドキュメントコメント参照)。「複数チャンクに
+        // またがる出力が完全に届く」という検証意図(5000 行の完全一致)は
+        // 弱めていない。
         let (tx, rx) = channel();
         let surface = PtySurface::spawn(
-            spec("/bin/sh", &["-c", "yes 0123456789abcdef | head -n 5000"]),
+            spec(
+                "/bin/sh",
+                &["-c", "yes 0123456789abcdef | head -n 5000; sleep 30"],
+            ),
             Arc::new(ChannelSink { tx }),
         )
         .expect("spawn /bin/sh");
-        let (out, code) = drain(&rx, &surface);
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(20), |acc| {
+            acc.matches("0123456789abcdef").count() >= 5000
+        });
         let lines = out.matches("0123456789abcdef").count();
         assert_eq!(
             lines,
@@ -603,7 +716,8 @@ mod tests {
             "expected all 5000 lines, got {lines} (actual tail: {:?})",
             &out[out.len().saturating_sub(80)..]
         );
-        assert_eq!(code, Some(0));
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
         assert!(!surface.is_alive());
     }
 
@@ -1015,18 +1129,25 @@ mod tests {
         // リンクなので、tempfile が返すパスをそのまま文字列比較するとフレークする
         // 恐れがある。`std::fs::canonicalize` で解決した値と比較する
         // (`pwd -P` も物理パスを返すため、両辺とも symlink 解決済みで揃う)。
+        //
+        // fix round 1: `pwd -P` の後ろに `sleep 30` を残し、期待するパスが
+        // 届いた時点で観測を打ち切って kill() する形に変更(理由は
+        // observe_while_alive のドキュメントコメント参照)。
         let (tx, rx) = channel();
         let dir = tempfile::tempdir().expect("create temp dir");
-        let mut s = spec("/bin/sh", &["-c", "pwd -P"]);
+        let mut s = spec("/bin/sh", &["-c", "pwd -P; sleep 30"]);
         s.cwd = dir.path().to_path_buf();
         let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
-        let (out, code) = drain(&rx, &surface);
         let expected = std::fs::canonicalize(dir.path())
             .expect("canonicalize temp dir")
             .to_string_lossy()
             .into_owned();
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.trim() == expected
+        });
         assert_eq!(out.trim(), expected, "actual output: {out:?}");
-        assert_eq!(code, Some(0));
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
     }
 
     #[test]
@@ -1036,28 +1157,41 @@ mod tests {
         // 確認するテスト。既定値と明確に異なる cols/rows を渡し、子プロセスの
         // `stty size`(macOS では "rows cols" の順で出力)がその値を報告する
         // ことを確認する。
+        //
+        // fix round 1: `stty size` の後ろに `sleep 30` を残せるよう `/bin/sh
+        // -c` 経由で実行し、期待する値が届いた時点で観測を打ち切って
+        // kill() する形に変更(理由は observe_while_alive のドキュメント
+        // コメント参照)。
         let (tx, rx) = channel();
-        let mut s = spec("/bin/stty", &["size"]);
+        let mut s = spec("/bin/sh", &["-c", "stty size; sleep 30"]);
         s.cols = 100;
         s.rows = 40;
         assert_ne!(s.cols, DEFAULT_COLS);
         assert_ne!(s.rows, DEFAULT_ROWS);
-        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/stty");
-        let (out, code) = drain(&rx, &surface);
+        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.trim() == "40 100"
+        });
         assert_eq!(out.trim(), "40 100", "actual output: {out:?}");
-        assert_eq!(code, Some(0));
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
     }
 
     #[test]
     fn write_reaches_the_child_process() {
+        // fix round 1: `cat` は入力を待ち続けるため EOF を送らずとも生きた
+        // ままであり、書いた内容がエコーされたことを観測してから kill() する
+        // 形に変更(理由は observe_while_alive のドキュメントコメント参照)。
         let (tx, rx) = channel();
         let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
             .expect("spawn /bin/cat");
         surface.write(b"ping-kamux\n").expect("write line");
-        // 行頭の Ctrl-D で cat に EOF を送って終了させる
-        surface.write(&[0x04]).expect("write eof");
-        let (out, _code) = drain(&rx, &surface);
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("ping-kamux")
+        });
         assert!(out.contains("ping-kamux"), "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
     }
 
     #[test]
