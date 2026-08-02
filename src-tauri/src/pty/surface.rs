@@ -487,9 +487,21 @@ mod tests {
         let started = Instant::now();
         exit_tx.send(()).expect("signal fake process exit");
 
-        let event = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("on_exit が届かなかった: close() が join() より先に呼ばれていない疑いがある");
+        // park 検知ループは Data を1個ずつ ack せずに消費するため、break 時点で
+        // channel に未消費の Data が複数残っていることがある(producer の reader
+        // スレッドが先行送出できるため)。exit_tx.send() 後の受信が「残留した
+        // 古い Data」を拾ってしまわないよう、Exit が届くまで Data を読み飛ばす。
+        // Exit が届かなければタイムアウトして panic するため、
+        // 「close() が join() より先に呼ばれる」という本来の弁別は弱めていない。
+        let event = loop {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(Ev::Data { .. }) => continue,
+                Ok(ev) => break ev,
+                Err(err) => panic!(
+                    "on_exit が届かなかった: close() が join() より先に呼ばれていない疑いがある ({err})"
+                ),
+            }
+        };
         let elapsed = started.elapsed();
         assert!(
             matches!(event, Ev::Exit(Some(0))),
