@@ -591,9 +591,39 @@ mod tests {
     /// `kill()` 済みの surface から Exit イベントが届くまで Data を読み飛ばして
     /// ack する。SIGKILL 後なので exit code はアサートしない(契約: kill() で
     /// 終了させたテストで exit_code == Some(0) をアサートしてはならない)。
+    ///
+    /// # 総経過時間の上限(fix round 2, 指摘2)
+    ///
+    /// `rx.recv_timeout(Duration::from_secs(10))` を `Ev::Data` 受信のたびに
+    /// 再スタートするだけの構造だと、指示が明示的に禁止した「recv_timeout を
+    /// Data 受信のたびにリセットし続ける」構造そのものになってしまう。ここが
+    /// ブロッキングしない理由は、`spawn_waiter_thread` が `child.wait()`
+    /// 復帰後の bounded join(`PTY_JOIN_DEADLINE` = 1 秒)を経て必ず `on_exit`
+    /// を送出する設計であり、`Ev::Exit` は必ず到達してループが必ず終わる
+    /// ためである。その保証が万一崩れた場合にテストが無期限にハングし続ける
+    /// のを防ぐため、`observe_while_alive` と同様に総経過時間にも別枠で上限を
+    /// 設け、超えたら明示的に panic する。上限は「`kill()` 後に `on_exit` が
+    /// 届くまでの最大は `PTY_JOIN_DEADLINE`(1 秒)+ reap 時間(実測フロアは
+    /// macOS の ttywait による ~600ms 程度)」に十分な余裕を持たせて 30 秒とする。
     pub(super) fn drain_until_exit_after_kill(rx: &Receiver<Ev>, surface: &PtySurface) {
+        const OVERALL_TIMEOUT: Duration = Duration::from_secs(30);
+        let started = std::time::Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_secs(10)) {
+            // 残り予算を毎回計算して `recv_timeout` に渡す。固定 10 秒を渡すと
+            // 「総経過時間 29.9 秒地点でチェックを通過 → 新たに 10 秒待つ」が
+            // 起こりうる。これを放置すると実際のブロック上限が総経過時間の
+            // 上限(30 秒)より大きくなって panic メッセージと矛盾する。
+            // 残り予算でキャップすることで、実際のブロック時間を総経過時間の
+            // 上限内に収める。
+            let remaining = OVERALL_TIMEOUT.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                panic!(
+                    "timed out after {OVERALL_TIMEOUT:?} (total elapsed) waiting for exit \
+                     after kill: on_exit never arrived even though recv_timeout kept being \
+                     reset by incoming Data events"
+                );
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_secs(10))) {
                 Ok(Ev::Data { seq, .. }) => surface.ack(seq),
                 Ok(Ev::Exit(_)) => break,
                 Err(err) => panic!("timed out waiting for exit after kill: {err}"),
@@ -1179,12 +1209,64 @@ mod tests {
 
     #[test]
     fn write_reaches_the_child_process() {
-        // fix round 1: `cat` は入力を待ち続けるため EOF を送らずとも生きた
-        // ままであり、書いた内容がエコーされたことを観測してから kill() する
-        // 形に変更(理由は observe_while_alive のドキュメントコメント参照)。
+        // fix round 2(指摘1、案A採用): 新しい openpty はデフォルトで line
+        // discipline の ECHO が有効なため、`cat` が実際に fd を読んでいなくても、
+        // 書き込んだバイト列は PTY 層のエコーとして master 側に戻ってくる。
+        // fix round 1 のテストは Ctrl-D 相当の終了待ちを経由しないため、
+        // 「write が PTY master に届く」ことしか証明できておらず、テスト名が
+        // 主張する「write が子プロセスに届く」ことは証明できていなかった
+        // (`write_all` を握り潰す変異も ECHO 経由の応答と `cat` の出力の両方を
+        // 同時に消すため判別不能)。
+        //
+        // 子側で `stty -echo` してからエコーを止め、`cat` の出力のみで判定する
+        // (指摘の (A) 案。応答文字列が2回現れることをアサートする (B) 案より、
+        // 意図が明確でエコーが混ざらないため採用)。`stty -echo` の完了と
+        // `write()` の間にレースが生まれないよう、`stty -echo` の直後に子側が
+        // 出す目印(`kamux-ready`)を読み取ってから `write()` する
+        // (`kill_terminates_a_process_that_ignores_sighup` と同じレース対策)。
+        //
+        // `stty -echo` 自体が(制御端末が無い等の理由で)静かに失敗すると、
+        // このテストは「ECHO 経由の応答」を「cat の出力」と誤認したまま
+        // green になりかねない(実測: 実 PTY 経由では `stty -echo` は
+        // `rc=0` で成功し `stty -a` が `-echo` を報告することを確認済みだが、
+        // 環境差でこの前提が崩れた場合に静かに壊れるのは避けたい)。
+        // そのため `stty -echo` の成否を子プロセス自身に報告させ、失敗した
+        // 場合はテストを明示的に落とす(`kamux-stty-failed` 目印)。
         let (tx, rx) = channel();
-        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
-            .expect("spawn /bin/cat");
+        let surface = PtySurface::spawn(
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "if stty -echo; then printf '%s\\n' kamux-ready; \
+                     else printf '%s\\n' kamux-stty-failed; fi; cat",
+                ],
+            ),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /bin/sh");
+        let mut ready = String::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { base64, seq }) => {
+                    ready.push_str(&String::from_utf8_lossy(
+                        &BASE64.decode(base64).expect("valid base64"),
+                    ));
+                    surface.ack(seq);
+                    if ready.contains("kamux-stty-failed") {
+                        panic!(
+                            "stty -echo が失敗した: ECHO が有効なままの可能性があり、\
+                             この後の判定が cat の出力かどうか保証できない \
+                             (actual output so far: {ready:?})"
+                        );
+                    }
+                    if ready.contains("kamux-ready") {
+                        break;
+                    }
+                }
+                other => panic!("readiness marker が届く前に想定外のイベント: {other:?}"),
+            }
+        }
         surface.write(b"ping-kamux\n").expect("write line");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
             acc.contains("ping-kamux")
