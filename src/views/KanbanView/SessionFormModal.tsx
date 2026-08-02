@@ -12,6 +12,7 @@ import {
   validateSessionForm,
   type SessionFormValues,
 } from './sessionForm';
+import './SessionFormModal.css';
 
 const CLI_KINDS: CliKind[] = ['claude', 'codex', 'shell', 'custom'];
 const MODES: SessionMode[] = ['worktree', 'in_place'];
