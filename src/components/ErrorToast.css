@@ -1,0 +1,59 @@
+/* components.md「トースト」節。ErrorToast は src/components/ の共有部品なので
+   ProjectBar.css と同じ扱いで自前の CSS を持つ（ビューの CSS に同居させない）。 */
+
+.error-toast {
+  position: fixed;
+  right: var(--space-8);
+  bottom: var(--space-8);
+  z-index: var(--z-toast);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  /* components.md が px で直接指定するトーストの幅 */
+  max-width: 468px;
+  padding: var(--space-6) var(--space-7);
+  border-radius: var(--radius-lg);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border: 1px solid var(--state-error);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-toast);
+  font-size: var(--text-sm);
+  font-family: var(--font-ui);
+  color: var(--text-primary);
+}
+
+.error-toast__code {
+  font-weight: 600;
+  color: var(--state-error);
+  white-space: nowrap;
+}
+
+.error-toast__message {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 8em;
+  overflow-y: auto;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--bg-terminal);
+  color: var(--text-term-dim);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+/* components.md「ボタン」節の「ゴースト」行（背景なし・文字 --text-muted・枠なし）を適用 */
+.error-toast__close {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.error-toast__close:hover {
+  color: var(--text-primary);
+}
