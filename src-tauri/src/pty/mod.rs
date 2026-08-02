@@ -601,6 +601,122 @@ mod tests {
         let _ = rx.recv_timeout(Duration::from_secs(10));
     }
 
+    // --- Fix round 1, 指摘1: get_surface 経由(write/resize/ack)の Arc 逸脱を固定する ---
+    //
+    // `get_surface` は `Arc::clone(&entry.surface)` を返す。この一時クローンが
+    // 呼び出しの間だけ生存し、確実に drop されることは `kill_drops_the_registrys_
+    // last_strong_reference_to_the_surface` では検証されない(`kill` は
+    // `get_surface` を経由せず、`kill` 自身が inline で `Arc::clone` している別経路
+    // のため)。`write`/`resize`/`ack` を呼んだ後、レジストリだけが唯一の強参照で
+    // あることを Weak で確認する。
+
+    #[test]
+    fn write_resize_and_ack_do_not_leak_a_strong_reference_to_the_surface() {
+        let (tx, rx) = channel();
+        let sink = Arc::new(NullSink { tx });
+        let manager = PtyManager::new();
+        manager
+            .spawn_with_sink(
+                Arc::clone(&sink) as Arc<dyn PtySink>,
+                manager_spec("s12:agent", "/bin/cat", &[]),
+            )
+            .expect("spawn");
+
+        manager.write("s12:agent", b"x").expect("write");
+        manager.resize("s12:agent", 80, 24).expect("resize");
+        manager.ack("s12:agent", 1).expect("ack");
+
+        let weak = {
+            let guard = manager.surfaces.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::downgrade(&guard.get("s12:agent").expect("entry registered").surface)
+        };
+
+        manager.kill("s12:agent").expect("kill");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("exit"),
+            "s12:agent"
+        );
+
+        assert!(
+            weak.upgrade().is_none(),
+            "write/resize/ack(get_surface 経由)は Arc の強参照を漏らしてはならない: \
+             on_exit が発火してレジストリから登録解除された時点で、PtySurface は \
+             実際に drop されなければならない(Task 4 のリーク封鎖はこれに \
+             全面依存している)"
+        );
+    }
+
+    // --- Fix round 1, 指摘2: PtyManager::kill の "registry にエントリが残ったまま
+    // dead" という Some(dead) 分岐を固定する ---
+    //
+    // この状態は `alive.store(false)`(surface.rs 434 行)から `RegistrySink::on_exit`
+    // によるレジストリからの削除までの間に構造的に到達するが、実プロセスの正確な
+    // タイミングでしか自然再現できない(かつ短命プロセスの厳密タイミング依存は
+    // このレーンが禁じるフレーク源そのものになる)。そのため、manager 経由で
+    // spawn した生きた surface の Arc をレジストリ登録済みのまま複製し、
+    // `manager.kill()` による自然な登録解除(on_exit 経由)を先に完了させてから、
+    // 同じ(既に dead な)Arc をレジストリへ手動で再挿入することで、決定論的に
+    // Some(dead) 分岐を通す。
+    //
+    // reviewer が示した「exit 受信後に Entry を再挿入」という記述を字面どおりに
+    // 実装すると、Arc のクローンを exit 受信より前に取得する必要があり、
+    // `/bin/sh -c "exit 0"` のような短命プロセスでは「on_exit がレジストリを
+    // 削除する」タイミングと「テストコードがロックを取って Arc を読む」
+    // タイミングの間に本物の競合が生まれてしまう(意図が逆にフレーク源になる)。
+    // ここでは `/bin/cat` のような生存し続けるプロセスに対して Arc を先に
+    // 複製し(この時点でレジストリはまだ生きたエントリを持っているので競合なし)、
+    // その後 `manager.kill()` で自然に死なせてから再挿入することで、この競合を
+    // 構造的に排除している。
+
+    #[test]
+    fn kill_on_a_registered_but_already_dead_surface_is_ok() {
+        let (tx, rx) = channel();
+        let sink = Arc::new(NullSink { tx });
+        let manager = PtyManager::new();
+        manager
+            .spawn_with_sink(
+                Arc::clone(&sink) as Arc<dyn PtySink>,
+                manager_spec("s13:agent", "/bin/cat", &[]),
+            )
+            .expect("spawn");
+
+        // まだ生きているうちに Arc を複製する(この時点ではレジストリと
+        // このクローンの2つが強参照を持つが、レジストリ側は依然として本物の
+        // エントリなので競合しない)
+        let surface = {
+            let guard = manager.surfaces.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(&guard.get("s13:agent").expect("entry registered").surface)
+        };
+
+        manager
+            .kill("s13:agent")
+            .expect("first kill (registry path, still Some(alive))");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("exit"),
+            "s13:agent"
+        );
+        assert!(
+            !surface.is_alive(),
+            "on_exit が届いた以上、surface は死んでいるはず"
+        );
+
+        // レジストリへ「登録されているが dead」なエントリを手動で作る
+        {
+            let mut guard = manager.surfaces.lock().unwrap_or_else(|p| p.into_inner());
+            guard.insert(
+                "s13:agent".to_string(),
+                Entry {
+                    valid: Arc::new(AtomicBool::new(true)),
+                    surface,
+                },
+            );
+        }
+
+        manager
+            .kill("s13:agent")
+            .expect("kill on a registered-but-dead surface (Some(dead)) must be Ok");
+    }
+
     // --- 必達 (d) 隣接: spawn 失敗はレジストリを汚さず、同じ id での再試行を妨げない ---
     //
     // `PtySurface::spawn` 内部のゾンビ問題(4 箇所のエラー経路が child を wait()
