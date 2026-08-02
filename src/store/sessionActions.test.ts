@@ -92,6 +92,29 @@ describe('editSession', () => {
     });
     expect(useAppStore.getState().sessions.a.title).toBe('旧');
   });
+
+  it('応答が返るまでにプロジェクトが切り替わっていたら、B の sessions へ A の応答を混ぜない（Task 19 の不変条件）', async () => {
+    seed([makeSession({ id: 'a', title: '旧' })]); // activeProjectId: 'p1'
+    const bSessions = { b: makeSession({ id: 'b', project_id: 'p2' }) };
+    vi.mocked(updateSession).mockImplementation(async (id, patch: SessionPatch) => {
+      const saved = { ...useAppStore.getState().sessions[id], ...patch } as Session;
+      // setActiveProject → loadSessions の実経路がそうするように、切り替えは
+      // activeProjectId の更新と sessions / sessionOrder の丸ごと置き換えを伴う
+      useAppStore.setState({
+        activeProjectId: 'p2',
+        sessions: bSessions,
+        sessionOrder: buildSessionOrder(bSessions),
+      });
+      return saved;
+    });
+
+    const saved = await useAppStore.getState().editSession('a', { title: '新' });
+
+    // IPC 自体は成功しているので戻り値は呼び出し元へそのまま返す
+    expect(saved.title).toBe('新');
+    // だが stale なプロジェクト(p1)の応答を B の sessions へ適用してはいけない
+    expect(useAppStore.getState().sessions).toEqual(bSessions);
+  });
 });
 
 describe('archiveSession', () => {
@@ -146,6 +169,49 @@ describe('archiveSession', () => {
     seed([]);
     await useAppStore.getState().archiveSession('missing');
     expect(updateSession).not.toHaveBeenCalled();
+  });
+
+  describe('プロジェクト切り替え中の応答（Task 19 の不変条件を archiveSession でも守る）', () => {
+    const bSessions = {
+      b: makeSession({ id: 'b', project_id: 'p2', kanban_status: 'done', sort_order: 1 }),
+    };
+    function switchToB() {
+      useAppStore.setState({
+        activeProjectId: 'p2',
+        sessions: bSessions,
+        sessionOrder: buildSessionOrder(bSessions),
+      });
+    }
+
+    it('成功応答が返るまでに切り替わっていたら、B の sessions へ A の応答を混ぜない', async () => {
+      seed([makeSession({ id: 'a', kanban_status: 'done', sort_order: 1 })]);
+      vi.mocked(updateSession).mockImplementation(async (id, patch: SessionPatch) => {
+        const saved = { ...useAppStore.getState().sessions[id], ...patch } as Session;
+        switchToB();
+        return saved;
+      });
+
+      await useAppStore.getState().archiveSession('a');
+
+      expect(useAppStore.getState().sessions).toEqual(bSessions);
+    });
+
+    it('失敗し、かつ応答までに切り替わっていたら、B の盤面へロールバックしない。ただし throw はする', async () => {
+      seed([makeSession({ id: 'a', kanban_status: 'done', sort_order: 1 })]);
+      vi.mocked(updateSession).mockImplementation(async () => {
+        switchToB();
+        throw { code: 'db', message: 'locked' };
+      });
+
+      await expect(useAppStore.getState().archiveSession('a')).rejects.toEqual({
+        code: 'db',
+        message: 'locked',
+      });
+
+      // A の盤面(a を含む)へロールバックされていないこと。B の盤面のまま
+      expect(useAppStore.getState().sessions).toEqual(bSessions);
+      expect(useAppStore.getState().sessionOrder).toEqual(buildSessionOrder(bSessions));
+    });
   });
 });
 

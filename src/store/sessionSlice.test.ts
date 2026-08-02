@@ -12,6 +12,7 @@ vi.mock('../ipc/commands', () => ({
 
 import type { Session } from '../types/model';
 import { useAppStore } from './index';
+import { buildSessionOrder } from './kanbanOrder';
 import { emptySessionOrder, indexSessions } from './sessionSlice';
 
 const session = (over: Partial<Session>): Session => ({
@@ -229,5 +230,38 @@ describe('addSession', () => {
     // sessions（id 索引）側にも review 列のセッションが入っていることを検証する。
     // sessionOrder だけ更新して sessions を更新し忘れる退行を拾う。
     expect(useAppStore.getState().sessions.r).toEqual(serverSession);
+  });
+
+  it('IPC 応答が返るまでにプロジェクトが切り替わっていたら、B の sessions へ A の作成結果を混ぜない（Task 19 の不変条件）', async () => {
+    // loadSessions と同じ不変条件（sessions / sessionOrder は常に activeProjectId のもの）を
+    // addSession でも守る。IPC 往復中の切り替えは setActiveProject → loadSessions の実経路が
+    // そうするように、activeProjectId の更新と sessions / sessionOrder の丸ごと置き換えを伴う。
+    useAppStore.setState({ activeProjectId: 'p1' });
+    const created = session({ id: 'new', project_id: 'p1' });
+    const bSessions = { b: session({ id: 'b', project_id: 'p2', kanban_status: 'review' }) };
+    createSession.mockImplementation(async () => {
+      useAppStore.setState({
+        activeProjectId: 'p2',
+        sessions: bSessions,
+        sessionOrder: buildSessionOrder(bSessions),
+      });
+      return created;
+    });
+
+    const result = await useAppStore.getState().addSession({
+      projectId: 'p1',
+      title: 'new',
+      description: '',
+      mode: 'in_place',
+      branch: null,
+      cliKind: 'shell',
+      cliCommand: null,
+    });
+
+    // IPC 自体は成功しているので戻り値は呼び出し元へそのまま返す
+    expect(result).toEqual(created);
+    // だが stale なプロジェクト(p1)の作成結果を B の sessions へ足してはいけない
+    expect(useAppStore.getState().sessions).toEqual(bSessions);
+    expect(useAppStore.getState().sessionOrder).toEqual(buildSessionOrder(bSessions));
   });
 });
