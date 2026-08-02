@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::error::{AppError, AppResult};
 use crate::pty::backpressure::{Backpressure, PTY_READ_CHUNK};
@@ -39,16 +39,15 @@ pub struct SpawnSpec {
 }
 
 /// 1 PTY = 1 サーフェス。reader / waiter の 2 スレッドを従える。
-/// `master` / `writer` / `killer` は Task 4 (write/resize/kill) が読み出す消費者で、
-/// Task 3 の時点では構築のみ(未読) のため `dead_code` を明示的に許可する。
 pub struct PtySurface {
     id: String,
-    #[allow(dead_code)]
     master: Mutex<Box<dyn MasterPty + Send>>,
-    #[allow(dead_code)]
     writer: Mutex<Box<dyn Write + Send>>,
-    #[allow(dead_code)]
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// `kill()` が SIGKILL を直接送るのに使う。portable-pty の
+    /// `ChildKiller`(`clone_killer()` が返す `ProcessSignaller`)は unix では
+    /// SIGHUP を1発送るだけでエスカレーションが無いため使わない
+    /// (詳細は `kill()` のドキュメントコメント参照)。
+    pid: Option<u32>,
     backpressure: Arc<Backpressure>,
     alive: Arc<AtomicBool>,
 }
@@ -64,7 +63,6 @@ impl std::fmt::Debug for PtySurface {
 }
 
 /// 中毒したロックからも回復する(panic 経路を作らない)
-#[allow(dead_code)] // Task 4 の write/resize/kill から使われる
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -104,7 +102,12 @@ impl PtySurface {
         // child は spawn 済みなので、以降のどの失敗経路でも kill せずに return すると
         // 孤児プロセスとして残る。killer は child とは独立に kill を送れるため、
         // 以下の各エラー経路で確実に子プロセスを終わらせてから return する
+        // (成功経路では使わない。成功後の kill() は SIGKILL を直接送る。詳細は
+        // `kill()` のドキュメントコメント参照)
         let mut killer = child.clone_killer();
+        // 成功経路で `PtySurface::kill()` が使う。waiter スレッドへ `child` を
+        // 渡す(move する)前に取得しておく必要がある
+        let pid = child.process_id();
         let reader = pair.master.try_clone_reader().map_err(|e| {
             let _ = killer.kill();
             AppError::PtySpawn(e.to_string())
@@ -153,7 +156,7 @@ impl PtySurface {
             id: spec.surface_id,
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
-            killer: Mutex::new(killer),
+            pid,
             backpressure,
             alive,
         }))
@@ -174,6 +177,86 @@ impl PtySurface {
     /// フロントが seq まで消化したことを反映する
     pub fn ack(&self, seq: u64) {
         self.backpressure.ack(seq);
+    }
+
+    /// PTY にバイト列を書き込む
+    pub fn write(&self, data: &[u8]) -> AppResult<()> {
+        let mut writer = lock_or_recover(&self.writer);
+        writer
+            .write_all(data)
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        writer.flush().map_err(|e| AppError::Io(e.to_string()))
+    }
+
+    /// 端末サイズを変更する。0 は子プロセスを壊すので 1 にクランプする
+    pub fn resize(&self, cols: u16, rows: u16) -> AppResult<()> {
+        let master = lock_or_recover(&self.master);
+        master
+            .resize(PtySize {
+                rows: rows.max(1),
+                cols: cols.max(1),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| AppError::Io(e.to_string()))
+    }
+
+    pub fn size(&self) -> AppResult<(u16, u16)> {
+        let master = lock_or_recover(&self.master);
+        let size = master.get_size().map_err(|e| AppError::Io(e.to_string()))?;
+        Ok((size.cols, size.rows))
+    }
+
+    /// 子プロセスを殺す。契約 §15: SIGKILL 相当、完全に冪等(既に死んでいても Ok)。
+    ///
+    /// portable-pty 0.9 の `ChildKiller::kill`(`clone_killer()` が返す
+    /// `ProcessSignaller`)は unix では SIGHUP を1発送るだけでエスカレーションが
+    /// 無く、SIGHUP をハンドル/無視するプロセスを終了させられない。grace
+    /// period → SIGKILL のエスカレーションを持つのは
+    /// `impl ChildKiller for std::process::Child` だけだが、その `Child` は
+    /// waiter スレッドが `wait()` のために専有しており、ここから呼べない。
+    /// そのため spawn 時に取得した PID へ直接 `SIGKILL` を送る。子は
+    /// portable-pty の unix 実装が `pre_exec` で `setsid()` しており
+    /// プロセスグループリーダー(pgid == pid)になっているため、負の pid で
+    /// `kill(2)` を呼ぶと `killpg` 相当になり、子が生んだ孫プロセスも
+    /// まとめて終わらせられる。
+    pub fn kill(&self) -> AppResult<()> {
+        // reader が滞留待ちで停止していても必ず起こす。close() は何度呼んでも安全
+        self.backpressure.close();
+        if !self.is_alive() {
+            return Ok(());
+        }
+        let Some(pid) = self.pid else {
+            // process_id() が None ならこれ以上シグナルを送る手段が無い。alive は
+            // waiter が child.wait() から戻った時点で自然に false になる
+            return Ok(());
+        };
+        // Safety: pid は spawn 成功時に portable-pty から取得した実在のプロセス
+        // ID。負号を付けることで対象プロセスのグループ全体への SIGKILL になる
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // ESRCH: シグナル送信の直前に自然終了していた(冪等性)
+            Some(libc::ESRCH) => Ok(()),
+            _ => Err(AppError::Io(err.to_string())),
+        }
+    }
+}
+
+impl Drop for PtySurface {
+    fn drop(&mut self) {
+        // `master`/`writer` フィールドを drop するだけでは、SIGHUP を
+        // ハンドル/無視するよう構成された子プロセス(例: `trap '' HUP`)を
+        // 終了させられない(実測: Drop 未実装のまま
+        // `dropping_a_surface_without_kill_still_terminates_the_child_process`
+        // 相当の状況を再現すると、5 秒待っても生存し続けることを確認済み)。
+        // kill() で確実に子プロセスを終わらせ、backpressure を close して
+        // 滞留待ちの reader も起こす(kill() 自体が close() を呼ぶ)。
+        // 既に kill 済み/自然終了済みでも kill() は Ok を返すため panic しない。
+        let _ = self.kill();
     }
 }
 
@@ -648,5 +731,183 @@ mod tests {
         let (out, code) = drain(&rx, &surface);
         assert_eq!(out.trim(), "40 100", "actual output: {out:?}");
         assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn write_reaches_the_child_process() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+            .expect("spawn /bin/cat");
+        surface.write(b"ping-kamux\n").expect("write line");
+        // 行頭の Ctrl-D で cat に EOF を送って終了させる
+        surface.write(&[0x04]).expect("write eof");
+        let (out, _code) = drain(&rx, &surface);
+        assert!(out.contains("ping-kamux"), "actual output: {out:?}");
+    }
+
+    #[test]
+    fn resize_updates_the_pty_window_size() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+            .expect("spawn /bin/cat");
+        assert_eq!(
+            surface.size().expect("initial size"),
+            (DEFAULT_COLS, DEFAULT_ROWS)
+        );
+        surface.resize(120, 40).expect("resize");
+        assert_eq!(surface.size().expect("resized size"), (120, 40));
+        surface.kill().expect("kill");
+        let _ = drain(&rx, &surface);
+    }
+
+    #[test]
+    fn resize_clamps_zero_to_one() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+            .expect("spawn /bin/cat");
+        surface.resize(0, 0).expect("resize");
+        assert_eq!(surface.size().expect("size"), (1, 1));
+        surface.kill().expect("kill");
+        let _ = drain(&rx, &surface);
+    }
+
+    #[test]
+    fn kill_terminates_a_long_running_child_and_emits_exit() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+            .expect("spawn /bin/cat");
+        assert!(surface.is_alive());
+        surface.kill().expect("kill");
+        // Exit イベントが届く(drain は Exit で戻る)
+        let _ = drain(&rx, &surface);
+        assert!(!surface.is_alive());
+    }
+
+    #[test]
+    fn kill_is_idempotent() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+            .expect("spawn /bin/cat");
+        surface.kill().expect("first kill");
+        let _ = drain(&rx, &surface);
+        // 契約 §15: 既に死んでいても Ok を返す
+        surface.kill().expect("second kill must be Ok");
+        surface.kill().expect("third kill must be Ok");
+    }
+
+    #[test]
+    fn kill_terminates_a_process_that_ignores_sighup() {
+        // Important(b) の弁別: portable-pty の `ChildKiller::kill`
+        // (`clone_killer()` が返す `ProcessSignaller`)は unix では SIGHUP を
+        // 1発送るだけでエスカレーションが無い。SIGHUP をハンドルして無視する
+        // プロセスに対して SIGHUP だけを送る実装だと、このプロセスは永久に
+        // 生き続け、この後の `drain` がタイムアウトして red になる。
+        // 契約 §15 は「SIGKILL 相当」を要求しており、SIGKILL はハンドラで
+        // 無視できないため、この弁別で kill() の強さを固定する。
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "trap '' HUP; echo kamux-ready; while true; do sleep 1; done",
+                ],
+            ),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /bin/sh");
+        assert!(surface.is_alive());
+        // `trap` の設置が完了する前に SIGHUP を送ると、まだ既定動作(Term)の
+        // ままの子プロセスがたまたま死んでしまい、この弁別が偽陽性で green に
+        // なってしまう(実測済み: 目印を待たずに送ると SIGHUP 単発の変異でも
+        // green になった)。子プロセスが trap 設置後に出す目印を読み取って
+        // からのみ kill() を送ることで、このレースを排除する。
+        let mut out = String::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { base64, seq }) => {
+                    out.push_str(&String::from_utf8_lossy(
+                        &BASE64.decode(base64).expect("valid base64"),
+                    ));
+                    surface.ack(seq);
+                    if out.contains("kamux-ready") {
+                        break;
+                    }
+                }
+                other => panic!("readiness marker が届く前に想定外のイベント: {other:?}"),
+            }
+        }
+        surface.kill().expect("kill");
+        let _ = drain(&rx, &surface);
+        assert!(!surface.is_alive());
+    }
+
+    #[test]
+    fn dropping_a_surface_without_kill_still_terminates_the_child_process() {
+        // Critical(a) の弁別: `PtySurface` の `master`/`writer` フィールドを
+        // 単純にフィールド単位で drop するだけでは、SIGHUP をハンドル/無視する
+        // よう構成された子プロセス(`trap '' HUP`)を終了させられない。
+        //
+        // 弁別対象を /bin/cat のような SIGHUP デフォルト動作(終了)のプロセス
+        // にすると、たとえ Drop を実装し忘れていても、master/writer が閉じる
+        // ことで発生する PTY 側の hang up 相当のイベントに乗って「たまたま」
+        // 死んでしまい、この弁別テストが偽陽性で green になる
+        // (実測済み: Drop を消してもこのケースは 11ms 以内に exit code 0 で
+        // 終了した)。SIGHUP を無視するプロセスに対してのみ、Drop の有無が
+        // 観測可能な差になる(実測: Drop を消すと 5 秒待っても生存し続けた)。
+        //
+        // ここでは kill() を一切呼ばずに `PtySurface` を drop し、OS レベルで
+        // (signal 0 による存在確認)子プロセスが実際に消えたことを確認する。
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "trap '' HUP; echo kamux-ready; while true; do sleep 1; done",
+                ],
+            ),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /bin/sh");
+        let pid = surface.pid.expect("pid captured at spawn");
+        // trap 設置前に何かが起きて偶然死ぬ余地を無くすため、trap 設置後に
+        // 子プロセスが出す目印が届くまで待ってから drop する
+        let mut out = String::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { base64, seq }) => {
+                    out.push_str(&String::from_utf8_lossy(
+                        &BASE64.decode(base64).expect("valid base64"),
+                    ));
+                    surface.ack(seq);
+                    if out.contains("kamux-ready") {
+                        break;
+                    }
+                }
+                other => panic!("readiness marker が届く前に想定外のイベント: {other:?}"),
+            }
+        }
+        drop(surface);
+        // PtySurface は drop 済みだが、reader/waiter スレッドは自分が持つ
+        // Arc<dyn PtySink> クローンで動き続けるため、on_exit は引き続き
+        // rx から届く。ポーリングせず、イベント到着を待つだけで済む
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ev::Exit(_)) => break,
+                Ok(Ev::Data { .. }) => continue,
+                Err(err) => panic!(
+                    "Drop 後に on_exit が届かなかった: master fd がリークして \
+                     子プロセスが終了していない疑いがある ({err})"
+                ),
+            }
+        }
+        // イベントに加え、OS レベルでも実際にプロセスが消えたことを直接確認する
+        // (signal 0: 存在確認のみでシグナルは送らない)
+        let alive_at_os_level = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        assert!(
+            !alive_at_os_level,
+            "on_exit は届いたが OS 上にはまだ pid={pid} が残っている"
+        );
     }
 }
