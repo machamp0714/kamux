@@ -1,8 +1,9 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { useAppStore } from '../../store';
 import { toAppError, type ModalState } from '../../store/uiSlice';
 import { proposeBranchName } from '../../lib/branchName';
 import type { CliKind, SessionMode } from '../../types/model';
+import { resolveDialogMode } from './dialogMode';
 import {
   buildCreateSessionArgs,
   buildSessionPatch,
@@ -32,21 +33,30 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
   const editSession = useAppStore((s) => s.editSession);
   const setError = useAppStore((s) => s.setError);
   const project = useAppStore((s) => s.projects.find((p) => p.id === s.activeProjectId) ?? null);
-  const editing = useAppStore((s) =>
+  const editingSession = useAppStore((s) =>
     modal.kind === 'edit_session' ? (s.sessions[modal.sessionId] ?? null) : null,
   );
+  const dialogMode = resolveDialogMode(modal, editingSession);
 
   const [values, setValues] = useState<SessionFormValues>(() =>
-    editing !== null
-      ? sessionFormValuesFrom(editing)
+    dialogMode.kind === 'edit'
+      ? sessionFormValuesFrom(dialogMode.session)
       : initialSessionFormValues(project?.default_cli ?? 'claude'),
   );
   // 編集時は既存のブランチ名を守るため、最初から追従を止めておく
-  const [branchTouched, setBranchTouched] = useState(editing !== null);
+  const [branchTouched, setBranchTouched] = useState(dialogMode.kind === 'edit');
   const [busy, setBusy] = useState(false);
 
+  // 編集モードで開いている間に対象セッションがストアから消えた場合（アーカイブ等）、
+  // 作成モードへフォールバックせず閉じる（dialogMode.ts 参照）。
+  useEffect(() => {
+    if (dialogMode.kind === 'lost') closeModal();
+  }, [dialogMode.kind, closeModal]);
+
+  if (dialogMode.kind === 'lost') return null;
+
   const errors = validateSessionForm(values);
-  const isEdit = editing !== null;
+  const isEdit = dialogMode.kind === 'edit';
   // 作成モードでは activeProjectId 先のプロジェクトが要る。無ければ黙って
   // 閉じるのではなく送信自体を止める（バリデーションエラーの一種として扱う）。
   const canSubmit = errors.length === 0 && !busy && (isEdit || project !== null);
@@ -64,9 +74,9 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
     if (!canSubmit) return;
     setBusy(true);
     try {
-      if (editing !== null) {
-        const patch = buildSessionPatch(editing, values);
-        if (Object.keys(patch).length > 0) await editSession(editing.id, patch);
+      if (dialogMode.kind === 'edit') {
+        const patch = buildSessionPatch(dialogMode.session, values);
+        if (Object.keys(patch).length > 0) await editSession(dialogMode.session.id, patch);
       } else if (project !== null) {
         await addSession(buildCreateSessionArgs(project.id, values));
       }
@@ -119,16 +129,18 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
               />
             </label>
 
-            {isEdit ? (
+            {dialogMode.kind === 'edit' ? (
               <dl className="session-form-modal__readonly">
                 <dt>分離モード</dt>
-                <dd>{editing.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
+                <dd>{dialogMode.session.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
                 <dt>ブランチ</dt>
-                <dd>{editing.branch ?? '—'}</dd>
+                <dd>{dialogMode.session.branch ?? '—'}</dd>
                 <dt>CLI</dt>
                 <dd>
-                  {editing.cli_kind}
-                  {editing.cli_command !== null ? ` (${editing.cli_command})` : ''}
+                  {dialogMode.session.cli_kind}
+                  {dialogMode.session.cli_command !== null
+                    ? ` (${dialogMode.session.cli_command})`
+                    : ''}
                 </dd>
                 <dt />
                 <dd className="session-form-modal__note">これらは作成時のみ設定できます</dd>
