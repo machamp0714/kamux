@@ -15,6 +15,8 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
     rows = 24;
     buffer = { active: { viewportY: 0, baseY: 0 } };
     disposed = false;
+    scrollToBottomCalls = 0;
+    scrollToLineCalls: number[] = [];
 
     constructor(public options: unknown) {
       FakeTerminal.instances.push(this);
@@ -50,11 +52,11 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
     }
 
     scrollToBottom(): void {
-      // 配線の対象外
+      this.scrollToBottomCalls += 1;
     }
 
-    scrollToLine(): void {
-      // 配線の対象外
+    scrollToLine(line: number): void {
+      this.scrollToLineCalls.push(line);
     }
 
     dispose(): void {
@@ -185,6 +187,8 @@ describe('term.onData / onBinary の単一登録（契約 §16・必達 2a）', 
 
     term.onBinaryHandlers.forEach((h) => h('\x01'));
     expect(writePtyBytes).toHaveBeenCalledTimes(1);
+    // encodeBinaryString('\x01') の base64。生データのまま渡していないことを締める
+    expect(writePtyBytes).toHaveBeenCalledWith(sid, 'AQ==');
   });
 });
 
@@ -254,6 +258,70 @@ describe('loadAcceleratedRenderer との配線', () => {
 
     expect(FakeWebglAddon.instances).toHaveLength(1);
     expect(FakeWebglAddon.instances[0]?.contextLossHandlers).toHaveLength(1);
+  });
+});
+
+describe('fitTerminal', () => {
+  it('未 attach なら null', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    expect(registry.fitTerminal(sid)).toBeNull();
+  });
+
+  it('0x0 の間は null を返す（0 列 0 行を PTY に送らない）', () => {
+    const sid = nextSurfaceId();
+    const container = document.createElement('div');
+    registry.attachTerminal(sid, container);
+    // jsdom の getBoundingClientRect は既定で 0x0
+    expect(registry.fitTerminal(sid)).toBeNull();
+  });
+
+  it('寸法があれば cols/rows を返し、変化が無ければ 2 回目は null', () => {
+    const sid = nextSurfaceId();
+    const container = document.createElement('div');
+    registry.attachTerminal(sid, container);
+    const host = container.firstElementChild as HTMLElement;
+    vi.spyOn(host, 'getBoundingClientRect').mockReturnValue({
+      width: 800,
+      height: 600,
+    } as unknown as DOMRect);
+
+    expect(registry.fitTerminal(sid)).toEqual({ cols: 80, rows: 24 });
+    expect(registry.fitTerminal(sid)).toBeNull();
+  });
+});
+
+describe('スクロールバックの保存/復元（契約 §16「付け替えでスクロールバックが消えない」）', () => {
+  it('末尾追従中でなければ detach → attach で同じ行へ scrollToLine する', () => {
+    const sid = nextSurfaceId();
+    const containerA = document.createElement('div');
+    const containerB = document.createElement('div');
+
+    registry.attachTerminal(sid, containerA);
+    const term = fakeOf(sid);
+    term.buffer = { active: { viewportY: 5, baseY: 10 } };
+
+    registry.detachTerminal(sid);
+    registry.attachTerminal(sid, containerB);
+
+    expect(term.scrollToLineCalls).toEqual([5]);
+  });
+
+  it('末尾追従中（viewportY >= baseY）なら detach → attach で scrollToBottom する', () => {
+    const sid = nextSurfaceId();
+    const containerA = document.createElement('div');
+    const containerB = document.createElement('div');
+
+    registry.attachTerminal(sid, containerA);
+    const term = fakeOf(sid);
+    term.buffer = { active: { viewportY: 10, baseY: 10 } };
+    const before = term.scrollToBottomCalls;
+
+    registry.detachTerminal(sid);
+    registry.attachTerminal(sid, containerB);
+
+    expect(term.scrollToBottomCalls).toBe(before + 1);
+    expect(term.scrollToLineCalls).toEqual([]);
   });
 });
 
