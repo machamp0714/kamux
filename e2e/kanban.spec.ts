@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { tauriMockScript } from './support/tauriMock';
 
 /**
@@ -16,6 +16,48 @@ async function dragCardTo(page: Page, fromSessionId: string, target: { x: number
   await page.mouse.move(box.x + box.width / 2 + 20, box.y + box.height / 2 + 20, { steps: 5 });
   await page.mouse.move(target.x, target.y, { steps: 10 });
   await page.mouse.up();
+}
+
+/**
+ * ドラッグ操作の直後に別の要素をクリックする場合専用のヘルパー。
+ *
+ * @dnd-kit/core の PointerSensor#handleEnd は detach() を呼び、detach() は
+ * 「ドロップ操作自身がその後に発生させる click イベント」を握りつぶすため、
+ * document に capture: true な click リスナー（stopPropagation のみを呼ぶ）を仕込む。
+ * このリスナーは即座には外れず setTimeout 50ms 後に外れる（documentListeners.removeAll。
+ * node_modules/@dnd-kit/core/dist/core.esm.js の PointerSensor 実装を参照。ライブラリの
+ * 意図的な仕様であり、kamux 側のバグではない）。
+ *
+ * capture:true かつ document に付いているため、この 50ms の窓に重なって別要素へ
+ * クリックを送ると、その伝播も一緒に握りつぶされ、対象要素の React 側 onClick が
+ * 一切発火しない（ネイティブの click イベント自体は正しい要素に届いているのに、
+ * バブリングで document まで上がる前に止められる）。E2E を並列実行して負荷が高いと
+ * ドラッグ完了からこのクリックまでの実時間が 50ms を下回りやすく、
+ * 単発 click() だと稀に空振りする。
+ *
+ * 50ms という値そのものに依存しないよう、「効くまで打ち直す」形で待つ
+ * （ライブラリの実装が変わっても壊れない）。ErrorToast 側の onClick が壊れていれば
+ * 打ち直しても効かないので、最終的に toBeHidden() の本来のタイムアウトで正しく失敗する
+ * （検出力は落ちない）。
+ */
+async function clickToastCloseUntilHidden(page: Page, toast: Locator) {
+  const closeButton = page.locator('.error-toast__close');
+  for (let attempt = 0; attempt < 10; attempt++) {
+    // 直前の周回の click が実は効いていた（ただし toBeHidden の 100ms 待ちに
+    // 間に合わなかっただけ）ケースを弾く。弾かないと、既に無い close ボタンへ
+    // click() を打つことになり、actionTimeout 未設定のため test timeout(15s) まで
+    // 待つ「別種の分かりにくい失敗」を生んでしまう。
+    if (await toast.isHidden()) return;
+    await closeButton.click();
+    try {
+      await expect(toast).toBeHidden({ timeout: 100 });
+      return;
+    } catch {
+      // dnd-kit の click ガードに握りつぶされた可能性。打ち直す。
+    }
+  }
+  // ここまでで外れているはずなので、ここは「本物の失敗」を正しいタイムアウトで検出する。
+  await expect(toast).toBeHidden();
 }
 
 test.describe('カンバン操作（共通の 1 プロジェクト・2 セッション）', () => {
@@ -330,8 +372,7 @@ test('move_session が失敗すると .error-toast が表示され、カード�
   await expect(page.locator('[data-column="backlog"] [data-session-id="s1"]')).toBeVisible();
   await expect(page.locator('[data-column="in_progress"] [data-session-id="s1"]')).toHaveCount(0);
 
-  await page.locator('.error-toast__close').click();
-  await expect(toast).toBeHidden();
+  await clickToastCloseUntilHidden(page, toast);
 });
 
 test('起動時復元: activeProjectId の選択・sort_order 順の描画・不正 ID のフォールバックが UI に反映される', async ({
