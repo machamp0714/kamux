@@ -329,12 +329,46 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
 
     expect(addon?.disposed).toBe(true);
   });
+});
 
-  it('lineHeight は渡さない（fix round 1: xterm の倍率と CSS line-height の単位が違うため）', () => {
+describe('readTerminalFont はトークンの値をそのまま渡す（RULINGS §23.2: lineHeight を自分で変換しない）', () => {
+  afterEach(() => {
+    document.documentElement.style.removeProperty('--font-mono');
+    document.documentElement.style.removeProperty('--text-sm');
+    document.documentElement.style.removeProperty('--leading-term');
+  });
+
+  it('--leading-term の値をそのまま lineHeight に渡す（変換・別数値のハードコード禁止）', () => {
+    document.documentElement.style.setProperty('--leading-term', '1.65');
     const sid = nextSurfaceId();
     registry.ensureTerminal(sid);
     const term = fakeOf(sid);
     const options = term.options as { lineHeight?: number };
+    expect(options.lineHeight).toBe(1.65);
+  });
+
+  it('--font-mono / --text-sm もそのまま fontFamily / fontSize に渡す', () => {
+    document.documentElement.style.setProperty('--font-mono', 'JetBrains Mono, monospace');
+    document.documentElement.style.setProperty('--text-sm', '12px');
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as { fontFamily?: string; fontSize?: number };
+    expect(options.fontFamily).toBe('JetBrains Mono, monospace');
+    expect(options.fontSize).toBe(12);
+  });
+
+  it('トークンが読めない（NaN / 空文字）ときはキー自体を省略し xterm の既定値に委ねる', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as {
+      fontFamily?: string;
+      fontSize?: number;
+      lineHeight?: number;
+    };
+    expect(options.fontFamily).toBeUndefined();
+    expect(options.fontSize).toBeUndefined();
     expect(options.lineHeight).toBeUndefined();
   });
 });

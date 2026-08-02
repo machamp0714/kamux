@@ -81,29 +81,37 @@ function readTerminalTheme(): ITheme {
 
 /**
  * xterm のフォント設定をデザインシステムのトークンから読む。
- * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm`。
+ * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm` / `--leading-term`。
  *
  * tokens.css が読み込まれていない環境（テストなど）では `getComputedStyle` が
  * 空文字列 / NaN を返す。その場合はキー自体を省略して xterm の既定値に委ねる
  * （hex フォールバックと違い、design token が無いときの防御であって「値を書く」ことにはならない）。
  *
- * **`lineHeight` は意図的に渡さない（fix round 1 で撤去）。** xterm の `lineHeight` は
- * CSS の `line-height` ではなく、`lineHeight="normal"` で測った自然な行ボックス
- * （JetBrains Mono だと概ね font-size の 1.3 倍）に対する追加倍率である
- * （`device.cell.height = char.height * lineHeight`）。`--leading-term: 1.65` は
- * CSS の line-height として定義された値なので、そのまま渡すとセル高が
- * CSS 換算で約 1.3 × 1.65 ≒ font-size の 2.2 倍になり、行数（と resize_pty に渡す
- * rows）が 3〜4 割減る。正しい倍率を出すには自然行ボックス比という別の literal が
- * 要り契約 §53 に抵触するため、`--leading-term` → xterm セル高の写像は
- * デザインシステム側の裁定待ち。**安易に戻さないこと。**
+ * **`lineHeight` に `--leading-term` の値をそのまま渡す（RULINGS §23.2 の裁定）。**
+ *
+ * xterm の `lineHeight` は CSS の `line-height` と同じ意味の数値ではない。
+ * `cell.height = Math.floor(char.height * lineHeight)` であり、`char.height` は
+ * フォントサイズではなく「フォントの自然な行ボックス」（TextMetrics の
+ * `fontBoundingBoxAscent + fontBoundingBoxDescent`、または `line-height: normal`
+ * を当てて測った `offsetHeight`。実測で概ね fontSize の 1.15〜1.3 倍）である。
+ * そのため `--leading-term: 1.65` をそのまま渡すと、セル高は fontSize の
+ * 約 2.0〜2.15 倍になる（CSS の `line-height: 1.65` が意図する見た目より広い）。
+ *
+ * **それでも数値を自分で変換・ハードコードしないこと。** `kamux-design-system` の
+ * SKILL.md が「3 体の実装者が独立に近い値を書いてトークンの島が 3 つできた」失敗を
+ * 名指ししている。`--leading-term` の値を変えるか、ターミナルグリッド専用のトークンを
+ * 別途足すかは team-lead / contract-owner の裁定であり、このファイルの裁量ではない。
+ * 見た目の可否は Task 14 の初回描画で目視確認する。
  */
-function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize'> {
+function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize' | 'lineHeight'> {
   const s = getComputedStyle(document.documentElement);
   const fontFamily = s.getPropertyValue('--font-mono').trim();
   const fontSize = parseFloat(s.getPropertyValue('--text-sm'));
+  const lineHeight = parseFloat(s.getPropertyValue('--leading-term'));
   return {
     ...(fontFamily && { fontFamily }),
     ...(!Number.isNaN(fontSize) && { fontSize }),
+    ...(!Number.isNaN(lineHeight) && { lineHeight }),
   };
 }
 
