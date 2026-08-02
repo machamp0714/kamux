@@ -698,6 +698,59 @@ mod tests {
             );
         }
 
+        // resize_pty のコマンド登録と surfaceId バインドを検証する（フィックス対象
+        // レビュー指摘: Task 8 fix round 2 Important 1。resize_pty は generate_handler!
+        // に登録されているだけでどのテストからも invoke されていなかった）。
+        // 注意: cols と rows の引数順は本テストでは弁別できない。読み戻し API が無く、
+        // それを検証するには Task 6 が凍結した PtyManager 内部（cols/rows の記録）に
+        // 手を入れる必要があるため、範囲外としている。
+        #[test]
+        fn resize_pty_reaches_the_pty_manager_and_returns_not_found_for_an_unknown_surface() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "resize_pty",
+                json!({"surfaceId": "nope:agent", "cols": 100, "rows": 40}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope:agent"),
+                "AppError::NotFound は surface_id をそのまま運ぶ(契約 §6)"
+            );
+        }
+
+        // ack_pty のコマンド登録と surfaceId バインドを検証する（フィックス対象
+        // レビュー指摘: Task 8 fix round 2 Important 1。契約 §9 のバックプレッシャー
+        // 解除路であり、ここが崩れると端末が途中まで出力されて固まったまま止まる）。
+        #[test]
+        fn ack_pty_reaches_the_pty_manager_and_returns_not_found_for_an_unknown_surface() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "ack_pty",
+                json!({"surfaceId": "nope:agent", "seq": 1}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope:agent"),
+                "AppError::NotFound は surface_id をそのまま運ぶ(契約 §6)"
+            );
+        }
+
         // stop_session が `SurfaceKind::Agent` の surface_id を kill することを検証する。
         // `session::stop_session` の内部を `Editor` に変異させると kill 対象が
         // ずれて `s:agent` が生き残ったままになり、この assert が赤くなる。

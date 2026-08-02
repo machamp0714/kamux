@@ -38,6 +38,15 @@ pub struct PtyExitPayload {
 /// 呼び出し方は変わらない。`tauri::test::mock_builder()` は `MockRuntime` を使う
 /// ため、`R` を固定していると `pty://data` / `pty://exit` の実 emit をユニット
 /// テストで検証できない（Task 8 必達 1）。
+// 所有権メモ(フィックス対象レビュー指摘: Task 8 fix round 2 Minor 2)。
+// AppHandle -> Arc<AppManager> -> managed AppState -> PtyManager.surfaces ->
+// Arc<PtySurface> -> RegistrySink -> inner: Arc<TauriSink> -> AppHandle という
+// 強参照の循環がある。on_exit で PtyManager がレジストリからエントリを外すと
+// 循環が切れるので生存中の漏れ続けにはならないが、逆に言うと「プロセス終了時」は
+// このパスを通らないため、PtySurface::Drop(surface.rs)はアプリ終了時には走らない。
+// 終了時の子プロセス掃除は lib.rs の on_window_event 側の明示 kill に依存している。
+// M2-1 が RuntimeStateManager を AppState に足すときの判断材料として残す。
+// コード自体は変えない(契約 §15 の凍結範囲)。
 pub struct TauriSink<R: Runtime = Wry> {
     app: AppHandle<R>,
 }
