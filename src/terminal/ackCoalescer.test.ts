@@ -126,4 +126,16 @@ describe('AckCoalescer', () => {
     ack.consumed(3);
     expect(schedule).toHaveBeenCalledTimes(1);
   });
+
+  it('既定スケジューラ（queueMicrotask）は同期実行せずマイクロタスク経由で送る', async () => {
+    const send = vi.fn();
+    const ack = new AckCoalescer(send); // schedule を省略 = 本番の既定引数
+
+    ack.consumed(1);
+    expect(send).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(1);
+  });
 });
