@@ -136,6 +136,18 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
     await page.keyboard.press('Meta+k');
     await expect(page.locator('[data-session-id="s1"]')).toHaveAttribute('aria-selected', 'true');
 
+    // タブ移動が実際に効いたこと（上の aria-selected の遷移）はここまでで証明済み
+    // ——xterm がフォーカスを持つ間も window の keydown リスナへ Cmd 系が届く、という
+    // 契約 §11 のバブリングの継ぎ目そのものを踏んでいる。
+    //
+    // 一方、以下の write_pty 0 件のアサーションは fix round 2 で変異実測したところ
+    // 恒真の疑いが強い: registry.ts の attachCustomKeyEventHandler を
+    // `() => true`（xterm にキーを処理させる）へ変異させても、この assert は赤くならない。
+    // headless Chromium では Meta+j がそもそも xterm 内でキー列（PTY へ書く文字列）を
+    // 生まない模様で、この engine ではこの assert に弁別力が無い。
+    // 「Cmd+J を押してシェルに j が入らないこと」の実測は §26.4 の手動スモーク
+    // （WKWebView）側で確認する。ここでは「write_pty が呼ばれていないこと」という
+    // 現状の事実だけを回帰の下限として残す。
     const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
     expect(calls.filter((c) => c.cmd === 'write_pty' || c.cmd === 'write_pty_bytes')).toHaveLength(
       0,
@@ -195,19 +207,6 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
    * ack は同じく飛ぶ）。境界の正しさの目視確認は手動スモークへ回す。
    */
   test('pty://data の 2 チャンクが xterm まで届き、ack_pty(seq=2) が返る', async ({ page }) => {
-    // fix round 1 の e2e 着手中に発見した実バグにより現状 fixme（詳細はレビュー報告）:
-    // src/terminal/ackCoalescer.ts の `schedule: (fn) => void = queueMicrotask` は
-    // 呼び出し側で `this.schedule(fn)`（メソッド呼び出し構文）として呼ばれるため、
-    // ネイティブの `queueMicrotask` に AckCoalescer インスタンスが `this` として渡り、
-    // 実ブラウザ（Chromium 実測 / WKWebView も同じ制約を持つ native API）では
-    // `TypeError: Illegal invocation` を投げる。ackCoalescer.test.ts は常に自前の
-    // schedule 関数を注入しており、既定値の queueMicrotask 経路を一度も通していない
-    // ため単体テストでは検出されない。src/ の修正は今回のタスク範囲外（BLOCKED として報告済み）。
-    // 修正後にこの行を外せば、このテストは本来の意図どおり検証として機能する。
-    test.fixme(
-      true,
-      'ackCoalescer.ts の queueMicrotask this-binding バグにより ack_pty が飛ばない',
-    );
     await page.addInitScript(commonInitScript());
     await gotoTerminalView(page);
     await page.locator('[data-session-id="s1"]').click();
@@ -241,11 +240,11 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
       [`pty://data/${surface}`, chunk2, 2] as [string, string, number],
     );
 
+    // 実測済み（fix round 2）: ackCoalescer.ts 修正後も toEqual([2]) は赤くなる。
     // 2 回の emit は別々の page.evaluate（CDP 往復を挟む別タスク）なので、chunk1 の
-    // ack が chunk2 の emit より先に飛ぶ可能性がある。その場合 seq 列は [1, 2] になりうる
-    // ため、「最後の ack が seq=2」だけを見る（[2] 固定だと ack が一切来ない本来の赤とは
-    // 別の理由で、ackCoalescer 修正後もここが赤いままになりうる）。このテストは fixme で
-    // 未実行のため、上記の判断は実測できていない —— un-fixme した直後に確認すること。
+    // ack（seq=1）が chunk2 の emit より先に飛び、実際の列は [1, 2] になる。
+    // 「最後の ack が seq=2」だけを見れば、この非決定な順序に依存せず、
+    // ack が一切来ない本来の赤（本バグ再発時）は引き続き検出できる。
     await expect
       .poll(async () => {
         const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);

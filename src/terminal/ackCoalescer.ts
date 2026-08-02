@@ -11,7 +11,13 @@ export class AckCoalescer {
 
   constructor(
     private readonly send: (seq: number) => void,
-    private readonly schedule: (fn: () => void) => void = queueMicrotask,
+    // 既定値は queueMicrotask の裸参照にしないこと。呼び出し側は `this.schedule(fn)`
+    // というメソッド呼び出し構文で呼ぶため、裸参照のままだとネイティブ queueMicrotask に
+    // AckCoalescer インスタンスが `this` として渡り、ブラウザの WebIDL 実装が
+    // `TypeError: Illegal invocation` を投げる（vitest の jsdom 環境ではこの this 束縛が
+    // 強制されず検出できなかった。fix round 2 で e2e から実ブラウザで発見）。
+    // アロー関数でラップして `this` を切り離す。
+    private readonly schedule: (fn: () => void) => void = (fn) => queueMicrotask(fn),
   ) {}
 
   /** xterm がそのチャンクを消化したときに呼ぶ */
@@ -29,8 +35,15 @@ export class AckCoalescer {
       this.highestConsumed = seq;
     }
     if (this.scheduled) return;
-    this.scheduled = true;
+    // `scheduled` は schedule() が実際に登録できてから立てる（呼ぶ前ではない）。
+    // queueMicrotask は同期的にコールバックを実行しないため、この並び替えは
+    // 成功時の挙動を一切変えない。変えるのは schedule() 自体が例外を投げた場合だけで、
+    // その場合 `scheduled` は false のまま残り、次の consumed() で再試行できる。
+    // fix round 2 で見つかったバグは「scheduled を先に立てていたため、schedule() が
+    // 例外を投げると恒久的に ack が止まる」という壊れ方だった。ここでの並び替えは
+    // その種の再発（schedule 実装側の別の失敗）を「1 回分の ack 遅延」に格下げする。
     this.schedule(() => this.flush());
+    this.scheduled = true;
   }
 
   /** PTY が終了して同じ surface_id で再起動されると Rust 側の seq は 1 に戻る */
