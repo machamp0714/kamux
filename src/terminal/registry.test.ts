@@ -134,9 +134,24 @@ const defaultAckPtyImpl = (_surfaceId: string, _seq: number): Promise<void> =>
   Promise.resolve(undefined);
 let ackPtyImpl: (surfaceId: string, seq: number) => Promise<void> = defaultAckPtyImpl;
 
+/**
+ * Important 2（PR 10 fix round 2）: writePty / writePtyBytes も ack_pty と同じ理由で
+ * unhandled rejection の回帰テストを持つ必要があるが、既存の call-args アサーション
+ * （`term.onData / onBinary の単一登録` describe）は `vi.fn()` の呼び出し記録に依存
+ * している。両立させるため、呼び出し口を「差し替え可能な関数変数」にし、既定では
+ * 上の vi.fn() へ委譲する。回帰テストだけ素の reject する関数へ挿げ替える。
+ */
+const defaultWritePtyImpl = (surfaceId: string, data: string): Promise<void> =>
+  writePty(surfaceId, data);
+let writePtyImpl: (surfaceId: string, data: string) => Promise<void> = defaultWritePtyImpl;
+const defaultWritePtyBytesImpl = (surfaceId: string, base64: string): Promise<void> =>
+  writePtyBytes(surfaceId, base64);
+let writePtyBytesImpl: (surfaceId: string, base64: string) => Promise<void> =
+  defaultWritePtyBytesImpl;
+
 vi.mock('../ipc/commands', () => ({
-  writePty: (surfaceId: string, data: string) => writePty(surfaceId, data),
-  writePtyBytes: (surfaceId: string, base64: string) => writePtyBytes(surfaceId, base64),
+  writePty: (surfaceId: string, data: string) => writePtyImpl(surfaceId, data),
+  writePtyBytes: (surfaceId: string, base64: string) => writePtyBytesImpl(surfaceId, base64),
   ackPty: (surfaceId: string, seq: number) => ackPtyImpl(surfaceId, seq),
 }));
 
@@ -165,6 +180,9 @@ beforeEach(() => {
   // （でないと 2 テスト目以降で「Cannot read properties of undefined (reading 'catch')」になる）
   writePty.mockReset().mockResolvedValue(undefined);
   writePtyBytes.mockReset().mockResolvedValue(undefined);
+  // 回帰テストが挿げ替えても、次のテストでは既定の vi.fn() 経由へ必ず戻す
+  writePtyImpl = defaultWritePtyImpl;
+  writePtyBytesImpl = defaultWritePtyBytesImpl;
 });
 
 afterEach(() => {
@@ -305,6 +323,65 @@ describe('ack_pty の reject 処理（契約 §16・必達 1・fix round 1）', 
 
       // AckCoalescer は queueMicrotask で flush する。unhandledRejection は
       // イベントループを最低 1 周させないと発火しないため、マクロタスクまで進める。
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+
+    expect(rejections).toHaveLength(0);
+  });
+});
+
+describe('write_pty / write_pty_bytes の reject 処理（契約 §16・Important 2・PR 10 fix round 2）', () => {
+  afterEach(() => {
+    // 次のテストに影響しないよう、必ず「解決する」実装へ戻す
+    writePtyImpl = defaultWritePtyImpl;
+    writePtyBytesImpl = defaultWritePtyBytesImpl;
+  });
+
+  it('write_pty が reject しても unhandled rejection にならない（.catch で握り潰す）', async () => {
+    // ack_pty のテストと同じ理由（コメント参照）で vi.fn() を経由させない
+    writePtyImpl = (): Promise<void> =>
+      Promise.reject(new Error('NotFound: surface already disposed'));
+
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term.onDataHandlers.forEach((h) => h('x'));
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+
+    expect(rejections).toHaveLength(0);
+  });
+
+  it('write_pty_bytes が reject しても unhandled rejection にならない（.catch で握り潰す）', async () => {
+    writePtyBytesImpl = (): Promise<void> =>
+      Promise.reject(new Error('NotFound: surface already disposed'));
+
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term.onBinaryHandlers.forEach((h) => h('\x01'));
+
       await new Promise((resolve) => setTimeout(resolve, 0));
       await new Promise((resolve) => setTimeout(resolve, 0));
     } finally {

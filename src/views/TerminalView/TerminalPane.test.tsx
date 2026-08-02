@@ -6,24 +6,37 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 // vi.mock はファイル先頭に巻き上げられるので、モック関数は vi.hoisted で先に作る
-const mocks = vi.hoisted(() => ({
-  startSession: vi.fn(),
-  resizePty: vi.fn(),
-  ensurePtySubscription: vi.fn(),
-  isStarted: vi.fn(),
-  markStarted: vi.fn(),
-  unmarkStarted: vi.fn(),
-  attachTerminal: vi.fn(),
-  detachTerminal: vi.fn(),
-  fitTerminal: vi.fn(),
-  getTerminal: vi.fn(),
-  invalidateFitCache: vi.fn(),
-  writeNotice: vi.fn(),
-}));
+const mocks = vi.hoisted(() => {
+  const resizePty = vi.fn();
+  return {
+    startSession: vi.fn(),
+    resizePty,
+    // Important 1（PR 10 fix round 2）の回帰テストは resize_pty の reject が
+    // 本当に unhandled rejection にならないかを検証する。vitest の vi.fn() は
+    // 呼び出し結果を mock.results に記録するために内部で Promise を横取りして
+    // おり、それ自体が Node の「処理済み」判定を成立させてしまう（registry.test.ts
+    // の ack_pty のテストと同じ理由）。そのため resizePty（vi.fn）を直接 reject
+    // させても unhandled rejection は検出できない。呼び出し口を関数変数として
+    // 差し替え可能にしておき、回帰テストだけ素の reject する関数へ挿げ替える。
+    resizePtyImpl: (surfaceId: string, cols: number, rows: number): Promise<void> =>
+      resizePty(surfaceId, cols, rows),
+    ensurePtySubscription: vi.fn(),
+    isStarted: vi.fn(),
+    markStarted: vi.fn(),
+    unmarkStarted: vi.fn(),
+    attachTerminal: vi.fn(),
+    detachTerminal: vi.fn(),
+    fitTerminal: vi.fn(),
+    getTerminal: vi.fn(),
+    invalidateFitCache: vi.fn(),
+    writeNotice: vi.fn(),
+  };
+});
 
 vi.mock('../../ipc/commands', () => ({
   startSession: mocks.startSession,
-  resizePty: mocks.resizePty,
+  resizePty: (surfaceId: string, cols: number, rows: number) =>
+    mocks.resizePtyImpl(surfaceId, cols, rows),
 }));
 vi.mock('../../terminal/ptyBridge', () => ({
   ensurePtySubscription: mocks.ensurePtySubscription,
@@ -43,7 +56,25 @@ vi.mock('../../terminal/registry', () => ({
 import { useAppStore } from '../../store';
 import { TerminalPane } from './TerminalPane';
 
+/**
+ * このプロジェクトは `@types/node` を依存に持たないため、`process` はグローバルに
+ * 型付けされていない（実行環境が vitest = Node なので実体は存在する）。
+ * unhandled rejection の実測にだけ使う（registry.test.ts と同じ形）。
+ */
+declare const process: {
+  on(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+  off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+};
+
+// ResizeObserver 経路の isStarted 門を手動発火で検証するため、コールバックを
+// 保持できるようにする（既定の no-op スタブでは発火手段が無い）
 class FakeResizeObserver {
+  static callbacks: Array<() => void> = [];
+
+  constructor(cb: () => void) {
+    FakeResizeObserver.callbacks.push(cb);
+  }
+
   observe(): void {}
   disconnect(): void {}
 }
@@ -72,9 +103,14 @@ function renderPane(sessionId: string | null): void {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+  FakeResizeObserver.callbacks = [];
   mocks.isStarted.mockReturnValue(false);
   mocks.fitTerminal.mockReturnValue(null);
   mocks.getTerminal.mockReturnValue(undefined);
+  mocks.resizePty.mockResolvedValue(undefined);
+  // 回帰テストが差し替えても、次のテストでは既定の vi.fn() 経由へ必ず戻す
+  mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
+    mocks.resizePty(surfaceId, cols, rows);
   useAppStore.setState({ modal: null });
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -170,6 +206,59 @@ describe('TerminalPane（Important 1: 未起動 PTY への resize_pty を防ぐ�
     await flush();
 
     expect(mocks.fitTerminal).toHaveBeenCalledTimes(1);
+  });
+
+  it('ResizeObserver 経路にも同じ門がある（isStarted が false の間は resize が来ても fitTerminal を呼ばない）', async () => {
+    mocks.isStarted.mockReturnValue(false); // pty://exit 後、まだ再起動していない状態を模す
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+
+    renderPane('s1');
+    await flush();
+    expect(mocks.fitTerminal).not.toHaveBeenCalled(); // マウント時点（既存の門）
+
+    // ResizeObserver のコールバックを手動発火し、デバウンス（60ms）を実時間で待つ
+    FakeResizeObserver.callbacks.forEach((cb) => {
+      cb();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await flush();
+
+    expect(mocks.fitTerminal).not.toHaveBeenCalled();
+  });
+});
+
+describe('TerminalPane（Important 1: resize_pty の reject が unhandled rejection にならない・PR 10 fix round 2）', () => {
+  it('isStarted の門を通った resize_pty が reject しても unhandled rejection にならない', async () => {
+    // resizePtyImpl を素の reject する関数へ挿げ替える（vi.fn() 越しでは検出できない。
+    // mocks 定義側のコメント参照）
+    mocks.resizePtyImpl = (): Promise<void> =>
+      Promise.reject(new Error('NotFound: pty already exited'));
+
+    // markStarted 直後（start_session 未解決の in-flight）を模す。isStarted は
+    // 「起動済み」ではなく「start_session を投げ済み」の意味なので true になりうる
+    mocks.isStarted.mockReturnValue(true);
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      // isStarted=true なのでマウント直後の syncSize が走り resize_pty が飛ぶ
+      renderPane('s1');
+      await flush();
+      // unhandledRejection はイベントループを最低 1 周させないと発火しない
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+
+    expect(rejections).toHaveLength(0);
   });
 });
 

@@ -37,11 +37,22 @@ export function TerminalPane({ sessionId }: { sessionId: string | null }): JSX.E
 
     attachTerminal(surface, container);
 
-    // Important 1（PR 10 fix round 1）: 未起動の PTY に resize_pty を投げても
-    // 必ず NotFound で失敗する（唯一の副作用である lastSize の更新も、この直後の
-    // 起動成功パスで invalidateFitCache が捨てる）。isStarted の間だけ実行する
-    // ——再 attach 経路（画面外にいる間にウィンドウがリサイズされた場合など）では
-    // 既に起動済みの PTY に対して正しく効く必要があるので、単純に消してはならない。
+    // Important 1（PR 10 fix round 1・fix round 2 で述語を訂正）: 未起動の PTY に
+    // resize_pty を投げても必ず NotFound で失敗する（唯一の副作用である lastSize の
+    // 更新も、この直後の起動成功パスで invalidateFitCache が捨てる）。
+    // isStarted(surface) の間だけ実行する。
+    //
+    // ここでの isStarted は「起動済み（spawn 完了）」ではなく「start_session を
+    // 投げ済み」の意味である——markStarted は startSession() の解決を待たずに
+    // 呼ばれる（下の ensurePtySubscription チェーン参照）。したがって
+    // isStarted(surface) が true でも実際の spawn が完了しているとは限らない
+    // （in-flight のごく短い窓では resize_pty がまだ NotFound になりうる。
+    // それは syncSize 側の .catch で吸収する。この門の役割は「PTY が存在しないと
+    // 分かりきっている大半のケース」を防ぐことである）。
+    //
+    // 再 attach 経路（画面外にいる間にウィンドウがリサイズされた場合など）では
+    // 既に start_session を投げ済みの PTY に対して正しく効く必要があるので、
+    // 単純に消してはならない。
     if (isStarted(surface)) {
       syncSize(surface);
     }
@@ -83,7 +94,15 @@ export function TerminalPane({ sessionId }: { sessionId: string | null }): JSX.E
       if (timer !== null) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         timer = null;
-        syncSize(surface);
+        // Important 1（PR 10 fix round 2）: pty://exit の後もこのペインはマウント
+        // されたまま残りうる（ユーザーがタブを離れない限り、この effect は
+        // 再実行されず ResizeObserver も張られたまま）。exit 後にウィンドウ /
+        // コンテナがリサイズされると、存在しない PTY へ resize_pty を投げて
+        // しまう。マウント直後の呼び出しと同じ isStarted の門をここにも通す
+        // （syncSize の 2 経路で扱いを揃える）。
+        if (isStarted(surface)) {
+          syncSize(surface);
+        }
       }, RESIZE_DEBOUNCE_MS);
     });
     observer.observe(container);
@@ -129,5 +148,11 @@ export function TerminalPane({ sessionId }: { sessionId: string | null }): JSX.E
 function syncSize(surface: string): void {
   const size = fitTerminal(surface);
   if (size === null) return;
-  void resizePty(surface, size.cols, size.rows);
+  // Important 1（PR 10 fix round 2）: isStarted の門をすり抜ける in-flight の窓
+  // （start_session を投げた直後、実際の spawn が完了する前）では resize_pty が
+  // NotFound で reject されうる。ackPty / writePty と同じ理由（もう存在しない、
+  // またはまだ存在しない PTY への通知なので、失敗しても何も壊れない）で握り潰す。
+  resizePty(surface, size.cols, size.rows).catch(() => {
+    // 上記の理由により意図的に無視する
+  });
 }
