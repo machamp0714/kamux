@@ -27,7 +27,7 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
   const store = useAppStore.getState();
   const action = resolveKeymap(
     { key: event.key, metaKey: event.metaKey },
-    { modalOpen: store.modal !== null },
+    { modalOpen: store.modal !== null, view: store.view },
   );
   if (action === null) return;
   event.preventDefault();
@@ -40,6 +40,9 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
       break;
     case 'close_modal':
       store.closeModal();
+      break;
+    case 'cycle_session':
+      store.cycleSession(action.dir);
       break;
   }
 }

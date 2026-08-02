@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { resolveKeymap } from './keymap';
 
-const closed = { modalOpen: false };
-const open = { modalOpen: true };
+const closed = { modalOpen: false, view: 'kanban' as const };
+const open = { modalOpen: true, view: 'kanban' as const };
+const terminalView = { modalOpen: false, view: 'terminal' as const };
 
 describe('resolveKeymap', () => {
   it('Cmd+1 でカンバン画面へ切り替える（契約 §11）', () => {
@@ -10,6 +11,43 @@ describe('resolveKeymap', () => {
       type: 'set_view',
       view: 'kanban',
     });
+  });
+
+  it('Cmd+2 でターミナル画面へ切り替える（契約 §11）', () => {
+    expect(resolveKeymap({ key: '2', metaKey: true }, closed)).toEqual({
+      type: 'set_view',
+      view: 'terminal',
+    });
+  });
+
+  it('ターミナル画面では Cmd+J が cycleSession(1)', () => {
+    expect(resolveKeymap({ key: 'j', metaKey: true }, terminalView)).toEqual({
+      type: 'cycle_session',
+      dir: 1,
+    });
+  });
+
+  it('ターミナル画面では Cmd+K が cycleSession(-1)', () => {
+    expect(resolveKeymap({ key: 'k', metaKey: true }, terminalView)).toEqual({
+      type: 'cycle_session',
+      dir: -1,
+    });
+  });
+
+  it('Shift 併用で大文字になっても Cmd+J/K は効く', () => {
+    expect(resolveKeymap({ key: 'J', metaKey: true }, terminalView)).toEqual({
+      type: 'cycle_session',
+      dir: 1,
+    });
+    expect(resolveKeymap({ key: 'K', metaKey: true }, terminalView)).toEqual({
+      type: 'cycle_session',
+      dir: -1,
+    });
+  });
+
+  it('ターミナル画面でないときは Cmd+J/K を無視する（null を返す）', () => {
+    expect(resolveKeymap({ key: 'j', metaKey: true }, closed)).toBeNull();
+    expect(resolveKeymap({ key: 'k', metaKey: true }, closed)).toBeNull();
   });
 
   it('Cmd+N で新規セッションモーダルを開く', () => {
@@ -42,9 +80,9 @@ describe('resolveKeymap', () => {
     expect(resolveKeymap({ key: 'n', metaKey: false }, closed)).toBeNull();
   });
 
-  it('M1-2 で未実装のキーは null を返す', () => {
-    // 契約 §11 のうち M1-2 の担当外。後続フェーズがこのユニオンに variant を足す
-    for (const key of ['2', '3', 'p', 'j', 'k', 'd', '[', ']']) {
+  it('M3 系の未実装キーは null を返す', () => {
+    // 契約 §11 のうち M3-1 / M3-2 / M3-4 の担当外。後続フェーズがこのユニオンに variant を足す
+    for (const key of ['3', 'p', 'd', '[', ']']) {
       expect(resolveKeymap({ key, metaKey: true }, closed)).toBeNull();
     }
   });
