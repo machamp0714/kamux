@@ -142,11 +142,17 @@ fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
 /// `R: tauri::Runtime` はテストのために足した内部実装の一般化であり、契約上の
 /// 型ではない（`TauriSink<R: Runtime = Wry>` と同じ前例。`pty/sink.rs` 参照）。
 /// production の `run()` は `tauri::Builder::default()`（= Wry）のまま呼ぶため
-/// 挙動は変わらない。ただし `MockRuntime` は `WindowEvent::Destroyed` を
-/// 一度も発火しない（`tauri-2.11.5/src/test/mock_runtime.rs` に該当コードが
-/// 無いことを grep で確認済み）。ジェネリックにしてもこの関数を「Destroyed が
-/// 来たときに kill する」経路としてテストから到達させる術は無い
-/// （守っているテストは無い）。
+/// 挙動は変わらない。
+///
+/// `MockRuntime` は `WindowEvent::Destroyed` を一度も発火しない
+/// （`tauri-2.11.5/src/test/mock_runtime.rs` を `grep -n "Destroyed"` した
+/// 結果が 0 件であることを確認済み）ため、「Destroyed イベントの配送」を
+/// 経由した経路は守るテストが無い。ただし `WindowEvent::Destroyed` は
+/// フィールドの無いユニットバリアントであり、enum 全体に付いた
+/// `#[non_exhaustive]` があってもクレート外から構築できる
+/// （`let _ = tauri::WindowEvent::Destroyed;` がこのクレートからコンパイルを
+/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる:
+/// `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`。
 fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
     if matches!(event, WindowEvent::Destroyed) {
         if let Some(state) = window.try_state::<AppState>() {
@@ -516,6 +522,85 @@ mod tests {
         assert!(
             !app_handle.state::<AppState>().pty.is_alive("run-event-exit:agent"),
             "kill_on_run_event_exit must kill every surface that was live when RunEvent::Exit fired"
+        );
+    }
+
+    // 「Destroyed が来たときに kill する」経路のうち、MockRuntime がイベント配送
+    // 自体を再現できない部分（実測: 上の run_event_exit テストの `Destroyed`
+    // grep が 0 件）を除いた「関数本体がロジックとして正しいか」は、
+    // `tauri::WindowEvent::Destroyed` がフィールドの無いユニットバリアントで
+    // あり `#[non_exhaustive]` が付いていてもクレート外から構築できる
+    // （実測: `let _ = tauri::WindowEvent::Destroyed;` がこのクレートから
+    // コンパイルを通ることを確認済み）ため、関数を直接呼ぶ形で固定できる。
+    #[test]
+    fn kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
+
+        use crate::pty::surface::PtySink;
+        use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+        use crate::store::test_support::open_temp;
+
+        struct ExitSink(std::sync::mpsc::Sender<String>);
+        impl PtySink for ExitSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, surface_id: &str, _exit_code: Option<i32>) {
+                let _ = self.0.send(surface_id.to_string());
+            }
+        }
+
+        let (_dir, store) = open_temp();
+        let app = mock_builder()
+            .manage(AppState {
+                store: Arc::new(store),
+                pty: crate::pty::PtyManager::new(),
+            })
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+        WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build webview");
+        // `on_window_event` は `&tauri::Window<R>` を渡す。`WebviewWindow` は
+        // それを直接公開しないため（`WindowBuilder` は unstable フィーチャ
+        // 越しでしか使えない）、`Manager::get_window` で同じラベルの
+        // `Window<R>` を引き直す。
+        let window = app.get_window("main").expect("window registered");
+
+        let (exit_tx, exit_rx) = channel();
+        let sink: Arc<dyn PtySink> = Arc::new(ExitSink(exit_tx));
+        {
+            let state = app.state::<AppState>();
+            state
+                .pty
+                .spawn_with_sink(
+                    Arc::clone(&sink),
+                    SpawnSpec {
+                        surface_id: "window-destroyed:agent".to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn");
+            assert!(state.pty.is_alive("window-destroyed:agent"));
+        }
+
+        super::kill_on_window_destroyed(&window, &WindowEvent::Destroyed);
+
+        exit_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("WindowEvent::Destroyed must have killed the pty surface");
+        assert!(
+            !app.state::<AppState>()
+                .pty
+                .is_alive("window-destroyed:agent"),
+            "kill_on_window_destroyed must kill every surface that was live when Destroyed fired"
         );
     }
 
