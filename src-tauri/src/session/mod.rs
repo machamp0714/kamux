@@ -10,16 +10,17 @@ use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::state::AppState;
 use cli_args::{build_launch_command, login_shell, resolve_cwd, ResumeMode};
 
-/// セッションの agent サーフェスを起動する。
-/// M1-3 では worktree 準備を行わない（M1-4 が start_session の前段に足す）。
-/// サイズは 80x24 で起動し、フロントが attach 直後の fit() → resize_pty で合わせる。
-#[tauri::command]
-pub async fn start_session(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    id: String,
-) -> AppResult<Session> {
-    let session = state.store.get_session(&id)?;
+/// `start_session` の `AppHandle` を必要としない部分だけを切り出した純関数。
+///
+/// 契約 §15 が `PtyManager::spawn(&self, app: &tauri::AppHandle, ..)` を Wry 固定で
+/// 凍結しているため、`start_session` 全体は `MockRuntime` の `generate_handler!` に
+/// 登録できず IPC テストから到達不能になる（フィックス対象レビュー指摘: Task 8 fix
+/// round 1、Important 1）。`id -> get_session -> get_project -> resolve_cwd ->
+/// build_launch_command -> SpawnSpec` の組み立て自体は `AppHandle` を要求しない
+/// ので、ここへ分離すればランタイム不要の普通のユニットテストで固定できる。
+/// `start_session` に残るのは `state.pty.spawn(&app, spec)` の 1 行だけになる。
+fn plan_agent_spawn(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec)> {
+    let session = state.store.get_session(id)?;
     let project = state.store.get_project(&session.project_id)?;
     let cwd = resolve_cwd(&session, &project.repo_path);
 
@@ -36,20 +37,31 @@ pub async fn start_session(
         ResumeMode::None,
     )?;
 
-    state.pty.spawn(
-        &app,
-        SpawnSpec {
-            surface_id: surface_id(&session.id, SurfaceKind::Agent),
-            program: launch.program.to_string_lossy().into_owned(),
-            args: launch.args,
-            cwd: launch.cwd,
-            // KAMUX_SESSION_ID は build_launch_command が入れている
-            env: launch.env,
-            cols: DEFAULT_COLS,
-            rows: DEFAULT_ROWS,
-        },
-    )?;
+    let spec = SpawnSpec {
+        surface_id: surface_id(&session.id, SurfaceKind::Agent),
+        program: launch.program.to_string_lossy().into_owned(),
+        args: launch.args,
+        cwd: launch.cwd,
+        // KAMUX_SESSION_ID は build_launch_command が入れている
+        env: launch.env,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+    };
 
+    Ok((session, spec))
+}
+
+/// セッションの agent サーフェスを起動する。
+/// M1-3 では worktree 準備を行わない（M1-4 が start_session の前段に足す）。
+/// サイズは 80x24 で起動し、フロントが attach 直後の fit() → resize_pty で合わせる。
+#[tauri::command]
+pub async fn start_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> AppResult<Session> {
+    let (session, spec) = plan_agent_spawn(&state, &id)?;
+    state.pty.spawn(&app, spec)?;
     Ok(session)
 }
 
