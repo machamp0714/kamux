@@ -81,21 +81,29 @@ function readTerminalTheme(): ITheme {
 
 /**
  * xterm のフォント設定をデザインシステムのトークンから読む。
- * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm` / `--leading-term`。
+ * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm`。
  *
  * tokens.css が読み込まれていない環境（テストなど）では `getComputedStyle` が
  * 空文字列 / NaN を返す。その場合はキー自体を省略して xterm の既定値に委ねる
  * （hex フォールバックと違い、design token が無いときの防御であって「値を書く」ことにはならない）。
+ *
+ * **`lineHeight` は意図的に渡さない（fix round 1 で撤去）。** xterm の `lineHeight` は
+ * CSS の `line-height` ではなく、`lineHeight="normal"` で測った自然な行ボックス
+ * （JetBrains Mono だと概ね font-size の 1.3 倍）に対する追加倍率である
+ * （`device.cell.height = char.height * lineHeight`）。`--leading-term: 1.65` は
+ * CSS の line-height として定義された値なので、そのまま渡すとセル高が
+ * CSS 換算で約 1.3 × 1.65 ≒ font-size の 2.2 倍になり、行数（と resize_pty に渡す
+ * rows）が 3〜4 割減る。正しい倍率を出すには自然行ボックス比という別の literal が
+ * 要り契約 §53 に抵触するため、`--leading-term` → xterm セル高の写像は
+ * デザインシステム側の裁定待ち。**安易に戻さないこと。**
  */
-function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize' | 'lineHeight'> {
+function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize'> {
   const s = getComputedStyle(document.documentElement);
   const fontFamily = s.getPropertyValue('--font-mono').trim();
   const fontSize = parseFloat(s.getPropertyValue('--text-sm'));
-  const lineHeight = parseFloat(s.getPropertyValue('--leading-term'));
   return {
     ...(fontFamily && { fontFamily }),
     ...(!Number.isNaN(fontSize) && { fontSize }),
-    ...(!Number.isNaN(lineHeight) && { lineHeight }),
   };
 }
 
@@ -253,6 +261,25 @@ export function fitTerminal(surfaceId: string): { cols: number; rows: number } |
   if (cols === entry.lastSize.cols && rows === entry.lastSize.rows) return null;
   entry.lastSize = { cols, rows };
   return { cols, rows };
+}
+
+/**
+ * `fitTerminal` の直近サイズキャッシュを無効化する（M1-3 の追加。契約 §16 の 8 関数ではない）。
+ *
+ * fix round 1 で発見: PTY 再起動時、`fitTerminal` は寸法が前回と同じであれば `null` を返し
+ * `resize_pty` を飛ばす。一方 `start_session` は固定 80×24 で spawn するため、
+ * 再起動された PTY だけ 80 桁のまま xterm 側の実寸に追従しない
+ * （初回起動は `lastSize` が `{0,0}` から始まるので影響を受けない）。
+ *
+ * `detachTerminal` で `lastSize` を戻すだけでは直らない
+ * （`syncSize` が `start_session` より前に走る順序は変わらないため）。
+ * 呼び出し側（Task 14）が `startSession` の解決後にこれを呼んでから `fitTerminal` /
+ * `resizePty` をもう一度実行する。
+ */
+export function invalidateFitCache(surfaceId: string): void {
+  const entry = entries.get(surfaceId);
+  if (!entry) return;
+  entry.lastSize = { cols: 0, rows: 0 };
 }
 
 /**

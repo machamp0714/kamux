@@ -34,8 +34,10 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
       this.onBinaryHandlers.push(cb);
     }
 
-    attachCustomKeyEventHandler(): void {
-      // 配線の対象外
+    customKeyEventHandler: ((event: { metaKey: boolean }) => boolean) | null = null;
+
+    attachCustomKeyEventHandler(handler: (event: { metaKey: boolean }) => boolean): void {
+      this.customKeyEventHandler = handler;
     }
 
     open(): void {
@@ -125,9 +127,9 @@ function fakeOf(surfaceId: string): InstanceType<typeof FakeTerminal> {
 
 let seq = 0;
 /** テストごとに衝突しない surfaceId を作る */
-function nextSurfaceId(): string {
+function nextSurfaceId(kind: 'agent' | 'editor' = 'agent'): string {
   seq += 1;
-  return `s${seq}:agent`;
+  return `s${seq}:${kind}`;
 }
 
 beforeEach(() => {
@@ -258,6 +260,108 @@ describe('loadAcceleratedRenderer との配線', () => {
 
     expect(FakeWebglAddon.instances).toHaveLength(1);
     expect(FakeWebglAddon.instances[0]?.contextLossHandlers).toHaveLength(1);
+  });
+
+  it(
+    'onContextLoss が発火すると WebGL アドオンを実際に dispose して降格させる ' +
+      '（計画 §2.4。ハンドラを noop に差し替えただけでは緑にならない形）',
+    () => {
+      const sid = nextSurfaceId();
+      const container = document.createElement('div');
+      FakeWebglAddon.instances.length = 0;
+
+      registry.attachTerminal(sid, container);
+      const addon = FakeWebglAddon.instances[0];
+      expect(addon?.disposed).toBe(false);
+
+      // WebGL コンテキストロストを模擬発火（本物の xterm は GPU プロセスクラッシュ等で呼ぶ）
+      addon?.contextLossHandlers.forEach((h) => h());
+
+      expect(addon?.disposed).toBe(true);
+    },
+  );
+});
+
+describe('契約規定の配線（fix round 1 で追加）', () => {
+  it('scrollbackFor: :editor 接尾辞ならスクロールバックを 1,000 行にする（契約 §19）', () => {
+    const sid = nextSurfaceId('editor');
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as { scrollback?: number };
+    expect(options.scrollback).toBe(1_000);
+  });
+
+  it('scrollbackFor: エージェント用サーフェスは 10,000 行のまま', () => {
+    const sid = nextSurfaceId('agent');
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as { scrollback?: number };
+    expect(options.scrollback).toBe(10_000);
+  });
+
+  it('cursorBlink は false で生成する（契約 §0: アイドル CPU をほぼ 0% に保つ）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as { cursorBlink?: boolean };
+    expect(options.cursorBlink).toBe(false);
+  });
+
+  it('attachCustomKeyEventHandler で Cmd 系キーを xterm に処理させない（契約 §11）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    expect(term.customKeyEventHandler).not.toBeNull();
+    expect(term.customKeyEventHandler?.({ metaKey: true })).toBe(false);
+    expect(term.customKeyEventHandler?.({ metaKey: false })).toBe(true);
+  });
+
+  it('detachTerminal は WebGL アドオンを dispose して DOM レンダラへ降格する（計画 §2.4）', () => {
+    const sid = nextSurfaceId();
+    const container = document.createElement('div');
+    FakeWebglAddon.instances.length = 0;
+
+    registry.attachTerminal(sid, container);
+    const addon = FakeWebglAddon.instances[0];
+    expect(addon?.disposed).toBe(false);
+
+    registry.detachTerminal(sid);
+
+    expect(addon?.disposed).toBe(true);
+  });
+
+  it('lineHeight は渡さない（fix round 1: xterm の倍率と CSS line-height の単位が違うため）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    const options = term.options as { lineHeight?: number };
+    expect(options.lineHeight).toBeUndefined();
+  });
+});
+
+describe('invalidateFitCache（fix round 1・PTY 再起動時の fit キャッシュ無効化）', () => {
+  it('無効化後は寸法が前回と同じでも fitTerminal が null を返さない', () => {
+    const sid = nextSurfaceId();
+    const container = document.createElement('div');
+    registry.attachTerminal(sid, container);
+    const host = container.firstElementChild as HTMLElement;
+    vi.spyOn(host, 'getBoundingClientRect').mockReturnValue({
+      width: 800,
+      height: 600,
+    } as unknown as DOMRect);
+
+    expect(registry.fitTerminal(sid)).toEqual({ cols: 80, rows: 24 });
+    // キャッシュにより 2 回目は null（寸法が変わっていない）
+    expect(registry.fitTerminal(sid)).toBeNull();
+
+    registry.invalidateFitCache(sid);
+
+    // 無効化後は寸法が同じでも null を返さない（PTY 再起動後に resize_pty を必ず送るため）
+    expect(registry.fitTerminal(sid)).toEqual({ cols: 80, rows: 24 });
+  });
+
+  it('存在しない surfaceId に対しては何もしない（例外を投げない）', () => {
+    expect(() => registry.invalidateFitCache('no-such-surface:agent')).not.toThrow();
   });
 });
 
