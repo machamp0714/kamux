@@ -283,6 +283,13 @@ mod tests {
 
     #[test]
     fn login_shell_is_an_absolute_path() {
+        // SHELL を書き換えるテスト（remove_var/set_var）と同時に走ると、$SHELL を直接読む
+        // login_shell() がその書き換えと競合しうる（Rust 1.82 以降 env::set_var/remove_var は
+        // プロセス全体に影響する unsafe fn）ため、他の SHELL 読み書きテストと同じロックで
+        // 直列化する
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(login_shell().starts_with('/'), "actual: {}", login_shell());
     }
 
