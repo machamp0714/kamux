@@ -23,9 +23,11 @@ const dispatch = (init: KeyboardEventInit) => {
 };
 
 describe('handleKeymapKeyDown', () => {
+  const originalCycleSession = useAppStore.getState().cycleSession;
+
   beforeEach(() => {
     window.addEventListener('keydown', handleKeymapKeyDown);
-    useAppStore.setState({ view: 'kanban', modal: null });
+    useAppStore.setState({ view: 'kanban', modal: null, cycleSession: originalCycleSession });
   });
 
   afterEach(() => {
