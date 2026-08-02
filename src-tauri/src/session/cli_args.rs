@@ -89,7 +89,7 @@ pub fn resolve_cwd(session: &Session, repo_path: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
     use std::path::{Path, PathBuf};
@@ -98,16 +98,19 @@ mod tests {
     /// `SHELL` 環境変数を読み書きするテスト同士を直列化するためのロック。
     /// 環境変数はプロセス全体で共有されるため、既定の並列実行では他テストと干渉しうる
     /// （フィックス対象レビュー指摘: `cli_args.rs` fix round 1）。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// `pub(crate)`: `session::mod` の `plan_agent_spawn` テストも `login_shell()`
+    /// （＝ `$SHELL` 読み取り）を踏むため、同じロックで直列化する必要がある
+    /// （Task 8 fix round 1 の残り）。新しいロックを作らないこと。
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// `SHELL` 環境変数を一時的に上書き/削除し、Drop で必ず元の値へ戻すガード。
     /// panic してもテスト終了時に環境変数が復元される。
-    struct ShellEnvGuard {
+    pub(crate) struct ShellEnvGuard {
         original: Option<String>,
     }
 
     impl ShellEnvGuard {
-        fn set(value: &str) -> Self {
+        pub(crate) fn set(value: &str) -> Self {
             let original = std::env::var("SHELL").ok();
             // SAFETY: 呼び出し元は ENV_LOCK を保持した状態でのみこのガードを作る前提
             // （呼び出し規約はこの struct のドキュメントコメントで明示）。
