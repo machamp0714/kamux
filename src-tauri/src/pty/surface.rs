@@ -1061,10 +1061,12 @@ mod tests {
         // 手順: 高水位を超えるまで Data を消費して park させる → `on_data` が
         // 実際に渡してきた最後の seq を ack する → reader が再開し、まだ Exit を
         // 発火していない waiter より先に「追加の Data」が届くことを確認する。
-        // 通常経路(reader が `PTY_JOIN_DEADLINE` 内に読み切って join() が返る)
-        // では Exit は reader が完全に読み切るまで送られない
-        // (`waiter_wakes_a_reader_parked_on_high_water_and_still_delivers_on_exit_promptly`
-        // が保証済み)。ただし Timeout 分岐(孫プロセスが slave を握って reader が
+        // 通常経路(reader が `PTY_JOIN_DEADLINE` 内に終了する)では、
+        // `spawn_waiter_thread` が `reader_handle.join()` の完了を待ってから
+        // `sink.on_exit()` を呼ぶため、Exit は reader が終了するまで送られない
+        // (この経路は
+        // `waiter_wakes_a_reader_parked_on_high_water_and_still_delivers_on_exit_promptly`
+        // が運用している)。ただし Timeout 分岐(孫プロセスが slave を握って reader が
         // `read()` で wedge した場合)ではこの順序は成立せず、`pty://exit` の後に
         // `pty://data` が最大 1 件飛びうる(詳細は `PTY_JOIN_DEADLINE` のドキュメント
         // コメント参照)。このテストは通常経路のみを対象とするため、park から
