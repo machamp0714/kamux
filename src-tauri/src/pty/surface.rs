@@ -1257,4 +1257,115 @@ mod tests {
             "on_exit は届いたが OS 上にはまだ pid={pid} が残っている"
         );
     }
+
+    #[test]
+    fn reader_pauses_at_high_water_and_resumes_after_ack() {
+        // Task 2〜4 の結線を実 PTY(合成 Read/Child ではなく本物の /usr/bin/yes)
+        // で検証する。子プロセスは生かしたまま観測を終える形にすることで、
+        // 「バックプレッシャーで停止中に子プロセスが終了すると macOS の
+        // ttywait/ttyclose(最後の slave fd が閉じる際、カーネルが master 側の
+        // drain を最大 ~600ms 待ってから未読分を破棄する)により出力末尾が
+        // 失われうる」既知の受容済み欠陥を踏まない(lane-controller 裁定で
+        // parked = 受容。このテストでは踏む必要がない)。
+        use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
+
+        let (tx, rx) = channel();
+        // /usr/bin/yes は無限に出力し続ける。PATH に依存しないよう絶対パスで指定する
+        let surface = PtySurface::spawn(
+            spec("/usr/bin/yes", &["kamux"]),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /usr/bin/yes");
+
+        // ack をせずに高水位まで受け取る
+        let mut last_seq = 0u64;
+        while surface.pending_bytes() < BACKPRESSURE_HIGH_WATER {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { seq, .. }) => last_seq = seq,
+                other => panic!("expected pty data before high water, got {other:?}"),
+            }
+        }
+
+        // 送出済みで未受信のチャンクを、来なくなるまで吸い出す(sleep による
+        // 同期ではなく、短いタイムアウトが Err(Timeout) を返した時点を
+        // 「これ以上チャンクが来ない」の決定的な合図として扱う。負荷下の
+        // --test-threads=2 でも reader がまだ送出中のチャンクを取りこぼして
+        // 後段の assert が偽陽性で red になることを避ける)
+        loop {
+            match rx.recv_timeout(Duration::from_millis(300)) {
+                Ok(Ev::Data { seq, .. }) => last_seq = seq,
+                Ok(other) => panic!("expected pty data while draining, got {other:?}"),
+                Err(_) => break,
+            }
+        }
+        assert!(surface.pending_bytes() >= BACKPRESSURE_HIGH_WATER);
+
+        // ack すると読み取りが再開する
+        surface.ack(last_seq);
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ev::Data { .. })),
+            "reader must resume after ack"
+        );
+
+        surface.kill().expect("kill");
+        // 子プロセスの後始末が非同期に走るため、Exit を受け取るまで待って
+        // からテストを終える(残留プロセス/スレッドが後続テストへ漏れるのを防ぐ)
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ev::Data { .. }) => continue,
+                Ok(Ev::Exit(_)) => break,
+                Err(err) => panic!("exit event never arrived after kill: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn killing_a_paused_surface_still_emits_exit() {
+        // 実測でわかった注記(重要): このテストは元々「kill() 冒頭の
+        // `self.backpressure.close()` を消すと 2 秒の閾値を超えて red になる」
+        // という弁別を狙っていたが、`spawn_waiter_thread` は `child.wait()`
+        // 復帰直後に `backpressure.close()` を無条件に呼ぶため、kill() 側の
+        // close() の有無に関わらず「時間内に Exit が届く」結果は変わらない
+        // (実測: どちらの実装でも一貫して ~602ms。macOS の ttywait が
+        // child.wait() 自体の復帰を ~600ms 遅らせるのが支配的要因で、これは
+        // kill() の close() の有無とは無関係)。close() 単体の弁別は Task 4 で
+        // 既に `FakeChild`(child.wait() の復帰タイミングを完全に制御できる
+        // 合成子プロセス)を使った
+        // `waiter_wakes_a_reader_parked_on_high_water_and_still_delivers_on_exit_promptly`
+        // が担っており、そちらは実測でこの弁別に成功している。
+        //
+        // そのためこのテストは「時間」ではなく、
+        // 「バックプレッシャーで停止中の surface を kill しても、
+        // デッドロックせず Exit が届き is_alive() が false になる」という
+        // 実 PTY 上の結合的事実だけを検証する(close() 行それ自体の弁別では
+        // ない)。タイムアウトは実測フロア(~600ms)+ 負荷時の余裕を見て 5 秒とする。
+        use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
+
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec("/usr/bin/yes", &["kamux"]),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /usr/bin/yes");
+
+        while surface.pending_bytes() < BACKPRESSURE_HIGH_WATER {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ev::Data { .. }) => {}
+                other => panic!("expected pty data before high water, got {other:?}"),
+            }
+        }
+
+        surface.kill().expect("kill");
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ev::Data { .. }) => continue,
+                Ok(Ev::Exit(_)) => break,
+                Err(err) => panic!(
+                    "exit event never arrived: backpressure による停止と kill() が \
+                     デッドロックしている疑いがある ({err})"
+                ),
+            }
+        }
+        assert!(!surface.is_alive());
+    }
 }
