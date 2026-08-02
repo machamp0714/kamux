@@ -7,6 +7,7 @@ import { bootstrap, useAppStore } from './store';
 import { toAppError } from './store/uiSlice';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
+import './App.css';
 
 export default function App() {
   const view = useAppStore((s) => s.view);

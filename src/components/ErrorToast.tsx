@@ -1,4 +1,5 @@
 import { useAppStore } from '../store';
+import './ErrorToast.css';
 
 /**
  * 設計書 §12「stderr をトーストでそのまま表示」。message は加工しない（契約 §6）。

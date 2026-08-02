@@ -1,0 +1,47 @@
+/* ---- ドキュメント全体のリセット / テーマ連動（components.md に対応する節は無い） ----
+ * App がシェルを描画する唯一の場所なので、body の既定 margin と color-scheme も
+ * ここで処理する。tokens.css は編集しない（逐語コピー）ため、テーマの発火条件
+ * （data-theme 属性 / OS 設定）そのものは重複させず、color-scheme はブラウザに
+ * OS 設定への追従を委ねる 'light dark' を既定にし、data-theme='light' の明示指定
+ * だけをここでも上書きする（@media (prefers-color-scheme) は重複させない）。 */
+body {
+  margin: 0;
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+}
+
+/* button/input/select/textarea は UA スタイルシートが独自の font を持つため、
+   .app の font-family を継承しない（`font-family` の inherit ではなく明示指定が要る）。
+   font ではなく font-family だけを継承させる —— font-size/font-weight は各部品の指定を守る。 */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+.app__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  font-size: var(--text-md);
+  color: var(--text-muted);
+}

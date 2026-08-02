@@ -23,8 +23,11 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     await page.addInitScript(
       tauriMockScript({
         commands: {
+          // default_cli を 'claude' 以外にしてある。initialSessionFormValues の
+          // フォールバック値も 'claude' なので、'claude' のままでは
+          // 「プロジェクトから継承できている」ことに判別力が無い（第1部 §9.1 相当の穴）。
           list_projects: () => [
-            { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'claude' },
+            { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'codex' },
           ],
           list_sessions: () => [
             {
@@ -105,6 +108,29 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
             const order = [...l.slice(0, insertAt), s1, ...l.slice(insertAt)];
             return order.map((s, i) => ({ ...s, sort_order: (i + 1) * 1000 }));
           },
+          // 契約 §4 の Session（18 フィールド）に一致させる。フォームの入力値を
+          // そのまま返すことで、渡された args（cliKind の継承・branch の自動生成）を
+          // 呼び出し履歴と戻り値の両方から検証できるようにする。
+          create_session: (args) => ({
+            id: 's3',
+            project_id: args.projectId,
+            title: args.title,
+            description: args.description,
+            kanban_status: 'backlog',
+            sort_order: 3000,
+            mode: args.mode,
+            branch: args.branch,
+            worktree_path: null,
+            cli_kind: args.cliKind,
+            cli_command: args.cliCommand,
+            claude_session_id: null,
+            last_runtime_state: 'idle',
+            last_runtime_error: null,
+            first_started_at: null,
+            archived_at: null,
+            created_at: Date.now(),
+            updated_at: Date.now(),
+          }),
         },
       }),
     );
@@ -186,6 +212,54 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
     expect(calls.filter((c) => c.cmd === 'create_session')).toHaveLength(0);
     await expect(page.locator('.error-toast')).toHaveCount(0);
+  });
+
+  test('Cmd+N でセッションを作成すると Backlog 列の末尾にカードが現れる', async ({ page }) => {
+    const dialog = page.getByRole('dialog', { name: '新規セッション' });
+    await page.keyboard.press('Meta+n');
+    await expect(dialog).toBeVisible();
+
+    await dialog.getByPlaceholder('Fix login bug').fill('e2e new session');
+    await dialog.getByRole('button', { name: '作成' }).click();
+    await expect(dialog).toBeHidden();
+
+    const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+    const createCalls = calls.filter((c) => c.cmd === 'create_session');
+    expect(createCalls).toHaveLength(1);
+    // cliKind はプロジェクトの default_cli ('codex') を継承し、branch は
+    // 未入力のままタイトルから自動生成される（sessionForm.buildCreateSessionArgs）。
+    expect(createCalls[0].args).toMatchObject({
+      projectId: 'p1',
+      title: 'e2e new session',
+      mode: 'worktree',
+      cliKind: 'codex',
+      branch: 'session/e2e-new-session',
+    });
+
+    await expect(page.locator('[data-column="backlog"] .kanban-card__title')).toHaveText([
+      'fix login',
+      'add tests',
+      'e2e new session',
+    ]);
+    await expect(page.locator('.error-toast')).toHaveCount(0);
+  });
+
+  test('kanban-card__actions はホバーまたはキーボードフォーカスで現れる', async ({ page }) => {
+    const card = page.locator('[data-session-id="s1"]');
+    const actions = card.locator('.kanban-card__actions');
+
+    await expect(actions).toHaveCSS('opacity', '0');
+
+    await card.hover();
+    await expect(actions).toHaveCSS('opacity', '1');
+
+    // ホバーを外してから確認しないと、直前の hover が残ったまま
+    // :focus-within の効果を検証したことになってしまう。
+    await page.mouse.move(0, 0);
+    await expect(actions).toHaveCSS('opacity', '0');
+
+    await card.getByRole('button', { name: '編集' }).focus();
+    await expect(actions).toHaveCSS('opacity', '1');
   });
 
   test('Cmd+1 でカンバン画面が表示される', async ({ page }) => {
