@@ -241,12 +241,20 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
       [`pty://data/${surface}`, chunk2, 2] as [string, string, number],
     );
 
+    // 2 回の emit は別々の page.evaluate（CDP 往復を挟む別タスク）なので、chunk1 の
+    // ack が chunk2 の emit より先に飛ぶ可能性がある。その場合 seq 列は [1, 2] になりうる
+    // ため、「最後の ack が seq=2」だけを見る（[2] 固定だと ack が一切来ない本来の赤とは
+    // 別の理由で、ackCoalescer 修正後もここが赤いままになりうる）。このテストは fixme で
+    // 未実行のため、上記の判断は実測できていない —— un-fixme した直後に確認すること。
     await expect
       .poll(async () => {
         const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
-        return calls.filter((c) => c.cmd === 'ack_pty').map((c) => (c.args as { seq: number }).seq);
+        const acks = calls
+          .filter((c) => c.cmd === 'ack_pty')
+          .map((c) => (c.args as { seq: number }).seq);
+        return acks[acks.length - 1];
       })
-      .toEqual([2]);
+      .toBe(2);
   });
 
   /**
