@@ -143,7 +143,16 @@ export function ensureTerminal(surfaceId: string): Terminal {
   term.loadAddon(fit);
 
   const ack = new AckCoalescer((seq) => {
-    void ackPty(surfaceId, seq);
+    // 握り潰してよい理由（fix round 1・必達 1）: `RegistrySink::on_exit`（Rust）は
+    // レジストリからの登録解除を先に行い、その後に `pty://exit` を emit する。
+    // したがってフロントが exit を知る時点で surface は既に消えており、
+    // 保留中の ack flush が `NotFound` を返すのは正常系である
+    // （「もう存在しない PTY への通知」なので、失敗しても何も壊れない）。
+    // `void ackPty(...)` のままだと PTY が終了するたびに unhandled promise
+    // rejection が発生する（Task 13 で実測）。
+    ackPty(surfaceId, seq).catch(() => {
+      // 上記の理由により意図的に無視する
+    });
   });
 
   // term.onData / onBinary の接続はここで 1 回だけ行う（契約 §16 / 1034 行）。

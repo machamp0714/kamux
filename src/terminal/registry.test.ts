@@ -5,6 +5,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * フェイクの Terminal / アドオンで検証する。実描画は契約 §26 の E2E に回す。
  */
 
+/**
+ * このプロジェクトは `@types/node` を依存に持たないため、`process` はグローバルに
+ * 型付けされていない（実行環境が vitest = Node なので実体は存在する）。
+ * unhandled rejection の実測にだけ使うので、必要な最小限のシグネチャだけを
+ * このテストファイルに閉じたアンビエント宣言として与える。
+ */
+declare const process: {
+  on(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+  off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
+};
+
 const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoisted(() => {
   class FakeTerminal {
     static instances: FakeTerminal[] = [];
@@ -108,12 +119,25 @@ vi.mock('@xterm/addon-canvas', () => ({ CanvasAddon: FakeCanvasAddon }));
 
 const writePty = vi.fn().mockResolvedValue(undefined);
 const writePtyBytes = vi.fn().mockResolvedValue(undefined);
-const ackPty = vi.fn().mockResolvedValue(undefined);
+
+/**
+ * `ackPty` だけは意図的に `vi.fn()` で包まない。
+ *
+ * vitest の `vi.fn()` は呼び出し結果を `mock.results` に記録するために内部で
+ * Promise を横取りしており、それ自体が Node の「unhandled rejection ではない
+ * （処理済みである）」判定を成立させてしまう（Task 13 の実測で判明）。
+ * `ack_pty` の reject が本当に unhandled にならないかを検証するテスト
+ * （下の「ack_pty の reject 処理」describe）が `vi.fn()` 越しだと原理的に
+ * 何も検出できなくなるため、素の関数変数として持つ。
+ */
+const defaultAckPtyImpl = (_surfaceId: string, _seq: number): Promise<void> =>
+  Promise.resolve(undefined);
+let ackPtyImpl: (surfaceId: string, seq: number) => Promise<void> = defaultAckPtyImpl;
 
 vi.mock('../ipc/commands', () => ({
   writePty: (surfaceId: string, data: string) => writePty(surfaceId, data),
   writePtyBytes: (surfaceId: string, base64: string) => writePtyBytes(surfaceId, base64),
-  ackPty: (surfaceId: string, seq: number) => ackPty(surfaceId, seq),
+  ackPty: (surfaceId: string, seq: number) => ackPtyImpl(surfaceId, seq),
 }));
 
 const { AckCoalescer } = await import('./ackCoalescer');
@@ -136,7 +160,6 @@ beforeEach(() => {
   FakeTerminal.instances.length = 0;
   writePty.mockClear();
   writePtyBytes.mockClear();
-  ackPty.mockClear();
 });
 
 afterEach(() => {
@@ -247,6 +270,43 @@ describe('writeToTerminal の seq 後退検知（契約 §16・必達 1）', () 
     registry.writeToTerminal(sid, new Uint8Array([9]), 42);
 
     expect(consumedSpy).toHaveBeenCalledWith(42);
+  });
+});
+
+describe('ack_pty の reject 処理（契約 §16・必達 1・fix round 1）', () => {
+  afterEach(() => {
+    // 次のテストに影響しないよう、必ず「解決する」実装へ戻す
+    ackPtyImpl = defaultAckPtyImpl;
+  });
+
+  it('ack_pty が reject しても unhandled rejection にならない（.catch で握り潰す）', async () => {
+    // なぜ vi.fn().mockRejectedValue(...) を使わないか:
+    // vitest の vi.fn() は呼び出し結果を mock.results に記録するために内部で
+    // Promise を横取りしており、それ自体が Node の「処理済み」判定を成立させてしまう。
+    // そのため vi.fn() 経由では unhandled rejection が絶対に観測できない
+    // （Task 13 の実測で判明。`ackPtyImpl` がただの関数変数で vi.fn ではないのはこのため。
+    // ここを vi.fn() に書き換えるとこのテストは黙って空振りに戻る）。
+    ackPtyImpl = (): Promise<void> =>
+      Promise.reject(new Error('NotFound: surface already disposed'));
+
+    const rejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandledRejection);
+
+    try {
+      registry.writeToTerminal(nextSurfaceId(), new Uint8Array([1]), 1);
+
+      // AckCoalescer は queueMicrotask で flush する。unhandledRejection は
+      // イベントループを最低 1 周させないと発火しないため、マクロタスクまで進める。
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+
+    expect(rejections).toHaveLength(0);
   });
 });
 
