@@ -294,6 +294,64 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
 
     await expect.poll(() => startCallCountFor('s1')).toBe(2);
   });
+
+  /**
+   * 契約 §16 が名指しする危険（onData の二重登録 = 打鍵 1 回が 2 回 PTY に届く）を、
+   * `registry.test.ts:183`（同一 surface への attachTerminal 複数回呼び出し）や
+   * `ptyBridge.test.ts:48/55`（同一 surface への ensurePtySubscription 多重呼び出し）
+   * とは異なる経路で踏む。それらは「同一 surface への重複呼び出し」を守っているが、
+   * ここで踏むのは「ペイン再割当（タブ切り替え）を跨いだ再マウント」——
+   * `TerminalPane` の sessionId 依存変化のたびに cleanup（detachTerminal のみ。
+   * disposeTerminal も disposePtySubscription も呼ばない）→ 再実行（attachTerminal）
+   * するが、registry.ts の entries / onData 登録は生きたままになる経路である。
+   */
+  test('タブを A→B→A→B→A と往復してから合成キー入力すると write_pty が 1 回だけ飛ぶ（onData の二重登録防止）', async ({
+    page,
+  }) => {
+    await page.addInitScript(commonInitScript());
+    await gotoTerminalView(page);
+
+    await page.locator('[data-session-id="s1"]').click();
+    await expect
+      .poll(async () => {
+        const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+        return calls.filter(
+          (c) => c.cmd === 'start_session' && (c.args as { id: string }).id === 's1',
+        ).length;
+      })
+      .toBe(1);
+
+    // A→B→A→B→A（2 往復）
+    await page.locator('[data-session-id="s2"]').click();
+    await page.locator('[data-session-id="s1"]').click();
+    await page.locator('[data-session-id="s2"]').click();
+    await page.locator('[data-session-id="s1"]').click();
+
+    await expect(page.locator('[data-session-id="s1"]')).toHaveAttribute('aria-selected', 'true');
+    // detachTerminal は host を display:none にするだけで DOM から取り除かない
+    // （契約 §16: スクロールバックを保ったまま付け替える）。そのため s1 / s2 両方の
+    // .xterm-helper-textarea が同じコンテナに共存する。加えて xterm の textarea は
+    // 意図的に極小サイズ（visible な要素として bounding box を持たない）なので
+    // Playwright の :visible 疑似クラスでは絞り込めない。display:none でない
+    // .kamux-term-host にスコープして絞り込む。
+    await expect(
+      page.locator('.kamux-term-host:not([style*="display: none"]) .xterm-helper-textarea'),
+    ).toBeFocused();
+
+    // Cmd 修飾なしの通常キー。優先度 4 で確認した「Meta+j は Chromium ではキー列を
+    // 生まない」問題には当たらない（恒真にならない）。
+    await page.keyboard.type('x');
+
+    await expect
+      .poll(async () => {
+        const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+        return calls.filter(
+          (c) =>
+            c.cmd === 'write_pty' && (c.args as { surfaceId: string }).surfaceId === 's1:agent',
+        ).length;
+      })
+      .toBe(1);
+  });
 });
 
 /**
