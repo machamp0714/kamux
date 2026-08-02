@@ -2,12 +2,13 @@
 pub mod error;
 pub mod model;
 pub mod pty;
+pub mod session;
 pub mod state;
 pub mod store;
 
 use std::sync::Arc;
 
-use tauri::{Manager, State};
+use tauri::{Manager, State, WindowEvent};
 
 use crate::error::AppResult;
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
@@ -112,9 +113,24 @@ async fn move_session(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
-            app.manage(AppState { store });
+            app.manage(AppState {
+                store,
+                pty: pty::PtyManager::new(),
+            });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // アプリ終了時に PTY の子プロセスを残さない。
+            // Cmd+Q でこれが走らない場合は Builder::build() + RunEvent::Exit に移す（第1部 2.6）
+            if matches!(event, WindowEvent::Destroyed) {
+                if let Some(state) = window.try_state::<AppState>() {
+                    for id in state.pty.live_surfaces() {
+                        let _ = state.pty.kill(&id);
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             create_project,
@@ -124,6 +140,12 @@ pub fn run() {
             list_sessions,
             delete_project,
             move_session,
+            pty::commands::write_pty,
+            pty::commands::write_pty_bytes,
+            pty::commands::resize_pty,
+            pty::commands::ack_pty,
+            session::start_session,
+            session::stop_session,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run kamux");
@@ -149,6 +171,7 @@ mod tests {
         let (_dir, store) = open_temp();
         let state = AppState {
             store: Arc::new(store),
+            pty: crate::pty::PtyManager::new(),
         };
 
         let project_a = state
@@ -283,6 +306,7 @@ mod tests {
         let (_dir, store) = open_temp();
         let state = AppState {
             store: Arc::new(store),
+            pty: crate::pty::PtyManager::new(),
         };
         let project = state
             .store
@@ -309,7 +333,7 @@ mod tests {
 
         use serde_json::{json, Value};
         use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
-        use tauri::{ipc::CallbackFn, webview::InvokeRequest, WebviewWindowBuilder};
+        use tauri::{ipc::CallbackFn, webview::InvokeRequest, Manager, WebviewWindowBuilder};
 
         use crate::state::AppState;
         use crate::store::test_support::open_temp;
@@ -318,6 +342,7 @@ mod tests {
             mock_builder()
                 .manage(AppState {
                     store: Arc::new(store),
+                    pty: crate::pty::PtyManager::new(),
                 })
                 .invoke_handler(tauri::generate_handler![
                     super::super::create_project,
@@ -327,6 +352,11 @@ mod tests {
                     super::super::list_sessions,
                     super::super::delete_project,
                     super::super::move_session,
+                    crate::pty::commands::write_pty,
+                    crate::pty::commands::write_pty_bytes,
+                    crate::pty::commands::resize_pty,
+                    crate::pty::commands::ack_pty,
+                    crate::session::stop_session,
                 ])
                 .build(mock_context(noop_assets()))
                 .expect("build mock app")
@@ -350,6 +380,34 @@ mod tests {
             match response {
                 Ok(b) => b.deserialize::<Value>().expect("deserialize response"),
                 Err(e) => panic!("{cmd} returned an error over IPC: {e}"),
+            }
+        }
+
+        /// `invoke_ok` の失敗版。コマンドが `AppError` を返すことを期待するテスト用。
+        /// 契約 §6 の `{"code": ..., "message": ...}` 形をそのまま返す。
+        fn invoke_err(
+            webview: &tauri::WebviewWindow<MockRuntime>,
+            cmd: &str,
+            body: Value,
+        ) -> Value {
+            let response = get_ipc_response(
+                webview,
+                InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: "tauri://localhost".parse().expect("url"),
+                    body: body.into(),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_string(),
+                },
+            );
+            match response {
+                Ok(b) => panic!(
+                    "{cmd} was expected to return an error over IPC but succeeded: {:?}",
+                    b.deserialize::<Value>()
+                ),
+                Err(e) => e,
             }
         }
 
@@ -576,6 +634,197 @@ mod tests {
                     .iter()
                     .any(|s| s["id"] == json!(target_id) && s["sort_order"] == json!(0.0)),
                 "toIndex: 0 が無視されて先頭挿入（既存より小さい値）になっていない"
+            );
+        }
+
+        // --- Task 8 必達 2: PtyManager が AppState に配線されていることを検証する ---
+        //
+        // `state.rs` は Task 7 まで `pty` フィールドを持たずコメントのみだった。
+        // 未登録の surface_id を渡すと `PtyManager::get_surface` が
+        // `AppError::NotFound(surface_id)` を返す。これが IPC 越しにそのまま
+        // 返ってくれば、camelCase キーのバインドと PtyManager への到達を
+        // 同時に証明できる（`start_session` は `AppHandle` を要求するため
+        // MockRuntime の invoke_handler に登録できず、この経路では検証できない。
+        // 契約 392 行が `AppHandle`（Wry 固定）を明記しているのでシグネチャは
+        // 変えない。report の CONCERNS に明記する）。
+        #[test]
+        fn write_pty_reaches_the_pty_manager_and_returns_not_found_for_an_unknown_surface() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": "nope:agent", "data": "hello"}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope:agent"),
+                "AppError::NotFound は surface_id をそのまま運ぶ(契約 §6)"
+            );
+        }
+
+        // write_pty_bytes の base64 デコード分岐を検証する。デコードを飛ばして
+        // 生バイトのまま `state.pty.write` に渡す変異を入れると、不正な base64
+        // でも surface_id の解決まで進んでしまい `not_found` が返る(この
+        // テストが期待する `io` と食い違って赤くなる)。
+        #[test]
+        fn write_pty_bytes_rejects_invalid_base64_before_reaching_the_pty_manager() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "write_pty_bytes",
+                json!({"surfaceId": "nope:agent", "base64": "!!!not-base64!!!"}),
+            );
+
+            assert_eq!(err["code"], json!("io"));
+            assert!(
+                err["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains("invalid base64 payload"),
+                "actual message: {:?}",
+                err["message"]
+            );
+        }
+
+        // resize_pty のコマンド登録と surfaceId バインドを検証する（フィックス対象
+        // レビュー指摘: Task 8 fix round 2 Important 1。resize_pty は generate_handler!
+        // に登録されているだけでどのテストからも invoke されていなかった）。
+        // 注意: cols と rows の引数順は本テストでは弁別できない。読み戻し API が無く、
+        // それを検証するには Task 6 が凍結した PtyManager 内部（cols/rows の記録）に
+        // 手を入れる必要があるため、範囲外としている。
+        #[test]
+        fn resize_pty_reaches_the_pty_manager_and_returns_not_found_for_an_unknown_surface() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "resize_pty",
+                json!({"surfaceId": "nope:agent", "cols": 100, "rows": 40}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope:agent"),
+                "AppError::NotFound は surface_id をそのまま運ぶ(契約 §6)"
+            );
+        }
+
+        // ack_pty のコマンド登録と surfaceId バインドを検証する（フィックス対象
+        // レビュー指摘: Task 8 fix round 2 Important 1。契約 §9 のバックプレッシャー
+        // 解除路であり、ここが崩れると端末が途中まで出力されて固まったまま止まる）。
+        #[test]
+        fn ack_pty_reaches_the_pty_manager_and_returns_not_found_for_an_unknown_surface() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "ack_pty",
+                json!({"surfaceId": "nope:agent", "seq": 1}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope:agent"),
+                "AppError::NotFound は surface_id をそのまま運ぶ(契約 §6)"
+            );
+        }
+
+        // stop_session が `SurfaceKind::Agent` の surface_id を kill することを検証する。
+        // `session::stop_session` の内部を `Editor` に変異させると kill 対象が
+        // ずれて `s:agent` が生き残ったままになり、この assert が赤くなる。
+        #[test]
+        fn stop_session_kills_the_agent_surface_registered_for_the_session() {
+            use std::sync::mpsc::channel;
+            use std::time::Duration;
+
+            use crate::model::SurfaceKind;
+            use crate::pty::surface::PtySink;
+            use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+            struct ExitSink(std::sync::mpsc::Sender<()>);
+            impl PtySink for ExitSink {
+                fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+                fn on_exit(&self, _surface_id: &str, _exit_code: Option<i32>) {
+                    let _ = self.0.send(());
+                }
+            }
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+            let session = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "shell session",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "shell",
+                    "cliCommand": null,
+                }),
+            );
+            let session_id = session["id"].as_str().expect("session id").to_owned();
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let (tx, rx) = channel();
+            let state = app.state::<AppState>();
+            state
+                .pty
+                .spawn_with_sink(
+                    std::sync::Arc::new(ExitSink(tx)),
+                    SpawnSpec {
+                        surface_id: agent_surface_id.clone(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn the agent surface directly for the test");
+            assert!(state.pty.is_alive(&agent_surface_id));
+
+            invoke_ok(&webview, "stop_session", json!({"id": session_id}));
+
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("agent surface must exit within 10s of stop_session");
+            assert!(
+                !state.pty.is_alive(&agent_surface_id),
+                "stop_session must kill the SurfaceKind::Agent surface for the session"
             );
         }
     }

@@ -4,12 +4,18 @@ const invoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 
 import {
+  ackPty,
   createProject,
   createSession,
   listProjects,
   listSessions,
   moveSession,
+  resizePty,
+  startSession,
+  stopSession,
   updateSession,
+  writePty,
+  writePtyBytes,
 } from './commands';
 
 beforeEach(() => {
@@ -84,5 +90,42 @@ describe('ipc/commands', () => {
       toStatus: 'review',
       toIndex: 1,
     });
+  });
+
+  it('startSession が id を渡す', async () => {
+    await startSession('s1');
+    expect(invoke).toHaveBeenCalledWith('start_session', { id: 's1' });
+  });
+
+  it('stopSession が id を渡す', async () => {
+    await stopSession('s1');
+    expect(invoke).toHaveBeenCalledWith('stop_session', { id: 's1' });
+  });
+
+  it('writePty が surfaceId と data を渡す', async () => {
+    await writePty('s1:agent', 'ls\n');
+    expect(invoke).toHaveBeenCalledWith('write_pty', { surfaceId: 's1:agent', data: 'ls\n' });
+  });
+
+  it('writePtyBytes が surfaceId と base64 を渡す（data キーではない）', async () => {
+    await writePtyBytes('s1:agent', 'AAEC');
+    expect(invoke).toHaveBeenCalledWith('write_pty_bytes', {
+      surfaceId: 's1:agent',
+      base64: 'AAEC',
+    });
+  });
+
+  it('resizePty が surfaceId / cols / rows をこの順で渡す', async () => {
+    await resizePty('s1:agent', 80, 24);
+    expect(invoke).toHaveBeenCalledWith('resize_pty', {
+      surfaceId: 's1:agent',
+      cols: 80,
+      rows: 24,
+    });
+  });
+
+  it('ackPty が surfaceId と seq を渡す', async () => {
+    await ackPty('s1:agent', 42);
+    expect(invoke).toHaveBeenCalledWith('ack_pty', { surfaceId: 's1:agent', seq: 42 });
   });
 });
