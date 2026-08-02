@@ -108,10 +108,30 @@ async fn move_session(
     state.store.move_session(&id, to_status, to_index)
 }
 
+// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
+// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
+// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
+// 撃つ設計を選んだのはこの冪等性が前提）。
+//
+// 「いつ」これを呼ぶか（下の on_window_event / RunEvent::Exit の 2 箇所）を守る
+// テストは無い。`run()` は `tauri::Builder::default()`（= Wry）へ単型化されて
+// おり、`App::run` は実イベントループを消費して戻らないため、テストから
+// `run()` を呼ぶ手段自体が無い（`MockRuntime::run` は最後の窓が消えた後に
+// `RunEvent::Exit` を出すが、それを使うには `run()` をランタイム汎用にする
+// 必要があり、契約 §7 / §15 が `AppHandle` を Wry で凍結している）。
+// この関数自体（「生きている surface_id を集めて機械的に kill する」という
+// ロジック）だけは `tests::kill_all_pty_surfaces_kills_every_live_surface` が
+// 実プロセスの spawn/kill/exit を通しで固定している。
+fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
+    for id in pty.live_surfaces() {
+        let _ = pty.kill(&id);
+    }
+}
+
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
@@ -122,13 +142,26 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // アプリ終了時に PTY の子プロセスを残さない。
-            // Cmd+Q でこれが走らない場合は Builder::build() + RunEvent::Exit に移す（第1部 2.6）
+            // 窓が閉じる経路（赤ボタンなど）で PTY の子プロセスを残さない。
+            //
+            // Cmd+Q はここを通らない。PR 単位レビューが依存クレートのソースを
+            // 追跡して確定した（tauri 2.11.5 / tao 0.35.3 / muda 0.19.3。実機
+            // 起動での観測は Task 16 の手動スモークが行う）。既定の macOS
+            // メニューの `PredefinedMenuItem::quit` は `sel!(terminate:)` を送り、
+            // `[NSApp terminate:]` は個々の窓を閉じずに直接
+            // `applicationWillTerminate:` へ進む。`WindowEvent::Destroyed` を
+            // 発火させる tao の経路は `windowWillClose:` の 1 箇所のみで、
+            // `terminate:` はこれを経由しない。そのため Cmd+Q の後始末は
+            // `run()` の `RunEvent::Exit` 側が担う（下記）。
+            //
+            // それでもここを消さずに残すのは、macOS で最後の窓を閉じても
+            // プロセスが終了しない経路があるため（RULINGS §23.1）。その場合
+            // `RunEvent::Exit` は飛ばないが、この Destroyed 側でサーフェスは
+            // 消える。`kill_all_pty_surfaces` は冪等なので両方から撃っても安全
+            // （ledger の `Task 6: minor (deferred)` が実測で記録済み）。
             if matches!(event, WindowEvent::Destroyed) {
                 if let Some(state) = window.try_state::<AppState>() {
-                    for id in state.pty.live_surfaces() {
-                        let _ = state.pty.kill(&id);
-                    }
+                    kill_all_pty_surfaces(&state.pty);
                 }
             }
         })
@@ -147,8 +180,27 @@ pub fn run() {
             session::start_session,
             session::stop_session,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run kamux");
+        .build(tauri::generate_context!())
+        .expect("failed to build kamux");
+
+    app.run(|app_handle, event| {
+        // Cmd+Q はこの経路を通る。PR 単位レビューが依存クレートのソースを
+        // 追跡して確定した（tauri 2.11.5 / tao 0.35.3 / muda 0.19.3 /
+        // tauri-runtime-wry 2.11.4。実機起動での観測は Task 16 の手動スモークが
+        // 行う）: 既定メニューの `PredefinedMenuItem::quit` が送る `terminate:`
+        // を tao の `applicationWillTerminate:` が受け、`AppState::exit()` ->
+        // `Event::LoopDestroyed` を経て tauri-runtime-wry がこれを
+        // `RunEvent::Exit` に変換する。
+        //
+        // 上の `on_window_event` の Destroyed 側と両方から撃つ（なぜ両方かは
+        // そちら側のコメント参照）。`kill_all_pty_surfaces` は冪等なので
+        // 二重に撃っても安全。
+        if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                kill_all_pty_surfaces(&state.pty);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -297,6 +349,63 @@ mod tests {
             Err(AppError::NotFound(id)) => assert_eq!(id, project_b.id),
             other => panic!("expected AppError::NotFound, got {other:?}"),
         }
+    }
+
+    // --- Task 12.5（番外）: RunEvent::Exit / WindowEvent::Destroyed の両方から
+    // 撃つ一括 kill ロジックを純関数へ切り出し、そこだけを実測で固定する。
+    // 「いつ」呼ぶか（Destroyed イベント / RunEvent::Exit）そのものは run() の中で
+    // 具体的な Wry ランタイムに固定されており、テストから到達できない
+    // (run() 内のコメント参照。守っているテストは無い)。
+    #[test]
+    fn kill_all_pty_surfaces_kills_every_live_surface() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        use crate::pty::surface::PtySink;
+        use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+        struct ExitSink(std::sync::mpsc::Sender<String>);
+        impl PtySink for ExitSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, surface_id: &str, _exit_code: Option<i32>) {
+                let _ = self.0.send(surface_id.to_string());
+            }
+        }
+
+        let pty = crate::pty::PtyManager::new();
+        let (tx, rx) = channel();
+        let sink: Arc<dyn PtySink> = Arc::new(ExitSink(tx));
+        for i in 0..2 {
+            pty.spawn_with_sink(
+                Arc::clone(&sink),
+                SpawnSpec {
+                    surface_id: format!("kill-all-{i}:agent"),
+                    program: "/bin/cat".to_string(),
+                    args: Vec::new(),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    env: Vec::new(),
+                    cols: DEFAULT_COLS,
+                    rows: DEFAULT_ROWS,
+                },
+            )
+            .expect("spawn");
+        }
+        assert_eq!(
+            pty.live_surfaces().len(),
+            2,
+            "both surfaces must be live before kill"
+        );
+
+        super::kill_all_pty_surfaces(&pty);
+
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("each surface must exit after kill_all_pty_surfaces");
+        }
+        assert!(
+            pty.live_surfaces().is_empty(),
+            "kill_all_pty_surfaces must kill every surface it was told was live"
+        );
     }
 
     #[test]
