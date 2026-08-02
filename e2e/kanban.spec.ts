@@ -171,6 +171,13 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
 
     await page.keyboard.press('Escape');
     await expect(dialog).toBeHidden();
+
+    // 第1部 §9「作成」: Escape で閉じたときカードは作られない
+    // （create_session は未モックなので、呼ばれていれば unmocked command で reject し
+    //  .error-toast が出るはずだが、それも起きていないことまで見る）。
+    const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+    expect(calls.filter((c) => c.cmd === 'create_session')).toHaveLength(0);
+    await expect(page.locator('.error-toast')).toHaveCount(0);
   });
 
   test('Cmd+1 でカンバン画面が表示される', async ({ page }) => {
@@ -313,6 +320,8 @@ test('起動時復元: activeProjectId の選択・sort_order 順の描画・不
   // sort_order 昇順どおりに、それぞれ正しい列へ描画される
   await expect(page.locator('[data-column="backlog"] .kanban-card__title')).toHaveText(['A', 'C']);
   await expect(page.locator('[data-column="in_progress"] .kanban-card__title')).toHaveText(['B']);
+  // 第1部 §9「表示」: in_place モードのカードにはブランチ名を出さない
+  await expect(page.locator('.kanban-card__branch')).toHaveCount(0);
 
   // localStorage が存在しないプロジェクトを指す状態にしてから再読み込みする
   await page.evaluate(() => {
