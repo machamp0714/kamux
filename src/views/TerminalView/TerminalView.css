@@ -1,0 +1,81 @@
+.kamux-terminal-view {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  /* xterm の下地なのでターミナル面のトークン（テーマ非依存） */
+  background: var(--bg-terminal);
+}
+
+.kamux-tablist {
+  flex: 0 0 220px;
+  overflow-y: auto;
+  /* タブ一覧はターミナル面ではなくクロムなので、通常のトークン系統（テーマ追従） */
+  border-right: 1px solid var(--border);
+  padding: var(--space-4) 0;
+}
+
+.kamux-tab {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-md);
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.kamux-tab:hover {
+  background: var(--bg-elevated);
+}
+
+/* 選択中: components.md「セッションタブ」節。--accent-soft 背景 + 左端に
+   幅 3px・高さ 30px・--accent のバー（絶対配置）。3px/30px は components.md が
+   px で直接指定する部品固有寸法であり尺度ではないため literal のままでよい */
+.kamux-tab[aria-selected='true'] {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.kamux-tab[aria-selected='true']::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 30px;
+  background: var(--accent);
+}
+
+/* 契約 §57.3。M3-2 が分割で使うのと同じブロック名を M1-3 の単一ペインでも使う。
+   旧称（正典表 §25.3 の禁止列を参照）に戻すと M3-2 が同じ要素を改名することになる */
+.terminal-pane-slot {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  /* 上下分割で xterm がスロットからはみ出すのを防ぐ（契約 §28.4）。M1-3 でも書いておく */
+  min-height: 0;
+  overflow: hidden;
+  padding: var(--space-2);
+}
+
+/* attachTerminal のコンテナ。契約 §57.3 でこの要素に固定されている。
+   絶対配置の包含ブロックはパディングボックスなので inset: 0 で padding は効く */
+.terminal-pane-slot__host {
+  position: absolute;
+  inset: 0;
+}
+
+.terminal-pane-slot__empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  pointer-events: none;
+}
