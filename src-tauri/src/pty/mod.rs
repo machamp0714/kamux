@@ -193,7 +193,13 @@ impl PtyManager {
             // (必達 (c))
             old.valid.store(false, Ordering::SeqCst);
         }
-        guard.insert(id, Entry { valid, surface });
+        // `on_exit` 側の `drop(removed)` と対称に、レジストリのロックを離してから
+        // 旧エントリ(あれば)を drop する。旧エントリの `PtySurface` がここで
+        // 最後の強参照を失うと `Drop` → `kill()` が走りうるため、ロック保持中に
+        // それを起こさない
+        let previous = guard.insert(id, Entry { valid, surface });
+        drop(guard);
+        drop(previous);
         Ok(())
     }
 
