@@ -105,6 +105,18 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     );
     await page.goto('/');
     await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
+
+    // 第1部 §9「表示」: 4 列見出しの件数、カードの CLI アイコン・ブランチ名表示、
+    // runtime バッジが 1 枚も出ないこと（M1-2 は runtimeStates が空のまま。契約 §34.7）。
+    await expect(page.locator('section[aria-label="Backlog"] .kanban-column__count')).toHaveText(
+      '2',
+    );
+    await expect(
+      page.locator('section[aria-label="In Progress"] .kanban-column__count'),
+    ).toHaveText('0');
+    await expect(page.locator('[data-column="backlog"] .kanban-card__cli')).toHaveCount(2);
+    await expect(page.locator('[data-column="backlog"] .kanban-card__branch')).toHaveCount(2);
+    await expect(page.locator('.kanban-card__badge')).toHaveCount(0);
   });
 
   test('カードを Backlog から In Progress へドラッグすると move_session が飛び、盤面に反映される', async ({
