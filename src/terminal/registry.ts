@@ -159,10 +159,18 @@ export function ensureTerminal(surfaceId: string): Terminal {
   // 消費側（TerminalView / EditorView / ペイン再割当）は絶対に onData / onBinary を張らないこと。
   // xterm の onData はリスナを重ねられるため、二重登録すると打鍵 1 回が 2 回 PTY に届く。
   term.onData((data) => {
-    void writePty(surfaceId, data);
+    // Important 2（PR 10 fix round 1）: Task 13 必達 1 で ackPty だけに .catch を
+    // 足したが、同じ理由（PTY 終了後は NotFound を返すのが正常系）が成り立つ隣の
+    // write_pty / write_pty_bytes が残っていた。PTY 終了後（[process exited] 表示のまま）
+    // の打鍵ごとに unhandled promise rejection が発生する。
+    writePty(surfaceId, data).catch(() => {
+      // 上記の理由により意図的に無視する
+    });
   });
   term.onBinary((data) => {
-    void writePtyBytes(surfaceId, encodeBinaryString(data));
+    writePtyBytes(surfaceId, encodeBinaryString(data)).catch(() => {
+      // 上記の理由により意図的に無視する
+    });
   });
   // Cmd 系は window のキーマップに渡す（契約 §11）。
   // Cmd+C / Cmd+V はブラウザのネイティブ処理なので、ここで止めても効く
@@ -245,7 +253,13 @@ export function attachTerminal(surfaceId: string, container: HTMLElement): void 
   }
 
   restoreScroll(entry);
-  entry.term.focus();
+  // term.focus() はここでは呼ばない（PR 10 fix round 1 の Critical）。
+  // ここは契約 §16 に無い副作用で、モーダル表示中の Cmd+2 再マウントでも
+  // 無条件に発火すると、実シェルの PTY が DOM フォーカスを奪ってしまい、
+  // モーダルへの入力が打鍵ごとに write_pty として実シェルへ流れる
+  // （§11.4.3 が許容したのは「見た目の違和感」であって「入力が別の宛先で
+  // 実行される」ことではない）。呼び出し側（TerminalPane）が
+  // modal === null を確認したうえで getTerminal(surfaceId)?.focus() を呼ぶ。
 }
 
 /** DOM から切り離すがインスタンスとスクロールバックは保持する（契約 §16） */

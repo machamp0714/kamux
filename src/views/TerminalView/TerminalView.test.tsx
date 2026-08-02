@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   attachTerminal: vi.fn(),
   detachTerminal: vi.fn(),
   fitTerminal: vi.fn(),
+  getTerminal: vi.fn(),
   invalidateFitCache: vi.fn(),
   writeNotice: vi.fn(),
 }));
@@ -33,6 +34,7 @@ vi.mock('../../terminal/registry', () => ({
   attachTerminal: mocks.attachTerminal,
   detachTerminal: mocks.detachTerminal,
   fitTerminal: mocks.fitTerminal,
+  getTerminal: mocks.getTerminal,
   invalidateFitCache: mocks.invalidateFitCache,
   writeNotice: mocks.writeNotice,
 }));
@@ -87,6 +89,7 @@ beforeEach(() => {
   mocks.ensurePtySubscription.mockResolvedValue(undefined);
   mocks.startSession.mockResolvedValue(undefined);
   mocks.fitTerminal.mockReturnValue(null);
+  mocks.getTerminal.mockReturnValue(undefined);
 
   const emptyOrder: Record<KanbanStatus, string[]> = {
     backlog: [],
@@ -99,6 +102,7 @@ beforeEach(() => {
     sessionOrder: emptyOrder,
     paneAssignment: ['s1', null],
     activePane: 0,
+    modal: null,
   });
 
   container = document.createElement('div');

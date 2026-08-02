@@ -35,15 +35,26 @@ export class AckCoalescer {
       this.highestConsumed = seq;
     }
     if (this.scheduled) return;
-    // `scheduled` は schedule() が実際に登録できてから立てる（呼ぶ前ではない）。
-    // queueMicrotask は同期的にコールバックを実行しないため、この並び替えは
-    // 成功時の挙動を一切変えない。変えるのは schedule() 自体が例外を投げた場合だけで、
-    // その場合 `scheduled` は false のまま残り、次の consumed() で再試行できる。
-    // fix round 2 で見つかったバグは「scheduled を先に立てていたため、schedule() が
-    // 例外を投げると恒久的に ack が止まる」という壊れ方だった。ここでの並び替えは
-    // その種の再発（schedule 実装側の別の失敗）を「1 回分の ack 遅延」に格下げする。
-    this.schedule(() => this.flush());
+    // Important 3（PR 10 fix round 1）: `scheduled` は schedule() を呼ぶ「前」に立てる。
+    //
+    // 以前は schedule() 呼び出しの後ろで scheduled = true していたが、これは
+    // 同期スケジューラ（テスト注入の `(fn) => fn()` 等）を渡すと新しい恒久停止を生む
+    // ——schedule() が同期的に flush() を実行し、flush() の先頭で scheduled を
+    // false に戻した「直後」に、戻ってきた呼び出し側がここで scheduled = true を
+    // 上書きしてしまい、「保留中の flush は無いのに scheduled が立ったまま」になって
+    // 以後すべての consumed() が早期リターンし続ける。
+    //
+    // schedule() を呼ぶ前に scheduled = true しておけば、同期スケジューラでも
+    // flush() が最後に立てた false が正しく残る。一方 schedule() 自体が登録に
+    // 失敗して例外を投げた場合（fix round 2 で見つかった経路）は catch で
+    // scheduled を false に戻し、次の consumed() で再試行できるようにする。
     this.scheduled = true;
+    try {
+      this.schedule(() => this.flush());
+    } catch (e) {
+      this.scheduled = false;
+      throw e;
+    }
   }
 
   /** PTY が終了して同じ surface_id で再起動されると Rust 側の seq は 1 に戻る */

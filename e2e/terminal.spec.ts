@@ -122,7 +122,8 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
     await page.addInitScript(commonInitScript());
     await gotoTerminalView(page);
 
-    // s1 タブをクリックしてアクティブにする（TerminalPane が attachTerminal → term.focus() する）
+    // s1 タブをクリックしてアクティブにする（PR 10 fix round 1 以降、フォーカスは
+    // TerminalPane の modal === null 用 effect が当てる。attachTerminal 自体はもう focus しない）
     await page.locator('[data-session-id="s1"]').click();
     await expect(page.locator('[data-session-id="s1"]')).toHaveAttribute('aria-selected', 'true');
 
@@ -340,6 +341,93 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
 
     // Cmd 修飾なしの通常キー。優先度 4 で確認した「Meta+j は Chromium ではキー列を
     // 生まない」問題には当たらない（恒真にならない）。
+    await page.keyboard.type('x');
+
+    await expect
+      .poll(async () => {
+        const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+        return calls.filter(
+          (c) =>
+            c.cmd === 'write_pty' && (c.args as { surfaceId: string }).surfaceId === 's1:agent',
+        ).length;
+      })
+      .toBe(1);
+  });
+
+  /**
+   * PR 10 fix round 1（Critical）。registry.ts の attachTerminal は term.focus() を
+   * 呼んでいた（契約 §16 に無い副作用）。SessionFormModal は view 分岐の外にあるため
+   * unmount されず、Cmd+N でモーダルを開いたまま Cmd+2 でターミナルへ戻ると
+   * TerminalPane が再マウントされて DOM フォーカスをモーダルの入力欄から奪っていた。
+   * ここでは「モーダルが可視のまま打鍵しても write_pty が飛ばない」ことを固定する。
+   * 変異（modal === null の条件を外して無条件 focus に戻す）で赤くなることを実測した。
+   */
+  test('モーダル表示中に Cmd+2 でターミナルへ戻っても、打鍵が実シェルへ流れない', async ({
+    page,
+  }) => {
+    await page.addInitScript(commonInitScript());
+    await gotoTerminalView(page);
+
+    await page.locator('[data-session-id="s1"]').click();
+    await expect
+      .poll(async () => {
+        const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+        return calls.filter((c) => c.cmd === 'start_session').length;
+      })
+      .toBe(1);
+
+    // Cmd+N はターミナル画面からも効く（契約 §11）。openModal は view を kanban へ
+    // 切り替えるので、この時点で TerminalView（TerminalPane 含む）は一旦 unmount される
+    await page.keyboard.press('Meta+n');
+    await expect(page.locator('[role="dialog"]')).toBeVisible();
+
+    // モーダルは view 分岐の外にあるため残ったまま、TerminalPane だけが再マウントされる
+    await page.keyboard.press('Meta+2');
+    await expect(page.locator('.kamux-terminal-view')).toBeVisible();
+    await expect(page.locator('[role="dialog"]')).toBeVisible();
+
+    await page.keyboard.type('x');
+
+    const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+    expect(calls.filter((c) => c.cmd === 'write_pty' || c.cmd === 'write_pty_bytes')).toHaveLength(
+      0,
+    );
+    // 宛先が正しくモーダルのタイトル入力へ届いていることも直接確認する
+    await expect(page.locator('[role="dialog"] input[type="text"]').first()).toHaveValue('x');
+  });
+
+  /**
+   * PR 10 fix round 1（Critical、契約側の追加裁定）。フォーカスは modal の遷移に
+   * 追従する必要があり、「マウント時に 1 度評価する」だけでは、モーダルを開いてから
+   * 閉じた後にターミナルが無フォーカスのまま残る別の穴が開く。ここでは
+   * 「モーダルを閉じると、TerminalPane を再マウントすることなく打鍵が実シェルへ
+   * 届くようになる」ことを固定する。変異（フォーカス effect の依存配列から modal を
+   * 外す）で赤くなることを実測した。
+   */
+  test('モーダルを閉じると、再マウントなしでターミナルへの打鍵が再び効くようになる', async ({
+    page,
+  }) => {
+    await page.addInitScript(commonInitScript());
+    await gotoTerminalView(page);
+
+    await page.locator('[data-session-id="s1"]').click();
+    await expect
+      .poll(async () => {
+        const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+        return calls.filter((c) => c.cmd === 'start_session').length;
+      })
+      .toBe(1);
+
+    await page.keyboard.press('Meta+n');
+    await expect(page.locator('[role="dialog"]')).toBeVisible();
+    await page.keyboard.press('Meta+2');
+    await expect(page.locator('.kamux-terminal-view')).toBeVisible();
+
+    // Escape はモーダル表示中に close_modal として effect される（契約 §11）。
+    // view はここでは変わらないので TerminalPane は再マウントされない
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+
     await page.keyboard.type('x');
 
     await expect

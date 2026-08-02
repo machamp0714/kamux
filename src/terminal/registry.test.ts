@@ -158,8 +158,13 @@ function nextSurfaceId(kind: 'agent' | 'editor' = 'agent'): string {
 
 beforeEach(() => {
   FakeTerminal.instances.length = 0;
-  writePty.mockClear();
-  writePtyBytes.mockClear();
+  // afterEach の vi.restoreAllMocks() は素の vi.fn()（spy 元が無い）に対しては
+  // 実装を空関数へ戻す（mockReset 相当）。Important 2（PR 10 fix round 1）で
+  // onData/onBinary が writePty(...).catch(...) を呼ぶようになったため、
+  // 戻り値が Promise であることを毎テスト再設定する必要がある
+  // （でないと 2 テスト目以降で「Cannot read properties of undefined (reading 'catch')」になる）
+  writePty.mockReset().mockResolvedValue(undefined);
+  writePtyBytes.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(() => {

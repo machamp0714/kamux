@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   attachTerminal: vi.fn(),
   detachTerminal: vi.fn(),
   fitTerminal: vi.fn(),
+  getTerminal: vi.fn(),
   invalidateFitCache: vi.fn(),
   writeNotice: vi.fn(),
 }));
@@ -34,10 +35,12 @@ vi.mock('../../terminal/registry', () => ({
   attachTerminal: mocks.attachTerminal,
   detachTerminal: mocks.detachTerminal,
   fitTerminal: mocks.fitTerminal,
+  getTerminal: mocks.getTerminal,
   invalidateFitCache: mocks.invalidateFitCache,
   writeNotice: mocks.writeNotice,
 }));
 
+import { useAppStore } from '../../store';
 import { TerminalPane } from './TerminalPane';
 
 class FakeResizeObserver {
@@ -71,6 +74,8 @@ beforeEach(() => {
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
   mocks.isStarted.mockReturnValue(false);
   mocks.fitTerminal.mockReturnValue(null);
+  mocks.getTerminal.mockReturnValue(undefined);
+  useAppStore.setState({ modal: null });
   container = document.createElement('div');
   document.body.appendChild(container);
 });
@@ -123,6 +128,9 @@ describe('TerminalPane（不変条件 B・D）', () => {
 
 describe('TerminalPane（不変条件 C）', () => {
   it('start_session 解決後に invalidateFitCache → fitTerminal の順で再実行する', async () => {
+    // isStarted は既定で false（beforeEach）なので、マウント直後の syncSize は
+    // Important 1 の門でスキップされる。ここで実行されるのは start_session
+    // 解決後の 1 回だけである
     mocks.ensurePtySubscription.mockResolvedValue(undefined);
     mocks.startSession.mockResolvedValue(undefined);
     const callOrder: string[] = [];
@@ -137,9 +145,77 @@ describe('TerminalPane（不変条件 C）', () => {
     renderPane('s1');
     await flush();
 
-    // マウント直後の syncSize（1 回目の fit）→ start_session 解決後の invalidate → 2 回目の fit
-    expect(callOrder).toEqual(['fit', 'invalidate', 'fit']);
-    expect(mocks.fitTerminal).toHaveBeenCalledTimes(2);
+    expect(callOrder).toEqual(['invalidate', 'fit']);
+    expect(mocks.fitTerminal).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TerminalPane（Important 1: 未起動 PTY への resize_pty を防ぐ門）', () => {
+  it('isStarted が false の初回マウントでは、start_session が解決するまで fitTerminal を呼ばない', async () => {
+    mocks.isStarted.mockReturnValue(false);
+    // ensurePtySubscription を pending のまま止めて「マウント直後」の状態を固定する
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+
+    renderPane('s1');
+    await flush();
+
+    expect(mocks.fitTerminal).not.toHaveBeenCalled();
+  });
+
+  it('isStarted が true の再 attach（画面外にいる間の window resize 相当）ではマウント直後に fitTerminal を呼ぶ', async () => {
+    mocks.isStarted.mockReturnValue(true);
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+
+    renderPane('s1');
+    await flush();
+
+    expect(mocks.fitTerminal).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TerminalPane（Critical: モーダル表示中は実シェルへ focus を渡さない）', () => {
+  it('modal が null なら getTerminal(surface).focus() を呼ぶ', async () => {
+    const focus = vi.fn();
+    mocks.getTerminal.mockReturnValue({ focus });
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    useAppStore.setState({ modal: null });
+
+    renderPane('s1');
+    await flush();
+
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+
+  it('modal が開いていれば focus しない（実シェルへ打鍵が流れるのを防ぐ）', async () => {
+    const focus = vi.fn();
+    mocks.getTerminal.mockReturnValue({ focus });
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    useAppStore.setState({ modal: { kind: 'create_session' } });
+
+    renderPane('s1');
+    await flush();
+
+    expect(focus).not.toHaveBeenCalled();
+  });
+
+  it('モーダルを閉じると（再マウントなしで）フォーカスが戻る', async () => {
+    const focus = vi.fn();
+    mocks.getTerminal.mockReturnValue({ focus });
+    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    useAppStore.setState({ modal: { kind: 'create_session' } });
+
+    renderPane('s1');
+    await flush();
+    expect(focus).not.toHaveBeenCalled();
+
+    // TerminalPane を作り直すのではなく、購読しているストアの modal だけを更新する
+    // ——「マウント時に 1 度評価する」ではなく modal の遷移に追従することの検証
+    act(() => {
+      useAppStore.setState({ modal: null });
+    });
+    await flush();
+
+    expect(focus).toHaveBeenCalledTimes(1);
   });
 });
 
