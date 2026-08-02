@@ -100,6 +100,22 @@ describe('AckCoalescer', () => {
     expect(send).toHaveBeenLastCalledWith(2);
   });
 
+  it('フラッシュ保留中に reset されたら死んだ世代の ack を撃たない', () => {
+    const send = vi.fn();
+    const scheduler = manualScheduler();
+    const ack = new AckCoalescer(send, scheduler.schedule);
+
+    ack.consumed(5000); // フラッシュ未実行のまま
+    ack.reset(); // Task 13 が pty://exit で呼ぶ経路
+    scheduler.flush();
+    expect(send).not.toHaveBeenCalled();
+
+    ack.consumed(1); // 新世代
+    scheduler.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(1);
+  });
+
   it('スケジュールは 1 回のフラッシュにつき 1 度だけ積まれる', () => {
     const send = vi.fn();
     const schedule = vi.fn();
