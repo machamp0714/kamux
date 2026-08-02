@@ -331,20 +331,23 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
   });
 });
 
-describe('readTerminalFont はトークンの値をそのまま渡す（RULINGS §23.2: lineHeight を自分で変換しない）', () => {
+describe('readTerminalFont（RULINGS §25: lineHeight は渡さない。§23.2 は撤回済み）', () => {
   afterEach(() => {
     document.documentElement.style.removeProperty('--font-mono');
     document.documentElement.style.removeProperty('--text-sm');
     document.documentElement.style.removeProperty('--leading-term');
   });
 
-  it('--leading-term の値をそのまま lineHeight に渡す（変換・別数値のハードコード禁止）', () => {
+  it('--leading-term トークンが読めても lineHeight は渡さない（xterm の単位が CSS の line-height と違うため）', () => {
+    // トークンを実際に注入したうえで「それでも渡さない」ことを見る。
+    // トークン注入なしでは --leading-term は常に空文字（NaN）を返すため、
+    // 実装のあらゆる変異が緑になる no-op テストになってしまう。
     document.documentElement.style.setProperty('--leading-term', '1.65');
     const sid = nextSurfaceId();
     registry.ensureTerminal(sid);
     const term = fakeOf(sid);
     const options = term.options as { lineHeight?: number };
-    expect(options.lineHeight).toBe(1.65);
+    expect(options.lineHeight).toBeUndefined();
   });
 
   it('--font-mono / --text-sm もそのまま fontFamily / fontSize に渡す', () => {

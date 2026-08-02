@@ -81,37 +81,43 @@ function readTerminalTheme(): ITheme {
 
 /**
  * xterm のフォント設定をデザインシステムのトークンから読む。
- * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm` / `--leading-term`。
+ * `components.md`「ターミナル面」: `--font-mono` / `--text-xs`〜`--text-sm`。
  *
  * tokens.css が読み込まれていない環境（テストなど）では `getComputedStyle` が
  * 空文字列 / NaN を返す。その場合はキー自体を省略して xterm の既定値に委ねる
  * （hex フォールバックと違い、design token が無いときの防御であって「値を書く」ことにはならない）。
  *
- * **`lineHeight` に `--leading-term` の値をそのまま渡す（RULINGS §23.2 の裁定）。**
+ * **`lineHeight` は意図的に渡さない（RULINGS §25。§23.2 は撤回済み）。**
  *
  * xterm の `lineHeight` は CSS の `line-height` と同じ意味の数値ではない。
  * `cell.height = Math.floor(char.height * lineHeight)` であり、`char.height` は
- * フォントサイズではなく「フォントの自然な行ボックス」（TextMetrics の
- * `fontBoundingBoxAscent + fontBoundingBoxDescent`、または `line-height: normal`
- * を当てて測った `offsetHeight`。実測で概ね fontSize の 1.15〜1.3 倍）である。
+ * フォントサイズではなく「フォントの自然な行ボックス」（`line-height: normal` を
+ * 当てて測った `offsetHeight`。実測で概ね fontSize の 1.15〜1.3 倍）である。
  * そのため `--leading-term: 1.65` をそのまま渡すと、セル高は fontSize の
- * 約 2.0〜2.15 倍になる（CSS の `line-height: 1.65` が意図する見た目より広い）。
+ * 約 2.0〜2.15 倍になる。
  *
- * **それでも数値を自分で変換・ハードコードしないこと。** `kamux-design-system` の
- * SKILL.md が「3 体の実装者が独立に近い値を書いてトークンの島が 3 つできた」失敗を
- * 名指ししている。`--leading-term` の値を変えるか、ターミナルグリッド専用のトークンを
- * 別途足すかは team-lead / contract-owner の裁定であり、このファイルの裁量ではない。
- * 見た目の可否は Task 14 の初回描画で目視確認する。
+ * これは「実装できない」からではない。正しい倍率
+ * `lineHeight = (fontSize * leadingTerm) / 自然行ボックスの高さ` は実行時に測れるので
+ * literal は要らず、契約 §53 に抵触するという前回の理由づけは成り立たない。**渡さない
+ * 理由は「やる価値が未確定」であること**:
+ *
+ * 1. `--leading-term: 1.65` が xterm のセルグリッドを意図しているか未確定。
+ *    `tokens.css:87` の定義コメントは「ターミナルとコード」双方を指しており、
+ *    コードブロック（DOM）向けの値が「ターミナル」の名前で共有されているだけの
+ *    可能性がある。CSS 換算 1.65 は一般的な端末（概ね 1.0〜1.4）よりかなり広い
+ * 2. 実測が 1 度も無い。見た目の議論を実測なしで進めない
+ *
+ * Task 14 の初回描画で lane-controller が実機目視して数値を出し、
+ * `--leading-term` を変えるか専用トークンを足すかは team-lead が決める。
+ * **安易に戻さないこと。**
  */
-function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize' | 'lineHeight'> {
+function readTerminalFont(): Pick<ITerminalOptions, 'fontFamily' | 'fontSize'> {
   const s = getComputedStyle(document.documentElement);
   const fontFamily = s.getPropertyValue('--font-mono').trim();
   const fontSize = parseFloat(s.getPropertyValue('--text-sm'));
-  const lineHeight = parseFloat(s.getPropertyValue('--leading-term'));
   return {
     ...(fontFamily && { fontFamily }),
     ...(!Number.isNaN(fontSize) && { fontSize }),
-    ...(!Number.isNaN(lineHeight) && { lineHeight }),
   };
 }
 
