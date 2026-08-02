@@ -88,11 +88,13 @@
   /* 上下分割で xterm がスロットからはみ出すのを防ぐ（契約 §28.4）。M1-3 でも書いておく */
   min-height: 0;
   overflow: hidden;
-  padding: var(--space-2);
 }
 
 /* attachTerminal のコンテナ。契約 §57.3 でこの要素に固定されている。
-   絶対配置の包含ブロックはパディングボックスなので inset: 0 で padding は効く */
+   絶対配置の包含ブロックは祖先の padding「エッジ」で区切られる箱なので、
+   inset: 0 の子は padding 領域まで覆う（= 親に padding を置いても効かない。
+   headless Chromium で実測済み）。余白が要る場合は親の padding ではなく、
+   この要素の inset の値で与えること（M3-2 が focus border を入れるときの申し送り） */
 .terminal-pane-slot__host {
   position: absolute;
   inset: 0;
