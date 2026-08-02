@@ -2,7 +2,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,15 +18,57 @@ use crate::pty::backpressure::{Backpressure, PTY_READ_CHUNK};
 pub const DEFAULT_COLS: u16 = 80;
 pub const DEFAULT_ROWS: u16 = 24;
 
-/// waiter が「reader が自然に EOF/EIO まで読み切ってスレッド終了する」のを
-/// 待つ上限。reader スレッド終了時に `drain_tx`(mpsc::Sender)が drop され、
-/// waiter 側の `drain_rx.recv_timeout()` は `Disconnected` を即座に返す
-/// (=出力欠損ゼロで close() へ進める)。この期限を超えたら、reader が
-/// バックプレッシャーのゲートで park している(または read() でブロックして
-/// いる)とみなし、従来どおり `Backpressure::close()` でハードストップする。
+/// waiter が `Backpressure::close()` を撃った後、reader スレッドの `join()`
+/// を待つ上限。
+///
+/// # なぜ「reader の自然な drain を待ってから close() する」設計(fix round 2)
+/// を廃止したか
+///
+/// fix round 2 では、reader が最初の `read()` に到達する前に waiter が
+/// `close()` を撃つと出力を丸ごと失いうる、という短命プロセスのバグに対して
+/// 「reader が自然に読み切るまで close() を最大 500ms 遅らせる」対策を入れた。
+/// しかしラウンド3のレビューで実測により、この対策が無効だったと判明した。
+/// 真の機構は macOS の `ttywait`/`ttyclose` である: 最後の slave fd が閉じる
+/// とき、カーネルは master 側が出力を読み切るまで `child.wait()` の復帰自体を
+/// 最大 ~600ms ブロックし、それでも読み切られなければ未読バッファを破棄して
+/// から `child.wait()` を返す。つまり `child.wait()` が返った時点で、出力が
+/// 読めるかどうかの勝負は既にカーネル側でついている。waiter 側で close() を
+/// 遅らせても、この破棄より後に効くタイマーでしかなく、無意味だった(実測:
+/// reader に 3 秒の遅延を注入すると `child.wait()` は 603ms で復帰し、その後
+/// reader が実際に `read()` して 0 バイトを得ることを確認した)。
+///
+/// そのため close() は再び `child.wait()` 復帰直後に即座に撃つ(fix round 1
+/// 以前と同じ)。短命プロセスの出力全損そのものは直さない(根治には reader を
+/// 子より先に起動する `spawn` の再設計が要るが、park している最中に子が
+/// 終了すれば ttywait は必ずタイムアウトするため park ケースには効かず、
+/// lane-controller の裁定で受容されている)。
+///
+/// # このチャネルの新しい役割: bounded join
+///
+/// `close()` は 2 つのケースで reader に効く:
+/// - reader が高水位でゲート(`wait_until_drained`)に park している場合:
+///   close() は条件変数を起こすので、reader はほぼ即座にループを抜ける
+/// - reader が `read()` でブロックしている場合: 子プロセスが本当に終了して
+///   いれば(=孫プロセスが slave を握っていなければ)EOF/EIO がすぐ返る
+///
+/// このどちらのケースでも、reader スレッド終了時に drop される `drain_tx`
+/// (mpsc::Sender)が、waiter 側の `drain_rx.recv_timeout()` にほぼ即座に
+/// `Disconnected` を返す。`PTY_JOIN_DEADLINE` はその十分な上界として 1 秒とした。
+/// これを超えるのは、孫プロセスが setsid 済みの pgid に残って slave を握り
+/// 続け、reader の `read()` が本当に無期限にブロックしている(wedge している)
+/// 場合だけである(例: `$SHELL -l` で `sleep 1000 &` してから `exit` した
+/// ケース。契約 §9 が最悪のケースとして名指ししている経路)。この場合
+/// `join()` を無条件に待ち続けると `pty://exit` が永久に飛ばず、M2-1 の
+/// 状態機械が `exited` へ遷移できずカードが永久に 🟢 のまま残ってしまう
+/// (pty://exit が飛ばないほうが join() のタイムアウトより桁違いに悪い)。
+/// そのため waiter は `PTY_JOIN_DEADLINE` でタイムアウトしたら、reader
+/// スレッドをリークさせてでも(`JoinHandle` を join せずに drop するだけ。
+/// 検知不能のままスレッドが走り続けるだけで panic やリソース破壊は起きない)
+/// `on_exit` を優先して届ける。
+///
 /// 契約に定義は無い内部実装用の定数(契約 §15 は M1-3 が内部実装を自由に
 /// 決めてよいと明記している)。
-const PTY_DRAIN_DEADLINE: Duration = Duration::from_millis(500);
+const PTY_JOIN_DEADLINE: Duration = Duration::from_secs(1);
 
 /// PTY の出力先。Tauri から切り離してテスト可能にするための境界
 pub trait PtySink: Send + Sync + 'static {
@@ -374,21 +416,39 @@ fn spawn_waiter_thread(
             // になる(詳細は `PtySurface::kill()` のドキュメントコメント参照)。
             *lock_or_recover(&pid) = None;
             alive.store(false, Ordering::SeqCst);
-            // reader がまだ最初の read() すら試みていないうちにここで
-            // 即座に close() すると、reader は wait_until_drained() で
-            // closed=true を見て1バイトも読まずに終了しうる(短命プロセスの
-            // 出力が丸ごと失われるバグ)。reader スレッド終了時に drain_tx が
-            // drop されると drain_rx は即座に Disconnected を返すので、まずは
-            // それを PTY_DRAIN_DEADLINE を上限として待つ。reader が高水位で
-            // park している等で自然に終わらない場合は、deadline 到達後に
-            // 今までどおり close() でハードストップする(この分岐は
-            // Backpressure の意味論そのものは一切変えていない)。
-            let _ = drain_rx.recv_timeout(PTY_DRAIN_DEADLINE);
-            // reader が滞留待ちで眠っていても起こす。close() を join() より先に
-            // 呼ばないと、バックプレッシャーで停止した reader は二度と起きず
-            // waiter の join() がハングする(契約: 終了経路は join の前に close)。
+            // close() は child.wait() 復帰直後に即座に撃つ。`child.wait()` が
+            // 返った時点で「出力が読めるかどうか」の勝負は既に macOS の
+            // ttywait/ttyclose で決着済みなので、ここで close() を遅らせても
+            // 意味が無い(詳細は PTY_JOIN_DEADLINE のドキュメントコメント参照)。
+            // 滞留待ちで眠っている reader を起こす役目もこれが担う。
             backpressure.close();
-            // 残りの出力を出し切ってから exit を通知する(表示順序の保証)
+            // reader が自然に終了(EOF/EIO、または上の close() を受けての
+            // park 解除)すれば drain_tx が drop され、ここは即座に
+            // Disconnected を返す。reader が孫プロセスに slave を握られて
+            // read() で本当に無期限にブロックしている(wedge している)場合
+            // だけ、ここは PTY_JOIN_DEADLINE でタイムアウトする。
+            match drain_rx.recv_timeout(PTY_JOIN_DEADLINE) {
+                Err(RecvTimeoutError::Timeout) => {
+                    // join() を無条件に待ち続けると pty://exit が永久に飛ばない
+                    // (契約 §9 が最悪のケースとして名指しした経路: 孫プロセスが
+                    // slave を握ったまま親が exit するケース)。reader スレッド
+                    // を JoinHandle ごと drop してリークさせてでも(検知不能の
+                    // まま走り続けるだけで panic やリソース破壊は起きない)
+                    // on_exit を優先して届ける
+                    sink.on_exit(&surface_id, exit_code);
+                    return;
+                }
+                _ => {
+                    // Disconnected: reader スレッドが終了して drain_tx が
+                    // drop された(= close() が期待どおり効いた)。
+                    // Ok(()) の場合は現状 reader が drain_tx へ send しない
+                    // ため到達しないが、将来 send する実装に変わっても
+                    // 「reader がまだ生きている可能性がある」前提で join()
+                    // に進むのが安全なため、ここでは分岐しない
+                }
+            }
+            // reader は既に終了しているはずなので、この join() は速やかに
+            // 返る。残りの出力を出し切ってから exit を通知する(表示順序の保証)
             let _ = reader_handle.join();
             sink.on_exit(&surface_id, exit_code);
         })
@@ -465,29 +525,6 @@ mod tests {
         assert!(out.contains("hello-kamux"), "actual output: {out:?}");
         assert_eq!(code, Some(0));
         assert!(!surface.is_alive());
-    }
-
-    #[test]
-    fn short_lived_process_output_is_never_lost_across_repeated_spawns() {
-        // 指摘Aの回帰テスト: reader が最初の read() に到達する前に waiter が
-        // backpressure.close() を撃つと、reader は1バイトも読まずに終了し
-        // うる(修正前は実測で `echo_emits_its_output_then_exits_with_zero` /
-        // `multibyte_output_survives_base64_round_trip` が `cargo test
-        // --workspace` の並列実行下で一過性に `actual output: ""` の red に
-        // なっていた)。単発では踏まないレースなので30回繰り返す。
-        for i in 0..30 {
-            let (tx, rx) = channel();
-            let marker = format!("kamux-drain-check-{i}");
-            let surface =
-                PtySurface::spawn(spec("/bin/echo", &[&marker]), Arc::new(ChannelSink { tx }))
-                    .unwrap_or_else(|e| panic!("spawn /bin/echo (iteration {i}): {e:?}"));
-            let (out, code) = drain(&rx, &surface);
-            assert!(
-                out.contains(&marker),
-                "iteration {i}: actual output: {out:?} (short-lived process output was lost)"
-            );
-            assert_eq!(code, Some(0), "iteration {i}: actual output: {out:?}");
-        }
     }
 
     #[test]
@@ -614,94 +651,22 @@ mod tests {
     }
 
     #[test]
-    fn waiter_holds_off_backpressure_close_while_the_reader_has_not_signaled_drain_yet() {
-        // 指摘A(本番バグ)の核心を、スケジューラの偶然に頼らず直接固定する
-        // テスト: waiter は「reader が自然に読み切ってスレッド終了した」ことを
-        // `drain_tx` の drop(Disconnected)で検知するまで、
-        // `Backpressure::close()` を呼ぶのを最大 `PTY_DRAIN_DEADLINE` だけ
-        // 遅らせなければならない。ここでは実 reader スレッドは使わず、
-        // `drain_tx` をテスト側のローカル変数として保持し続けることで
-        // 「reader はまだ生きている(1回も読み切っていない)」を模す。
-        // reader 側(wait_until_drained の意味論)は変更対象外なので、その
-        // 弁別は別テストに委ねる。
-        //
-        // 修正前(即座に close() する実装)では、この関数の最初の assert
-        // ( `!backpressure.is_closed()` )が red になる: `drain_tx` がまだ
-        // 生きているにもかかわらず、waiter は child.wait() 復帰直後に
-        // close() を呼んでしまうため。
-        use std::time::Instant;
-
-        let backpressure = Arc::new(Backpressure::new());
-        let alive = Arc::new(AtomicBool::new(true));
-        let (tx, _rx) = channel::<Ev>();
-        let sink: Arc<dyn PtySink> = Arc::new(ChannelSink { tx });
-
-        // reader はまだ1回も drain 完了を知らせていない(=Sender を保持し続ける)
-        let (drain_tx, drain_rx) = channel::<()>();
-        // reader_handle は join() を成立させるためだけのダミー(即座に終わる)。
-        // このテストの弁別対象は「waiter が close() を呼ぶタイミング」であり、
-        // reader 自体の動作ではない。
-        let reader_handle = std::thread::spawn(|| {});
-
-        // 子プロセスは「今まさに終了した」を模す: exit_gate に事前に送っておくと
-        // wait() は即座に返る
-        let (exit_tx, exit_rx) = channel::<()>();
-        exit_tx.send(()).expect("pre-fire fake process exit");
-        let fake_child = FakeChild {
-            exit_gate: Mutex::new(exit_rx),
-        };
-        let pid = Arc::new(Mutex::new(None));
-        spawn_waiter_thread(
-            "surf".to_string(),
-            Box::new(fake_child),
-            reader_handle,
-            Arc::clone(&backpressure),
-            Arc::clone(&alive),
-            pid,
-            sink,
-            drain_rx,
-        )
-        .expect("spawn waiter thread");
-
-        // waiter は child.wait() からほぼ即座に復帰する。reader がまだ
-        // drain 完了を知らせていない(drain_tx がまだ生きている)間は、
-        // close() が呼ばれてはいけない
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            !backpressure.is_closed(),
-            "reader がまだ drain 完了を知らせていないのに close() が呼ばれた: \
-             waiter が drain_rx を待たずに即座に close() している疑いがある"
-        );
-
-        // reader が「たった今、自然に読み切ってスレッド終了した」を模す
-        drop(drain_tx);
-
-        // close() は deadline(500ms)を待たずに速やかに呼ばれるはず
-        let started = Instant::now();
-        while !backpressure.is_closed() {
-            assert!(
-                started.elapsed() < Duration::from_millis(200),
-                "drain_tx を drop したのに close() が速やかに呼ばれなかった: \
-                 PTY_DRAIN_DEADLINE まで律儀に待ってしまっている疑いがある"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn waiter_hard_stops_a_reader_still_parked_on_high_water_after_the_drain_deadline() {
-        // 指摘A修正後の不変条件の弁別テスト: reader がバックプレッシャーの
-        // ゲート(wait_until_drained)で確実に停止している状態を合成の Read /
-        // Child で決定的に作り、その状態で子プロセスの "終了" を発火させる。
-        // ack が一切来ない(=自然に EOF まで読み切れない)ままなので、waiter は
-        // PTY_DRAIN_DEADLINE だけ待った後 backpressure.close() でハード
-        // ストップし、それでも必ず join() が返って on_exit が届くことを検証
-        // する(「park したまま無期限にハングしない」という Task 4 の保護は
-        // 維持されたまま、close() のタイミングだけが即時から deadline 後に
-        // 変わったことを確認する)。実プロセスでこの境界を再現しようとすると、
-        // reader が止まった直後に子プロセス自身が write() でブロックして
-        // 終了しなくなるため(実験で確認済み)、ここではホワイトボックスに
-        // 直接 spawn_reader_thread / spawn_waiter_thread を呼んで弁別する。
+    fn waiter_wakes_a_reader_parked_on_high_water_and_still_delivers_on_exit_promptly() {
+        // Fix round 3 で復活させた Task 3 由来の不変条件: reader がバック
+        // プレッシャーのゲート(wait_until_drained)で確実に停止している状態を
+        // 合成の Read / Child で決定的に作り、その状態で子プロセスの "終了" を
+        // 発火させる。close() は「reader が自然に drain するのを待つ」フェーズ
+        // (fix round 2)を経由せず、child.wait() 復帰直後に即座に撃つ(fix
+        // round 3 で復元した挙動。理由は PTY_JOIN_DEADLINE のドキュメント
+        // コメント参照: 実測でこの「待ち」は既にカーネル側の ttywait/ttyclose
+        // で勝負がついた後に始まるタイマーだったと判明したため)。park した
+        // reader は close() の通知でほぼ即座にゲートを抜けるため、on_exit の
+        // 到着は「reader が drain 完了を自ら知らせるまで待つ」旧設計での
+        // 所要時間(常に旧 deadline の 500ms 前後)よりずっと短くなるはずである。
+        // 実プロセスでこの境界を再現しようとすると、reader が止まった直後に
+        // 子プロセス自身が write() でブロックして終了しなくなるため(実験で
+        // 確認済み)、ここではホワイトボックスに直接 spawn_reader_thread /
+        // spawn_waiter_thread を呼んで弁別する。
         use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
         use std::time::Instant;
 
@@ -769,7 +734,8 @@ mod tests {
                 Ok(Ev::Data { .. }) => continue,
                 Ok(ev) => break ev,
                 Err(err) => panic!(
-                    "on_exit が届かなかった: drain deadline 後の close() が join() より先に呼ばれていない疑いがある ({err})"
+                    "on_exit が届かなかった: close() が join() より先に park した reader を \
+                     起こしていない疑いがある ({err})"
                 ),
             }
         };
@@ -779,15 +745,114 @@ mod tests {
             "actual event: {event:?}"
         );
         assert!(!alive.load(Ordering::SeqCst));
+        // 400ms は旧設計(reader が drain 完了を自ら知らせるまで close() を
+        // 遅らせる、常に旧 deadline の 500ms を要した)と新設計(close() が
+        // 即座 → park した reader がほぼ即座に起きる)を区別するための閾値。
+        // 500ms より確実に小さく、かつ通常のスケジューリング揺らぎを吸収できる
+        // 十分な余裕を持たせた
         assert!(
-            elapsed >= PTY_DRAIN_DEADLINE,
-            "close() が drain deadline を待たずに早期発火した ({elapsed:?}): \
-             park したまま自然 drain できないケースでもハードストップの \
-             タイミングが deadline より前に来てはいけない"
+            elapsed < Duration::from_millis(400),
+            "on_exit の到着が遅すぎる ({elapsed:?}): close() が park した reader を \
+             即座に起こせていない(旧設計の「drain 完了を待つ」経路に戻っている)疑いがある"
         );
+    }
+
+    #[test]
+    fn waiter_still_emits_on_exit_within_the_join_deadline_when_reader_is_wedged_on_read() {
+        // 修正2の核心(契約 §9 が最悪と名指しした経路): `$SHELL -l` で
+        // `sleep 1000 &` してから `exit` すると、孫プロセスは setsid 済みの
+        // pgid に残って slave を握り続け、reader は無出力の read() で
+        // 永久にブロックしうる。この状態を合成の Read で決定的に作る
+        // (対応する Sender をテスト側で意図的に drop しない = read() が
+        // 永久に返らない状態を模す)。waiter は reader_handle.join() を
+        // 無条件に待たず、PTY_JOIN_DEADLINE でタイムアウトしたら reader
+        // スレッドをリークさせてでも on_exit を届けなければならない。
+        struct WedgedReader {
+            block: Receiver<()>,
+        }
+        impl std::io::Read for WedgedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                // 対応する Sender は通常 drop されない設計なので、この recv() は
+                // 通常決して返らない(孫プロセスに slave を握られ続けている状態を
+                // 模す)。ただし、このテストが(タイミング flake 等で)途中で
+                // panic してスタック巻き戻り時に Sender が drop された場合でも
+                // `unreachable!()` で二次 panic を起こしてしまうと、本来の
+                // 失敗理由がこのスレッドの panic メッセージに埋もれてしまう。
+                // それを避けるため、recv() が Err で返っても park() で
+                // 眠り直すだけにする(ポーリングではなく、誰にも起こされない
+                // ため実質的に無期限にブロックし続ける = production コードが
+                // 前提とする「read() が永久に戻らない」を安全に維持する)
+                loop {
+                    let _ = self.block.recv();
+                    std::thread::park();
+                }
+            }
+        }
+
+        let (tx, rx) = channel::<Ev>();
+        let sink: Arc<dyn PtySink> = Arc::new(ChannelSink { tx });
+        let backpressure = Arc::new(Backpressure::new());
+        let alive = Arc::new(AtomicBool::new(true));
+
+        // 対応する Sender を意図的に保持したまま drop しない(このテスト関数の
+        // スコープを抜けるとプロセスごと破棄される)。reader スレッドは
+        // `read()` から永久に戻らず、production コードの設計どおりリークする
+        let (_never_signaled, block_rx) = channel::<()>();
+        let reader = WedgedReader { block: block_rx };
+        let (drain_tx, drain_rx) = channel::<()>();
+        let reader_handle = spawn_reader_thread(
+            "surf".to_string(),
+            Box::new(reader),
+            Arc::clone(&backpressure),
+            Arc::clone(&sink),
+            drain_tx,
+        )
+        .expect("spawn reader thread");
+
+        let (exit_tx, exit_rx) = channel::<()>();
+        exit_tx.send(()).expect("pre-fire fake process exit");
+        let fake_child = FakeChild {
+            exit_gate: Mutex::new(exit_rx),
+        };
+        let pid = Arc::new(Mutex::new(None));
+        let started = std::time::Instant::now();
+        spawn_waiter_thread(
+            "surf".to_string(),
+            Box::new(fake_child),
+            reader_handle,
+            Arc::clone(&backpressure),
+            Arc::clone(&alive),
+            pid,
+            sink,
+            drain_rx,
+        )
+        .expect("spawn waiter thread");
+
+        // このテスト自身の待ちは必ず上限を切る(production 内部の deadline
+        // 値そのものに結合させないよう、意図的に余裕を持たせた 3 秒とする)。
+        // 超えたら明示的に panic させる
+        let event = rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "on_exit が 3 秒以内に届かなかった: reader が read() で wedge した \
+                 ときに waiter が join() を無条件に待ってハングしている疑いがある ({err})"
+                )
+            });
+        let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_secs(2),
-            "on_exit の到着が遅すぎる ({elapsed:?}): stall_timeout(5秒)待ちの疑いがある"
+            matches!(event, Ev::Exit(Some(0))),
+            "actual event: {event:?}"
+        );
+        assert!(!alive.load(Ordering::SeqCst));
+        // reader が wedge しているため、waiter は内部の join deadline まで
+        // 律儀に待ってから on_exit を出しているはず。ほぼ即座に返ってしまうと、
+        // 待たずに on_exit を出す(=バグを別の形で踏んでいる)か、たまたま
+        // wedge を再現できていない疑いがある
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "on_exit が早く届きすぎた ({elapsed:?}): join deadline を待たずに \
+             on_exit を出している、または reader の wedge を再現できていない疑いがある"
         );
     }
 
