@@ -72,33 +72,38 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
                 },
               ];
             }
-            // 同一列（backlog）内の入れ替え: s1 を s2 の後ろへ
-            return [
-              {
-                id: 's2',
-                project_id: 'p1',
-                title: 'add tests',
-                description: '',
-                kanban_status: 'backlog',
-                sort_order: 1500,
-                cli_kind: 'claude',
-                mode: 'worktree',
-                branch: 'add-tests',
-                archived_at: null,
-              },
-              {
-                id: 's1',
-                project_id: 'p1',
-                title: 'fix login',
-                description: '',
-                kanban_status: 'backlog',
-                sort_order: 2500,
-                cli_kind: 'claude',
-                mode: 'worktree',
-                branch: 'fix-login',
-                archived_at: null,
-              },
-            ];
+            // 同一列（backlog）内の入れ替え。フロント（resolveDragEnd / moveCardInOrder）と
+            // 同じ規約 —— 移動対象 (s1) を除いた配列 L = [s2] に対する挿入 index として
+            // args.toIndex を解釈し、並びをここで再現する。列間 DnD の分岐（args.toStatus）と
+            // 同様に「モックが引数に依存する」構造にすることで、resolveDragEnd が誤った index
+            // （例えば no-op の 0）を返したときにこの関数が返す並びも追従して壊れ、
+            // 下の toHaveText アサーションが実際に落ちる（固定配列を読み返すだけの判別力ゼロを避ける）。
+            const s1 = {
+              id: 's1',
+              project_id: 'p1',
+              title: 'fix login',
+              description: '',
+              kanban_status: 'backlog',
+              cli_kind: 'claude',
+              mode: 'worktree',
+              branch: 'fix-login',
+              archived_at: null,
+            };
+            const s2 = {
+              id: 's2',
+              project_id: 'p1',
+              title: 'add tests',
+              description: '',
+              kanban_status: 'backlog',
+              cli_kind: 'claude',
+              mode: 'worktree',
+              branch: 'add-tests',
+              archived_at: null,
+            };
+            const l = [s2];
+            const insertAt = Math.max(0, Math.min(Number(args.toIndex), l.length));
+            const order = [...l.slice(0, insertAt), s1, ...l.slice(insertAt)];
+            return order.map((s, i) => ({ ...s, sort_order: (i + 1) * 1000 }));
           },
         },
       }),
@@ -151,10 +156,13 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
     const moveSessionCalls = calls.filter((c) => c.cmd === 'move_session');
     expect(moveSessionCalls).toHaveLength(1);
-    expect(moveSessionCalls[0].args).toMatchObject({ id: 's1', toStatus: 'backlog' });
+    // over カード (s2) の移動前の位置（backlog = [s1, s2] における index 1）を
+    // resolveDragEnd がそのまま返すこと（契約 §49.3.2 の to_index 規約）。
+    expect(moveSessionCalls[0].args).toMatchObject({ id: 's1', toStatus: 'backlog', toIndex: 1 });
 
-    // 主アサーションはモックの戻り値どおりに並びが入れ替わったこと
-    // （dnd-kit の over 解決の細部より、盤面に反映される最終結果の方が壊れにくい）。
+    // かつ、その toIndex を使って move_session モックが組み立てた並びが実際に DOM へ
+    // 反映されていること（dnd-kit の over 解決の細部より、盤面に反映される最終結果の方が
+    // 壊れにくい。上の toIndex アサーションと合わせて二重に判別力を持たせる）。
     await expect(page.locator('[data-column="backlog"] .kanban-card__title')).toHaveText([
       'add tests',
       'fix login',
@@ -191,67 +199,77 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     await expect(board).toBeVisible();
     await expect(page.locator('.app__placeholder')).toHaveCount(0);
   });
+});
 
-  test('move_session が失敗すると .error-toast が表示され、カードは元の列に戻る', async ({
-    page,
-  }) => {
-    // move_session だけ失敗させるため、このテストは共通モックを上書きする。
-    await page.addInitScript(
-      tauriMockScript({
-        commands: {
-          list_projects: () => [
-            { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'claude' },
-          ],
-          list_sessions: () => [
-            {
-              id: 's1',
-              project_id: 'p1',
-              title: 'fix login',
-              description: '',
-              kanban_status: 'backlog',
-              sort_order: 1000,
-              cli_kind: 'claude',
-              mode: 'worktree',
-              branch: 'fix-login',
-              archived_at: null,
-            },
-          ],
-          move_session: () => {
-            throw { code: 'db', message: 'forced' };
+// 共通 describe の外に置く独立した spec。この spec だけ move_session が reject する
+// モックが要り、共通 beforeEach の move_session（成功する版）と同じプロパティを
+// 上書きする 2 本目の addInitScript を重ねる形は取らない —— Playwright は
+// 「複数の addInitScript の評価順を保証しない」と明記しており、同じプロパティを
+// 取り合う 2 スクリプトを重ねると理論上どちらが最終的に勝つか決まらない
+// （たまたま今は後勝ちで動いていても、将来 flaky な失敗として顕在化しうる）。
+// addInitScript は 1 回だけ、必要な形をあらかじめ全部詰めて呼ぶ。
+test('move_session が失敗すると .error-toast が表示され、カードは元の列に戻る', async ({
+  page,
+}) => {
+  await page.addInitScript(
+    tauriMockScript({
+      commands: {
+        list_projects: () => [
+          { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'claude' },
+        ],
+        list_sessions: () => [
+          {
+            id: 's1',
+            project_id: 'p1',
+            title: 'fix login',
+            description: '',
+            kanban_status: 'backlog',
+            sort_order: 1000,
+            cli_kind: 'claude',
+            mode: 'worktree',
+            branch: 'fix-login',
+            archived_at: null,
           },
+        ],
+        move_session: () => {
+          throw { code: 'db', message: 'forced' };
         },
-      }),
-    );
-    await page.reload();
-    await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
+      },
+    }),
+  );
+  await page.goto('/');
+  await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
 
-    const target = await page.locator('[data-column="in_progress"]').boundingBox();
-    if (target === null) throw new Error('column has no bounding box');
-    await dragCardTo(page, 's1', {
-      x: target.x + target.width / 2,
-      y: target.y + target.height / 2,
-    });
-
-    const toast = page.locator('.error-toast');
-    await expect(toast).toBeVisible();
-    await expect(page.locator('.error-toast__code')).toHaveText('db');
-    await expect(page.locator('.error-toast__message')).toHaveText('forced');
-
-    // ロールバック: カードは Backlog に留まる（sessionSlice.moveCard の catch 節）
-    await expect(page.locator('[data-column="backlog"] [data-session-id="s1"]')).toBeVisible();
-    await expect(page.locator('[data-column="in_progress"] [data-session-id="s1"]')).toHaveCount(0);
-
-    await page.locator('.error-toast__close').click();
-    await expect(toast).toBeHidden();
+  const target = await page.locator('[data-column="in_progress"]').boundingBox();
+  if (target === null) throw new Error('column has no bounding box');
+  await dragCardTo(page, 's1', {
+    x: target.x + target.width / 2,
+    y: target.y + target.height / 2,
   });
+
+  const toast = page.locator('.error-toast');
+  await expect(toast).toBeVisible();
+  await expect(page.locator('.error-toast__code')).toHaveText('db');
+  await expect(page.locator('.error-toast__message')).toHaveText('forced');
+
+  // ロールバック: カードは Backlog に留まる（sessionSlice.moveCard の catch 節）
+  await expect(page.locator('[data-column="backlog"] [data-session-id="s1"]')).toBeVisible();
+  await expect(page.locator('[data-column="in_progress"] [data-session-id="s1"]')).toHaveCount(0);
+
+  await page.locator('.error-toast__close').click();
+  await expect(toast).toBeHidden();
 });
 
 test('起動時復元: activeProjectId の選択・sort_order 順の描画・不正 ID のフォールバックが UI に反映される', async ({
   page,
 }) => {
   // localStorage が既に値を持つ場合（後段の reload）は上書きしない。
-  // Playwright は複数 addInitScript の評価順を保証しないため、後から足すスクリプトで
-  // 「後勝ち」を狙う設計にはしない（本スクリプトを毎回 no-op 化できる形にする）。
+  // Playwright は複数 addInitScript の評価順を保証しないため、「後勝ち」に依存する
+  // 設計は取らない。下の tauriMockScript の初期化スクリプトとは触るプロパティが
+  // 完全に別（このスクリプトは localStorage、あちらは window.__TAURI_INTERNALS__）
+  // なので、2 本の評価順がどちらであっても最終結果は変わらない。
+  // このスクリプト自身も「値が無いときだけ書く」形にして、reload で再評価されても
+  // （page.evaluate で書き換えた値を）壊さないようにしてある（下の fallback 検証で使う）。
   await page.addInitScript(() => {
     if (window.localStorage.getItem('kamux.activeProjectId') === null) {
       window.localStorage.setItem('kamux.activeProjectId', 'p2');
