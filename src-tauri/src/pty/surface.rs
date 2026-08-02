@@ -47,7 +47,15 @@ pub struct PtySurface {
     /// `ChildKiller`(`clone_killer()` が返す `ProcessSignaller`)は unix では
     /// SIGHUP を1発送るだけでエスカレーションが無いため使わない
     /// (詳細は `kill()` のドキュメントコメント参照)。
-    pid: Option<u32>,
+    ///
+    /// `Mutex` で包んでいるのは値の排他制御のためだけではない。waiter スレッドは
+    /// `child.wait()` で reap した直後に、この Mutex を保持したまま `None` を
+    /// 書き込む。`kill()` 側も同じ Mutex を保持したまま「pid が Some か」の
+    /// チェックとシグナル送出の syscall を行うため、両者は互いに排他される。
+    /// これにより「reap 済みで OS が pid を再利用しうる状態」と「kill() が
+    /// その pid へシグナルを送る」が同時に起こる窓が無くなる(TOCTOU 対策)。
+    /// waiter スレッドも同じ `Arc` を共有するため `Arc` で包む。
+    pid: Arc<Mutex<Option<u32>>>,
     backpressure: Arc<Backpressure>,
     alive: Arc<AtomicBool>,
 }
@@ -106,8 +114,10 @@ impl PtySurface {
         // `kill()` のドキュメントコメント参照)
         let mut killer = child.clone_killer();
         // 成功経路で `PtySurface::kill()` が使う。waiter スレッドへ `child` を
-        // 渡す(move する)前に取得しておく必要がある
-        let pid = child.process_id();
+        // 渡す(move する)前に取得しておく必要がある。waiter スレッドと
+        // `PtySurface` 本体の双方が同じ Mutex を共有する必要があるため、
+        // `Self` を構築するより前に `Arc<Mutex<_>>` として確保しておく
+        let pid = Arc::new(Mutex::new(child.process_id()));
         let reader = pair.master.try_clone_reader().map_err(|e| {
             let _ = killer.kill();
             AppError::PtySpawn(e.to_string())
@@ -141,6 +151,7 @@ impl PtySurface {
             reader_handle,
             Arc::clone(&backpressure),
             Arc::clone(&alive),
+            Arc::clone(&pid),
             sink,
         ) {
             // waiter スレッドの起動に失敗すると、reader スレッドの JoinHandle は
@@ -220,20 +231,41 @@ impl PtySurface {
     /// プロセスグループリーダー(pgid == pid)になっているため、負の pid で
     /// `kill(2)` を呼ぶと `killpg` 相当になり、子が生んだ孫プロセスも
     /// まとめて終わらせられる。
+    ///
+    /// pid 再利用対策(TOCTOU): 「pid が Some か確認する」から「実際に
+    /// syscall を撃つ」までを `pid` の Mutex ガード 1 回の下で行う。waiter
+    /// スレッドは `child.wait()` で reap した直後、同じ Mutex を保持したまま
+    /// `None` を書き込む。この 2 者が同じ Mutex で直列化されるため、
+    /// 「reap 済みで OS が pid を再利用しうる状態」で本関数がまだ古い pid へ
+    /// シグナルを送ってしまう窓が無くなる。
     pub fn kill(&self) -> AppResult<()> {
         // reader が滞留待ちで停止していても必ず起こす。close() は何度呼んでも安全
         self.backpressure.close();
-        if !self.is_alive() {
-            return Ok(());
-        }
-        let Some(pid) = self.pid else {
-            // process_id() が None ならこれ以上シグナルを送る手段が無い。alive は
-            // waiter が child.wait() から戻った時点で自然に false になる
+        let guard = lock_or_recover(&self.pid);
+        let Some(pid) = *guard else {
+            // None は「process_id() が取れなかった」か「waiter が既に reap 済み」
+            // のいずれか。どちらもこれ以上シグナルを送る手段/必要が無い
             return Ok(());
         };
-        // Safety: pid は spawn 成功時に portable-pty から取得した実在のプロセス
-        // ID。負号を付けることで対象プロセスのグループ全体への SIGKILL になる
-        let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        // u32 → i32 変換に失敗するのは pid が i32::MAX を超える場合のみで、
+        // macOS の pid_max(既定・上限とも i32 の範囲内)では到達不能。単項マイナス
+        // (`-(pid as libc::pid_t)`)は pid が `i32::MIN` にキャストされると
+        // debug ビルドで overflow panic するため、`try_from` で明示的に弾き、
+        // 万一到達した場合もシグナルを送らず Ok を返す(Drop 経由で呼ばれても
+        // panic しない)。
+        let Ok(pid_t) = i32::try_from(pid) else {
+            return Ok(());
+        };
+        // Safety: `guard` を保持したままここに到達している。waiter スレッドは
+        // `child.wait()` から復帰した直後、この同じ Mutex を保持してからでない
+        // と `pid` を `None` に書き換えられない(上のコメント参照)。つまり
+        // このロックを握っている間、waiter はまだ pid を書き換え中でないことが
+        // 保証され、「reap 済みで OS が pid を再利用した後の別プロセス
+        // (グループ)を誤って殺す」という論理ハザードをこの不変条件が防いでいる。
+        // `libc::kill` 自体は任意の整数値に対してメモリ安全な呼び出しであり、
+        // 危険なのは UB ではなくこの論理ハザードの方である。
+        let result = unsafe { libc::kill(-pid_t, libc::SIGKILL) };
+        drop(guard);
         if result == 0 {
             return Ok(());
         }
@@ -296,12 +328,18 @@ fn spawn_waiter_thread(
     reader_handle: JoinHandle<()>,
     backpressure: Arc<Backpressure>,
     alive: Arc<AtomicBool>,
+    pid: Arc<Mutex<Option<u32>>>,
     sink: Arc<dyn PtySink>,
 ) -> AppResult<()> {
     std::thread::Builder::new()
         .name(format!("kamux-pty-wait-{surface_id}"))
         .spawn(move || {
             let exit_code = child.wait().ok().map(|status| status.exit_code() as i32);
+            // reap した直後、Mutex を保持したまま pid を None にする。`kill()`
+            // 側もこの同じ Mutex を保持したまま「pid が Some か」のチェックと
+            // シグナル送出を行うため、この 1 行が pid 再利用 TOCTOU を塞ぐ境界
+            // になる(詳細は `PtySurface::kill()` のドキュメントコメント参照)。
+            *lock_or_recover(&pid) = None;
             alive.store(false, Ordering::SeqCst);
             // reader が滞留待ちで眠っていても起こす。close() を join() より先に
             // 呼ばないと、バックプレッシャーで停止した reader は二度と起きず
@@ -557,12 +595,14 @@ mod tests {
         let fake_child = FakeChild {
             exit_gate: Mutex::new(exit_rx),
         };
+        let pid = Arc::new(Mutex::new(None));
         spawn_waiter_thread(
             "surf".to_string(),
             Box::new(fake_child),
             reader_handle,
             Arc::clone(&backpressure),
             Arc::clone(&alive),
+            pid,
             sink,
         )
         .expect("spawn waiter thread");
@@ -649,12 +689,14 @@ mod tests {
         let fake_child = FakeChild {
             exit_gate: Mutex::new(exit_rx),
         };
+        let pid = Arc::new(Mutex::new(None));
         spawn_waiter_thread(
             "surf".to_string(),
             Box::new(fake_child),
             reader_handle,
             Arc::clone(&backpressure),
             Arc::clone(&alive),
+            pid,
             sink,
         )
         .expect("spawn waiter thread");
@@ -843,6 +885,34 @@ mod tests {
     }
 
     #[test]
+    fn kill_after_reap_does_not_signal_a_recycled_pid() {
+        // Important 1 の弁別: waiter は `child.wait()` で reap した直後、
+        // `pid` mutex を保持したまま `None` を書き込む。on_exit を受け取った
+        // 時点で(waiter スレッド内で on_exit 送出は None 書き込みの後に行われる
+        // ため)、`surface.pid` は必ず `None` になっているはずである。もし
+        // waiter の「pid を None にする」処理が抜けていると、ここは red になる。
+        // その状態で `kill()` を呼んでも、裸の pid へシグナルが飛ばないこと
+        // (= Ok(()) を返すこと)を確認する。
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec("/bin/echo", &["reap-then-kill"]),
+            Arc::new(ChannelSink { tx }),
+        )
+        .expect("spawn /bin/echo");
+        let (_out, code) = drain(&rx, &surface);
+        assert_eq!(code, Some(0));
+        assert!(
+            surface
+                .pid
+                .lock()
+                .expect("pid mutex not poisoned")
+                .is_none(),
+            "reap 後も pid が Some のまま残っている(TOCTOU の窓が塞がっていない疑い)"
+        );
+        assert!(surface.kill().is_ok(), "reap 後の kill() は Ok を返すべき");
+    }
+
+    #[test]
     fn dropping_a_surface_without_kill_still_terminates_the_child_process() {
         // Critical(a) の弁別: `PtySurface` の `master`/`writer` フィールドを
         // 単純にフィールド単位で drop するだけでは、SIGHUP をハンドル/無視する
@@ -870,7 +940,11 @@ mod tests {
             Arc::new(ChannelSink { tx }),
         )
         .expect("spawn /bin/sh");
-        let pid = surface.pid.expect("pid captured at spawn");
+        let pid = surface
+            .pid
+            .lock()
+            .expect("pid mutex not poisoned")
+            .expect("pid captured at spawn");
         // trap 設置前に何かが起きて偶然死ぬ余地を無くすため、trap 設置後に
         // 子プロセスが出す目印が届くまで待ってから drop する
         let mut out = String::new();
