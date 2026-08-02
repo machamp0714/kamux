@@ -66,6 +66,22 @@ pub const DEFAULT_ROWS: u16 = 24;
 /// 検知不能のままスレッドが走り続けるだけで panic やリソース破壊は起きない)
 /// `on_exit` を優先して届ける。
 ///
+/// # この Timeout 分岐に限られるトレードオフ: `on_exit` の後に `on_data` が
+/// 最大 1 件届きうる
+///
+/// Timeout 分岐で `on_exit` を撃って `return` した後も、リークした reader
+/// スレッドは走り続けている。その `read()` が(孫プロセス側の出力等で)
+/// たまたま `n > 0` を得て戻ってくると、reader は
+/// `backpressure.record(n)` → `sink.on_data(...)` を実行してから、ループ
+/// 先頭の `wait_until_drained()` で `closed` を見て初めて終了する。
+/// `Backpressure::record()` は `closed` を見ずに `seq` を進めるため、この
+/// 経路では **`pty://exit` の後に `pty://data` が最大 1 件届き**、かつ
+/// **論理的には既に死んでいる surface の `seq` が 1 つ進む**ことがある。
+/// 素の `join()` だった(Timeout 分岐を持たない)修正前は、この順序は
+/// 構造的に起こり得なかった。この挙動を変える(reader が `closed` を見て
+/// emit 自体を抑止する等)かどうかは M2-1 との契約に関わる判断のため、
+/// ここでは事実を記録するに留め、コードは変更していない。
+///
 /// 契約に定義は無い内部実装用の定数(契約 §15 は M1-3 が内部実装を自由に
 /// 決めてよいと明記している)。
 const PTY_JOIN_DEADLINE: Duration = Duration::from_secs(1);
@@ -434,7 +450,11 @@ fn spawn_waiter_thread(
                     // slave を握ったまま親が exit するケース)。reader スレッド
                     // を JoinHandle ごと drop してリークさせてでも(検知不能の
                     // まま走り続けるだけで panic やリソース破壊は起きない)
-                    // on_exit を優先して届ける
+                    // on_exit を優先して届ける。
+                    // この分岐に限り、リークした reader が read() から復帰した
+                    // 場合 on_exit の後に on_data が最大 1 件届き、死んだ
+                    // surface の seq が 1 つ進みうる(詳細は PTY_JOIN_DEADLINE
+                    // のドキュメントコメント参照。挙動は未変更、記録のみ)
                     sink.on_exit(&surface_id, exit_code);
                     return;
                 }
@@ -769,9 +789,15 @@ mod tests {
         // スレッドをリークさせてでも on_exit を届けなければならない。
         struct WedgedReader {
             block: Receiver<()>,
+            // reader が read() に実際に到達したことをテスト側へ知らせる
+            // セットアップ・ハンドシェイク(詳細は呼び出し側のコメント参照)
+            reached_read: Sender<()>,
         }
         impl std::io::Read for WedgedReader {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                // read() に到達した合図を送る。テスト側はこれを受け取ってから
+                // 子プロセスの exit を発火させる(詳細は呼び出し側のコメント参照)
+                let _ = self.reached_read.send(());
                 // 対応する Sender は通常 drop されない設計なので、この recv() は
                 // 通常決して返らない(孫プロセスに slave を握られ続けている状態を
                 // 模す)。ただし、このテストが(タイミング flake 等で)途中で
@@ -798,7 +824,20 @@ mod tests {
         // スコープを抜けるとプロセスごと破棄される)。reader スレッドは
         // `read()` から永久に戻らず、production コードの設計どおりリークする
         let (_never_signaled, block_rx) = channel::<()>();
-        let reader = WedgedReader { block: block_rx };
+        // セットアップ・ハンドシェイク用チャネル。これが無いと、waiter の
+        // close()(`backpressure.rs::wait_until_drained()` は `closed` を
+        // `pending` より先に判定する)が reader の最初の
+        // `wait_until_drained()` より先に届くことがあり、reader が一度も
+        // `read()` を呼ばずに break してしまう(= wedge が成立しないまま
+        // on_exit が数百マイクロ秒で届き、下の `elapsed >= 300ms` が偶発的に
+        // red になるセットアップ・レース)。reader が `read()` に到達した
+        // ことを確認してから子プロセスの exit を発火させることで、この
+        // レースを決定的に排除する
+        let (reached_read_tx, reached_read_rx) = channel::<()>();
+        let reader = WedgedReader {
+            block: block_rx,
+            reached_read: reached_read_tx,
+        };
         let (drain_tx, drain_rx) = channel::<()>();
         let reader_handle = spawn_reader_thread(
             "surf".to_string(),
@@ -808,6 +847,18 @@ mod tests {
             drain_tx,
         )
         .expect("spawn reader thread");
+
+        // reader が read() に到達するまで待つ(上記ハンドシェイクの受信側)。
+        // 上限を切り、タイムアウトしたら「reader が read() に到達しなかった」
+        // と分かるメッセージで明示的に panic させる
+        reached_read_rx
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "reader が read() に到達しなかった(セットアップに失敗した \
+                 疑いがある): {err}"
+                )
+            });
 
         let (exit_tx, exit_rx) = channel::<()>();
         exit_tx.send(()).expect("pre-fire fake process exit");
