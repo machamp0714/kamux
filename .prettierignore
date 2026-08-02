@@ -13,3 +13,6 @@ skills-lock.json
 # task brief / report / 進捗台帳（.superpowers/sdd/*/.gitignore で git 管理外）。
 # 他タスクの brief や共有 progress.md を Prettier が書き換えるのを防ぐ。
 .superpowers/
+# 契約 §53.2: .claude/skills/kamux-design-system/tokens.css の逐語コピー。
+# Prettier のコメント字送り整形すら許さない（1 文字も編集しない）。
+src/styles/tokens.css
