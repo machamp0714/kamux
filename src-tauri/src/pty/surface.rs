@@ -1290,13 +1290,28 @@ mod tests {
         // 同期ではなく、短いタイムアウトが Err(Timeout) を返した時点を
         // 「これ以上チャンクが来ない」の決定的な合図として扱う。負荷下の
         // --test-threads=2 でも reader がまだ送出中のチャンクを取りこぼして
-        // 後段の assert が偽陽性で red になることを避ける)
+        // 後段の assert が偽陽性で red になることを避ける)。
+        // reader がゲートで止まらない退行(バックプレッシャーが効かず
+        // /usr/bin/yes の出力が来続ける)が起きた場合、このループは
+        // recv_timeout(300ms) を毎回リセットしながら際限なく回り続けて
+        // ハングしうる(実測済み: mutation 確認で 132.8 秒ハングし、外部から
+        // 子プロセスを kill するまで終わらなかった)。「必ず recv_timeout 等で
+        // 上限を切り、タイムアウトしたら明示的に panic する」という要件を
+        // 満たすため、ドレイン開始からの総経過時間にも別枠で上限を設け、
+        // 超えたら明示的に panic させる(正しい実装は最後のチャンクから
+        // 300ms 以内にここを抜けるため、5 秒は十分すぎる余裕)
+        let drain_started = std::time::Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(Ev::Data { seq, .. }) => last_seq = seq,
                 Ok(other) => panic!("expected pty data while draining, got {other:?}"),
                 Err(_) => break,
             }
+            assert!(
+                drain_started.elapsed() < Duration::from_secs(5),
+                "reader never stopped draining within 5s: backpressure gate may be gone \
+                 (reader not pausing at high water)"
+            );
         }
         assert!(surface.pending_bytes() >= BACKPRESSURE_HIGH_WATER);
 
