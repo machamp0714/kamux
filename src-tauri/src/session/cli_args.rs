@@ -245,6 +245,18 @@ mod tests {
         assert!(login_shell().starts_with('/'), "actual: {}", login_shell());
     }
 
+    // login_shell() が login_shell_from(std::env::var("SHELL").ok()) に確かに委譲していることを
+    // 固定する。login_shell_from の 3 分岐テストは wrapper を経由しないため、wrapper 自体が
+    // $SHELL を握りつぶして固定値を返す変異（login_shell_from(None) など）を検出できない。
+    // 実行環境の SHELL を読むだけで書き換えないため、並列テストと干渉しない。
+    #[test]
+    fn login_shell_reflects_the_shell_environment_variable() {
+        match std::env::var("SHELL") {
+            Ok(shell) if shell.starts_with('/') => assert_eq!(login_shell(), shell),
+            _ => assert_eq!(login_shell(), "/bin/zsh"),
+        }
+    }
+
     // login_shell() 自体は $SHELL 環境変数に依存し、書き換えると並列テストと干渉する
     // （レーンの制約）。3 分岐は login_shell_from に切り出した純関数として固定する。
     #[test]
