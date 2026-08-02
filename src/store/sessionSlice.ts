@@ -1,42 +1,85 @@
 import type { StateCreator } from 'zustand';
 
-import { createSession, listSessions, moveSession, type CreateSessionArgs } from '../ipc/commands';
-import type { KanbanStatus, Session } from '../types/model';
+import {
+  createSession,
+  listSessions,
+  moveSession,
+  updateSession as updateSessionCmd,
+  type CreateSessionArgs,
+} from '../ipc/commands';
+import type { KanbanStatus, RuntimeState, Session, SessionPatch } from '../types/model';
 import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
 
 export { emptySessionOrder, indexSessions } from './kanbanOrder';
 
+/**
+ * await をまたぐ経路の先頭で呼び、戻り値の関数を「応答を適用する直前」に呼んで判定する。
+ * sessions / sessionOrder は常に activeProjectId のものである、という不変条件
+ * （loadSessions が最初に宣言したもの。上のコメント参照）を、addSession / editSession /
+ * archiveSession / moveCard の成功・失敗の両経路でも守るための共通ガード。
+ * IPC 往復中にプロジェクトが切り替わっていたら、応答は盤面へ適用せず捨てる
+ * （呼び出し元への返り値・throw はこのガードと無関係に行うこと）。
+ */
+function isStillActiveProject(get: () => AppStore): () => boolean {
+  const projectId = get().activeProjectId;
+  return () => get().activeProjectId === projectId;
+}
+
 export interface SessionSlice {
   sessions: Record<string, Session>;
   sessionOrder: Record<KanbanStatus, string[]>;
+
+  /**
+   * runtime バッジの表示枠。M1-2 は型と初期値だけを置き、書き換えない。
+   * 値の導出（applyStateEvent）は M2-1 の担当（契約 §2 / §10）。
+   */
+  runtimeStates: Record<string, RuntimeState>;
+
   loadSessions: (projectId: string) => Promise<void>;
   addSession: (args: CreateSessionArgs) => Promise<Session>;
   moveCard: (sessionId: string, to: KanbanStatus, index: number) => Promise<void>;
+  editSession: (id: string, patch: SessionPatch) => Promise<Session>;
+  archiveSession: (id: string) => Promise<void>;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
   sessions: {},
   sessionOrder: emptySessionOrder(),
+  runtimeStates: {},
 
   loadSessions: async (projectId) => {
     // アーカイブ済みは表示しない（復活 UX は M3-4）
     const list = await listSessions(projectId, false);
+    // 応答が返るまでにプロジェクトが切り替わっていたら捨てる（M1-1 からの申し送り）。
+    // sessions / sessionOrder を所有する sessionSlice が「これらは常に activeProjectId の
+    // ものである」という不変条件も持つ。projectSlice.setActiveProject は
+    // activeProjectId を set してから loadSessions を await するので、初回ロードは弾かれない。
+    // 【この行より上で set() しないこと】ガードは「この応答を捨てるかどうか」の判定であり、
+    // ガードより前に set すると、捨てたはずの応答の副作用だけがストアに残る。
+    // 例: 契約 §34.6 で M2-1 が足す予定の seedRuntimeStates(list, true) は、必ずこのガードの
+    // 下（return の後）に置くこと。上に置くと runtimeStates だけ stale なプロジェクトで
+    // seed され、sessions / sessionOrder は現行のまま、という split-brain に戻ってしまう。
+    if (get().activeProjectId !== projectId) return;
     set(indexSessions(list));
   },
 
   addSession: async (args) => {
+    const isStillActive = isStillActiveProject(get);
     const created = await createSession(args);
-    const { sessions, sessionOrder } = get();
-    const column = sessionOrder[created.kanban_status];
-    set({
-      sessions: { ...sessions, [created.id]: created },
-      sessionOrder: { ...sessionOrder, [created.kanban_status]: [...column, created.id] },
-    });
+    if (isStillActive()) {
+      const { sessions, sessionOrder } = get();
+      const column = sessionOrder[created.kanban_status];
+      set({
+        sessions: { ...sessions, [created.id]: created },
+        sessionOrder: { ...sessionOrder, [created.kanban_status]: [...column, created.id] },
+      });
+    }
     return created;
   },
 
   moveCard: async (sessionId, to, index) => {
+    const isStillActive = isStillActiveProject(get);
     const { sessions, sessionOrder } = get();
     const target = sessions[sessionId];
     if (!target) return;
@@ -53,15 +96,65 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       // 戻り値は「移動先の列」の全 Session（sort_order 昇順・同値は id タイブレーク。契約 §49.4）。
       // 移動元の列は 1 行も変化しないので返らない。楽観更新で除去済みの状態が正しい。
       const column = await moveSession(sessionId, to, index);
-      const merged = { ...get().sessions };
-      for (const s of column) merged[s.id] = s;
-      set({
-        sessions: merged,
-        sessionOrder: { ...get().sessionOrder, [to]: column.map((s) => s.id) },
-      });
+      if (isStillActive()) {
+        const merged = { ...get().sessions };
+        for (const s of column) merged[s.id] = s;
+        set({
+          sessions: merged,
+          sessionOrder: { ...get().sessionOrder, [to]: column.map((s) => s.id) },
+        });
+      }
     } catch (e) {
       // DB が受け付けなかった位置にカードを残さない
-      set({ sessions, sessionOrder });
+      // ただし切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で
+      // 上書きしてはいけない。throw はガードと無関係に行う
+      if (isStillActive()) {
+        set({ sessions, sessionOrder });
+      }
+      throw e;
+    }
+  },
+
+  editSession: async (id, patch) => {
+    // title / description しか変えない想定（判断 10）。並びに影響しないので
+    // sessionOrder は触らず、sessions の当該エントリだけを差し替える。
+    const isStillActive = isStillActiveProject(get);
+    const saved = await updateSessionCmd(id, patch);
+    if (isStillActive()) {
+      set({ sessions: { ...get().sessions, [saved.id]: saved } });
+    }
+    return saved;
+  },
+
+  archiveSession: async (id) => {
+    const isStillActive = isStillActiveProject(get);
+    const snapshot = get().sessions;
+    const prevOrder = get().sessionOrder;
+    const target = snapshot[id];
+    if (target === undefined) return;
+
+    // 楽観更新: 盤面からは当該列だけ除去する（buildSessionOrder による全列再構築は
+    // moveCard の in-flight 中と重なると、移動中のカードが古い sort_order の位置へ
+    // 吸着して見えるおそれがあるため避ける）。
+    const archivedAt = Date.now();
+    const optimisticSessions = { ...snapshot, [id]: { ...target, archived_at: archivedAt } };
+    const optimisticOrder = {
+      ...prevOrder,
+      [target.kanban_status]: prevOrder[target.kanban_status].filter((sid) => sid !== id),
+    };
+    set({ sessions: optimisticSessions, sessionOrder: optimisticOrder });
+
+    try {
+      const saved = await updateSessionCmd(id, { archived_at: archivedAt });
+      if (isStillActive()) {
+        set({ sessions: { ...get().sessions, [saved.id]: saved } });
+      }
+    } catch (e) {
+      // 切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で上書きしない。
+      // throw はガードと無関係に行う（呼び出し側がエラーを表示する契約は変えない）
+      if (isStillActive()) {
+        set({ sessions: snapshot, sessionOrder: prevOrder });
+      }
       throw e;
     }
   },

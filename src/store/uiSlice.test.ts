@@ -9,6 +9,7 @@ vi.mock('../ipc/commands', () => ({
 }));
 
 import { useAppStore } from './index';
+import { toAppError } from './uiSlice';
 
 // createUiSlice が実際に生成する初期値をプリミティブとして捕獲する。
 // beforeEach で 'kanban' を書き戻すと「初期ビューはカンバン」テストが
@@ -59,4 +60,65 @@ describe('uiSlice', () => {
       expect(useAppStore.getState().view).toBe(targetView);
     },
   );
+});
+
+describe('uiSlice のモーダル', () => {
+  beforeEach(() => {
+    useAppStore.setState({ modal: null, lastError: null, view: 'terminal' });
+  });
+
+  it('初期状態ではモーダルは開いていない', () => {
+    expect(useAppStore.getState().modal).toBeNull();
+  });
+
+  it('openModal はモーダルを開くと同時にカンバン画面へ切り替える', () => {
+    useAppStore.getState().openModal({ kind: 'create_session' });
+    expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
+    expect(useAppStore.getState().view).toBe('kanban');
+  });
+
+  it('openModal は編集対象の sessionId を保持する', () => {
+    useAppStore.getState().openModal({ kind: 'edit_session', sessionId: 's1' });
+    expect(useAppStore.getState().modal).toEqual({ kind: 'edit_session', sessionId: 's1' });
+  });
+
+  it('closeModal でモーダルが閉じる', () => {
+    useAppStore.getState().openModal({ kind: 'create_session' });
+    useAppStore.getState().closeModal();
+    expect(useAppStore.getState().modal).toBeNull();
+  });
+
+  it('closeModal は view を戻さない（カンバンに留まる）', () => {
+    useAppStore.getState().openModal({ kind: 'create_session' });
+    useAppStore.getState().closeModal();
+    expect(useAppStore.getState().view).toBe('kanban');
+  });
+});
+
+describe('uiSlice のエラー', () => {
+  beforeEach(() => {
+    useAppStore.setState({ lastError: null });
+  });
+
+  it('setError でエラーを保持し、null で消せる', () => {
+    useAppStore.getState().setError({ code: 'db', message: 'disk full' });
+    expect(useAppStore.getState().lastError).toEqual({ code: 'db', message: 'disk full' });
+    useAppStore.getState().setError(null);
+    expect(useAppStore.getState().lastError).toBeNull();
+  });
+});
+
+describe('toAppError', () => {
+  it('Rust から来た AppError 形状はそのまま通す', () => {
+    expect(toAppError({ code: 'git', message: 'fatal: bad revision' })).toEqual({
+      code: 'git',
+      message: 'fatal: bad revision',
+    });
+  });
+
+  it('AppError でない値は io として包む', () => {
+    expect(toAppError(new Error('boom'))).toEqual({ code: 'io', message: 'Error: boom' });
+    expect(toAppError('plain string')).toEqual({ code: 'io', message: 'plain string' });
+    expect(toAppError(null)).toEqual({ code: 'io', message: 'null' });
+  });
 });

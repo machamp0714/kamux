@@ -12,6 +12,7 @@ vi.mock('../ipc/commands', () => ({
 
 import type { Session } from '../types/model';
 import { useAppStore } from './index';
+import { buildSessionOrder } from './kanbanOrder';
 import { emptySessionOrder, indexSessions } from './sessionSlice';
 
 const session = (over: Partial<Session>): Session => ({
@@ -39,7 +40,9 @@ const session = (over: Partial<Session>): Session => ({
 beforeEach(() => {
   listSessions.mockReset();
   createSession.mockReset();
-  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder() });
+  // activeProjectId は loadSessions のガードが参照するため、前のテストの値が
+  // 漏れないよう毎回リセットする。
+  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: 'p1' });
 });
 
 describe('emptySessionOrder', () => {
@@ -110,11 +113,72 @@ describe('loadSessions', () => {
     await useAppStore.getState().loadSessions('p1');
 
     listSessions.mockResolvedValue([session({ id: 'new', project_id: 'p2' })]);
+    // loadSessions は activeProjectId が指すプロジェクトの応答しか適用しない。この行が
+    // 無いと、この呼び出し自体がガードの弾く stale 呼び出しになる（lane-controller 裁定）。
+    useAppStore.setState({ activeProjectId: 'p2' });
     await useAppStore.getState().loadSessions('p2');
 
     expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', false);
     expect(Object.keys(useAppStore.getState().sessions)).toEqual(['new']);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['new']);
+  });
+
+  it('切り替え中に後着した古いプロジェクトの応答で盤面を上書きしない', async () => {
+    // A の応答を B より後に解決させる（実際の切り替えで起きる競合そのもの）
+    let resolveA: (v: Session[]) => void = () => {};
+    listSessions.mockImplementation((projectId: string) => {
+      if (projectId === 'pA') {
+        return new Promise<Session[]>((r) => {
+          resolveA = r;
+        });
+      }
+      return Promise.resolve([session({ id: 'b1', project_id: 'pB' })]);
+    });
+
+    const pendingA = useAppStore.getState().loadSessions('pA');
+    useAppStore.setState({ activeProjectId: 'pB' });
+    await useAppStore.getState().loadSessions('pB');
+
+    // ここで A が後着する
+    resolveA([session({ id: 'a1', project_id: 'pA' })]);
+    await pendingA;
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+    expect(useAppStore.getState().sessions.a1).toBeUndefined();
+  });
+
+  it('要求時のプロジェクトが選択されたままなら通常どおり反映する', async () => {
+    useAppStore.setState({ activeProjectId: 'pA' });
+    listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'pA' })]);
+
+    await useAppStore.getState().loadSessions('pA');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a1']);
+  });
+
+  it('setActiveProject でプロジェクトを切り替えた際も後着応答で上書きしない', async () => {
+    // 実際の呼び出し経路（ProjectBar → setActiveProject → loadSessions）で
+    // 不変条件が守られることを固定する。
+    let resolveA: (v: Session[]) => void = () => {};
+    listSessions.mockImplementation((projectId: string) => {
+      if (projectId === 'pA') {
+        return new Promise<Session[]>((r) => {
+          resolveA = r;
+        });
+      }
+      return Promise.resolve([session({ id: 'b1', project_id: 'pB' })]);
+    });
+
+    const pendingA = useAppStore.getState().setActiveProject('pA');
+    // pA の応答が返る前に pB へ切り替える
+    await useAppStore.getState().setActiveProject('pB');
+
+    // ここで pA が後着する
+    resolveA([session({ id: 'a1', project_id: 'pA' })]);
+    await pendingA;
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+    expect(useAppStore.getState().sessions.a1).toBeUndefined();
   });
 });
 
@@ -166,5 +230,38 @@ describe('addSession', () => {
     // sessions（id 索引）側にも review 列のセッションが入っていることを検証する。
     // sessionOrder だけ更新して sessions を更新し忘れる退行を拾う。
     expect(useAppStore.getState().sessions.r).toEqual(serverSession);
+  });
+
+  it('IPC 応答が返るまでにプロジェクトが切り替わっていたら、B の sessions へ A の作成結果を混ぜない（Task 19 の不変条件）', async () => {
+    // loadSessions と同じ不変条件（sessions / sessionOrder は常に activeProjectId のもの）を
+    // addSession でも守る。IPC 往復中の切り替えは setActiveProject → loadSessions の実経路が
+    // そうするように、activeProjectId の更新と sessions / sessionOrder の丸ごと置き換えを伴う。
+    useAppStore.setState({ activeProjectId: 'p1' });
+    const created = session({ id: 'new', project_id: 'p1' });
+    const bSessions = { b: session({ id: 'b', project_id: 'p2', kanban_status: 'review' }) };
+    createSession.mockImplementation(async () => {
+      useAppStore.setState({
+        activeProjectId: 'p2',
+        sessions: bSessions,
+        sessionOrder: buildSessionOrder(bSessions),
+      });
+      return created;
+    });
+
+    const result = await useAppStore.getState().addSession({
+      projectId: 'p1',
+      title: 'new',
+      description: '',
+      mode: 'in_place',
+      branch: null,
+      cliKind: 'shell',
+      cliCommand: null,
+    });
+
+    // IPC 自体は成功しているので戻り値は呼び出し元へそのまま返す
+    expect(result).toEqual(created);
+    // だが stale なプロジェクト(p1)の作成結果を B の sessions へ足してはいけない
+    expect(useAppStore.getState().sessions).toEqual(bSessions);
+    expect(useAppStore.getState().sessionOrder).toEqual(buildSessionOrder(bSessions));
   });
 });

@@ -41,7 +41,7 @@ beforeEach(() => {
   updateSession.mockReset();
   listSessions.mockReset();
   moveSession.mockReset();
-  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder() });
+  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: 'p1' });
 });
 
 describe('moveCard', () => {
@@ -133,6 +133,9 @@ describe('moveCard', () => {
     expect(moveSession).toHaveBeenCalledWith('a', 'done', 0);
     expect(useAppStore.getState().sessionOrder.done).toEqual(['a']);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
+    // 移動元でも移動先でもない列は手を付けない（丸ごと置換に書き換えると x が消える）
+    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'y']);
+    expect(useAppStore.getState().sessions.x).toEqual(session('x', 'review', 10));
   });
 
   it('ドロップ直後に楽観更新が反映される（サーバ応答を待たない）', async () => {
@@ -172,8 +175,60 @@ describe('moveCard', () => {
       message: 'boom',
     });
 
-    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['a']);
-    expect(useAppStore.getState().sessionOrder.review).toEqual(['x', 'y']);
+    expect(useAppStore.getState().sessionOrder).toEqual({
+      backlog: ['a'],
+      in_progress: [],
+      review: ['x', 'y'],
+      done: [],
+    });
     expect(useAppStore.getState().sessions.a.kanban_status).toBe('backlog');
+  });
+
+  describe('プロジェクト切り替え中の応答（Task 19 の不変条件を moveCard でも守る）', () => {
+    /**
+     * moveSession の IPC 往復中に、ユーザーが別プロジェクト B へ切り替えた状態を再現する。
+     * setActiveProject → loadSessions の実経路がそうするように、B への切り替えは
+     * activeProjectId の更新と sessions / sessionOrder の丸ごと置き換えを伴う。
+     * ガードが無いと、A 宛ての確定応答・ロールバックが B の盤面へ後から書き込まれ、
+     * 「B が active なのに A のセッションが sessions に混じる」幽霊状態になる
+     * （sessionSlice.ts:41-49 が宣言した不変条件と同型。lane-controller 裁定）。
+     */
+    const bBoard = {
+      sessions: { z: session('z', 'review', 1) },
+      sessionOrder: { backlog: [], in_progress: [], review: ['z'], done: [] },
+    };
+    function switchToB() {
+      useAppStore.setState({ activeProjectId: 'p2', ...bBoard });
+    }
+
+    it('確定応答が返るまでに切り替わっていたら、B の盤面へ A の確定応答を適用しない', async () => {
+      seed();
+      moveSession.mockImplementation(async () => {
+        switchToB();
+        return [session('a', 'review', 15), session('x', 'review', 10), session('y', 'review', 20)];
+      });
+
+      await useAppStore.getState().moveCard('a', 'review', 1);
+
+      expect(useAppStore.getState().sessions).toEqual(bBoard.sessions);
+      expect(useAppStore.getState().sessionOrder).toEqual(bBoard.sessionOrder);
+    });
+
+    it('保存に失敗し、かつ応答までに切り替わっていたら、巻き戻さず B の盤面のまま。ただし throw はする', async () => {
+      seed();
+      moveSession.mockImplementation(async () => {
+        switchToB();
+        throw { code: 'db', message: 'boom' };
+      });
+
+      await expect(useAppStore.getState().moveCard('a', 'review', 1)).rejects.toEqual({
+        code: 'db',
+        message: 'boom',
+      });
+
+      // A の盤面(backlog に a、review に x, y)へロールバックされていないこと
+      expect(useAppStore.getState().sessions).toEqual(bBoard.sessions);
+      expect(useAppStore.getState().sessionOrder).toEqual(bBoard.sessionOrder);
+    });
   });
 });
