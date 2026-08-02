@@ -2,8 +2,10 @@
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -15,6 +17,16 @@ use crate::pty::backpressure::{Backpressure, PTY_READ_CHUNK};
 /// spawn 時の既定サイズ。フロントが attach 直後に fit() → resize_pty で合わせる
 pub const DEFAULT_COLS: u16 = 80;
 pub const DEFAULT_ROWS: u16 = 24;
+
+/// waiter が「reader が自然に EOF/EIO まで読み切ってスレッド終了する」のを
+/// 待つ上限。reader スレッド終了時に `drain_tx`(mpsc::Sender)が drop され、
+/// waiter 側の `drain_rx.recv_timeout()` は `Disconnected` を即座に返す
+/// (=出力欠損ゼロで close() へ進める)。この期限を超えたら、reader が
+/// バックプレッシャーのゲートで park している(または read() でブロックして
+/// いる)とみなし、従来どおり `Backpressure::close()` でハードストップする。
+/// 契約に定義は無い内部実装用の定数(契約 §15 は M1-3 が内部実装を自由に
+/// 決めてよいと明記している)。
+const PTY_DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 
 /// PTY の出力先。Tauri から切り離してテスト可能にするための境界
 pub trait PtySink: Send + Sync + 'static {
@@ -53,7 +65,8 @@ pub struct PtySurface {
     /// 書き込む。`kill()` 側も同じ Mutex を保持したまま「pid が Some か」の
     /// チェックとシグナル送出の syscall を行うため、両者は互いに排他される。
     /// これにより「reap 済みで OS が pid を再利用しうる状態」と「kill() が
-    /// その pid へシグナルを送る」が同時に起こる窓が無くなる(TOCTOU 対策)。
+    /// その pid へシグナルを送る」が同時に起こる窓は、`wait()` 復帰〜ロック取得
+    /// までの短い区間に縮小される(完全には消えない。TOCTOU 対策)。
     /// waiter スレッドも同じ `Arc` を共有するため `Arc` で包む。
     pid: Arc<Mutex<Option<u32>>>,
     backpressure: Arc<Backpressure>,
@@ -129,12 +142,17 @@ impl PtySurface {
 
         let backpressure = Arc::new(Backpressure::new());
         let alive = Arc::new(AtomicBool::new(true));
+        // reader スレッドが自然に終了(EOF/EIO)すると drain_tx が drop され、
+        // waiter 側の drain_rx.recv_timeout() が即座に Disconnected を返す。
+        // 詳細は spawn_waiter_thread のコメント参照
+        let (drain_tx, drain_rx) = std::sync::mpsc::channel::<()>();
 
         let reader_handle = match spawn_reader_thread(
             spec.surface_id.clone(),
             reader,
             Arc::clone(&backpressure),
             Arc::clone(&sink),
+            drain_tx,
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -153,6 +171,7 @@ impl PtySurface {
             Arc::clone(&alive),
             Arc::clone(&pid),
             sink,
+            drain_rx,
         ) {
             // waiter スレッドの起動に失敗すると、reader スレッドの JoinHandle は
             // ここで捨てられ二度と join されない。close() で滞留待ちの reader を
@@ -237,7 +256,8 @@ impl PtySurface {
     /// スレッドは `child.wait()` で reap した直後、同じ Mutex を保持したまま
     /// `None` を書き込む。この 2 者が同じ Mutex で直列化されるため、
     /// 「reap 済みで OS が pid を再利用しうる状態」で本関数がまだ古い pid へ
-    /// シグナルを送ってしまう窓が無くなる。
+    /// シグナルを送ってしまう窓は、`wait()` 復帰〜ロック取得までの短い区間に
+    /// 縮小される(完全には消えない)。
     pub fn kill(&self) -> AppResult<()> {
         // reader が滞留待ちで停止していても必ず起こす。close() は何度呼んでも安全
         self.backpressure.close();
@@ -261,7 +281,8 @@ impl PtySurface {
         // と `pid` を `None` に書き換えられない(上のコメント参照)。つまり
         // このロックを握っている間、waiter はまだ pid を書き換え中でないことが
         // 保証され、「reap 済みで OS が pid を再利用した後の別プロセス
-        // (グループ)を誤って殺す」という論理ハザードをこの不変条件が防いでいる。
+        // (グループ)を誤って殺す」という論理ハザードの窓は、`wait()` 復帰〜
+        // ロック取得までの短い区間に縮小される(完全には消えない)。
         // `libc::kill` 自体は任意の整数値に対してメモリ安全な呼び出しであり、
         // 危険なのは UB ではなくこの論理ハザードの方である。
         let result = unsafe { libc::kill(-pid_t, libc::SIGKILL) };
@@ -297,10 +318,16 @@ fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     backpressure: Arc<Backpressure>,
     sink: Arc<dyn PtySink>,
+    drain_tx: Sender<()>,
 ) -> AppResult<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("kamux-pty-read-{surface_id}"))
         .spawn(move || {
+            // ループ全体で保持し、スレッド終了時(このクロージャを抜けるとき)に
+            // drop される。waiter 側はこの drop(Sender 側切断 = Disconnected)
+            // を「reader が自然に読み切って終わった」合図として使う
+            // (詳細は spawn_waiter_thread のコメント参照)。
+            let _drain_tx = drain_tx;
             let mut buf = vec![0u8; PTY_READ_CHUNK];
             loop {
                 // 滞留が高水位を超えている間はここで眠る(ポーリングしない)
@@ -322,6 +349,11 @@ fn spawn_reader_thread(
         .map_err(|e| AppError::Io(e.to_string()))
 }
 
+// 指摘A修正で `drain_rx` を追加したことで 7→8 引数になった。全て異なる型で
+// 意味も独立しており(構造体1個にまとめると、テストの白箱呼び出し側で
+// 「どのフィールドが何を表すか」を毎回書き起こす手間が増えるだけで
+// 可読性は上がらないと判断)、この private ヘルパー限定で許可する。
+#[allow(clippy::too_many_arguments)]
 fn spawn_waiter_thread(
     surface_id: String,
     mut child: Box<dyn Child + Send + Sync>,
@@ -330,6 +362,7 @@ fn spawn_waiter_thread(
     alive: Arc<AtomicBool>,
     pid: Arc<Mutex<Option<u32>>>,
     sink: Arc<dyn PtySink>,
+    drain_rx: Receiver<()>,
 ) -> AppResult<()> {
     std::thread::Builder::new()
         .name(format!("kamux-pty-wait-{surface_id}"))
@@ -341,6 +374,16 @@ fn spawn_waiter_thread(
             // になる(詳細は `PtySurface::kill()` のドキュメントコメント参照)。
             *lock_or_recover(&pid) = None;
             alive.store(false, Ordering::SeqCst);
+            // reader がまだ最初の read() すら試みていないうちにここで
+            // 即座に close() すると、reader は wait_until_drained() で
+            // closed=true を見て1バイトも読まずに終了しうる(短命プロセスの
+            // 出力が丸ごと失われるバグ)。reader スレッド終了時に drain_tx が
+            // drop されると drain_rx は即座に Disconnected を返すので、まずは
+            // それを PTY_DRAIN_DEADLINE を上限として待つ。reader が高水位で
+            // park している等で自然に終わらない場合は、deadline 到達後に
+            // 今までどおり close() でハードストップする(この分岐は
+            // Backpressure の意味論そのものは一切変えていない)。
+            let _ = drain_rx.recv_timeout(PTY_DRAIN_DEADLINE);
             // reader が滞留待ちで眠っていても起こす。close() を join() より先に
             // 呼ばないと、バックプレッシャーで停止した reader は二度と起きず
             // waiter の join() がハングする(契約: 終了経路は join の前に close)。
@@ -422,6 +465,29 @@ mod tests {
         assert!(out.contains("hello-kamux"), "actual output: {out:?}");
         assert_eq!(code, Some(0));
         assert!(!surface.is_alive());
+    }
+
+    #[test]
+    fn short_lived_process_output_is_never_lost_across_repeated_spawns() {
+        // 指摘Aの回帰テスト: reader が最初の read() に到達する前に waiter が
+        // backpressure.close() を撃つと、reader は1バイトも読まずに終了し
+        // うる(修正前は実測で `echo_emits_its_output_then_exits_with_zero` /
+        // `multibyte_output_survives_base64_round_trip` が `cargo test
+        // --workspace` の並列実行下で一過性に `actual output: ""` の red に
+        // なっていた)。単発では踏まないレースなので30回繰り返す。
+        for i in 0..30 {
+            let (tx, rx) = channel();
+            let marker = format!("kamux-drain-check-{i}");
+            let surface =
+                PtySurface::spawn(spec("/bin/echo", &[&marker]), Arc::new(ChannelSink { tx }))
+                    .unwrap_or_else(|e| panic!("spawn /bin/echo (iteration {i}): {e:?}"));
+            let (out, code) = drain(&rx, &surface);
+            assert!(
+                out.contains(&marker),
+                "iteration {i}: actual output: {out:?} (short-lived process output was lost)"
+            );
+            assert_eq!(code, Some(0), "iteration {i}: actual output: {out:?}");
+        }
     }
 
     #[test]
@@ -548,16 +614,94 @@ mod tests {
     }
 
     #[test]
-    fn waiter_closes_backpressure_before_joining_a_reader_parked_on_high_water() {
-        // 「必ず満たせ」項目2・3 の弁別テスト: reader がバックプレッシャーの
+    fn waiter_holds_off_backpressure_close_while_the_reader_has_not_signaled_drain_yet() {
+        // 指摘A(本番バグ)の核心を、スケジューラの偶然に頼らず直接固定する
+        // テスト: waiter は「reader が自然に読み切ってスレッド終了した」ことを
+        // `drain_tx` の drop(Disconnected)で検知するまで、
+        // `Backpressure::close()` を呼ぶのを最大 `PTY_DRAIN_DEADLINE` だけ
+        // 遅らせなければならない。ここでは実 reader スレッドは使わず、
+        // `drain_tx` をテスト側のローカル変数として保持し続けることで
+        // 「reader はまだ生きている(1回も読み切っていない)」を模す。
+        // reader 側(wait_until_drained の意味論)は変更対象外なので、その
+        // 弁別は別テストに委ねる。
+        //
+        // 修正前(即座に close() する実装)では、この関数の最初の assert
+        // ( `!backpressure.is_closed()` )が red になる: `drain_tx` がまだ
+        // 生きているにもかかわらず、waiter は child.wait() 復帰直後に
+        // close() を呼んでしまうため。
+        use std::time::Instant;
+
+        let backpressure = Arc::new(Backpressure::new());
+        let alive = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = channel::<Ev>();
+        let sink: Arc<dyn PtySink> = Arc::new(ChannelSink { tx });
+
+        // reader はまだ1回も drain 完了を知らせていない(=Sender を保持し続ける)
+        let (drain_tx, drain_rx) = channel::<()>();
+        // reader_handle は join() を成立させるためだけのダミー(即座に終わる)。
+        // このテストの弁別対象は「waiter が close() を呼ぶタイミング」であり、
+        // reader 自体の動作ではない。
+        let reader_handle = std::thread::spawn(|| {});
+
+        // 子プロセスは「今まさに終了した」を模す: exit_gate に事前に送っておくと
+        // wait() は即座に返る
+        let (exit_tx, exit_rx) = channel::<()>();
+        exit_tx.send(()).expect("pre-fire fake process exit");
+        let fake_child = FakeChild {
+            exit_gate: Mutex::new(exit_rx),
+        };
+        let pid = Arc::new(Mutex::new(None));
+        spawn_waiter_thread(
+            "surf".to_string(),
+            Box::new(fake_child),
+            reader_handle,
+            Arc::clone(&backpressure),
+            Arc::clone(&alive),
+            pid,
+            sink,
+            drain_rx,
+        )
+        .expect("spawn waiter thread");
+
+        // waiter は child.wait() からほぼ即座に復帰する。reader がまだ
+        // drain 完了を知らせていない(drain_tx がまだ生きている)間は、
+        // close() が呼ばれてはいけない
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !backpressure.is_closed(),
+            "reader がまだ drain 完了を知らせていないのに close() が呼ばれた: \
+             waiter が drain_rx を待たずに即座に close() している疑いがある"
+        );
+
+        // reader が「たった今、自然に読み切ってスレッド終了した」を模す
+        drop(drain_tx);
+
+        // close() は deadline(500ms)を待たずに速やかに呼ばれるはず
+        let started = Instant::now();
+        while !backpressure.is_closed() {
+            assert!(
+                started.elapsed() < Duration::from_millis(200),
+                "drain_tx を drop したのに close() が速やかに呼ばれなかった: \
+                 PTY_DRAIN_DEADLINE まで律儀に待ってしまっている疑いがある"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn waiter_hard_stops_a_reader_still_parked_on_high_water_after_the_drain_deadline() {
+        // 指摘A修正後の不変条件の弁別テスト: reader がバックプレッシャーの
         // ゲート(wait_until_drained)で確実に停止している状態を合成の Read /
         // Child で決定的に作り、その状態で子プロセスの "終了" を発火させる。
-        // waiter が Backpressure::close() を reader_handle.join() より先に
-        // 呼んでいなければ、on_exit は既定の stall_timeout(5秒)が満了するまで
-        // 届かない。実プロセスでこの境界を再現しようとすると、reader が
-        // 止まった直後に子プロセス自身が write() でブロックして終了しなく
-        // なるため(実験で確認済み)、ここではホワイトボックスに直接
-        // spawn_reader_thread / spawn_waiter_thread を呼んで弁別する。
+        // ack が一切来ない(=自然に EOF まで読み切れない)ままなので、waiter は
+        // PTY_DRAIN_DEADLINE だけ待った後 backpressure.close() でハード
+        // ストップし、それでも必ず join() が返って on_exit が届くことを検証
+        // する(「park したまま無期限にハングしない」という Task 4 の保護は
+        // 維持されたまま、close() のタイミングだけが即時から deadline 後に
+        // 変わったことを確認する)。実プロセスでこの境界を再現しようとすると、
+        // reader が止まった直後に子プロセス自身が write() でブロックして
+        // 終了しなくなるため(実験で確認済み)、ここではホワイトボックスに
+        // 直接 spawn_reader_thread / spawn_waiter_thread を呼んで弁別する。
         use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
         use std::time::Instant;
 
@@ -569,11 +713,13 @@ mod tests {
         let reader = FakeReader {
             remaining: BACKPRESSURE_HIGH_WATER + PTY_READ_CHUNK * 4,
         };
+        let (drain_tx, drain_rx) = channel::<()>();
         let reader_handle = spawn_reader_thread(
             "surf".to_string(),
             Box::new(reader),
             Arc::clone(&backpressure),
             Arc::clone(&sink),
+            drain_tx,
         )
         .expect("spawn reader thread");
 
@@ -604,6 +750,7 @@ mod tests {
             Arc::clone(&alive),
             pid,
             sink,
+            drain_rx,
         )
         .expect("spawn waiter thread");
 
@@ -615,13 +762,14 @@ mod tests {
         // スレッドが先行送出できるため)。exit_tx.send() 後の受信が「残留した
         // 古い Data」を拾ってしまわないよう、Exit が届くまで Data を読み飛ばす。
         // Exit が届かなければタイムアウトして panic するため、
-        // 「close() が join() より先に呼ばれる」という本来の弁別は弱めていない。
+        // 「close() が最終的に join() より先に呼ばれる」という本来の弁別は
+        // 弱めていない。
         let event = loop {
-            match rx.recv_timeout(Duration::from_secs(2)) {
+            match rx.recv_timeout(Duration::from_secs(3)) {
                 Ok(Ev::Data { .. }) => continue,
                 Ok(ev) => break ev,
                 Err(err) => panic!(
-                    "on_exit が届かなかった: close() が join() より先に呼ばれていない疑いがある ({err})"
+                    "on_exit が届かなかった: drain deadline 後の close() が join() より先に呼ばれていない疑いがある ({err})"
                 ),
             }
         };
@@ -632,8 +780,14 @@ mod tests {
         );
         assert!(!alive.load(Ordering::SeqCst));
         assert!(
+            elapsed >= PTY_DRAIN_DEADLINE,
+            "close() が drain deadline を待たずに早期発火した ({elapsed:?}): \
+             park したまま自然 drain できないケースでもハードストップの \
+             タイミングが deadline より前に来てはいけない"
+        );
+        assert!(
             elapsed < Duration::from_secs(2),
-            "on_exit の到着が遅すぎる ({elapsed:?}): stall_timeout 待ちの疑いがある"
+            "on_exit の到着が遅すぎる ({elapsed:?}): stall_timeout(5秒)待ちの疑いがある"
         );
     }
 
@@ -663,11 +817,13 @@ mod tests {
         let reader = FakeReader {
             remaining: BACKPRESSURE_HIGH_WATER + PTY_READ_CHUNK * 8,
         };
+        let (drain_tx, drain_rx) = channel::<()>();
         let reader_handle = spawn_reader_thread(
             "surf".to_string(),
             Box::new(reader),
             Arc::clone(&backpressure),
             Arc::clone(&sink),
+            drain_tx,
         )
         .expect("spawn reader thread");
 
@@ -698,6 +854,7 @@ mod tests {
             Arc::clone(&alive),
             pid,
             sink,
+            drain_rx,
         )
         .expect("spawn waiter thread");
 
