@@ -93,6 +93,47 @@ mod tests {
     use super::*;
     use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// `SHELL` 環境変数を読み書きするテスト同士を直列化するためのロック。
+    /// 環境変数はプロセス全体で共有されるため、既定の並列実行では他テストと干渉しうる
+    /// （フィックス対象レビュー指摘: `cli_args.rs` fix round 1）。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `SHELL` 環境変数を一時的に上書き/削除し、Drop で必ず元の値へ戻すガード。
+    /// panic してもテスト終了時に環境変数が復元される。
+    struct ShellEnvGuard {
+        original: Option<String>,
+    }
+
+    impl ShellEnvGuard {
+        fn set(value: &str) -> Self {
+            let original = std::env::var("SHELL").ok();
+            // SAFETY: 呼び出し元は ENV_LOCK を保持した状態でのみこのガードを作る前提
+            // （呼び出し規約はこの struct のドキュメントコメントで明示）。
+            // 他スレッドとの同時書き換えはロックで排除している
+            unsafe { std::env::set_var("SHELL", value) };
+            Self { original }
+        }
+
+        fn unset() -> Self {
+            let original = std::env::var("SHELL").ok();
+            // SAFETY: 上記 set() と同様、ENV_LOCK 保持下でのみ呼ばれる
+            unsafe { std::env::remove_var("SHELL") };
+            Self { original }
+        }
+    }
+
+    impl Drop for ShellEnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                // SAFETY: ENV_LOCK 保持下でのみ呼ばれる
+                Some(value) => unsafe { std::env::set_var("SHELL", value) },
+                // SAFETY: 同上
+                None => unsafe { std::env::remove_var("SHELL") },
+            }
+        }
+    }
 
     fn launch_env() -> LaunchEnv {
         LaunchEnv {
@@ -247,14 +288,28 @@ mod tests {
 
     // login_shell() が login_shell_from(std::env::var("SHELL").ok()) に確かに委譲していることを
     // 固定する。login_shell_from の 3 分岐テストは wrapper を経由しないため、wrapper 自体が
-    // $SHELL を握りつぶして固定値を返す変異（login_shell_from(None) など）を検出できない。
-    // 実行環境の SHELL を読むだけで書き換えないため、並列テストと干渉しない。
+    // $SHELL を握りつぶして固定値を返す変異（login_shell_from(Some("/bin/zsh")) など）を検出
+    // できない。フォールバック値 `/bin/zsh` とも実行環境の実際の $SHELL とも明確に異なる値
+    // （`/tmp/kamux-test-login-shell`）を一時的に設定して読み返すことで弁別力を持たせる
+    // （フィックス対象レビュー指摘: 既定の $SHELL=/bin/zsh 環境では旧テストは vacuous だった）。
     #[test]
     fn login_shell_reflects_the_shell_environment_variable() {
-        match std::env::var("SHELL") {
-            Ok(shell) if shell.starts_with('/') => assert_eq!(login_shell(), shell),
-            _ => assert_eq!(login_shell(), "/bin/zsh"),
-        }
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ShellEnvGuard::set("/tmp/kamux-test-login-shell");
+        assert_eq!(login_shell(), "/tmp/kamux-test-login-shell");
+    }
+
+    // login_shell() が $SHELL 未設定時に login_shell_from の既定値 `/bin/zsh` へ確かに
+    // フォールバックすることを、wrapper 経由で固定する。
+    #[test]
+    fn login_shell_falls_back_to_bin_zsh_when_shell_is_unset() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ShellEnvGuard::unset();
+        assert_eq!(login_shell(), "/bin/zsh");
     }
 
     // login_shell() 自体は $SHELL 環境変数に依存し、書き換えると並列テストと干渉する
