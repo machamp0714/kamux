@@ -1061,10 +1061,14 @@ mod tests {
         // 手順: 高水位を超えるまで Data を消費して park させる → `on_data` が
         // 実際に渡してきた最後の seq を ack する → reader が再開し、まだ Exit を
         // 発火していない waiter より先に「追加の Data」が届くことを確認する。
-        // Exit は reader が完全に読み切って join() が返るまで送られない設計
-        // (`waiter_closes_backpressure_before_joining_a_reader_parked_on_high_water`
-        // が保証済み)なので、park から再開できたかどうかがこのテストの唯一の
-        // 弁別点になる。
+        // 通常経路(reader が `PTY_JOIN_DEADLINE` 内に読み切って join() が返る)
+        // では Exit は reader が完全に読み切るまで送られない
+        // (`waiter_wakes_a_reader_parked_on_high_water_and_still_delivers_on_exit_promptly`
+        // が保証済み)。ただし Timeout 分岐(孫プロセスが slave を握って reader が
+        // `read()` で wedge した場合)ではこの順序は成立せず、`pty://exit` の後に
+        // `pty://data` が最大 1 件飛びうる(詳細は `PTY_JOIN_DEADLINE` のドキュメント
+        // コメント参照)。このテストは通常経路のみを対象とするため、park から
+        // 再開できたかどうかがこのテストの唯一の弁別点になる。
         use crate::pty::backpressure::BACKPRESSURE_HIGH_WATER;
 
         let (tx, rx) = channel::<Ev>();
@@ -1203,6 +1207,32 @@ mod tests {
             acc.trim() == "40 100"
         });
         assert_eq!(out.trim(), "40 100", "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
+    }
+
+    #[test]
+    fn spawn_passes_the_given_env_to_the_child_process() {
+        // Important B の弁別: `SpawnSpec.env` を子プロセスへ渡す `cmd.env(...)`
+        // ループを削除する変異が生存しないことを確認するテスト。契約 §15 は
+        // 消費者を名指ししている(M1-4 がここに `("KAMUX_SESSION_ID",
+        // session.id)` を入れる)ため、env の弁別テストは不可欠。
+        //
+        // cwd/cols_rows のテストと同じ作法(observe_while_alive /
+        // drain_until_exit_after_kill)に倣い、子プロセスを生かしたまま出力を
+        // 観測してから kill() する(理由は observe_while_alive のドキュメント
+        // コメント参照)。
+        let (tx, rx) = channel();
+        let mut s = spec(
+            "/bin/sh",
+            &["-c", "printf \"%s\\n\" \"$KAMUX_TEST_ENV\"; sleep 30"],
+        );
+        s.env = vec![("KAMUX_TEST_ENV".to_string(), "kamux-env-ok".to_string())];
+        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("kamux-env-ok")
+        });
+        assert!(out.contains("kamux-env-ok"), "actual output: {out:?}");
         surface.kill().expect("kill");
         drain_until_exit_after_kill(&rx, &surface);
     }
