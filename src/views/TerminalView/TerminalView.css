@@ -9,20 +9,29 @@
 .kamux-tablist {
   flex: 0 0 220px;
   overflow-y: auto;
-  /* タブ一覧はターミナル面ではなくクロムなので、通常のトークン系統（テーマ追従） */
+  /* タブ一覧はターミナル面ではなくクロムなので、通常のトークン系統（テーマ追従）。
+     親の .kamux-terminal-view がテーマ非依存の --bg-terminal を敷いているため、
+     ここで自前の背景を持たないと light テーマでクロム文字色（--text-secondary /
+     --text-muted）がテーマ非依存の暗色地に乗り、コントラストが崩れる
+     （fix round 1、light: 2.25:1 / 3.17:1 だった）。components.md がペインヘッダに
+     --bg-surface を指定しているのと同じ「ターミナル面内のクロム面」の扱いを踏襲する */
+  background: var(--bg-surface);
   border-right: 1px solid var(--border);
   padding: var(--space-4) 0;
 }
 
+/* components.md「セッションタブ」節: 縦 2 段。kamux-tab 自身をフレックスの
+   縦積みコンテナにし、1 段目 __title / 2 段目 __meta（__cli を含む）を並べる */
 .kamux-tab {
   position: relative;
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
   width: 100%;
   padding: var(--space-4) var(--space-5);
   border-radius: var(--radius-md);
   border: none;
   background: transparent;
-  color: var(--text-secondary);
   font: inherit;
   text-align: left;
   cursor: pointer;
@@ -33,11 +42,30 @@
 }
 
 /* 選択中: components.md「セッションタブ」節。--accent-soft 背景 + 左端に
-   幅 3px・高さ 30px・--accent のバー（絶対配置）。3px/30px は components.md が
-   px で直接指定する部品固有寸法であり尺度ではないため literal のままでよい */
+   幅 3px・高さ 30px・--accent のバー(絶対配置)。3px/30px は components.md が
+   px で直接指定する部品固有寸法であり尺度ではないため literal のままでよい。
+   __title は選択有無に関わらず --text-primary 固定なので、ここでの色上書きは無い */
 .kamux-tab[aria-selected='true'] {
   background: var(--accent-soft);
+}
+
+.kamux-tab__title {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: var(--leading-tight);
   color: var(--text-primary);
+}
+
+.kamux-tab__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.kamux-tab__cli {
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  color: var(--text-muted);
 }
 
 .kamux-tab[aria-selected='true']::before {
@@ -76,6 +104,9 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-muted);
+  /* この要素はターミナル面（--bg-terminal、テーマ非依存）に直接乗るので、
+     テーマ追従の --text-muted ではなくターミナル面専用のトークン系統を使う
+     （fix round 1、light: --text-muted だと 3.17:1 だった） */
+  color: var(--text-term-dim);
   pointer-events: none;
 }
