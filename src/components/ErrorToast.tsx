@@ -12,7 +12,12 @@ export function ErrorToast() {
     <div className="error-toast" role="alert">
       <span className="error-toast__code">{lastError.code}</span>
       <pre className="error-toast__message">{lastError.message}</pre>
-      <button type="button" onClick={() => setError(null)} aria-label="閉じる">
+      <button
+        type="button"
+        className="error-toast__close"
+        onClick={() => setError(null)}
+        aria-label="閉じる"
+      >
         ×
       </button>
     </div>
