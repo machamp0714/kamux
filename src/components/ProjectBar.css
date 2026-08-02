@@ -1,0 +1,78 @@
+/* components.md に project-bar 専用の節は無いため、パネル・表節の帯レイアウトと
+   ボタン/入力欄節の値をそのまま適用する（components.md 冒頭の手順どおり）。 */
+
+.project-bar {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-7);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.project-bar__list {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.project-bar__item {
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-md);
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.project-bar__item--active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.project-bar__form {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-left: auto;
+}
+
+.project-bar__input,
+.project-bar__select {
+  height: 36px;
+  padding: 0 var(--space-5);
+  border-radius: var(--radius-md);
+  background: var(--bg-app);
+  border: 1px solid var(--border-input);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+}
+
+.project-bar__input:focus,
+.project-bar__select:focus {
+  border: 2px solid var(--accent);
+}
+
+.project-bar__input--mono {
+  font-family: var(--font-mono);
+}
+
+.project-bar__submit {
+  padding: var(--space-4) var(--space-7);
+  border-radius: var(--radius-md);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.project-bar__submit:disabled {
+  background: var(--bg-app);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}

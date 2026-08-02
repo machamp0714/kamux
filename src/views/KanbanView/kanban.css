@@ -1,7 +1,8 @@
 .kanban-view {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -351,4 +352,62 @@
   background: transparent;
   color: var(--text-muted);
   border: none;
+}
+
+/* ---- App シェル / エラートースト（components.md「トースト」） ---- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app__placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 0;
+  font-size: var(--text-md);
+  color: var(--text-muted);
+}
+
+.error-toast {
+  position: fixed;
+  right: var(--space-8);
+  bottom: var(--space-8);
+  z-index: var(--z-toast);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  /* components.md が px で直接指定するトーストの幅 */
+  max-width: 468px;
+  padding: var(--space-6) var(--space-7);
+  border-radius: var(--radius-lg);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border: 1px solid var(--state-error);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-toast);
+  font-size: var(--text-sm);
+}
+
+.error-toast__code {
+  font-weight: 600;
+  color: var(--state-error);
+  white-space: nowrap;
+}
+
+.error-toast__message {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 8em;
+  overflow-y: auto;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--bg-terminal);
+  color: var(--text-term-dim);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
 }
