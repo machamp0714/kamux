@@ -3,7 +3,7 @@ pub mod cli_args;
 
 use tauri::{AppHandle, State};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::model::{Session, SurfaceKind};
 use crate::pty::launch_env::LaunchEnv;
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
@@ -23,6 +23,26 @@ fn plan_agent_spawn(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec
     let session = state.store.get_session(id)?;
     let project = state.store.get_project(&session.project_id)?;
     let cwd = resolve_cwd(&session, &project.repo_path);
+
+    // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:501-506）は
+    // cwd を `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリ
+    // でなければ chdir を一度も試みずに黙って $HOME へフォールバックする（stderr も出ない）。
+    // したがって spawn 前のここでの検証だけが、この経路でユーザーに失敗を報告できる唯一の
+    // 手段になる。述語は portable-pty の filter と逐語で一致させる必要があり、`exists()`
+    // にすると通常ファイルの cwd がここを素通りして結局 $HOME に落ちる（直したつもりの
+    // 再発）ため、`is_dir()` を使う。
+    //
+    // 申し送り（M1-4 への安全性）: M1-3 では UX の問題だが、M1-4 では安全性の問題になる。
+    // M1-4 は同じ経路で `claude` を起動する。worktree の作成に失敗した状態で起動すると、
+    // エージェントが $HOME で動き出し、無関係なファイルを触りうる。`resolve_cwd` の直後に
+    // 置くのは、M1-4 が worktree を作ってから `start_session` を呼ぶ順序を壊さず、むしろ
+    // worktree 作成の無言失敗を捕まえる網になるため。
+    if !cwd.is_dir() {
+        return Err(AppError::InvalidState(format!(
+            "working directory does not exist or is not a directory: {}",
+            cwd.display()
+        )));
+    }
 
     // M1-3 は shell のみなので program はログインシェル。
     // M1-4 はここを §18 の resolve_program(binary_name(cli_kind)?) に差し替え、
@@ -77,6 +97,7 @@ pub async fn stop_session(state: State<'_, AppState>, id: String) -> AppResult<S
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use super::*;
@@ -86,13 +107,10 @@ mod tests {
     use crate::store::now_ms;
     use crate::store::test_support::open_temp;
 
-    /// worktree セッションを 1 件持つ `AppState` を組み立てる。
-    /// `worktree_path` を `repo_path` と明確に別値にするのは、`resolve_cwd` を経由した
-    /// 値であることを、`project.repo_path` をそのまま使う変異と区別できるようにするため。
-    /// `insert_test_session` ヘルパは `worktree_path: None` の in_place セッションしか
-    /// 作れないので、ここでは `Session::new_backlog` を直接使う（`store/mod.rs` の
-    /// `insert_test_session` ドキュメントコメントが明示する逃げ道）。
-    fn build_state_with_worktree_session() -> (tempfile::TempDir, AppState, Session) {
+    /// worktree モードのプロジェクト・セッションだけを作り、worktree の設定は呼び出し側に
+    /// 委ねる。cwd 実在検証のテスト（存在しないパス／通常ファイル）が実体を持たない
+    /// worktree_path を注入できるようにするための共通部分。
+    fn build_project_and_session() -> (tempfile::TempDir, crate::store::Store, Session) {
         let (dir, store) = open_temp();
         let project = store
             .insert_project("kamux", "/tmp/kamux-test-repo", CliKind::Shell)
@@ -109,14 +127,32 @@ mod tests {
             now_ms(),
         );
         let session = store.insert_session(&session).expect("insert session");
+        (dir, store, session)
+    }
+
+    /// worktree セッションを 1 件持つ `AppState` を組み立てる。
+    /// `worktree_path` を `repo_path` と明確に別値にするのは、`resolve_cwd` を経由した
+    /// 値であることを、`project.repo_path` をそのまま使う変異と区別できるようにするため。
+    /// `plan_agent_spawn` が cwd の実在（is_dir）を検証するようになったため、
+    /// `/tmp/kamux-test-worktree` のような存在しない固定パスは使えない。`dir`（既存の
+    /// TempDir）の中にサブディレクトリを作って渡す。2 個目の TempDir を作って渡さずに
+    /// 落とすと即座に drop されて消えるため使わない。
+    fn build_state_with_worktree_session() -> (tempfile::TempDir, AppState, Session, PathBuf) {
+        let (dir, store, session) = build_project_and_session();
+        let worktree_path = dir.path().join("worktree");
+        std::fs::create_dir(&worktree_path).expect("create worktree dir");
         store
-            .set_worktree(&session.id, "session/shell", "/tmp/kamux-test-worktree")
+            .set_worktree(
+                &session.id,
+                "session/shell",
+                worktree_path.to_str().expect("utf8 path"),
+            )
             .expect("set worktree");
         let state = AppState {
             store: Arc::new(store),
             pty: PtyManager::new(),
         };
-        (dir, state, session)
+        (dir, state, session, worktree_path)
     }
 
     /// 変異 1: `surface_id(&session.id, SurfaceKind::Agent)` を `SurfaceKind::Editor`
@@ -127,7 +163,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (_dir, state, session) = build_state_with_worktree_session();
+        let (_dir, state, session, _worktree_path) = build_state_with_worktree_session();
 
         let (_, spec) = plan_agent_spawn(&state, &session.id).expect("plan spawn");
 
@@ -142,14 +178,11 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (_dir, state, session) = build_state_with_worktree_session();
+        let (_dir, state, session, worktree_path) = build_state_with_worktree_session();
 
         let (_, spec) = plan_agent_spawn(&state, &session.id).expect("plan spawn");
 
-        assert_eq!(
-            spec.cwd,
-            std::path::PathBuf::from("/tmp/kamux-test-worktree")
-        );
+        assert_eq!(spec.cwd, worktree_path);
     }
 
     /// 変異 3: `build_launch_command` が入れる `KAMUX_SESSION_ID` を `spec.env` から
@@ -160,7 +193,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (_dir, state, session) = build_state_with_worktree_session();
+        let (_dir, state, session, _worktree_path) = build_state_with_worktree_session();
 
         let (_, spec) = plan_agent_spawn(&state, &session.id).expect("plan spawn");
 
@@ -177,7 +210,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (_dir, state, session) = build_state_with_worktree_session();
+        let (_dir, state, session, _worktree_path) = build_state_with_worktree_session();
 
         let (_, spec) = plan_agent_spawn(&state, &session.id).expect("plan spawn");
 
@@ -195,11 +228,80 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = ShellEnvGuard::set("/tmp/kamux-test-login-shell");
-        let (_dir, state, session) = build_state_with_worktree_session();
+        let (_dir, state, session, _worktree_path) = build_state_with_worktree_session();
 
         let (_, spec) = plan_agent_spawn(&state, &session.id).expect("plan spawn");
 
         assert_eq!(spec.program, "/tmp/kamux-test-login-shell");
         assert_eq!(spec.args, vec!["-l".to_string()]);
+    }
+
+    /// `resolve_cwd` が返す cwd がディレクトリとして実在しない場合、`plan_agent_spawn` は
+    /// spawn 前に `AppError::InvalidState` を返す。portable-pty 0.9.0 の
+    /// `CommandBuilder::as_command()`（cmdbuilder.rs:501-506）は cwd を
+    /// `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリで
+    /// なければ黙って `$HOME` にフォールバックする。この経路は chdir を一度も試みず
+    /// stderr も出さないため、spawn 前の検証だけがユーザーへの唯一の報告手段になる。
+    /// message に該当パスが含まれることも確認する（メッセージが空になる変異を弁別する）。
+    #[test]
+    fn plan_agent_spawn_rejects_a_worktree_path_that_does_not_exist() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (dir, store, session) = build_project_and_session();
+        let missing_path = dir.path().join("does-not-exist");
+        store
+            .set_worktree(
+                &session.id,
+                "session/shell",
+                missing_path.to_str().expect("utf8 path"),
+            )
+            .expect("set worktree");
+        let state = AppState {
+            store: Arc::new(store),
+            pty: PtyManager::new(),
+        };
+
+        let err = plan_agent_spawn(&state, &session.id).expect_err("must reject missing cwd");
+
+        match err {
+            AppError::InvalidState(message) => {
+                assert!(
+                    message.contains(missing_path.to_str().expect("utf8 path")),
+                    "message does not mention the missing path: {message}"
+                );
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+    }
+
+    /// cwd が「ディレクトリではない通常ファイル」の場合も同様に拒否する。portable-pty の
+    /// `.filter(is_dir)` と述語を逐語で一致させる必要があるため `exists()` ではなく
+    /// `is_dir()` を使う。この変異は `is_dir()` → `exists()` の入れ替えを弁別できる唯一
+    /// のテスト（通常ファイルは `exists()` を通ってしまう）。
+    #[test]
+    fn plan_agent_spawn_rejects_a_worktree_path_that_is_a_regular_file() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (dir, store, session) = build_project_and_session();
+        let file_path = dir.path().join("not-a-directory");
+        std::fs::write(&file_path, b"").expect("create regular file");
+        store
+            .set_worktree(
+                &session.id,
+                "session/shell",
+                file_path.to_str().expect("utf8 path"),
+            )
+            .expect("set worktree");
+        let state = AppState {
+            store: Arc::new(store),
+            pty: PtyManager::new(),
+        };
+
+        let err =
+            plan_agent_spawn(&state, &session.id).expect_err("must reject a regular file cwd");
+
+        assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
     }
 }
