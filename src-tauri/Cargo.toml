@@ -23,4 +23,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-tauri = { version = "2", features = ["test"] }
+# "unstable" は Manager::get_window（テストのみで使用: WebviewWindow から
+# 素の Window<R> を引き直すため）に必要。dev-dependencies なので production
+# の `cargo build` / `cargo build --release` には影響しない。
+tauri = { version = "2", features = ["test", "unstable"] }

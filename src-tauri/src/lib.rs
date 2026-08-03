@@ -108,10 +108,89 @@ async fn move_session(
     state.store.move_session(&id, to_status, to_index)
 }
 
+// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
+// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
+// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
+// 撃つ設計を選んだのはこの冪等性が前提）。
+//
+// この関数自体（「生きている surface_id を集めて機械的に kill する」という
+// ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
+// 実プロセスの spawn/kill/exit を通しで固定している。
+fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
+    for id in pty.live_surfaces() {
+        let _ = pty.kill(&id);
+    }
+}
+
+/// 窓が閉じる経路（赤ボタンなど）で PTY の子プロセスを残さない。
+///
+/// Cmd+Q はここを通らない。PR 単位レビューが依存クレートのソースを追跡して
+/// 確定した（tauri 2.11.5 / tao 0.35.3 / muda 0.19.3。実機起動での観測は
+/// Task 16 の手動スモークが行う）。既定の macOS メニューの
+/// `PredefinedMenuItem::quit` は `sel!(terminate:)` を送り、
+/// `[NSApp terminate:]` は個々の窓を閉じずに直接 `applicationWillTerminate:`
+/// へ進む。`WindowEvent::Destroyed` を発火させる tao の経路は
+/// `windowWillClose:` の 1 箇所のみで、`terminate:` はこれを経由しない。
+/// そのため Cmd+Q の後始末は `kill_on_run_event_exit` が担う。
+///
+/// それでもここを消さずに残すのは、macOS で最後の窓を閉じてもプロセスが
+/// 終了しない経路があるため（RULINGS §23.1）。その場合 `RunEvent::Exit` は
+/// 飛ばないが、この Destroyed 側でサーフェスは消える。`kill_all_pty_surfaces`
+/// は冪等なので両方から撃っても安全（ledger の `Task 6: minor (deferred)`
+/// が実測で記録済み）。
+///
+/// `R: tauri::Runtime` はテストのために足した内部実装の一般化であり、契約上の
+/// 型ではない（`TauriSink<R: Runtime = Wry>` と同じ前例。`pty/sink.rs` 参照）。
+/// production の `run()` は `tauri::Builder::default()`（= Wry）のまま呼ぶため
+/// 挙動は変わらない。
+///
+/// `MockRuntime` は `WindowEvent::Destroyed` を一度も発火しない
+/// （`tauri-2.11.5/src/test/mock_runtime.rs` を `grep -n "Destroyed"` した
+/// 結果が 0 件であることを確認済み）ため、「Destroyed イベントの配送」を
+/// 経由した経路は守るテストが無い。ただし `WindowEvent::Destroyed` は
+/// フィールドの無いユニットバリアントであり、enum 全体に付いた
+/// `#[non_exhaustive]` があってもクレート外から構築できる
+/// （`let _ = tauri::WindowEvent::Destroyed;` がこのクレートからコンパイルを
+/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる:
+/// `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`。
+fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
+    if matches!(event, WindowEvent::Destroyed) {
+        if let Some(state) = window.try_state::<AppState>() {
+            kill_all_pty_surfaces(&state.pty);
+        }
+    }
+}
+
+/// `RunEvent::Exit` でも `kill_on_window_destroyed` と同じ一括 kill を撃つ。
+///
+/// Cmd+Q はこの経路を通る。PR 単位レビューが依存クレートのソースを追跡して
+/// 確定した（tauri 2.11.5 / tao 0.35.3 / muda 0.19.3 / tauri-runtime-wry
+/// 2.11.4。実機起動での観測は Task 16 の手動スモークが行う）: 既定メニューの
+/// `PredefinedMenuItem::quit` が送る `terminate:` を tao の
+/// `applicationWillTerminate:` が受け、`AppState::exit()` ->
+/// `Event::LoopDestroyed` を経て tauri-runtime-wry がこれを `RunEvent::Exit`
+/// に変換する。`kill_on_window_destroyed` と両方から撃つ理由はそちらの doc
+/// コメント参照。
+///
+/// `R: tauri::Runtime` はテストのために足した内部実装の一般化（上記と同じ
+/// 前例）。`MockRuntime` は最後の窓が消えたあと必ず `RunEvent::Exit` を
+/// 発火する（`tauri-2.11.5/src/test/mock_runtime.rs:1393`）ため、この関数は
+/// `tests::run_event_exit_kills_every_live_pty_surface` から実際に到達できる。
+fn kill_on_run_event_exit<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    event: tauri::RunEvent,
+) {
+    if matches!(event, tauri::RunEvent::Exit) {
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            kill_all_pty_surfaces(&state.pty);
+        }
+    }
+}
+
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
@@ -121,17 +200,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            // アプリ終了時に PTY の子プロセスを残さない。
-            // Cmd+Q でこれが走らない場合は Builder::build() + RunEvent::Exit に移す（第1部 2.6）
-            if matches!(event, WindowEvent::Destroyed) {
-                if let Some(state) = window.try_state::<AppState>() {
-                    for id in state.pty.live_surfaces() {
-                        let _ = state.pty.kill(&id);
-                    }
-                }
-            }
-        })
+        .on_window_event(kill_on_window_destroyed)
         .invoke_handler(tauri::generate_handler![
             create_project,
             list_projects,
@@ -147,8 +216,10 @@ pub fn run() {
             session::start_session,
             session::stop_session,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run kamux");
+        .build(tauri::generate_context!())
+        .expect("failed to build kamux");
+
+    app.run(kill_on_run_event_exit);
 }
 
 #[cfg(test)]
@@ -297,6 +368,240 @@ mod tests {
             Err(AppError::NotFound(id)) => assert_eq!(id, project_b.id),
             other => panic!("expected AppError::NotFound, got {other:?}"),
         }
+    }
+
+    // --- Task 12.5（番外）: RunEvent::Exit / WindowEvent::Destroyed の両方から
+    // 撃つ一括 kill ロジックを純関数へ切り出し、そこだけを実測で固定する。
+    #[test]
+    fn kill_all_pty_surfaces_kills_every_live_surface() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        use crate::pty::surface::PtySink;
+        use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+        struct ExitSink(std::sync::mpsc::Sender<String>);
+        impl PtySink for ExitSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, surface_id: &str, _exit_code: Option<i32>) {
+                let _ = self.0.send(surface_id.to_string());
+            }
+        }
+
+        let pty = crate::pty::PtyManager::new();
+        let (tx, rx) = channel();
+        let sink: Arc<dyn PtySink> = Arc::new(ExitSink(tx));
+        for i in 0..2 {
+            pty.spawn_with_sink(
+                Arc::clone(&sink),
+                SpawnSpec {
+                    surface_id: format!("kill-all-{i}:agent"),
+                    program: "/bin/cat".to_string(),
+                    args: Vec::new(),
+                    cwd: std::path::PathBuf::from("/tmp"),
+                    env: Vec::new(),
+                    cols: DEFAULT_COLS,
+                    rows: DEFAULT_ROWS,
+                },
+            )
+            .expect("spawn");
+        }
+        assert_eq!(
+            pty.live_surfaces().len(),
+            2,
+            "both surfaces must be live before kill"
+        );
+
+        super::kill_all_pty_surfaces(&pty);
+
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("each surface must exit after kill_all_pty_surfaces");
+        }
+        assert!(
+            pty.live_surfaces().is_empty(),
+            "kill_all_pty_surfaces must kill every surface it was told was live"
+        );
+    }
+
+    // 「いつ」kill_all_pty_surfaces を呼ぶかの配線のうち、`RunEvent::Exit` 側は
+    // MockRuntime でも到達できる。`MockRuntime::run` は最後の窓が消えたあと
+    // 必ず `RunEvent::Exit` を発火する（tauri-2.11.5/src/test/mock_runtime.rs
+    // の `run` 実装の末尾、ループを抜けた直後の `callback(RunEvent::Exit)`）。
+    // 一方 `WindowEvent::Destroyed` 側は MockRuntime に発火経路が無いため
+    // （同ファイルを grep しても Destroyed を作る箇所は 0 件）、こちらは
+    // 引き続き「守っているテストは無い」。
+    #[test]
+    fn run_event_exit_kills_every_live_pty_surface() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Manager, WebviewWindowBuilder};
+
+        use crate::pty::surface::PtySink;
+        use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+        use crate::store::test_support::open_temp;
+
+        struct ExitSink(std::sync::mpsc::Sender<String>);
+        impl PtySink for ExitSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, surface_id: &str, _exit_code: Option<i32>) {
+                let _ = self.0.send(surface_id.to_string());
+            }
+        }
+
+        let (_dir, store) = open_temp();
+        let app = mock_builder()
+            .manage(AppState {
+                store: Arc::new(store),
+                pty: crate::pty::PtyManager::new(),
+            })
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+
+        // 窓が 1 つも無いと MockRuntime::run はいつまでも「窓が空になった」を
+        // 検知できず Exit まで進まないため、close する対象として 1 枚作る。
+        let window = WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build webview");
+
+        let app_handle = app.handle().clone();
+        let (exit_tx, exit_rx) = channel();
+        let sink: Arc<dyn PtySink> = Arc::new(ExitSink(exit_tx));
+        {
+            let state = app_handle.state::<AppState>();
+            state
+                .pty
+                .spawn_with_sink(
+                    Arc::clone(&sink),
+                    SpawnSpec {
+                        surface_id: "run-event-exit:agent".to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn");
+            assert!(state.pty.is_alive("run-event-exit:agent"));
+        }
+
+        // MockRuntime::run はメッセージが無ければ 1 秒スリープを挟んで
+        // ポーリングする。`window.close()` を送るのが早すぎると
+        // `is_running` が立つ前に処理されてしまい、待っている相手が
+        // 誰も居ないまま `CloseWindow` が握りつぶされる（`RuntimeContext::
+        // send_message` は `is_running` が false ならチャンネルを経由せず
+        // 即座に窓を消すだけで、`RunEvent::Exit` を発火する経路を通らない）。
+        // そこで `RunEvent::Ready`（ループ開始直後に必ず飛ぶ）を合図に
+        // `close()` を送ることで、ポーリング待ちのレースを避ける。
+        let (ready_tx, ready_rx) = channel::<()>();
+        let run_thread = std::thread::spawn(move || {
+            app.run(move |handle, event| {
+                if matches!(event, tauri::RunEvent::Ready) {
+                    let _ = ready_tx.send(());
+                }
+                super::kill_on_run_event_exit(handle, event);
+            });
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("event loop must reach RunEvent::Ready before we close the window");
+        window
+            .close()
+            .expect("close the only window to drive the loop to RunEvent::Exit");
+
+        run_thread.join().expect("event loop thread must not panic");
+
+        exit_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("RunEvent::Exit must have killed the pty surface");
+        assert!(
+            !app_handle.state::<AppState>().pty.is_alive("run-event-exit:agent"),
+            "kill_on_run_event_exit must kill every surface that was live when RunEvent::Exit fired"
+        );
+    }
+
+    // 「Destroyed が来たときに kill する」経路のうち、MockRuntime がイベント配送
+    // 自体を再現できない部分（実測: 上の run_event_exit テストの `Destroyed`
+    // grep が 0 件）を除いた「関数本体がロジックとして正しいか」は、
+    // `tauri::WindowEvent::Destroyed` がフィールドの無いユニットバリアントで
+    // あり `#[non_exhaustive]` が付いていてもクレート外から構築できる
+    // （実測: `let _ = tauri::WindowEvent::Destroyed;` がこのクレートから
+    // コンパイルを通ることを確認済み）ため、関数を直接呼ぶ形で固定できる。
+    #[test]
+    fn kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
+
+        use crate::pty::surface::PtySink;
+        use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+        use crate::store::test_support::open_temp;
+
+        struct ExitSink(std::sync::mpsc::Sender<String>);
+        impl PtySink for ExitSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, surface_id: &str, _exit_code: Option<i32>) {
+                let _ = self.0.send(surface_id.to_string());
+            }
+        }
+
+        let (_dir, store) = open_temp();
+        let app = mock_builder()
+            .manage(AppState {
+                store: Arc::new(store),
+                pty: crate::pty::PtyManager::new(),
+            })
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+        WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build webview");
+        // `on_window_event` は `&tauri::Window<R>` を渡す。`WebviewWindow` は
+        // それを直接公開しないため（`WindowBuilder` は unstable フィーチャ
+        // 越しでしか使えない）、`Manager::get_window` で同じラベルの
+        // `Window<R>` を引き直す。
+        let window = app.get_window("main").expect("window registered");
+
+        let (exit_tx, exit_rx) = channel();
+        let sink: Arc<dyn PtySink> = Arc::new(ExitSink(exit_tx));
+        {
+            let state = app.state::<AppState>();
+            state
+                .pty
+                .spawn_with_sink(
+                    Arc::clone(&sink),
+                    SpawnSpec {
+                        surface_id: "window-destroyed:agent".to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn");
+            assert!(state.pty.is_alive("window-destroyed:agent"));
+        }
+
+        super::kill_on_window_destroyed(&window, &WindowEvent::Destroyed);
+
+        exit_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("WindowEvent::Destroyed must have killed the pty surface");
+        assert!(
+            !app.state::<AppState>()
+                .pty
+                .is_alive("window-destroyed:agent"),
+            "kill_on_window_destroyed must kill every surface that was live when Destroyed fired"
+        );
     }
 
     #[test]

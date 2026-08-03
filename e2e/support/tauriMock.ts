@@ -22,6 +22,13 @@ declare global {
       invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
       transformCallback: (cb: unknown) => unknown;
       __kamuxCalls: TauriMockCall[];
+      /** event 名 → @tauri-apps/api/event の listen() が渡すハンドラ配列（plugin:event|listen が積む） */
+      __kamuxEventHandlers: Record<
+        string,
+        Array<(event: { event: string; payload: unknown }) => void>
+      >;
+      /** spec 側から合成 emit するためのヘルパ（page.evaluate 経由で呼ぶ） */
+      __kamuxEmit: (event: string, payload: unknown) => void;
     };
   }
 }
@@ -32,6 +39,12 @@ declare global {
  * 持ち込めない。そのため tauriMockScript 自身は文字列を返す純関数にし、
  * spec.commands の各関数本体は toString() で文字列化して埋め込む
  * ——**渡す関数は外側の変数を参照しないこと**（参照するとブラウザ側で undefined になる）。
+ *
+ * `plugin:event|listen` / `plugin:event|unlisten` はコマンド名として spec.commands には
+ * 書かせない。`@tauri-apps/api/event` の `listen()` は `invoke('plugin:event|listen', ...)`
+ * を呼び、`handler` には `transformCallback(handler)` の戻り値が渡る（下で
+ * `transformCallback` を恒等関数にしてあるので、渡ってくるのはハンドラ関数そのもの）。
+ * これを `__kamuxEventHandlers[event]` に積み、`__kamuxEmit` で叩けるようにする。
  */
 export function tauriMockScript(spec: TauriMockSpec): string {
   const entries = Object.entries(spec.commands)
@@ -40,13 +53,31 @@ export function tauriMockScript(spec: TauriMockSpec): string {
   return `
     window.__TAURI_INTERNALS__ = window.__TAURI_INTERNALS__ || {};
     window.__TAURI_INTERNALS__.__kamuxCalls = [];
+    window.__TAURI_INTERNALS__.__kamuxEventHandlers = {};
     const handlers = { ${entries} };
     window.__TAURI_INTERNALS__.invoke = (cmd, args) => {
       window.__TAURI_INTERNALS__.__kamuxCalls.push({ cmd, args });
+      if (cmd === 'plugin:event|listen') {
+        const event = (args || {}).event;
+        const handler = (args || {}).handler;
+        const list = window.__TAURI_INTERNALS__.__kamuxEventHandlers[event] || [];
+        list.push(handler);
+        window.__TAURI_INTERNALS__.__kamuxEventHandlers[event] = list;
+        return Promise.resolve(list.length);
+      }
+      if (cmd === 'plugin:event|unlisten') {
+        const event = (args || {}).event;
+        delete window.__TAURI_INTERNALS__.__kamuxEventHandlers[event];
+        return Promise.resolve(null);
+      }
       const h = handlers[cmd];
       if (h === undefined) return Promise.reject(new Error('unmocked command: ' + cmd));
       return Promise.resolve(h(args || {}));
     };
     window.__TAURI_INTERNALS__.transformCallback = (cb) => cb;
+    window.__TAURI_INTERNALS__.__kamuxEmit = (event, payload) => {
+      const list = window.__TAURI_INTERNALS__.__kamuxEventHandlers[event] || [];
+      list.forEach((handler) => handler({ event, id: 0, payload }));
+    };
   `;
 }

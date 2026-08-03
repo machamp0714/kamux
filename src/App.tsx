@@ -7,6 +7,7 @@ import { bootstrap, useAppStore } from './store';
 import { toAppError } from './store/uiSlice';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
+import { TerminalView } from './views/TerminalView';
 import './App.css';
 
 export default function App() {
@@ -23,9 +24,7 @@ export default function App() {
     <div className="app">
       <ProjectBar />
       {view === 'kanban' ? <KanbanView /> : null}
-      {view === 'terminal' ? (
-        <div className="app__placeholder">ターミナル画面は M1-3 で実装します</div>
-      ) : null}
+      {view === 'terminal' && <TerminalView />}
       {view === 'editor' ? (
         <div className="app__placeholder">エディタ画面は M3-1 で実装します</div>
       ) : null}
