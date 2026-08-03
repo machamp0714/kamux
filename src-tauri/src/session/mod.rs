@@ -24,9 +24,10 @@ fn plan_agent_spawn(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec
     let project = state.store.get_project(&session.project_id)?;
     let cwd = resolve_cwd(&session, &project.repo_path);
 
-    // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:501-506）は
+    // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:502-507）は
     // cwd を `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリ
-    // でなければ chdir を一度も試みずに黙って $HOME へフォールバックする（stderr も出ない）。
+    // でなければ `.unwrap_or(home.as_ref())`（cmdbuilder.rs:507）で chdir を一度も試みず
+    // 黙って $HOME へフォールバックする（stderr も出ない）。
     // したがって spawn 前のここでの検証だけが、この経路でユーザーに失敗を報告できる唯一の
     // 手段になる。述語は portable-pty の filter と逐語で一致させる必要があり、`exists()`
     // にすると通常ファイルの cwd がここを素通りして結局 $HOME に落ちる（直したつもりの
@@ -108,12 +109,20 @@ mod tests {
     use crate::store::test_support::open_temp;
 
     /// worktree モードのプロジェクト・セッションだけを作り、worktree の設定は呼び出し側に
-    /// 委ねる。cwd 実在検証のテスト（存在しないパス／通常ファイル）が実体を持たない
-    /// worktree_path を注入できるようにするための共通部分。
-    fn build_project_and_session() -> (tempfile::TempDir, crate::store::Store, Session) {
+    /// 委ねる。cwd 実在検証のテスト（存在しないパス／通常ファイル／`worktree_path` 未設定）
+    /// が、それぞれ望む形の cwd を注入できるようにするための共通部分。`repo_path` を引数に
+    /// しているのは、`worktree_path` を設定しない（in_place 相当）ケースで `resolve_cwd` が
+    /// 返す `repo_path` 自体を意図的に存在しない値にできるようにするため。
+    /// `insert_test_session` ヘルパは `worktree_path: None` の in_place セッションしか
+    /// 作れない（`SessionMode::InPlace` 固定）ので、ここでは `Session::new_backlog` を
+    /// 直接使う（`store/mod.rs` の `insert_test_session` ドキュメントコメントが明示する
+    /// 逃げ道）。
+    fn build_project_and_session(
+        repo_path: &str,
+    ) -> (tempfile::TempDir, crate::store::Store, Session) {
         let (dir, store) = open_temp();
         let project = store
-            .insert_project("kamux", "/tmp/kamux-test-repo", CliKind::Shell)
+            .insert_project("kamux", repo_path, CliKind::Shell)
             .expect("insert project");
         let session = Session::new_backlog(
             &project.id,
@@ -130,6 +139,19 @@ mod tests {
         (dir, store, session)
     }
 
+    /// `build_project_and_session` の結果を `AppState` に包むだけの薄いラッパー。
+    /// `set_worktree` を一切呼ばないため、`session.worktree_path` は `None` のまま
+    /// （in_place 相当）になる。「`repo_path` そのものが存在しないプロジェクト」を
+    /// スモークで報告された症状のまま再現するテスト専用。
+    fn build_state_without_worktree(repo_path: &str) -> (tempfile::TempDir, AppState, Session) {
+        let (dir, store, session) = build_project_and_session(repo_path);
+        let state = AppState {
+            store: Arc::new(store),
+            pty: PtyManager::new(),
+        };
+        (dir, state, session)
+    }
+
     /// worktree セッションを 1 件持つ `AppState` を組み立てる。
     /// `worktree_path` を `repo_path` と明確に別値にするのは、`resolve_cwd` を経由した
     /// 値であることを、`project.repo_path` をそのまま使う変異と区別できるようにするため。
@@ -138,7 +160,7 @@ mod tests {
     /// TempDir）の中にサブディレクトリを作って渡す。2 個目の TempDir を作って渡さずに
     /// 落とすと即座に drop されて消えるため使わない。
     fn build_state_with_worktree_session() -> (tempfile::TempDir, AppState, Session, PathBuf) {
-        let (dir, store, session) = build_project_and_session();
+        let (dir, store, session) = build_project_and_session("/tmp/kamux-test-repo");
         let worktree_path = dir.path().join("worktree");
         std::fs::create_dir(&worktree_path).expect("create worktree dir");
         store
@@ -171,8 +193,11 @@ mod tests {
     }
 
     /// 変異 2: `resolve_cwd(&session, &project.repo_path)` を `project.repo_path` の
-    /// 素通しに変えると、この assert が赤くなる（`cwd` が `resolve_cwd` の戻り値である
-    /// ことの固定）。`repo_path` と `worktree_path` を別値にしているのがこの弁別力の要。
+    /// 素通しに変えると、この関数呼び出しが赤くなる（`cwd` が `resolve_cwd` の戻り値で
+    /// あることの固定）。`repo_path`（"/tmp/kamux-test-repo"）は実在しないため、変異後は
+    /// `cwd.is_dir()` の検証で弾かれて `Err(InvalidState)` になり、後続の `assert_eq!`
+    /// ではなく `.expect("plan spawn")` のパニックとして捕まる。`repo_path` と
+    /// `worktree_path` を別値にしているのがこの弁別力の要。
     #[test]
     fn plan_agent_spawn_resolves_cwd_from_the_worktree_path_not_the_repo_path() {
         let _lock = ENV_LOCK
@@ -238,17 +263,18 @@ mod tests {
 
     /// `resolve_cwd` が返す cwd がディレクトリとして実在しない場合、`plan_agent_spawn` は
     /// spawn 前に `AppError::InvalidState` を返す。portable-pty 0.9.0 の
-    /// `CommandBuilder::as_command()`（cmdbuilder.rs:501-506）は cwd を
+    /// `CommandBuilder::as_command()`（cmdbuilder.rs:502-507）は cwd を
     /// `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリで
-    /// なければ黙って `$HOME` にフォールバックする。この経路は chdir を一度も試みず
-    /// stderr も出さないため、spawn 前の検証だけがユーザーへの唯一の報告手段になる。
-    /// message に該当パスが含まれることも確認する（メッセージが空になる変異を弁別する）。
+    /// なければ `.unwrap_or(home.as_ref())`（cmdbuilder.rs:507）で黙って `$HOME` に
+    /// フォールバックする。この経路は chdir を一度も試みず stderr も出さないため、
+    /// spawn 前の検証だけがユーザーへの唯一の報告手段になる。message に該当パスが
+    /// 含まれることも確認する（メッセージが空になる変異を弁別する）。
     #[test]
     fn plan_agent_spawn_rejects_a_worktree_path_that_does_not_exist() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (dir, store, session) = build_project_and_session();
+        let (dir, store, session) = build_project_and_session("/tmp/kamux-test-repo");
         let missing_path = dir.path().join("does-not-exist");
         store
             .set_worktree(
@@ -284,7 +310,7 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (dir, store, session) = build_project_and_session();
+        let (dir, store, session) = build_project_and_session("/tmp/kamux-test-repo");
         let file_path = dir.path().join("not-a-directory");
         std::fs::write(&file_path, b"").expect("create regular file");
         store
@@ -303,5 +329,35 @@ mod tests {
             plan_agent_spawn(&state, &session.id).expect_err("must reject a regular file cwd");
 
         assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+    }
+
+    /// スモークで実際に報告されたケース: `repo_path` がそもそも存在しないプロジェクトで、
+    /// `worktree_path` を設定していない（in_place 相当）セッションを起動する。
+    ///
+    /// 弁別力の実証: ガードを `if session.worktree_path.is_some() && !cwd.is_dir()` の
+    /// ように worktree のケースだけへ狭める変異を入れると、`set_worktree` 経由で不正な
+    /// パスを注入する上の 2 本（`..._does_not_exist` / `..._is_a_regular_file`）は
+    /// `worktree_path.is_some()` が真なので変異後も緑のまま通ってしまう。`resolve_cwd`
+    /// が `repo_path` をそのまま返す腕（`worktree_path.is_none()`）を直接踏むのはこの
+    /// テストだけであり、その変異を弁別できる唯一のテスト。
+    #[test]
+    fn plan_agent_spawn_rejects_a_missing_repo_path_when_worktree_path_is_unset() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session) =
+            build_state_without_worktree("/tmp/kamux-test-repo-in-place-missing");
+
+        let err = plan_agent_spawn(&state, &session.id).expect_err("must reject missing repo_path");
+
+        match err {
+            AppError::InvalidState(message) => {
+                assert!(
+                    message.contains("/tmp/kamux-test-repo-in-place-missing"),
+                    "message does not mention the missing repo_path: {message}"
+                );
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
     }
 }
