@@ -81,17 +81,28 @@ fn extract_between(stdout: &str, begin: &str, end: &str) -> Option<String> {
 /// **1 回にまとめる理由**: `-ilc` は 1 回あたり約 310ms かかる（契約 §18 の実測値）。
 /// PATH と LANG で 2 回起動すると 620ms となり、契約 §0 の「起動 1 秒未満」を
 /// 単独で圧迫する。LANG が空文字のときは None ではなく空文字が返る点に注意
-/// （呼び出し側の `probe_login_env` が `system_lang()` にフォールバックする）。
+/// （呼び出し側の `probe_login_env_with` が `system_lang()` にフォールバックする）。
 ///
-/// 契約 §60.4 の注入版 seam。`probe_login_env` はここへ委譲する薄いラッパである。
-pub fn probe_login_env_with(shell: &str) -> Option<(String, String)> {
+/// 生の探査結果のみを返す内部ヘルパ。フォールバック方針は `probe_login_env_with` が持つ。
+/// タイムアウトを注入できる版に委譲する薄いラッパ（公開経路は `PROBE_TIMEOUT` を渡す）。
+fn probe_raw(shell: &str) -> Option<(String, String)> {
+    probe_raw_with_timeout(shell, PROBE_TIMEOUT)
+}
+
+/// タイムアウト値を注入できる版。テストが実測 `PROBE_TIMEOUT`（2 秒）を待たずに
+/// 「タイムアウトしても panic せずフォールバックする」ことを検証できるようにするため
+/// 分離した。フェーズ境界を越えて参照されないため契約 §60.4 によりモジュール内部に留める。
+fn probe_raw_with_timeout(shell: &str, timeout: Duration) -> Option<(String, String)> {
     let script =
         format!(r#"printf "{PATH_BEGIN}%s{PATH_END}{LANG_BEGIN}%s{LANG_END}" "$PATH" "$LANG""#);
     let shell = shell.to_string();
 
     let (tx, rx) = mpsc::channel();
-    // タイムアウト時に UI を待たせないよう別スレッドで待つ。
-    // タイムアウトしてもシェルは自然終了するのでスレッドは回収される。
+    // タイムアウト時にメインスレッドを待たせないよう別スレッドで実行し、recv_timeout で
+    // 抜ける。タイムアウトした場合、この子スレッドと起動済みのシェルプロセスは即座には
+    // 終了せず残り得る（kill していない）。ただし `probe_login_env()` は OnceLock で
+    // プロセス全体につき高々 1 回しかこの経路を呼ばないため、漏れは最大 1 スレッド・
+    // 1 子プロセスに有界であり、許容する。メインスレッドは子の回収を待たない。
     std::thread::spawn(move || {
         let result = Command::new(&shell)
             .args([SHELL_PROBE_FLAGS, &script])
@@ -99,7 +110,7 @@ pub fn probe_login_env_with(shell: &str) -> Option<(String, String)> {
         let _ = tx.send(result);
     });
 
-    let output = rx.recv_timeout(PROBE_TIMEOUT).ok()?.ok()?;
+    let output = rx.recv_timeout(timeout).ok()?.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // PATH が取れなければ探査自体が失敗とみなす。LANG は空でも成功扱い
@@ -107,6 +118,27 @@ pub fn probe_login_env_with(shell: &str) -> Option<(String, String)> {
     let path = extract_between(&stdout, PATH_BEGIN, PATH_END)?;
     let lang = extract_between(&stdout, LANG_BEGIN, LANG_END).unwrap_or_default();
     Some((path, lang))
+}
+
+/// 探査に使うシェル起動を注入できる版。フォールバック（PATH は `env::var("PATH")` →
+/// `MINIMAL_PATH`、LANG は空なら `system_lang()`）まで含めて必ず `LaunchEnv` を返す
+/// （panic しない）。契約 §60.4 の注入版 seam。`probe_login_env` はここへ委譲する
+/// 薄いラッパである。
+pub fn probe_login_env_with(shell: &str) -> LaunchEnv {
+    let probed = probe_raw(shell);
+
+    let path = probed
+        .as_ref()
+        .map(|(p, _)| p.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_else(|| MINIMAL_PATH.to_string());
+
+    // GUI 起動では LANG が空になるのでシステムロケールから導出する（契約 §18）
+    let lang = probed
+        .and_then(|(_, l)| if l.is_empty() { None } else { Some(l) })
+        .unwrap_or_else(system_lang);
+
+    LaunchEnv { path, lang }
 }
 
 /// 既知の CLI インストール先候補。
@@ -130,49 +162,65 @@ fn user_shell() -> String {
 }
 
 /// macOS のシステムロケールから LANG を導出する（契約 §18 のフォールバック）。
-/// `defaults read -g AppleLocale` は `ja_JP` のような値を返すので `.UTF-8` を付ける。
+/// `defaults read -g AppleLocale` の生の出力を `normalize_locale` に渡すだけの薄い層。
 /// フェーズ境界を越えて参照されないため契約 §60.4 によりモジュール内部に留める。
 fn system_lang() -> String {
-    let out = Command::new("defaults")
+    let raw = Command::new("defaults")
         .args(["read", "-g", "AppleLocale"])
         .output()
         .ok()
-        .filter(|o| o.status.success());
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    normalize_locale(&raw)
+}
 
-    match out {
-        Some(o) => {
-            let locale = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if locale.is_empty() {
-                "en_US.UTF-8".to_string()
-            } else {
-                // "ja_JP@calendar=gregorian" のような修飾子を落とす
-                let base = locale.split('@').next().unwrap_or(&locale);
-                format!("{base}.UTF-8")
-            }
-        }
-        None => "en_US.UTF-8".to_string(),
+/// システムから得たロケール文字列を POSIX ロケール（`ll` または `ll_CC`）+ `.UTF-8` へ
+/// 正規化する純関数。`defaults` の出力を注入できないテストのために分離した
+/// （`system_lang` は macOS 実機の `defaults` コマンドに依存するため 1 入力しか踏めない）。
+///
+/// 手順:
+/// 1. `@` 以降を落とす（`ja_JP@calendar=gregorian` のような修飾子）
+/// 2. `-` を `_` に置き換える（`defaults` が BCP-47 のハイフン形を返す環境がある）
+/// 3. `ll` / `ll_CC` の形として妥当でなければ `en_US.UTF-8` にフォールバックする
+///    （`zh-Hans-CN` のような 3 要素は POSIX ロケールとして解釈できないため。
+///    契約 §18 は「ハードコードよりシステム由来を優先せよ」という意味であり、
+///    システム由来の値が POSIX として解釈不能な場合まで禁じてはいない）
+/// 4. `.UTF-8` を付ける
+fn normalize_locale(raw: &str) -> String {
+    let base = raw.split('@').next().unwrap_or(raw).replace('-', "_");
+    if is_posix_locale(&base) {
+        format!("{base}.UTF-8")
+    } else {
+        "en_US.UTF-8".to_string()
     }
 }
 
+/// `ll` または `ll_CC`（`ll`/`CC` は英字のみ、2〜3 文字）の形かどうか。
+fn is_posix_locale(s: &str) -> bool {
+    match s.split('_').collect::<Vec<_>>().as_slice() {
+        [language] => is_alpha_of_len(language, 2..=3),
+        [language, country] => is_alpha_of_len(language, 2..=3) && is_alpha_of_len(country, 2..=2),
+        _ => false,
+    }
+}
+
+fn is_alpha_of_len(s: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&s.chars().count()) && s.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// `OnceLock` を注入できる版。テストが実ユーザーの `$SHELL` を起動せずに「探査は
+/// 高々 1 回しか呼ばれない」ことを検証できるようにするため分離した
+/// （キャッシュ機構そのものは `probe_login_env` と共有する）。
+fn get_or_probe(cache: &OnceLock<LaunchEnv>, probe: impl FnOnce() -> LaunchEnv) -> &LaunchEnv {
+    cache.get_or_init(probe)
+}
+
 /// 契約 §18: 1 回だけ探査してキャッシュする。失敗時もフォールバックし panic しない。
+/// `probe_login_env_with` へ委譲する薄いラッパ（契約 §60.4）。
 pub fn probe_login_env() -> &'static LaunchEnv {
     static CACHE: OnceLock<LaunchEnv> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let probed = probe_login_env_with(&user_shell());
-
-        let path = probed
-            .as_ref()
-            .map(|(p, _)| p.clone())
-            .or_else(|| std::env::var("PATH").ok())
-            .unwrap_or_else(|| MINIMAL_PATH.to_string());
-
-        // GUI 起動では LANG が空になるのでシステムロケールから導出する（契約 §18）
-        let lang = probed
-            .and_then(|(_, l)| if l.is_empty() { None } else { Some(l) })
-            .unwrap_or_else(system_lang);
-
-        LaunchEnv { path, lang }
-    })
+    get_or_probe(&CACHE, || probe_login_env_with(&user_shell()))
 }
 
 /// 実行可能な「ファイル」かどうか。同名ディレクトリを弾く。
@@ -316,13 +364,17 @@ mod tests {
 
         assert_eq!(
             probe_login_env_with(shell.to_str().expect("utf8")),
-            Some(("/fake/bin:/usr/bin".to_string(), "ja_JP.UTF-8".to_string()))
+            LaunchEnv {
+                path: "/fake/bin:/usr/bin".to_string(),
+                lang: "ja_JP.UTF-8".to_string()
+            }
         );
     }
 
     #[test]
-    fn probe_succeeds_with_empty_lang() {
-        // GUI 起動では LANG が空。PATH さえ取れれば探査は成功扱いにする
+    fn probe_falls_back_to_system_lang_when_probed_lang_is_empty() {
+        // GUI 起動では LANG が空。契約 §18: そのとき system_lang() の値へフォールバックする
+        // （空文字のまま渡すと nvim で日本語ファイル名が化けるため）。
         let dir = tempfile::tempdir().expect("tempdir");
         let shell = dir.path().join("fakeshell");
         std::fs::write(
@@ -334,15 +386,20 @@ mod tests {
         .expect("write");
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        assert_eq!(
-            probe_login_env_with(shell.to_str().expect("utf8")),
-            Some(("/fake/bin".to_string(), String::new()))
-        );
+        let env = probe_login_env_with(shell.to_str().expect("utf8"));
+        assert_eq!(env.path, "/fake/bin");
+        assert_eq!(env.lang, system_lang());
+        assert!(!env.lang.is_empty());
     }
 
     #[test]
-    fn probe_returns_none_for_missing_shell() {
-        assert_eq!(probe_login_env_with("/nonexistent/shell/xyz"), None);
+    fn probe_falls_back_to_process_path_when_shell_is_missing() {
+        // レビュー指摘: 探査失敗時のフォールバック（契約 §18「失敗時は
+        // std::env::var("PATH") にフォールバックする」）は、注入版に到達できないと
+        // 検証不能だった。存在しないシェルを渡して確実に探査を失敗させる。
+        let env = probe_login_env_with("/nonexistent/shell/xyz");
+        assert_eq!(env.path, std::env::var("PATH").unwrap_or_default());
+        assert_eq!(env.lang, system_lang());
     }
 
     #[test]
@@ -363,28 +420,30 @@ mod tests {
         .expect("write fake shell");
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-        probe_login_env_with(shell.to_str().expect("utf8"));
+        let _ = probe_login_env_with(shell.to_str().expect("utf8"));
 
         let recorded = std::fs::read_to_string(&args_file).expect("read args");
         assert_eq!(recorded, "-ilc");
     }
 
     #[test]
-    fn probe_login_env_with_times_out_instead_of_hanging() {
-        // 契約 §0: unwrap による panic 経路も、永久待機も禁止。タイムアウトで
-        // None に落ちることと、実測時間が PROBE_TIMEOUT を大きく超えないことを確認する。
+    fn probe_raw_with_timeout_falls_back_to_none_without_hanging() {
+        // 契約 §0: unwrap による panic 経路も、永久待機も禁止。実測 PROBE_TIMEOUT（2 秒）を
+        // 待つと CI の既定実行を遅くするので、タイムアウト値を短く注入して決定的かつ
+        // 高速に検証する。値そのもの（2 秒）は起動予算を食わない設計（判断 4）なので変えない。
         let dir = tempfile::tempdir().expect("tempdir");
         let shell = dir.path().join("slowshell");
         std::fs::write(&shell, "#!/bin/sh\nsleep 5\n").expect("write");
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         let start = std::time::Instant::now();
-        let result = probe_login_env_with(shell.to_str().expect("utf8"));
+        let result =
+            probe_raw_with_timeout(shell.to_str().expect("utf8"), Duration::from_millis(50));
         let elapsed = start.elapsed();
 
         assert_eq!(result, None);
         assert!(
-            elapsed < PROBE_TIMEOUT + Duration::from_secs(1),
+            elapsed < Duration::from_secs(1),
             "took too long: {elapsed:?}"
         );
     }
@@ -399,6 +458,35 @@ mod tests {
             "locale part must not be empty: {lang}"
         );
         assert!(!lang.contains('@'), "modifiers must be stripped: {lang}");
+    }
+
+    // ---- normalize_locale（純関数。system_lang のハイフン形・不正形の正規化） ----
+
+    #[test]
+    fn normalize_locale_passes_through_underscore_form() {
+        assert_eq!(normalize_locale("ja_JP"), "ja_JP.UTF-8");
+    }
+
+    #[test]
+    fn normalize_locale_converts_hyphen_form_to_underscore() {
+        // 判断 4 のレビュー指摘: defaults が BCP-47 のハイフン形（ja-JP）を返す環境がある
+        assert_eq!(normalize_locale("ja-JP"), "ja_JP.UTF-8");
+    }
+
+    #[test]
+    fn normalize_locale_falls_back_for_three_part_bcp47_form() {
+        // zh_Hans_CN は POSIX ロケール（ll または ll_CC）として無効なのでフォールバックする
+        assert_eq!(normalize_locale("zh-Hans-CN"), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn normalize_locale_strips_modifier_suffix() {
+        assert_eq!(normalize_locale("en_US@calendar=japanese"), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn normalize_locale_falls_back_for_empty_input() {
+        assert_eq!(normalize_locale(""), "en_US.UTF-8");
     }
 
     // ---- resolve_program_in（注入版） ----
@@ -514,11 +602,28 @@ mod tests {
     // ---- probe_login_env（キャッシュ） ----
 
     #[test]
-    fn probe_login_env_caches_result_across_calls() {
+    fn get_or_probe_invokes_the_probe_at_most_once() {
         // 契約 §0: 起動 1 秒未満。310ms の副作用が毎回走ってはならない。
-        // OnceLock により 2 回目以降は同一インスタンスを返すことで再探査していないと確認する。
-        let a = probe_login_env();
-        let b = probe_login_env();
+        // レビュー指摘: `probe_login_env()` を直接呼ぶと実ユーザーの $SHELL（と .zshrc）に
+        // 依存し CI ランナーで再現しない上、std::ptr::eq だけでは「本当に 1 回しか
+        // 呼ばれていないか」を検証できない（探査結果が何であれ緑になる）。
+        // ローカルな OnceLock と呼び出し回数カウンタを注入し、実シェルなしで検証する。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let probe = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LaunchEnv {
+                path: "/fake".to_string(),
+                lang: "C".to_string(),
+            }
+        };
+
+        let a = get_or_probe(&cache, probe);
+        let b = get_or_probe(&cache, probe);
+
         assert!(std::ptr::eq(a, b));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
