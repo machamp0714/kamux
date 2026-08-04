@@ -4,8 +4,12 @@ use std::process::Command;
 use crate::error::{AppError, AppResult};
 
 pub mod slug;
+pub mod suggest;
 
 pub use slug::title_slug;
+pub use suggest::{
+    branch_exists, branch_slug, suggest_branch_name, worktree_path_for, BRANCH_PREFIX,
+};
 
 // pub(crate) にするのは、Task 3/4/5（他モジュールの git テスト）からも
 // `crate::worktree::test_support::TestRepo` を再利用できるようにするため
