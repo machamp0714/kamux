@@ -234,4 +234,14 @@ describe('SortableCard 合成時（カード 1 枚あたりのタブストップ
     expect(s.view).toBe('terminal');
     expect(s.focusedSessionId).toBe('s1');
   });
+
+  it('カードのルート要素は role="article" のままで、dnd-kit 既定の role="button" には戻らない', () => {
+    // role='button' に戻ると「編集」「アーカイブ」の <button> が
+    // children-presentational になり支援技術から消える。ここが崩れると
+    // 症状が出ないまま dnd-kit の既定挙動（aria-pressed の付与含む）に戻る。
+    renderSortable();
+
+    expect(card().getAttribute('role')).toBe('article');
+    expect(card().hasAttribute('aria-pressed')).toBe(false);
+  });
 });

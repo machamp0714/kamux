@@ -61,17 +61,30 @@ fn plan_agent_spawn_with(
     // Custom を別経路に倒すと、Custom セッションが誤ったプログラムへ飛ぶ
     // （Task 7 レビューが名指しで警告した事故）。
     //
-    // **`prepare_worktree`（下）より前に解決すること**（レビュー指摘 Important 2）。
-    // ここが `prepare_worktree` より後ろだと、claude 未インストール環境で
-    // 「worktree はディスク上に作られたが CliNotFound で spawn まで届かない」状態になる。
-    // 判断 6 によりこの失敗時は DB を書かないため、次回の `start_session` はまた
-    // `session.worktree_path == None` から `prepare_worktree` を呼び直す。worktree
-    // モードのセッションは作成時に必ず `branch` が非 null になる
-    // （`sessionForm.ts` が空欄なら `proposeBranchName(title)` を埋める）ため、
-    // `prepare_worktree` の再利用腕にも `suggest_branch_name` の重複回避にも入らず、
-    // 既存 branch のまま `create_worktree` を再実行して git の
-    // 「branch already exists」で毎回失敗する —— claude 未インストールのユーザーが
-    // 1 回起動を試みただけでそのセッションが恒久的に起動不能になる。
+    // **`prepare_worktree`（下）より前に解決すること。** 根拠は「`claude` 未検出という
+    // 最も日常的な失敗で、worktree という副作用（git ブランチ作成・ディレクトリ作成）を
+    // 作らずに済むこと」である（契約 §63.4 の 1 段目の理由）。ここが `prepare_worktree`
+    // より後ろだと、claude 未インストール環境で「worktree はディスク上に作られたが
+    // CliNotFound で spawn まで届かない」状態になる。
+    //
+    // `branch` は NULL でありうる（契約 §62 案 D）。ユーザーがブランチ欄を編集していなければ
+    // `sessionForm.ts` は `create_session` へ `branch: null` を送る —— `proposeBranchName`
+    // の出力は入力欄の表示にのみ使われ、DB へは焼かれない。`prepare_worktree` は
+    // `session.branch == None` のとき `suggest_branch_name` で空いている名前を確定する。
+    //
+    // `set_worktree`（下）は `prepare_worktree` の直後、spawn より前で呼ばれる
+    // （契約 §63.1 / §63.4）。設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）
+    // の適用範囲は契約 §63.1 により `kanban_status` / `sort_order` に限定されている
+    // —— `branch` / `worktree_path` はこの解決の直後、spawn 成功より前に永続化される。
+    //
+    // `start_session` の起動フェーズの順序（契約 §63.4。順序の根拠はコード上ここにしか
+    // 無い —— 契約 §63.6 は `prepare_worktree` に `&Store` を持たせるチョークポイント化を
+    // 却下し、代わりに置くものとしてこの順序規則そのものを選んだ）:
+    //   1. resolve_program（副作用が無く cwd にも依存しないので最初に置く）
+    //   2. prepare_worktree
+    //   3. Store::set_worktree
+    //   4. build_launch_command
+    //   5. PtyManager::spawn
     let program = match binary_name(session.cli_kind) {
         Some(name) => resolve(name)?.display().to_string(),
         None => login_shell(),
@@ -518,19 +531,33 @@ mod tests {
         );
     }
 
-    /// レビュー指摘 Important 2: バイナリ解決（`resolve`）は `prepare_worktree` より
-    /// **前**に呼ばれなければならない。順序が逆だと、claude 未インストール環境で
-    /// worktree ディレクトリと git ブランチだけがディスク上に作られたまま
-    /// `AppError::CliNotFound` で失敗する。判断 6 によりこの失敗時は DB を書かないため、
-    /// 次回の `start_session` はまた `worktree_path == None` から `prepare_worktree` を
-    /// 呼び直す。worktree モードのセッションは作成時に必ず `branch` が非 null になる
-    /// （`sessionForm.ts` が空欄なら `proposeBranchName(title)` を埋める）ため、
-    /// 再利用腕にも `suggest_branch_name` の重複回避にも入らず、既存 branch のまま
-    /// `create_worktree` を再実行して git の「branch already exists」で毎回失敗する
-    /// —— claude 未インストールのユーザーが 1 回起動を試みただけでそのセッションが
-    /// 恒久的に起動不能になる。`.worktrees/` が作られていないことまで確認することで、
-    /// 順序の入れ替えを弁別する（`CliNotFound` が返ることだけを見るテストでは、
-    /// 「worktree を作ってから失敗した」場合と区別できない）。
+    /// バイナリ解決（`resolve`）は `prepare_worktree` より**前**に呼ばれなければならない。
+    /// 根拠は「`claude` 未検出という最も日常的な失敗で、worktree という副作用
+    /// （git ブランチ作成・ディレクトリ作成）を作らずに済むこと」である（契約 §63.4 の
+    /// 1 段目の理由）。順序が逆だと、claude 未インストール環境で worktree ディレクトリと
+    /// git ブランチだけがディスク上に作られたまま `AppError::CliNotFound` で失敗する。
+    ///
+    /// `branch` は NULL でありうる（契約 §62 案 D）。ユーザーがブランチ欄を編集していなければ
+    /// `sessionForm.ts` は `create_session` へ `branch: null` を送る —— `prepare_worktree`
+    /// は `session.branch == None` のとき `suggest_branch_name` で空いている名前を確定する。
+    ///
+    /// `set_worktree` は `prepare_worktree` の直後、spawn より前で呼ばれる（契約 §63.1 /
+    /// §63.4）。設計判断 6 の適用範囲は契約 §63.1 により `kanban_status` / `sort_order` に
+    /// 限定されている —— `branch` / `worktree_path` はこの解決の直後、spawn 成功より前に
+    /// 永続化される。
+    ///
+    /// `start_session` の起動フェーズの順序（契約 §63.4。順序の根拠はコード上ここにしか
+    /// 無い —— 契約 §63.6 は `prepare_worktree` に `&Store` を持たせるチョークポイント化
+    /// を却下し、代わりに置くものとしてこの順序規則そのものを選んだ）:
+    ///   1. resolve_program（副作用が無く cwd にも依存しないので最初に置く）
+    ///   2. prepare_worktree
+    ///   3. Store::set_worktree
+    ///   4. build_launch_command
+    ///   5. PtyManager::spawn
+    ///
+    /// `.worktrees/` が作られていないことまで確認することで、順序の入れ替えを弁別する
+    /// （`CliNotFound` が返ることだけを見るテストでは、「worktree を作ってから失敗した」
+    /// 場合と区別できない）。
     #[test]
     fn plan_agent_spawn_does_not_create_a_worktree_when_the_binary_cannot_be_resolved() {
         let _lock = ENV_LOCK
