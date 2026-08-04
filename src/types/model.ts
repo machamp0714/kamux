@@ -65,3 +65,13 @@ export interface AppError {
 
 /** 契約 §5 */
 export const surfaceId = (sessionId: string, kind: SurfaceKind) => `${sessionId}:${kind}`;
+
+/**
+ * `focus://session/{session_id}`（契約 §8）のペイロード。
+ * TS 側の置き場所の正典は src/types/model.ts（契約 §33.2。Rust 側の model.rs と 1:1）。
+ * emit するのは M2-3（通知クリック）。listen ラッパの正典は src/ipc/events.ts の listenFocus（契約 §35）。
+ */
+export interface FocusPayload {
+  session_id: string;
+  surface_kind: SurfaceKind;
+}

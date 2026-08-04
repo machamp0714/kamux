@@ -1,4 +1,5 @@
-import type { PointerEvent } from 'react';
+import type { KeyboardEvent, MouseEvent, PointerEvent } from 'react';
+import { useAppStore } from '../../store';
 import type { RuntimeState, Session } from '../../types/model';
 import { CLI_ICON, runtimeBadge } from './badge';
 
@@ -15,14 +16,38 @@ function stopDrag(e: PointerEvent<HTMLButtonElement>) {
 }
 
 /**
+ * カード内のボタン（編集 / アーカイブ）のクリックがカード自体の
+ * onClick（focusSession）へバブリングしないようにする（要件5）。
+ */
+function stopOpen(e: MouseEvent<HTMLButtonElement>) {
+  e.stopPropagation();
+}
+
+/**
  * カードの見た目のみを持つ。dnd-kit に依存しないので DragOverlay でもそのまま使える。
- * M1-4 で onOpen（クリック → ターミナルへ）が追加される。
+ * クリック / Enter でターミナル画面の該当ペインへフォーカスする（要件5・契約 §11）。
  */
 export function KanbanCard({ session, runtimeStates, onEdit, onArchive }: KanbanCardProps) {
   const badge = runtimeBadge(runtimeStates, session.id);
+  const focusSession = useAppStore((s) => s.focusSession);
+
+  const open = () => focusSession(session.id, 'terminal');
+
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    open();
+  };
 
   return (
-    <article className="kanban-card" data-session-id={session.id}>
+    <article
+      className="kanban-card"
+      data-session-id={session.id}
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={onKeyDown}
+    >
       <div className="kanban-card__head">
         {badge !== null && (
           <span className="kanban-card__badge" title={badge.label} aria-label={badge.label}>
@@ -46,10 +71,24 @@ export function KanbanCard({ session, runtimeStates, onEdit, onArchive }: Kanban
       ) : null}
 
       <div className="kanban-card__actions">
-        <button type="button" onPointerDown={stopDrag} onClick={() => onEdit?.(session.id)}>
+        <button
+          type="button"
+          onPointerDown={stopDrag}
+          onClick={(e) => {
+            stopOpen(e);
+            onEdit?.(session.id);
+          }}
+        >
           編集
         </button>
-        <button type="button" onPointerDown={stopDrag} onClick={() => onArchive?.(session.id)}>
+        <button
+          type="button"
+          onPointerDown={stopDrag}
+          onClick={(e) => {
+            stopOpen(e);
+            onArchive?.(session.id);
+          }}
+        >
           アーカイブ
         </button>
       </div>

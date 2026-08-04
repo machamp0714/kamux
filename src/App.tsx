@@ -1,8 +1,10 @@
 import { useEffect } from 'react';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 
 import { ErrorToast } from './components/ErrorToast';
 import { ProjectBar } from './components/ProjectBar';
 import { useKeymap } from './hooks/useKeymap';
+import { listenFocus } from './ipc/events';
 import { bootstrap, useAppStore } from './store';
 import { toAppError } from './store/uiSlice';
 import { KanbanView } from './views/KanbanView';
@@ -13,12 +15,31 @@ import './App.css';
 export default function App() {
   const view = useAppStore((s) => s.view);
   const setError = useAppStore((s) => s.setError);
+  const focusSession = useAppStore((s) => s.focusSession);
+  // セレクタはプリミティブを返す（sessions オブジェクト全体は select しない）。
+  // ID の集合が変わったときだけ effect を再実行すればよいので、ソート済みの
+  // カンマ区切り文字列にして依存値にする。
+  const sessionIdsKey = useAppStore((s) => Object.keys(s.sessions).sort().join(','));
 
   useKeymap();
 
   useEffect(() => {
     bootstrap().catch((e: unknown) => setError(toAppError(e)));
   }, [setError]);
+
+  // focus://session/{session_id}（契約 §8）の受信。emit するのは M2-3（通知クリック）。
+  // カードクリックと同じ focusSession に収束させる（要件5）。
+  useEffect(() => {
+    const sessionIds = sessionIdsKey === '' ? [] : sessionIdsKey.split(',');
+    const unlistens: Promise<UnlistenFn>[] = sessionIds.map((id) =>
+      listenFocus(id, (p) =>
+        focusSession(p.session_id, p.surface_kind === 'editor' ? 'editor' : 'terminal'),
+      ),
+    );
+    return () => {
+      unlistens.forEach((u) => void u.then((fn) => fn()));
+    };
+  }, [sessionIdsKey, focusSession]);
 
   return (
     <div className="app">
