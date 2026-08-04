@@ -186,6 +186,11 @@ mod tests {
             "ログイン不具合の修正",
             "!!!",
             &"a".repeat(60),
+            // 40 文字境界で base slug の末尾がハイフンになる入力（PR 11 全体レビュー
+            // Important）。with_suffix の trim_end_matches('-') が無いと
+            // "aaa...a--2" のように連続ハイフンが生まれ、branch_slug を通すと
+            // "-2" に潰れて元の branch と一致しなくなる（冪等性が破れる）。
+            &format!("{} bbbb", "a".repeat(37)),
         ] {
             let branch = suggest_branch_name(repo.path(), title, ID).expect("suggest");
             let slug = branch_slug(&branch, ID);
