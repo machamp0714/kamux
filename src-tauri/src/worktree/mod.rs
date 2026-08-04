@@ -3,6 +3,10 @@ use std::process::Command;
 
 use crate::error::{AppError, AppResult};
 
+pub mod slug;
+
+pub use slug::title_slug;
+
 // pub(crate) にするのは、Task 3/4/5（他モジュールの git テスト）からも
 // `crate::worktree::test_support::TestRepo` を再利用できるようにするため
 // （`store::test_support` と同じ可視性の前例に合わせた）。
