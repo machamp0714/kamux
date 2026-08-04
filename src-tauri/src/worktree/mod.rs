@@ -23,10 +23,10 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> AppResult<String> {
         .map_err(|e| AppError::Git(format!("failed to execute git: {e}")))?;
 
     if !output.status.success() {
+        // 契約 §6: message には加工していない stderr をそのまま入れる。
+        // trim 等の加工を挟まない（レビュー Important 1 の裁定: 契約が brief に優先する）。
         return Err(AppError::Git(
-            String::from_utf8_lossy(&output.stderr)
-                .trim_end()
-                .to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -47,13 +47,48 @@ mod tests {
     #[test]
     fn run_git_returns_raw_stderr_as_git_error() {
         let repo = TestRepo::new();
+
+        // run_git とは独立に同じコマンドを直接キャプチャし、生の stderr を
+        // 基準値にする（devrunerification: レビュー Important 2）。
+        // 装飾（trim/format 追記など）を混入させても弁別できるよう、
+        // contains ではなく完全一致で比較する。
+        let reference = Command::new("git")
+            .args(["checkout", "no-such-branch"])
+            .current_dir(repo.path())
+            .output()
+            .expect("spawn git directly for the reference capture");
+        assert!(!reference.status.success(), "reference command must fail");
+        let raw_stderr = String::from_utf8_lossy(&reference.stderr).to_string();
+
         let err = run_git(repo.path(), &["checkout", "no-such-branch"]).unwrap_err();
         match err {
             AppError::Git(msg) => {
-                // 加工しない stderr がそのまま入っていること（契約 §6）
+                // 加工しない stderr がそのまま入っていること（契約 §6）。
+                assert_eq!(
+                    msg, raw_stderr,
+                    "stderr should be passed through byte-for-byte verbatim"
+                );
+            }
+            other => panic!("expected AppError::Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_git_wraps_spawn_failure_when_cwd_does_not_exist() {
+        // cwd が存在しないと Command::output() 自体が失敗する（spawn 失敗経路）。
+        // これは git のコマンド失敗（非ゼロ終了・stderr あり）とは別の分岐であり、
+        // どちらも `AppError::Git` に載るが到達するコードパスが異なる（mod.rs の
+        // `.map_err` 側）。
+        let err = run_git(
+            Path::new("/nonexistent/path/for/run_git/probe"),
+            &["status"],
+        )
+        .unwrap_err();
+        match err {
+            AppError::Git(msg) => {
                 assert!(
-                    msg.contains("no-such-branch"),
-                    "stderr should be passed through verbatim, got: {msg}"
+                    msg.contains("failed to execute git"),
+                    "spawn failure message should be wrapped with context, got: {msg}"
                 );
             }
             other => panic!("expected AppError::Git, got {other:?}"),
