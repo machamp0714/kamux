@@ -33,7 +33,10 @@ fn plan_agent_spawn_with(
     state: &AppState,
     id: &str,
     launch_env: &LaunchEnv,
-    resolve_program: impl Fn(&str) -> AppResult<PathBuf>,
+    // レビュー指摘 M-2: パラメータ名を `resolve_program` にすると、同名で import した
+    // 本物の `crate::pty::launch_env::resolve_program` をシャドウし、関数内で
+    // どちらを呼んでいるか読みにくくなる。注入されたクロージャだと分かる名前にする。
+    resolve: impl Fn(&str) -> AppResult<PathBuf>,
 ) -> AppResult<(Session, SpawnSpec)> {
     let sid = surface_id(id, SurfaceKind::Agent);
 
@@ -49,6 +52,30 @@ fn plan_agent_spawn_with(
 
     let mut session = state.store.get_session(id)?;
     let project = state.store.get_project(&session.project_id)?;
+
+    // 実行ファイルを解決する（契約 §18。claude/codex 未検出はここで CliNotFound）。
+    // `binary_name` は Claude / Codex だけ `Some` を返す。Shell と Custom は**両方**
+    // `None` を返す —— Custom は `cli_args::build_launch_command` の Custom の腕が
+    // `$SHELL -l -c "<cli_command>"` を組む（シェル経由起動）ため、Shell と同じ
+    // ログインシェルへ意図的に相乗りさせている。`None` を「シェルだから」と早合点して
+    // Custom を別経路に倒すと、Custom セッションが誤ったプログラムへ飛ぶ
+    // （Task 7 レビューが名指しで警告した事故）。
+    //
+    // **`prepare_worktree`（下）より前に解決すること**（レビュー指摘 Important 2）。
+    // ここが `prepare_worktree` より後ろだと、claude 未インストール環境で
+    // 「worktree はディスク上に作られたが CliNotFound で spawn まで届かない」状態になる。
+    // 判断 6 によりこの失敗時は DB を書かないため、次回の `start_session` はまた
+    // `session.worktree_path == None` から `prepare_worktree` を呼び直す。worktree
+    // モードのセッションは作成時に必ず `branch` が非 null になる
+    // （`sessionForm.ts` が空欄なら `proposeBranchName(title)` を埋める）ため、
+    // `prepare_worktree` の再利用腕にも `suggest_branch_name` の重複回避にも入らず、
+    // 既存 branch のまま `create_worktree` を再実行して git の
+    // 「branch already exists」で毎回失敗する —— claude 未インストールのユーザーが
+    // 1 回起動を試みただけでそのセッションが恒久的に起動不能になる。
+    let program = match binary_name(session.cli_kind) {
+        Some(name) => resolve(name)?.display().to_string(),
+        None => login_shell(),
+    };
 
     // worktree モードなら必要に応じて worktree を作る/再利用し、in_place ならそのまま
     // repo_path を返す（契約 §13 / 設計判断 8）。`session.branch` / `session.worktree_path`
@@ -74,18 +101,6 @@ fn plan_agent_spawn_with(
             cwd.display()
         )));
     }
-
-    // 実行ファイルを解決する（契約 §18。claude/codex 未検出はここで CliNotFound）。
-    // `binary_name` は Claude / Codex だけ `Some` を返す。Shell と Custom は**両方**
-    // `None` を返す —— Custom は `cli_args::build_launch_command` の Custom の腕が
-    // `$SHELL -l -c "<cli_command>"` を組む（シェル経由起動）ため、Shell と同じ
-    // ログインシェルへ意図的に相乗りさせている。`None` を「シェルだから」と早合点して
-    // Custom を別経路に倒すと、Custom セッションが誤ったプログラムへ飛ぶ
-    // （Task 7 レビューが名指しで警告した事故）。
-    let program = match binary_name(session.cli_kind) {
-        Some(name) => resolve_program(name)?.display().to_string(),
-        None => login_shell(),
-    };
 
     // 起動コマンドを組み立てる（契約 §23 の純粋関数）。
     // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
@@ -173,6 +188,10 @@ pub async fn start_session(
 ) -> AppResult<Session> {
     let (mut session, spec) = plan_agent_spawn(&state, &id)?;
     // AppHandle に依存する行はこの 1 行だけ（設計判断 6: spawn 成功後にのみ DB を書く）。
+    // `state.pty.spawn` が Wry 固定（契約 §15）で MockRuntime に登録できないため、
+    // 「spawn 成功後にのみ commit_started_session を呼ぶ」という順序はユニットテストでは
+    // 担保できない。この 3 行の構造そのもの（`?` の早期リターンが commit の手前にあること）
+    // を目視レビューで担保する（レビュー指摘 M-1）。
     state.pty.spawn(&app, spec)?;
     commit_started_session(&state, &mut session)
 }
@@ -414,6 +433,16 @@ mod tests {
             "injected launch_env must flow into the SpawnSpec env: {:?}",
             spec.env
         );
+        // レビュー指摘 M-4: PATH だけ固定して LANG は無防備だった。契約 §18 が LANG を
+        // 注入する目的（空のままだと nvim/claude で日本語ファイル名が化ける）を守れて
+        // いることも合わせて固定する。
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "LANG" && v == "ja_JP.UTF-8"),
+            "injected launch_env.lang must flow into the SpawnSpec env: {:?}",
+            spec.env
+        );
     }
 
     /// 申し送り #1 の核心: `binary_name` は `Shell` と `Custom` の**両方**で `None` を
@@ -436,6 +465,58 @@ mod tests {
         assert_eq!(
             spec.args,
             vec!["-l".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
+    }
+
+    /// レビュー指摘 Important 2: バイナリ解決（`resolve`）は `prepare_worktree` より
+    /// **前**に呼ばれなければならない。順序が逆だと、claude 未インストール環境で
+    /// worktree ディレクトリと git ブランチだけがディスク上に作られたまま
+    /// `AppError::CliNotFound` で失敗する。判断 6 によりこの失敗時は DB を書かないため、
+    /// 次回の `start_session` はまた `worktree_path == None` から `prepare_worktree` を
+    /// 呼び直す。worktree モードのセッションは作成時に必ず `branch` が非 null になる
+    /// （`sessionForm.ts` が空欄なら `proposeBranchName(title)` を埋める）ため、
+    /// 再利用腕にも `suggest_branch_name` の重複回避にも入らず、既存 branch のまま
+    /// `create_worktree` を再実行して git の「branch already exists」で毎回失敗する
+    /// —— claude 未インストールのユーザーが 1 回起動を試みただけでそのセッションが
+    /// 恒久的に起動不能になる。`.worktrees/` が作られていないことまで確認することで、
+    /// 順序の入れ替えを弁別する（`CliNotFound` が返ることだけを見るテストでは、
+    /// 「worktree を作ってから失敗した」場合と区別できない）。
+    #[test]
+    fn plan_agent_spawn_does_not_create_a_worktree_when_the_binary_cannot_be_resolved() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = TestRepo::new();
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project("kamux", repo.path().to_str().expect("utf8"), CliKind::Shell)
+            .expect("insert project");
+        let session = Session::new_backlog(
+            &project.id,
+            "fix login bug",
+            "",
+            SessionMode::Worktree,
+            None,
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        let session = store.insert_session(&session).expect("insert session");
+        let state = AppState {
+            store: Arc::new(store),
+            pty: PtyManager::new(),
+        };
+
+        let failing_resolve =
+            |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("claude".to_string())) };
+        let err = plan_agent_spawn_with(&state, &session.id, &fake_launch_env(), failing_resolve)
+            .expect_err("must fail when the binary cannot be resolved");
+
+        assert!(matches!(err, AppError::CliNotFound(_)), "actual: {err:?}");
+        assert!(
+            !repo.path().join(".worktrees").exists(),
+            "worktree creation must not happen before the binary is resolved"
         );
     }
 
@@ -617,8 +698,16 @@ mod tests {
     }
 
     /// 順序の制約 2 を DB 行のレベルで固定する。既存の in_progress セッションを 1 件
-    /// 仕込んで tail（採番される sort_order）が現在の値と一致しない状況を作ることで、
-    /// `next_sort_order` に渡す `KanbanStatus` を取り違える変異も弁別できる。
+    /// 仕込んで tail（採番される sort_order）が現在の値と一致しない状況を作ることに加え、
+    /// **Backlog 列に sort_order の大きいダミーカードを置く**（レビュー指摘 Important 1）。
+    ///
+    /// この decoy が無いと、テスト対象セッション自身が Backlog 列の唯一のカード
+    /// （sort_order ≒ 1.0）になるため、`next_sort_order` に渡す `KanbanStatus` を
+    /// `InProgress` → `Backlog` に取り違える変異を入れても、Backlog 列の
+    /// `COALESCE(MAX(sort_order), 0) + 1` がたまたま InProgress 列の正しい tail と
+    /// 同じ値（2.0）を返してしまい、変異が検出できなかった（実測: 修正前のこのテストは
+    /// 変異を入れても 273 件全部緑のまま通っていた）。decoy の sort_order を 100.0 まで
+    /// 押し上げることで、取り違えた場合の値（≒101.0）と正しい値（≒2.0）を大きく引き離す。
     #[test]
     fn commit_started_session_moves_a_backlog_session_to_the_tail_of_in_progress() {
         let (_dir, state, project) = build_state("/tmp/kamux-test-repo");
@@ -656,6 +745,35 @@ mod tests {
             )
             .expect("move existing to in_progress");
 
+        // Backlog 列の decoy: sort_order を大きく引き離すことで、next_sort_order に
+        // 渡す KanbanStatus の取り違えを弁別できるようにする（上記コメント参照）。
+        let decoy_sort = state
+            .store
+            .next_sort_order(&project.id, KanbanStatus::Backlog)
+            .expect("next_sort_order");
+        let decoy = Session::new_backlog(
+            &project.id,
+            "decoy backlog card",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            decoy_sort,
+            now_ms(),
+        );
+        let decoy = state.store.insert_session(&decoy).expect("insert decoy");
+        state
+            .store
+            .update_session(
+                &decoy.id,
+                &SessionPatch {
+                    sort_order: Some(100.0),
+                    ..Default::default()
+                },
+            )
+            .expect("push decoy sort_order high");
+
         let backlog_sort = state
             .store
             .next_sort_order(&project.id, KanbanStatus::Backlog)
@@ -679,9 +797,13 @@ mod tests {
         let result = commit_started_session(&state, &mut session).expect("commit");
 
         assert_eq!(result.kanban_status, KanbanStatus::InProgress);
+        // 正しい実装なら In Progress 列の tail（existing_sort のすぐ後ろ）になり、
+        // Backlog 列の decoy（sort_order=100.0）には一切影響されない。取り違え変異が
+        // 入ると decoy に引きずられて 101.0 付近まで跳ね上がるため、上限 10.0 で弁別する。
         assert!(
-            result.sort_order > existing_sort,
-            "In Progress 列の末尾（既存より後）に置かれること: {} vs {}",
+            result.sort_order > existing_sort && result.sort_order < 10.0,
+            "In Progress 列の末尾（既存カードのすぐ後ろ）に置かれるべきで、Backlog 列の \
+             decoy（100.0）には影響されないはず: {} (existing_sort={})",
             result.sort_order,
             existing_sort
         );
