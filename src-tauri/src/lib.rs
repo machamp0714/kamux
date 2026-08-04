@@ -1194,5 +1194,42 @@ mod tests {
 
             assert_eq!(got.as_str(), Some("session/fix-login-bug"), "got: {got:?}");
         }
+
+        // `session_id` がラッパを経由して `worktree::suggest_branch_name` の第 3 引数
+        // まで実際に流れていることを固定する（契約 §60.1 の採用理由 1: `id` を持たない
+        // 限り §13 の fallback を作れない）。title を slug 化すると空になる値にすることで、
+        // 戻り値が session_id 由来の fallback（"session-{id 先頭 8 文字}"）になることを
+        // 検証する。title / session_id を取り違えるラッパの変異（第 3 引数を title に
+        // 差し替える等）を上の 2 テストは弁別できないが、これは弁別する。
+        #[test]
+        fn suggest_branch_name_flows_session_id_into_the_fallback_slug() {
+            use crate::worktree::test_support::TestRepo;
+
+            let repo = TestRepo::new();
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({
+                    "name": "kamux",
+                    "repoPath": repo.path().to_str().expect("utf8"),
+                    "defaultCli": "claude",
+                }),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let got = invoke_ok(
+                &webview,
+                "suggest_branch_name",
+                json!({"projectId": project_id, "title": "!!!", "sessionId": "sess-1"}),
+            );
+
+            assert_eq!(got.as_str(), Some("session/session-sess-1"), "got: {got:?}");
+        }
     }
 }
