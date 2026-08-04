@@ -79,9 +79,38 @@ fn plan_agent_spawn_with(
 
     // worktree モードなら必要に応じて worktree を作る/再利用し、in_place ならそのまま
     // repo_path を返す（契約 §13 / 設計判断 8）。`session.branch` / `session.worktree_path`
-    // をここで in-memory に確定させる。DB への永続化は spawn 成功後（`commit_started_session`）
-    // まで行わない（設計判断 6）。
+    // をここで in-memory に確定させる。
     let cwd = prepare_worktree(&project, &mut session)?;
+
+    // 契約 §63.1 / §63.4: `branch` / `worktree_path` の永続化は `prepare_worktree` が
+    // `Ok` を返した直後、これ以降のどの失敗しうる処理（cwd の `is_dir()` 検証・
+    // `build_launch_command`・`PtyManager::spawn`）よりも前に行う。
+    //
+    // 設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）は
+    // `kanban_status` / `sort_order` にのみ適用される —— 判断 6 が守ろうとしたのは
+    // 「カードが In Progress へ飛ぶのは DB が嘘をつくことに等しい」であり、対象は
+    // 列移動だけである。`branch` / `worktree_path` は性質が逆で、ディスク上に実在する
+    // worktree を DB に記録するのだから、書けば DB は真実に近づき、書かなければ嘘を
+    // つく。ここで書かずに `build_launch_command` や `spawn` が失敗すると、worktree と
+    // git ブランチはディスク上に残ったまま DB には記録されず、`resolve_cwd`（M3-1 の
+    // エディタ）がリポジトリ直上を開く・resume（M2-4）が `InvalidState` で弾かれる・
+    // 判断 8 の再利用腕が同じ branch で `create_worktree` を再試行して
+    // 「branch already exists」により恒久的に起動不能になる、という害が生じる
+    // （契約 §63 が実測した 5 つの消費者のうち複数）。
+    //
+    // `Store::update_session` の SET 句は title/description/kanban_status/sort_order/
+    // archived_at/updated_at だけで branch/worktree_path を含まない
+    // （`session_dao.rs` 実測）。`set_worktree` を別途呼ばない限りここで確定させた値は
+    // DB に残らず、次回起動でまた新規 worktree を作ってしまう。worktree モードなら
+    // 常に両方 Some、in_place なら常に両方 None なので `if let` の両側同時成立だけを
+    // 見ればよい。失敗（`AppError::NotFound` 等）は `?` で中断し、セッションを
+    // 起動しない —— DB に書けなかった worktree で起動を続けると、この関数が
+    // 埋めようとした真実性の穴がそのまま残る。
+    if let (Some(branch), Some(worktree_path)) = (&session.branch, &session.worktree_path) {
+        state
+            .store
+            .set_worktree(&session.id, branch, worktree_path)?;
+    }
 
     // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:502-507）は
     // cwd を `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリ
@@ -127,25 +156,19 @@ fn plan_agent_spawn(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec
     plan_agent_spawn_with(state, id, probe_login_env(), resolve_program)
 }
 
-/// PTY spawn が成功した**後**にのみ呼ぶ。worktree の確定・カンバン列の遷移判定・
-/// 永続化を行う（設計判断 6: 失敗時にカードが In Progress へ飛ぶと DB が嘘をつく）。
+/// PTY spawn が成功した**後**にのみ呼ぶ。カンバン列の遷移判定・永続化を行う
+/// （設計判断 6: 失敗時にカードが In Progress へ飛ぶと DB が嘘をつく）。
+///
+/// `branch` / `worktree_path` の永続化はここでは**行わない**。契約 §63.1 / §63.4 に
+/// より、それは `plan_agent_spawn_with` 側（`prepare_worktree` の直後、spawn より前）
+/// で既に完了している —— 判断 6 が「spawn 成功後にのみ書く」を要求するのは
+/// `kanban_status` / `sort_order` だけであり、`branch` / `worktree_path` は逆の性質
+/// （書けば DB が真実に近づく）を持つため、早期に確定させる。
 ///
 /// `AppHandle` も `PtyManager` も要らないため、実 PTY を起動せずに固定できる。
 /// `start_session` に残る `AppHandle` 依存の行は `state.pty.spawn(&app, spec)` の
 /// 1 行だけになる。
 fn commit_started_session(state: &AppState, session: &mut Session) -> AppResult<Session> {
-    // `Store::update_session` の SET 句は title/description/kanban_status/sort_order/
-    // archived_at/updated_at だけで branch/worktree_path を含まない
-    // （`session_dao.rs` 実測）。`prepare_worktree` が in-memory に確定させた値は
-    // `set_worktree` を別途呼ばない限り DB に残らず、次回起動でまた新規 worktree を
-    // 作ってしまう。worktree モードなら常に両方 Some、in_place なら常に両方 None
-    // なので `if let` の両側同時成立だけを見ればよい。
-    if let (Some(branch), Some(worktree_path)) = (&session.branch, &session.worktree_path) {
-        state
-            .store
-            .set_worktree(&session.id, branch, worktree_path)?;
-    }
-
     if session.kanban_status != KanbanStatus::Backlog {
         // 設計書 §5.3: 自動遷移は backlog -> in_progress のみ。review / done /
         // in_progress のセッションは列を動かさない。ここで `update_session` を
@@ -154,8 +177,12 @@ fn commit_started_session(state: &AppState, session: &mut Session) -> AppResult<
         // `next_sort_order` すら引かない。
         //
         // 戻り値は `session.clone()` ではなく `get_session` で読み直す。
-        // `set_worktree`（上）は `updated_at` を自前で進めるため、fetch し直さないと
-        // 返り値の `updated_at` が DB の値より古いまま返ってしまう。
+        // `plan_agent_spawn_with` 側の `set_worktree`（この関数より前、spawn より前に
+        // 実行済み）は DB の `updated_at` を自前で進めるが、この関数が受け取る
+        // `session`（in-memory）はその呼び出しの結果で更新されていない —— DAO は
+        // DB へ書くだけで呼び出し元の構造体は書き換えない。fetch し直さないと
+        // 返り値の `updated_at`（および万一のズレがあれば branch/worktree_path）が
+        // DB の値より古いまま返ってしまう。
         return state.store.get_session(&session.id);
     }
 
@@ -166,8 +193,9 @@ fn commit_started_session(state: &AppState, session: &mut Session) -> AppResult<
     // last_runtime_state は一切触らない（設計判断 7。M2-1 が pty://exit 購読で一元的に書く）。
     apply_start_kanban_transition(session, tail);
 
-    // 契約 §17: 部分更新は SessionPatch で行う。branch/worktree_path は上で
-    // set_worktree 済みなので、ここでは kanban_status / sort_order だけを書く。
+    // 契約 §17: 部分更新は SessionPatch で行う。branch/worktree_path は
+    // `plan_agent_spawn_with` 側で set_worktree 済み（契約 §63.4）なので、
+    // ここでは kanban_status / sort_order だけを書く。
     state.store.update_session(
         &session.id,
         &SessionPatch {
@@ -660,17 +688,30 @@ mod tests {
         (dir, state, project)
     }
 
-    /// 申し送り #3 の直接の網: `commit_started_session` が `set_worktree` を呼ばず
-    /// `update_session` だけに戻る変異を入れると、再読み込みした `branch` /
-    /// `worktree_path` が `None` のままになりこの assert が赤くなる。
+    /// 契約 §63.1 / §63.4: `branch` / `worktree_path` の永続化は `prepare_worktree` が
+    /// 成功した直後、spawn より前に完了していなければならない
+    /// （判断 6 は `kanban_status` / `sort_order` にのみ適用され、`branch` /
+    /// `worktree_path` はディスク上の worktree を記録するものなので、書けば DB は
+    /// 真実に近づく。書かずに `build_launch_command` や `spawn` が失敗すると、
+    /// worktree はディスク上に残ったまま DB は永久に `NULL` になり、判断 8 の再利用腕が
+    /// 同じ branch で `create_worktree` を再試行して恒久的に起動不能になる）。
+    ///
+    /// `spawn` 自体は契約 §15 の Wry 固定でユニットテストから到達できないため、
+    /// `plan_agent_spawn_with` が `Ok` を返した時点（spawn を呼ぶ前）で DB を読み直し、
+    /// `branch` / `worktree_path` が既に埋まっていることを確認する形で
+    /// 「spawn 前に永続化されている」ことを固定する。`set_worktree` の呼び出しを
+    /// （移動前の）`commit_started_session` 側へ戻す変異を入れると、この時点では
+    /// まだ DB に書かれていないため `reloaded.branch` が `None` のままになり赤くなる。
     #[test]
-    fn commit_started_session_persists_branch_and_worktree_path() {
+    fn plan_agent_spawn_with_persists_branch_and_worktree_path_before_spawn() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let repo = TestRepo::new();
-        let (_dir, state, project) = build_state(repo.path().to_str().expect("utf8"));
-        let sort_order = state
-            .store
-            .next_sort_order(&project.id, KanbanStatus::Backlog)
-            .expect("next_sort_order");
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project("kamux", repo.path().to_str().expect("utf8"), CliKind::Shell)
+            .expect("insert project");
         let session = Session::new_backlog(
             &project.id,
             "Fix login bug",
@@ -679,22 +720,32 @@ mod tests {
             None,
             CliKind::Shell,
             None,
-            sort_order,
+            1.0,
             now_ms(),
         );
-        let mut session = state
-            .store
-            .insert_session(&session)
-            .expect("insert session");
-        prepare_worktree(&project, &mut session).expect("prepare worktree");
-        assert!(session.branch.is_some());
-        assert!(session.worktree_path.is_some());
+        let session = store.insert_session(&session).expect("insert session");
+        let state = AppState {
+            store: Arc::new(store),
+            pty: PtyManager::new(),
+        };
 
-        commit_started_session(&state, &mut session).expect("commit");
+        let (returned, _spec) = plan(&state, &session.id).expect("plan spawn");
 
+        assert!(returned.branch.is_some());
+        assert!(returned.worktree_path.is_some());
+
+        // plan_agent_spawn_with はまだ spawn を呼んでいない。この時点で DB を読み直し、
+        // branch/worktree_path が既に一致していることが「spawn 前に永続化されている」
+        // ことの証拠になる。
         let reloaded = state.store.get_session(&session.id).expect("get_session");
-        assert_eq!(reloaded.branch, session.branch);
-        assert_eq!(reloaded.worktree_path, session.worktree_path);
+        assert_eq!(
+            reloaded.branch, returned.branch,
+            "branch must already be persisted before spawn is even attempted"
+        );
+        assert_eq!(
+            reloaded.worktree_path, returned.worktree_path,
+            "worktree_path must already be persisted before spawn is even attempted"
+        );
     }
 
     /// 順序の制約 2 を DB 行のレベルで固定する。既存の in_progress セッションを 1 件
@@ -863,17 +914,21 @@ mod tests {
     }
 
     /// 回帰テスト: 非遷移パスの戻り値は `session.clone()`（呼び出し前のスナップショット）
-    /// ではなく、DB を読み直した最新行でなければならない。worktree モードの Review
-    /// セッション（既に `set_worktree` 済み）で検証する —— `commit_started_session` は
-    /// 非遷移パスでも `set_worktree` を呼び直すため（現在値の再確認）、その呼び出しが
-    /// `updated_at` を進める。`clone()` のまま実装すると、返り値の `updated_at` が
-    /// 呼び出し前の（古い）値のままになりこの assert が赤くなる。
+    /// ではなく、DB を読み直した最新行でなければならない。
     ///
-    /// `now_ms()` はミリ秒精度なので、直前の `update_session`（列を Review へ移す）と
-    /// `commit_started_session` 内の `set_worktree` が同じミリ秒内で走ると、バグ入りの
-    /// `clone()` でも偶然 `updated_at` が一致して緑になってしまう（実測済み: sleep 無しで
-    /// 変異検証したところ検出できなかった）。決定的に弁別するため、2 回の書き込みの間に
-    /// 短い sleep を挟んでミリ秒境界を跨がせる。
+    /// 契約 §63.4 により `set_worktree` は `commit_started_session` の**外**
+    /// （`plan_agent_spawn_with` の `prepare_worktree` 直後）で呼ばれるようになった。
+    /// `commit_started_session` が受け取る `session`（in-memory）は、その
+    /// `plan_agent_spawn_with` の冒頭 `get_session` で読んだときのスナップショットの
+    /// ままであり、以後の `set_worktree` や（Review への移動などの）他経路からの
+    /// 書き込みで DB の `updated_at` が進んでも、in-memory 側は更新されない
+    /// （DAO は DB へ書くだけで呼び出し元の構造体を書き換えない）。ここではその状況を
+    /// `stale_session`（`plan_agent_spawn_with` 冒頭の fetch を模した古いコピー）と、
+    /// その後に別途走る `set_worktree` / `update_session` で再現する。
+    ///
+    /// `now_ms()` はミリ秒精度なので、書き込みの間に短い sleep を挟んでミリ秒境界を
+    /// 跨がせないと、バグ入りの `clone()` でも偶然 `updated_at` が一致して緑になって
+    /// しまう（実測済み: sleep 無しで変異検証したところ検出できなかった）。
     #[test]
     fn commit_started_session_returns_the_reloaded_row_not_a_stale_clone_when_not_advancing() {
         let (_dir, state, project) = build_state("/tmp/kamux-test-repo");
@@ -896,6 +951,21 @@ mod tests {
             .store
             .insert_session(&session)
             .expect("insert session");
+
+        // `plan_agent_spawn_with` 冒頭の `get_session` を模した古いスナップショット。
+        // `prepare_worktree` が in-memory に書き込む効果（branch/worktree_path の確定）
+        // だけを反映し、その後の DB 書き込みには追随させない。
+        let mut stale_session = state.store.get_session(&inserted.id).expect("get_session");
+        let updated_at_before_commit = stale_session.updated_at;
+        stale_session.branch = Some("session/in-review".to_string());
+        stale_session.worktree_path = Some("/tmp/kamux-test-repo/.worktrees/in-review".to_string());
+        stale_session.kanban_status = KanbanStatus::Review;
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // `plan_agent_spawn_with` の `set_worktree`（契約 §63.4）と、Review への移動
+        // （別経路。ここでは既にレビュー中だったと想定した既定挙動の再現）を、
+        // `stale_session` を経由せずに DB へ直接書く。
         state
             .store
             .set_worktree(
@@ -904,7 +974,7 @@ mod tests {
                 "/tmp/kamux-test-repo/.worktrees/in-review",
             )
             .expect("seed worktree");
-        let mut session = state
+        state
             .store
             .update_session(
                 &inserted.id,
@@ -914,19 +984,18 @@ mod tests {
                 },
             )
             .expect("move to review");
-        let updated_at_before_commit = session.updated_at;
-        std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let result = commit_started_session(&state, &mut session).expect("commit");
+        let result = commit_started_session(&state, &mut stale_session).expect("commit");
 
-        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        let reloaded = state.store.get_session(&inserted.id).expect("get_session");
         assert_eq!(
             result.updated_at, reloaded.updated_at,
             "戻り値は DB の最新行と一致しなければならない（clone() ではなく get_session 由来）"
         );
         assert!(
             result.updated_at > updated_at_before_commit,
-            "commit_started_session 内の set_worktree が進めた updated_at が戻り値に反映されていない"
+            "plan_agent_spawn_with 側の set_worktree などが進めた updated_at が \
+             戻り値に反映されていない"
         );
         assert_eq!(result.branch, reloaded.branch);
         assert_eq!(result.worktree_path, reloaded.worktree_path);
