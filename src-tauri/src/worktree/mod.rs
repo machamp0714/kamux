@@ -3,9 +3,11 @@ use std::process::Command;
 
 use crate::error::{AppError, AppResult};
 
+pub mod exclude;
 pub mod slug;
 pub mod suggest;
 
+pub use exclude::{ensure_worktrees_excluded, git_common_dir, EXCLUDE_ENTRY};
 pub use slug::title_slug;
 pub use suggest::{
     branch_exists, branch_slug, suggest_branch_name, worktree_path_for, BRANCH_PREFIX,
