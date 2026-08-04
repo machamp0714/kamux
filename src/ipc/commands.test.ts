@@ -13,6 +13,7 @@ import {
   resizePty,
   startSession,
   stopSession,
+  suggestBranchName,
   updateSession,
   writePty,
   writePtyBytes,
@@ -127,5 +128,18 @@ describe('ipc/commands', () => {
   it('ackPty が surfaceId と seq を渡す', async () => {
     await ackPty('s1:agent', 42);
     expect(invoke).toHaveBeenCalledWith('ack_pty', { surfaceId: 's1:agent', seq: 42 });
+  });
+
+  it('suggestBranchName が projectId / title / sessionId を camelCase で渡し、素の string を返す（契約 §60.2: BranchSuggestion ではない）', async () => {
+    invoke.mockResolvedValue('session/fix-login-bug');
+
+    const got = await suggestBranchName('proj-1', 'Fix login bug', 'sess-1');
+
+    expect(invoke).toHaveBeenCalledWith('suggest_branch_name', {
+      projectId: 'proj-1',
+      title: 'Fix login bug',
+      sessionId: 'sess-1',
+    });
+    expect(got).toBe('session/fix-login-bug');
   });
 });

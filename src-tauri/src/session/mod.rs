@@ -235,6 +235,28 @@ pub async fn stop_session(state: State<'_, AppState>, id: String) -> AppResult<S
     Ok(session)
 }
 
+/// 既存セッション向けのブランチ名提案（契約 §60.1 / §60.1.1）。
+///
+/// 衝突していれば `-2`, `-3` … を付けた**空いている候補**を返す。
+/// ユーザーはこれを編集できる（設計書 §6.5 / 設計判断 3）。
+///
+/// **新規作成ダイアログからは呼べない** —— その時点で `session_id` が存在しないため。
+/// 新規作成時のライブプレビューは TS 側 `proposeBranchName` が担当する（契約 §60.1.1）。
+#[tauri::command]
+pub async fn suggest_branch_name(
+    state: State<'_, AppState>,
+    project_id: String,
+    title: String,
+    session_id: String,
+) -> AppResult<String> {
+    let project = state.store.get_project(&project_id)?;
+    crate::worktree::suggest_branch_name(
+        std::path::Path::new(&project.repo_path),
+        &title,
+        &session_id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

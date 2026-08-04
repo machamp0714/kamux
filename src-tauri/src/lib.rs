@@ -216,6 +216,7 @@ pub fn run() {
             pty::commands::ack_pty,
             session::start_session,
             session::stop_session,
+            session::suggest_branch_name,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build kamux");
@@ -663,6 +664,7 @@ mod tests {
                     crate::pty::commands::resize_pty,
                     crate::pty::commands::ack_pty,
                     crate::session::stop_session,
+                    crate::session::suggest_branch_name,
                 ])
                 .build(mock_context(noop_assets()))
                 .expect("build mock app")
@@ -1132,6 +1134,65 @@ mod tests {
                 !state.pty.is_alive(&agent_surface_id),
                 "stop_session must kill the SurfaceKind::Agent surface for the session"
             );
+        }
+
+        // suggest_branch_name のコマンド登録と camelCase バインドを検証する（契約 §60.1）。
+        // project_id を未知の値にすることで、`get_project` に到達していることと
+        // 3 引数のバインドを同時に確認できる（git リポジトリ不要）。
+        #[test]
+        fn suggest_branch_name_binds_camel_case_and_returns_not_found_for_an_unknown_project() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let err = invoke_err(
+                &webview,
+                "suggest_branch_name",
+                json!({"projectId": "nope", "title": "Fix login bug", "sessionId": "sess-1"}),
+            );
+
+            assert_eq!(err["code"], json!("not_found"));
+            assert_eq!(
+                err["message"],
+                json!("nope"),
+                "AppError::NotFound はキーをそのまま運ぶ(契約 §6)"
+            );
+        }
+
+        // happy path: 戻り値が裸の JSON 文字列であることを固定する
+        // （契約 §60.2: `BranchSuggestion { branch, slug }` は却下されている。
+        // 誤って構造体へ戻す変異が入ると `.as_str()` が None になり赤くなる）。
+        #[test]
+        fn suggest_branch_name_returns_a_bare_string_not_an_object() {
+            use crate::worktree::test_support::TestRepo;
+
+            let repo = TestRepo::new();
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({
+                    "name": "kamux",
+                    "repoPath": repo.path().to_str().expect("utf8"),
+                    "defaultCli": "claude",
+                }),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let got = invoke_ok(
+                &webview,
+                "suggest_branch_name",
+                json!({"projectId": project_id, "title": "Fix login bug", "sessionId": "sess-1"}),
+            );
+
+            assert_eq!(got.as_str(), Some("session/fix-login-bug"), "got: {got:?}");
         }
     }
 }
