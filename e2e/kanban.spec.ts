@@ -302,6 +302,16 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
 
     await card.getByRole('button', { name: '編集' }).focus();
     await expect(actions).toHaveCSS('opacity', '1');
+
+    // カード自身がタブストップ（要件5 の Enter の受け口）である。そのフォーカスでも
+    // .kanban-card:focus-within が一致してアクションが出ること —— ドラッグ用の
+    // ラッパ側にタブストップがあると、ここが 0 のままになる。
+    await page.mouse.move(0, 0);
+    await card.getByRole('button', { name: '編集' }).blur();
+    await expect(actions).toHaveCSS('opacity', '0');
+
+    await card.focus();
+    await expect(actions).toHaveCSS('opacity', '1');
   });
 
   test('Cmd+1 でカンバン画面が表示される', async ({ page }) => {
