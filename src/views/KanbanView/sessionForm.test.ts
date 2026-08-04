@@ -15,6 +15,8 @@ function values(overrides: Partial<SessionFormValues> = {}): SessionFormValues {
     description: 'ログインが落ちる',
     mode: 'worktree',
     branch: '',
+    // 既定は未編集。編集済みを試すテストは明示的に branchTouched: true を渡す（契約 §62.3）。
+    branchTouched: false,
     cliKind: 'claude',
     cliCommand: '',
     ...overrides,
@@ -51,6 +53,7 @@ describe('initialSessionFormValues', () => {
       description: '',
       mode: 'worktree',
       branch: '',
+      branchTouched: false,
       cliKind: 'codex',
       cliCommand: '',
     });
@@ -58,7 +61,7 @@ describe('initialSessionFormValues', () => {
 });
 
 describe('sessionFormValuesFrom', () => {
-  it('既存セッションをフォーム値へ写す（null は空文字にする）', () => {
+  it('既存セッションをフォーム値へ写す（null は空文字にする。既存ブランチは編集済み扱い）', () => {
     expect(
       sessionFormValuesFrom(makeSession({ id: 's1', branch: null, cli_command: null })),
     ).toEqual({
@@ -66,6 +69,7 @@ describe('sessionFormValuesFrom', () => {
       description: 'ログインが落ちる',
       mode: 'worktree',
       branch: '',
+      branchTouched: true,
       cliKind: 'claude',
       cliCommand: '',
     });
@@ -115,24 +119,38 @@ describe('buildCreateSessionArgs', () => {
     expect(args.description).toBe('x');
   });
 
-  it('ブランチ欄が空ならタイトルから提案した名前を使う', () => {
-    expect(buildCreateSessionArgs('p1', values()).branch).toBe('session/fix-login-bug');
+  it('未編集なら branch を送らない（自動生成は prepare_worktree に任せる。契約 §62.3）', () => {
+    // タイトルは 'Fix Login Bug' で proposeBranchName なら 'session/fix-login-bug' を返すが、
+    // 未編集（branchTouched: false）である限りその提案値は CreateSessionArgs.branch に載らない。
+    expect(buildCreateSessionArgs('p1', values()).branch).toBeNull();
   });
 
-  it('ブランチ欄に入力があればそれを優先する', () => {
-    expect(buildCreateSessionArgs('p1', values({ branch: ' feature/manual ' })).branch).toBe(
-      'feature/manual',
-    );
+  it('編集済みならブランチ欄の入力を優先する', () => {
+    expect(
+      buildCreateSessionArgs('p1', values({ branchTouched: true, branch: ' feature/manual ' }))
+        .branch,
+    ).toBe('feature/manual');
   });
 
-  it('slug が空になるタイトルでは branch を null にする', () => {
-    expect(buildCreateSessionArgs('p1', values({ title: '日本語タイトル' })).branch).toBeNull();
+  it('編集済み + 入力ありのとき、その値がそのまま CreateSessionArgs.branch に載る（slug 検証はしない。契約 §51.3.2）', () => {
+    // slug 規則に沿わない文字列でも、フロントは検証・変換せずそのまま渡す
+    // （検証は create_worktree の前に Rust 側が行う。§51.3.2）。
+    expect(
+      buildCreateSessionArgs('p1', values({ branchTouched: true, branch: ' My Weird Branch!! ' }))
+        .branch,
+    ).toBe('My Weird Branch!!');
   });
 
-  it('mode が in_place ならブランチ欄に文字があっても null を送る（契約 §13）', () => {
+  it('編集済みでも欄が空文字なら branch を送らない', () => {
+    expect(
+      buildCreateSessionArgs('p1', values({ branchTouched: true, branch: '   ' })).branch,
+    ).toBeNull();
+  });
+
+  it('mode が in_place なら編集済みで文字があっても null を送る（契約 §13）', () => {
     const args = buildCreateSessionArgs(
       'p1',
-      values({ mode: 'in_place', branch: 'feature/manual' }),
+      values({ mode: 'in_place', branchTouched: true, branch: 'feature/manual' }),
     );
     expect(args.mode).toBe('in_place');
     expect(args.branch).toBeNull();

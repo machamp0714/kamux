@@ -268,14 +268,15 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
     const createCalls = calls.filter((c) => c.cmd === 'create_session');
     expect(createCalls).toHaveLength(1);
-    // cliKind はプロジェクトの default_cli ('codex') を継承し、branch は
-    // 未入力のままタイトルから自動生成される（sessionForm.buildCreateSessionArgs）。
+    // cliKind はプロジェクトの default_cli ('codex') を継承する。branch は未編集のまま
+    // 送信しているので null（契約 §62.3: 提案値は表示にのみ使い、DB へは焼かない。
+    // 確定は prepare_worktree が worktree を実際に作る瞬間に行う）。
     expect(createCalls[0].args).toMatchObject({
       projectId: 'p1',
       title: 'e2e new session',
       mode: 'worktree',
       cliKind: 'codex',
-      branch: 'session/e2e-new-session',
+      branch: null,
     });
 
     await expect(page.locator('[data-column="backlog"] .kanban-card__title')).toHaveText([
@@ -284,6 +285,27 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
       'e2e new session',
     ]);
     await expect(page.locator('.error-toast')).toHaveCount(0);
+  });
+
+  test('ブランチ欄を手で編集すると、その入力値が create_session に渡る（契約 §51.3.2）', async ({
+    page,
+  }) => {
+    const dialog = page.getByRole('dialog', { name: '新規セッション' });
+    await page.keyboard.press('Meta+n');
+    await expect(dialog).toBeVisible();
+
+    await dialog.getByPlaceholder('Fix login bug').fill('e2e manual branch');
+    await dialog.getByPlaceholder('作成時に自動生成されます').fill('feature/manual');
+    await dialog.getByRole('button', { name: '作成' }).click();
+    await expect(dialog).toBeHidden();
+
+    const calls = await page.evaluate(() => window.__TAURI_INTERNALS__.__kamuxCalls);
+    const createCalls = calls.filter((c) => c.cmd === 'create_session');
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0].args).toMatchObject({
+      title: 'e2e manual branch',
+      branch: 'feature/manual',
+    });
   });
 
   test('kanban-card__actions はホバーまたはキーボードフォーカスで現れる', async ({ page }) => {
