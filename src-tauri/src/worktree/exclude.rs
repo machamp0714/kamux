@@ -36,7 +36,15 @@ pub fn ensure_worktrees_excluded(repo_path: &Path) -> AppResult<()> {
     fs::create_dir_all(&info_dir)?;
 
     let exclude_path = info_dir.join("exclude");
-    let current = fs::read_to_string(&exclude_path).unwrap_or_default();
+    // ファイルが存在しない(NotFound)は正常系として空文字列扱いにする。
+    // それ以外の読み取りエラー(権限・非 UTF-8 等)はここで止める。
+    // 握り潰して空文字列にすると、直後の書き込みでユーザーの既存
+    // .git/info/exclude(git 管理外で復元手段が無い)を丸ごと上書きしてしまう。
+    let current = match fs::read_to_string(&exclude_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
 
     // 部分文字列一致ではなく、行単位・前後空白除去の完全一致で判定する。
     // "#.worktrees/"（コメント）や "foo/.worktrees/bar"（無関係な行）を
@@ -125,6 +133,42 @@ mod tests {
             1,
             "must not append a duplicate, got:\n{body}"
         );
+    }
+
+    #[test]
+    fn refuses_to_overwrite_when_existing_exclude_is_not_valid_utf8() {
+        // 非 UTF-8 の既存ファイルは read_to_string がエラーになる。これを
+        // unwrap_or_default() で握り潰すと、直後の write が既存の中身を
+        // .worktrees/ だけの内容で上書きしてしまう(データ破壊)。エラーで
+        // 止まり、既存ファイルが 1 バイトも変わっていないことを確認する。
+        let repo = TestRepo::new();
+        let path = repo.path().join(".git").join("info").join("exclude");
+        let original: &[u8] = b"\xff\xfe invalid utf8\n";
+        std::fs::write(&path, original).expect("seed invalid utf8");
+
+        let result = ensure_worktrees_excluded(repo.path());
+
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        let after = std::fs::read(&path).expect("read back raw bytes");
+        assert_eq!(
+            after, original,
+            "existing exclude file must not be modified on read error"
+        );
+    }
+
+    #[test]
+    fn creates_exclude_file_when_it_does_not_exist_yet() {
+        // `git init` はデフォルトで .git/info/exclude にサンプルコメント入りの
+        // テンプレートを作る。「存在しない」経路を確実に踏むため明示的に消す。
+        let repo = TestRepo::new();
+        let path = repo.path().join(".git").join("info").join("exclude");
+        std::fs::remove_file(&path).expect("remove default template exclude file");
+        assert!(!path.exists(), "precondition: exclude must not exist yet");
+
+        ensure_worktrees_excluded(repo.path()).expect("create new exclude file");
+
+        let body = exclude_contents(&repo);
+        assert_eq!(body, format!("{EXCLUDE_ENTRY}\n"));
     }
 
     #[test]
