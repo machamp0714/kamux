@@ -125,6 +125,14 @@ describe('buildCreateSessionArgs', () => {
     expect(buildCreateSessionArgs('p1', values()).branch).toBeNull();
   });
 
+  it('未編集なら、欄に提案値が表示されていても branch を送らない', () => {
+    // モーダルが proposeBranchName の提案値を values.branch に書き込んだ状態
+    // （branchTouched は既定の false のまま）を模す。
+    expect(
+      buildCreateSessionArgs('p1', values({ branch: 'session/fix-login-bug' })).branch,
+    ).toBeNull();
+  });
+
   it('編集済みならブランチ欄の入力を優先する', () => {
     expect(
       buildCreateSessionArgs('p1', values({ branchTouched: true, branch: ' feature/manual ' }))
