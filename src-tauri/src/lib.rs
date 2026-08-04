@@ -5,6 +5,7 @@ pub mod pty;
 pub mod session;
 pub mod state;
 pub mod store;
+pub mod worktree;
 
 use std::sync::Arc;
 
