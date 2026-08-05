@@ -744,7 +744,10 @@ mod tests {
         /// - `queried`: `list_ids_by_last_runtime_state` に渡された state の履歴。
         ///   同じ state が 2 回現れたら `normalize_on_startup` が 2 回走っている
         /// - `app_state_visible_during_normalize`: 走査中に `AppState` が
-        ///   `manage` 済みだったか。**`true` になった時点で `sender()` に到達できる**
+        ///   `manage` 済みだったか。**`true` になった時点で `sender()` に到達できる**。
+        ///   読み取りフェーズ（`list_ids_by_last_runtime_state`）と書き込みフェーズ
+        ///   （`set_last_runtime_state`）の**両方**で覗く。書き込みフェーズを見るために
+        ///   `Running` の行を 1 件だけ返す
         /// - `fail`: 走査を `AppError::Db` で失敗させる
         struct NormalizeProbe {
             handle: AppHandle<MockRuntime>,
@@ -771,8 +774,18 @@ mod tests {
             }
         }
 
+        impl NormalizeProbe {
+            fn note_app_state_visibility(&self) {
+                if self.handle.try_state::<AppState>().is_some() {
+                    self.app_state_visible_during_normalize
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
         impl StatePersist for NormalizeProbe {
             fn set_last_runtime_state(&self, _id: &str, _state: RuntimeState) -> AppResult<()> {
+                self.note_app_state_visibility();
                 Ok(())
             }
 
@@ -780,16 +793,17 @@ mod tests {
                 &self,
                 state: RuntimeState,
             ) -> AppResult<Vec<String>> {
-                if self.handle.try_state::<AppState>().is_some() {
-                    self.app_state_visible_during_normalize
-                        .store(true, Ordering::SeqCst);
-                }
+                self.note_app_state_visibility();
                 self.queried
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(state);
                 if self.fail {
                     return Err(AppError::Db("boom".into()));
+                }
+                // 昇格する行を 1 件だけ返し、書き込みフェーズにも probe を到達させる。
+                if state == RuntimeState::Running {
+                    return Ok(vec!["live".to_string()]);
                 }
                 Ok(Vec::new())
             }
