@@ -788,6 +788,10 @@ mod tests {
         first_started: Mutex<Vec<String>>,
         errors: Mutex<Vec<(String, String)>>, // 契約 §38.8 の set_runtime_error
         fail: AtomicBool,
+        /// `mark_first_started` が呼ばれた**回数**(dedup 前)。`first_started` は
+        /// DAO の冪等性を模して重複を積まないので、「Spawned を遷移表より前で
+        /// 拾っているか」を回数側でも固定する(契約 §34.5)。
+        first_started_calls: Mutex<usize>,
         /// `mark_first_started` の呼び出し時点で走らせるフック。
         /// consume_loop の「先頭ゲート通過後・DB 書き込み直前ゲートより前」という
         /// レース窓を決定的に再現するための注入点(変異検証専用)。
@@ -812,6 +816,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
+        }
+        fn first_started_calls(&self) -> usize {
+            *self
+                .first_started_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
         }
         fn set_on_mark_first_started(&self, f: impl Fn() + Send + Sync + 'static) {
             *self
@@ -838,6 +848,10 @@ mod tests {
         }
 
         fn mark_first_started(&self, session_id: &str) -> crate::error::AppResult<()> {
+            *self
+                .first_started_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) += 1;
             if let Some(hook) = self
                 .on_mark_first_started
                 .lock()
@@ -923,14 +937,14 @@ mod tests {
 
         mgr.sender().send("s1", In::Spawned);
 
-        assert!(wait_until(|| mgr.current("s1") == Running));
-        assert!(wait_until(
-            || persist.writes() == vec![("s1".to_string(), Running)]
-        ));
-        assert_eq!(
-            obs.seen(),
-            vec![("s1".to_string(), Running, StateReason::Spawned)]
-        );
+        // 副作用の順は memory -> DB -> observer。最後に起きる observer 通知を待ってから
+        // 先行する副作用を assert する(先行分だけ待って後続を assert すると、
+        // consumer が preempt されたときに flake する)。
+        assert!(wait_until(|| {
+            obs.seen() == vec![("s1".to_string(), Running, StateReason::Spawned)]
+        }));
+        assert_eq!(mgr.current("s1"), Running);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
     }
 
     /// 契約 §34.5: Spawned は「観測した時点」で記録する。
@@ -951,6 +965,10 @@ mod tests {
         mgr.sender().send("s1", In::Spawned);
         mgr.sender().send("s1", In::HookStop);
         assert!(wait_until(|| mgr.current("s1") == Idle));
+        // mark_first_started はメモリ更新より前に呼ばれるので、Idle 観測時点で
+        // 2 回目の呼び出しは処理済み(レースしない)。dedup 前の呼び出し回数で、
+        // 遷移が無くても呼ばれていることを固定する(§34.5「遷移表を引く前」)。
+        assert_eq!(persist.first_started_calls(), 2);
         // DAO 側が冪等なので、フェイクも重複を積まない
         assert_eq!(persist.first_started(), vec!["s1".to_string()]);
 
@@ -973,9 +991,10 @@ mod tests {
         mgr.sender().send("s1", In::OutputActivity);
         mgr.sender().send("s1", In::HookStop);
 
-        assert!(wait_until(|| mgr.current("s1") == Idle));
+        // 最後に起きる observer 通知を待ってから、先行する副作用を assert する。
+        assert!(wait_until(|| obs.seen().len() == 2));
+        assert_eq!(mgr.current("s1"), Idle);
         assert_eq!(persist.writes().len(), 2);
-        assert_eq!(obs.seen().len(), 2);
     }
 
     /// 計画 §4.4: 「判定から書き込みまでの間に終了が始まった」レース窓を決定的に再現する。
@@ -1047,6 +1066,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
         assert!(persist.writes().is_empty());
+        assert!(persist.first_started().is_empty());
         assert_eq!(mgr.current("s1"), Idle);
     }
 
@@ -1064,8 +1084,11 @@ mod tests {
 
         persist.fail.store(false, Ordering::SeqCst);
         mgr.sender().send("s1", In::HookStop);
-        assert!(wait_until(|| mgr.current("s1") == Idle));
-        assert_eq!(persist.writes(), vec![("s1".to_string(), Idle)]);
+        // observer を assert しないこの経路では DB 書き込みが最後の副作用。それを待つ。
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Idle)]
+        ));
+        assert_eq!(mgr.current("s1"), Idle);
     }
 
     /// sender 経由の note_surface が manager のスナップショットを見ていること。
@@ -1076,7 +1099,10 @@ mod tests {
         let sender = mgr.sender();
 
         sender.send("s1", In::Spawned);
-        assert!(wait_until(|| sender.current("s1") == Running));
+        // observer を assert しないこの経路では DB 書き込みが最後の副作用。それを待つ。
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
 
         // running 中の出力は捨てられる
         sender.note_surface("s1:agent", In::OutputActivity);
