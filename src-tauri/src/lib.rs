@@ -191,8 +191,17 @@ fn shutdown_runtime_then_kill_pty(state: &AppState) {
 /// フィールドの無いユニットバリアントであり、enum 全体に付いた
 /// `#[non_exhaustive]` があってもクレート外から構築できる
 /// （`let _ = tauri::WindowEvent::Destroyed;` がこのクレートからコンパイルを
-/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる:
-/// `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`。
+/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる。この形で
+/// 固定しているテストは 2 本ある:
+/// - `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`
+///   （PTY の一括 kill。M1-4）
+/// - `tests::wiring::window_destroyed_begins_runtime_shutdown`
+///   （状態機械の shutdown。M2-1 Task 6）
+///
+/// **この制約は E2E でも解消しない。** `MockRuntime` に発火経路が無いのは
+/// テストの書き方の問題ではなくランタイムの実装の問題なので、「E2E なら
+/// Destroyed の配送まで通せるはず」と考えて書き直さないこと。実配送の確認は
+/// 実機の手動スモーク（Task 16）でしか取れない。
 fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
     if matches!(event, WindowEvent::Destroyed) {
         if let Some(state) = window.try_state::<AppState>() {
