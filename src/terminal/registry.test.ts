@@ -45,11 +45,21 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
       this.onBinaryHandlers.push(cb);
     }
 
-    customKeyEventHandler: ((event: { metaKey: boolean }) => boolean) | null = null;
+    // 契約 §65.6 T1〜T8: `type` / `key` は手当ての判定に使う。`metaKey` は既存の
+    // Cmd 系テスト（「attachCustomKeyEventHandler で Cmd 系キーを xterm に処理させない
+    // （契約 §11）」）のため省略可能のまま残す。
+    customKeyEventHandler:
+      ((event: { type?: string; key?: string; metaKey?: boolean }) => boolean) | null = null;
 
-    attachCustomKeyEventHandler(handler: (event: { metaKey: boolean }) => boolean): void {
+    attachCustomKeyEventHandler(
+      handler: (event: { type?: string; key?: string; metaKey?: boolean }) => boolean,
+    ): void {
       this.customKeyEventHandler = handler;
     }
+
+    // 契約 §65.12: 実体は `_core` の下にある。初期値は未設定（T8 が検査する
+    // 「_core を持たない偽 term」はこのデフォルトのままにする）。
+    _core?: { _keyDownSeen: boolean };
 
     open(): void {
       // jsdom では実描画しない
@@ -458,6 +468,284 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     expect(term.customKeyEventHandler?.({ metaKey: false })).toBe(true);
   });
 
+  describe('修飾キーのみの keydown で _core._keyDownSeen を戻す（契約 §65.6 T1 / T7 / I1）', () => {
+    // fix round 1・Important: 5 要素（Shift / Control / Alt / Meta / CapsLock）の
+    // うち Shift と CapsLock しか通っていなかった。table 駆動で全要素を回す。
+    // Meta の行だけ metaKey: true を明示している —— 実機で Meta キー自身を押すと
+    // ブラウザは event.metaKey を true にするため、これが I1（修飾キーのみで
+    // _keyDownSeen を戻す）と I3（返り値は !event.metaKey）が交差する唯一の
+    // 組み合わせになる。ここだけ「フラグが false に戻る」と「返り値が false」の
+    // 両方を同時に見る。
+    it.each([
+      { key: 'Shift', metaKey: undefined, expectedReturn: true },
+      { key: 'Control', metaKey: undefined, expectedReturn: true },
+      { key: 'Alt', metaKey: undefined, expectedReturn: true },
+      { key: 'CapsLock', metaKey: undefined, expectedReturn: true },
+      { key: 'Meta', metaKey: true, expectedReturn: false },
+    ])(
+      'key=$key → _core._keyDownSeen: false / 返り値: $expectedReturn',
+      ({ key, metaKey, expectedReturn }) => {
+        const sid = nextSurfaceId();
+        registry.ensureTerminal(sid);
+        const term = fakeOf(sid);
+        term._core = { _keyDownSeen: true };
+
+        const result = term.customKeyEventHandler?.({ type: 'keydown', key, metaKey });
+
+        expect(term._core._keyDownSeen).toBe(false);
+        expect(result).toBe(expectedReturn);
+      },
+    );
+  });
+
+  it('修飾キー以外の keydown では _core._keyDownSeen に触らない（契約 §65.6 T2 / I2）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keydown', key: 'a' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it('keyup から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.6 T5 / I4）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keyup', key: 'Shift' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it('keypress から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.6 T6 / I4）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keypress', key: 'a' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it(
+    'keypress かつ修飾キー名（Shift）でも _core._keyDownSeen に触らない' +
+      '（契約 §65.6 T6 の判別力を補う。type ガード（I4）が key の一致より先に効くことを確認する）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term._core = { _keyDownSeen: true };
+
+      term.customKeyEventHandler?.({ type: 'keypress', key: 'Shift' });
+
+      expect(term._core._keyDownSeen).toBe(true);
+    },
+  );
+
+  it(
+    '_core を持たない偽 term では例外を投げず、返り値は true のまま' +
+      '（契約 §65.6 T8 / §3.3 の防御）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      // term._core は未設定のまま（デフォルトで undefined）
+
+      let result: boolean | undefined;
+      expect(() => {
+        result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+      }).not.toThrow();
+      expect(result).toBe(true);
+    },
+  );
+
+  it(
+    '_core はあるが _keyDownSeen が boolean でない偽 term では書き換えず、例外も投げない' +
+      '（契約 §65.6 T8 の亜種・fix round 1 Minor 3。版が上がって型だけ変わった形を模す。' +
+      'hasKeyDownSeenFlag が core != null だけに緩んだ場合の退行を捕まえる）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      // `_core` は在るが `_keyDownSeen` が boolean でない（版が上がって型だけ変わった形）
+      term._core = { _keyDownSeen: 'true' } as unknown as { _keyDownSeen: boolean };
+
+      let result: boolean | undefined;
+      expect(() => {
+        result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+      }).not.toThrow();
+      expect(result).toBe(true);
+      // boolean でない値を書き換えていないこと（'true' の文字列のまま）
+      expect(term._core._keyDownSeen).toBe('true');
+    },
+  );
+
+  describe(
+    '手当ての射程: !/@ だけでなく Shift+英字も含む（fix round 2 B・team-lead 必須事項 1。' +
+      '上流 _inputEvent 第 1 ガードのモデル）',
+    () => {
+      /**
+       * ⚠️ これは上流 `_inputEvent` の「モデル」であり上流そのものではない。
+       * モデルが実体からずれたらこのテストは緑のまま嘘をつく。フィールド名の存在を
+       * 見張るのは `xtermCanary.test.ts` の T4 の役目である（このテストの役目ではない）。
+       *
+       * `node_modules/@xterm/xterm/lib/xterm.js` の `_inputEvent` 第 1 ガードの逐語
+       * （brief §2 / lane-controller 確認済み）:
+       *
+       *   _inputEvent(e){ if(e.data && "insertText"===e.inputType
+       *                   && (!e.composed || !this._keyDownSeen) && !screenReaderMode){
+       *                     if(this._keyPressHandled) return !1;
+       *                     … this.coreService.triggerDataEvent(e.data,!0) … } }
+       *
+       * `_keyPressHandled` は実測（xtermCanary.test.ts のカナリア）で常に `false` なので
+       * ここでは固定値として扱う。`screenReaderMode` も対象外（false 固定）。
+       */
+      function passesUpstreamGuard(
+        state: { _keyDownSeen: boolean },
+        input: { data: string; inputType: string; composed: boolean },
+      ): boolean {
+        const keyPressHandled = false; // 実測: この環境では常に false
+        if (!input.data) return false;
+        if (input.inputType !== 'insertText') return false; // Cmd+V の insertFromPaste 等を弁別する
+        const guard1 = !input.composed || !state._keyDownSeen;
+        if (!guard1) return false;
+        if (keyPressHandled) return false;
+        return true;
+      }
+
+      /**
+       * 実測イベント列（spike-log.txt）を再生する。`data` / `inputType` / `composed` は
+       * brief §2 の表が指定した実測値をそのまま使う（`key` ではなく `data` を運ぶのが
+       * `input` イベントの実体）。
+       *
+       * 上流 `_keyDown(e)` は `this._keyDownSeen=!0` を **custom handler の呼び出しより
+       * 前に** 書く（brief §2 逐語）。そのため `state._keyDownSeen = true` を先に立てて
+       * から `onKeyDown` を呼ぶ。`onKeyDown` を省略すると「手当てが無い」状態を模す
+       * （手当て前の `attachCustomKeyEventHandler((event) => !event.metaKey)` は
+       * `_keyDownSeen` に一切触れなかったので、コールバック無しと等価）。
+       */
+      function replay(
+        events: Array<
+          | { type: 'keydown'; key: string }
+          | { type: 'input'; data: string; inputType: string; composed: boolean }
+        >,
+        state: { _keyDownSeen: boolean },
+        onKeyDown?: (event: { type: string; key?: string }) => void,
+      ): boolean {
+        let passed = false;
+        for (const event of events) {
+          if (event.type === 'keydown') {
+            state._keyDownSeen = true;
+            // Minor 2（fix round 3）: `onKeyDown` （呼び出し側では実際の
+            // customKeyEventHandler）の返り値をここで捨てている。現在の fixture
+            // （Shift / 素の英字）では無害（どちらも `!metaKey === true` で xterm 側の
+            // 早期 return を引かない）。だが上流 `_keyDown` は
+            // `if(!this._customKeyEventHandler(e)) return !1;` という早期 return を
+            // 持つ（`_customKeyEventHandler` が false を返すとそこで打ち切る）。
+            // Meta / Cmd の fixture を後から足す場合、この早期 return をこの replay は
+            // 写せていない点に注意すること（返り値を使う実装への作り替えは今回は行わない。
+            // `onKeyDown` の型が `=> void` であること自体が「返り値は使わない」を
+            // 型で強制している箇所でもある）。
+            onKeyDown?.(event);
+          } else {
+            passed = passesUpstreamGuard(state, event);
+          }
+        }
+        return passed;
+      }
+
+      // STEP 1: `!` の 1 打目 — keydown Shift → input(data:'!', inputType:'insertText', composed:true)
+      const shiftBangEvents = [
+        { type: 'keydown' as const, key: 'Shift' },
+        { type: 'input' as const, data: '!', inputType: 'insertText', composed: true },
+      ];
+      // STEP 3 / 9: Shift+英字（1 文字目）
+      // — keydown Shift → input(data:'A', inputType:'insertText', composed:true)
+      const shiftLetterEvents = [
+        { type: 'keydown' as const, key: 'Shift' },
+        { type: 'input' as const, data: 'A', inputType: 'insertText', composed: true },
+      ];
+      // STEP 4 / 10（対照）: 素の英字 — 先行する Shift の keydown なし。
+      // spike-log.txt 実測: input の「後ろ」に文字キー自身の keydown（keyCode 229）が
+      // 来る（beforeinput → input → onData → keydown の順）。これを末尾に含めることで
+      // 「末尾の keydown の後も state._keyDownSeen が true のまま（＝手当ては非修飾キーに
+      // 触らない）」という判別力のあるアサートが書ける（fix round 3 Important）。
+      const plainLetterEvents = [
+        { type: 'input' as const, data: 'a', inputType: 'insertText', composed: true },
+        { type: 'keydown' as const, key: 'a' },
+      ];
+
+      // Minor 1（fix round 3）: 以下のテスト名の「= 0 文字 / 1 文字」はこのモデルからは
+      // 導けない。モデルが写しているのは `_inputEvent` の第 1 ガードの経路だけで、
+      // `_keyDown` 自身の `triggerDataEvent`（この環境の keyCode 229 では発火しない）は
+      // 写していない。文字数の裏取りは spike-log.txt の `onData` の有無という実測である。
+      it.each([
+        ['! の 1 打目（STEP1）', shiftBangEvents],
+        ['Shift+英字（STEP3/9）', shiftLetterEvents],
+      ])('%s: 手当てが無いとガードを通らない = 0 文字', (_label, events) => {
+        const state = { _keyDownSeen: false };
+        const passed = replay(events, state);
+        expect(passed).toBe(false);
+      });
+
+      it.each([
+        ['! の 1 打目（STEP1）', shiftBangEvents],
+        ['Shift+英字（STEP3/9）', shiftLetterEvents],
+      ])('%s: 手当てがあるとガードを通る = 1 文字', (_label, events) => {
+        const sid = nextSurfaceId();
+        registry.ensureTerminal(sid);
+        const term = fakeOf(sid);
+        const state = { _keyDownSeen: false };
+        term._core = state; // 実際に ensureTerminal が登録したハンドラと状態を共有する
+
+        const passed = replay(events, state, (event) => {
+          // 実際の customKeyEventHandler を keydown ごとに呼ぶ（モデルの外の
+          // 別ロジックを新たに書かず、テスト対象の実装をそのまま使う）
+          term.customKeyEventHandler?.({ type: event.type, key: event.key });
+        });
+
+        expect(passed).toBe(true);
+      });
+
+      it('対照（STEP4/10）: 素の a は手当てが無くても 1 文字のまま', () => {
+        const state = { _keyDownSeen: false };
+        const passed = replay(plainLetterEvents, state);
+        expect(passed).toBe(true);
+      });
+
+      it(
+        '対照（STEP4/10）: 素の a は 1 文字通り、末尾の a の keydown でも ' +
+          '_keyDownSeen は true のまま（I2）',
+        () => {
+          // fix round 3 Important: plainLetterEvents は input の後ろに文字キー自身の
+          // keydown（実測。beforeinput→input→onData→keydown）を含むため、この keydown
+          // で実際の customKeyEventHandler が呼ばれる。修飾キーのみの判定（I2）を壊して
+          // 「全キーで戻す」にすると、下の 2 つ目のアサートが赤くなる
+          // （MODIFIER_ONLY_KEYS 判定の判別力の源。§65.6 T2 との重複ではなく、
+          // 同じ性質が replay モデルの上でも成り立つことを確かめる）。
+          const sid = nextSurfaceId();
+          registry.ensureTerminal(sid);
+          const term = fakeOf(sid);
+          const state = { _keyDownSeen: false };
+          term._core = state;
+
+          const passed = replay(plainLetterEvents, state, (event) => {
+            term.customKeyEventHandler?.({ type: event.type, key: event.key });
+          });
+
+          expect(passed).toBe(true);
+          // 素の a の keydown は修飾キーのみの手当ての対象外（I2）なので、
+          // 末尾の keydown の後でも state._keyDownSeen は true のまま。
+          expect(state._keyDownSeen).toBe(true);
+        },
+      );
+    },
+  );
+
   it('detachTerminal は WebGL アドオンを dispose して DOM レンダラへ降格する（計画 §2.4）', () => {
     const sid = nextSurfaceId();
     const container = document.createElement('div');
@@ -473,7 +761,7 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
   });
 });
 
-describe('readTerminalFont（RULINGS §25: lineHeight は渡さない。§23.2 は撤回済み）', () => {
+describe('readTerminalFont（契約 §58.2: lineHeight は渡さない）', () => {
   afterEach(() => {
     document.documentElement.style.removeProperty('--font-mono');
     document.documentElement.style.removeProperty('--text-sm');

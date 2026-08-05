@@ -21,6 +21,64 @@ function scrollbackFor(surfaceId: string): number {
   return surfaceId.endsWith(':editor') ? EDITOR_SCROLLBACK_LINES : AGENT_SCROLLBACK_LINES;
 }
 
+/**
+ * 契約 §65.6 の「修飾キーのみ」の最小集合 4 つに `CapsLock` を加えた 5 つ。
+ *
+ * `CapsLock` を含める判断は §65.6 がレーンの裁量とした点（lane-controller の裁定）:
+ * spike（実機 WKWebView）でこの環境には文字入力の `keypress` 経路が存在しないと
+ * 分かったため、`_keyDownSeen` を落とす副作用は `_inputEvent` のガードを通す
+ * だけになり、二重入力の経路が無い。一方 macOS の `CapsLock` は対になる `keyup`
+ * が同じ打鍵で来るとは限らず、来なければ `_keyDownSeen` が `true` のまま居座る。
+ * 落とす側に危険が無く、落とさない側に居座りの危険があるので含める。
+ * `AltGraph` は macOS の対象環境に存在しないため含めない。
+ */
+const MODIFIER_ONLY_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock']);
+
+/** `term._core` の必要な形だけを局所的に型付けする（契約 §65.12: 実体は `_core` の下） */
+interface XtermCoreKeyState {
+  _keyDownSeen: boolean;
+}
+
+/**
+ * `core != null` だけでは緩すぎる（fix round 1 Minor 3）: 版が上がって
+ * `_keyDownSeen` の型だけ変わった場合（例: 文字列やオブジェクトに変わる）を
+ * 弾くために `typeof ... === 'boolean'` まで見る。緩めると §65.6 T8 の亜種
+ * （`_core` はあるが `_keyDownSeen` が boolean でない偽 term）が検出できなくなる。
+ */
+function hasKeyDownSeenFlag(core: unknown): core is XtermCoreKeyState {
+  return (
+    typeof core === 'object' &&
+    core !== null &&
+    typeof (core as { _keyDownSeen?: unknown })._keyDownSeen === 'boolean'
+  );
+}
+
+/**
+ * 契約 §65.3: `@xterm/xterm` 5.5.0 の上流バグ（WKWebView + IME で `_keyDownSeen` が
+ * keydown のたびに立ったままになり、`_inputEvent` のガードが Shift 修飾の 1 文字目
+ * ── `!` `@` に加え、実機 spike（2026-08-05）で判明した Shift+英字も含む ── を
+ * 飲んでしまう）への手当て。修飾キーのみの `keydown` で `_keyDownSeen` を `false` へ
+ * 戻す（上流 PR #6054 の `wasModifierKeyOnlyEvent` と同じ意味論）。
+ *
+ * フラグの書き戻しは副作用として行う。返り値（Cmd 系の奪取）だけでは直らない
+ * —— `_keyDownSeen=true` は custom handler の呼び出しより前に xterm 自身が走らせる
+ * ため（契約 §65.2）。
+ *
+ * I2: 修飾キー以外の keydown には触らない。I4: keyup / keypress から呼ばれた
+ * ときは触らない（xterm 自身が `_keyUp` の先頭で false にしている。二重に書くと
+ * どちらが書いたか読めなくなる）。
+ */
+function resetKeyDownSeenIfModifierOnly(term: Terminal, event: KeyboardEvent): void {
+  if (event.type !== 'keydown') return; // I4
+  if (!MODIFIER_ONLY_KEYS.has(event.key)) return; // I2
+  // `_core` が無い / フラグが boolean でない場合は何もしない（版が上がって形が
+  // 変わったときに例外で落とさない。検出は xtermCanary.test.ts の役目）
+  const core = (term as unknown as { _core?: unknown })._core;
+  if (hasKeyDownSeenFlag(core)) {
+    core._keyDownSeen = false; // I1
+  }
+}
+
 interface TerminalEntry {
   term: Terminal;
   fit: FitAddon;
@@ -87,7 +145,7 @@ function readTerminalTheme(): ITheme {
  * 空文字列 / NaN を返す。その場合はキー自体を省略して xterm の既定値に委ねる
  * （hex フォールバックと違い、design token が無いときの防御であって「値を書く」ことにはならない）。
  *
- * **`lineHeight` は意図的に渡さない（RULINGS §25。§23.2 は撤回済み）。**
+ * **`lineHeight` は意図的に渡さない（契約 §58.2）。**
  *
  * xterm の `lineHeight` は CSS の `line-height` と同じ意味の数値ではない。
  * `cell.height = Math.floor(char.height * lineHeight)` であり、`char.height` は
@@ -173,8 +231,12 @@ export function ensureTerminal(surfaceId: string): Terminal {
     });
   });
   // Cmd 系は window のキーマップに渡す（契約 §11）。
-  // Cmd+C / Cmd+V はブラウザのネイティブ処理なので、ここで止めても効く
-  term.attachCustomKeyEventHandler((event) => !event.metaKey);
+  // Cmd+C / Cmd+V はブラウザのネイティブ処理なので、ここで止めても効く。
+  // 返り値の意味は変えない（I3）。フラグの書き戻しは副作用として行う（契約 §65.3）。
+  term.attachCustomKeyEventHandler((event) => {
+    resetKeyDownSeenIfModifierOnly(term, event);
+    return !event.metaKey;
+  });
 
   entries.set(surfaceId, {
     term,
