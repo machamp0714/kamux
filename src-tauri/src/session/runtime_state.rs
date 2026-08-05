@@ -2,6 +2,9 @@
 //! 遷移判断はこのファイルの純粋関数 `next_state` に閉じ込める。
 
 use crate::model::{RuntimeState, StateReason};
+use std::collections::HashMap;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// 状態機械への入力。
 /// 契約 §8 の `StateReason`（13 バリアント）から `StartupNormalize` / `SpawnFailed` を除いた 11 個。
@@ -111,6 +114,89 @@ pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
         | RuntimeState::Exited
         | RuntimeState::Interrupted
         | RuntimeState::Error => None,
+    }
+}
+
+/// surface_id の suffix（契約 §5）。agent サーフェスだけが状態機械に影響する。
+const SURFACE_KIND_AGENT: &str = "agent";
+
+pub type StateMap = HashMap<String, RuntimeState>;
+
+/// ロック毒化で panic しないためのヘルパ（契約 §0: unwrap 禁止）。
+/// 毒化は「別スレッドが保持中に panic した」だけで、マップ自体の不変条件は壊れていない。
+pub(crate) fn read_map(m: &RwLock<StateMap>) -> RwLockReadGuard<'_, StateMap> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+// Task 4 の `RuntimeStateManager`（次タスク）が状態遷移の書き込みに使う。
+// このタスク単体では未使用のため dead_code を明示的に許可する。
+#[expect(dead_code, reason = "Task 4 の RuntimeStateManager が消費する公開 API")]
+pub(crate) fn write_map(m: &RwLock<StateMap>) -> RwLockWriteGuard<'_, StateMap> {
+    m.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// チャネルを流れる 1 件の入力。
+#[derive(Debug)]
+pub struct RuntimeEvent {
+    pub session_id: String,
+    pub input: StateInput,
+}
+
+/// `mpsc::Sender` は `Send` だが **`!Sync`** である。
+/// `AppState` が `Arc<RuntimeStateManager>` を保持し、Tauri の `State<'_, T>` が
+/// `T: Send + Sync + 'static` を要求するため、`Mutex` で包んで `Sync` にする。
+/// ロックを持つのはキューへの push の間だけで、ブロッキングは実質発生しない。
+pub type EventTx = Arc<Mutex<Sender<RuntimeEvent>>>;
+
+/// 状態機械への唯一の入口。各スレッドへ Clone して配る。
+#[derive(Clone)]
+pub struct RuntimeSender {
+    states: Arc<RwLock<StateMap>>,
+    tx: EventTx,
+}
+
+impl RuntimeSender {
+    pub fn new(states: Arc<RwLock<StateMap>>, tx: EventTx) -> Self {
+        Self { states, tx }
+    }
+
+    /// 現在の runtime_state。未知のセッションは `Idle`。
+    pub fn current(&self, session_id: &str) -> RuntimeState {
+        read_map(&self.states)
+            .get(session_id)
+            .copied()
+            .unwrap_or(RuntimeState::Idle)
+    }
+
+    /// session_id を直接指定して入力を送る。M2-2（hooks）/ M3-3（ヒューリスティック）用。
+    /// consumer 側が落ちている場合は黙って捨てる（アプリ終了時に起きうる正常系）。
+    pub fn send(&self, session_id: &str, input: StateInput) {
+        let event = RuntimeEvent {
+            session_id: session_id.to_string(),
+            input,
+        };
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = tx.send(event);
+    }
+
+    /// surface_id 経由で送る。`sink.rs` と `write_pty` コマンド用。
+    ///
+    /// - `:editor` サーフェスは無視する(nvim を閉じてもセッションは ⛔ にならない)
+    /// - 現在状態から遷移が起きない入力は、`String` の確保もチャネル送信もせず捨てる。
+    ///   出力チャンク毎・キー入力毎に呼ばれるためのコスト対策(契約 §0)。
+    ///   判定と consumer 処理の間に状態が変わるレースはありうるが、捨てられるのは
+    ///   「送っても None になるはずだった入力」であり、後続の入力が正しい遷移を起こす。
+    pub fn note_surface(&self, surface_id: &str, input: StateInput) {
+        let Some((session_id, kind)) = surface_id.rsplit_once(':') else {
+            return;
+        };
+        if kind != SURFACE_KIND_AGENT {
+            return;
+        }
+        if next_state(self.current(session_id), input).is_none() {
+            return;
+        }
+        self.send(session_id, input);
     }
 }
 
@@ -435,5 +521,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    use std::sync::mpsc;
+    use std::sync::{Arc, RwLock};
+
+    fn sender_with(
+        initial: &[(&str, RuntimeState)],
+    ) -> (RuntimeSender, mpsc::Receiver<RuntimeEvent>) {
+        let map: StateMap = initial
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect();
+        let states = Arc::new(RwLock::new(map));
+        let (tx, rx) = mpsc::channel();
+        (RuntimeSender::new(states, Arc::new(Mutex::new(tx))), rx)
+    }
+
+    /// `RuntimeEvent` は Task 11 で enum になる（契約 §40.2.1）。フィールドアクセスをここへ
+    /// 集約し、enum 化時の書き換え面を 6 箇所から 1 箇所に減らす（lane-controller 指定）。
+    fn expect_input(ev: RuntimeEvent) -> (String, StateInput) {
+        (ev.session_id, ev.input)
+    }
+
+    /// `AppState` に `Arc<RuntimeStateManager>` を載せるため、Tauri の
+    /// `State<'_, T>: Send + Sync + 'static` を満たす必要がある。
+    /// `mpsc::Sender` は `Send` だが `!Sync` なので、`Mutex` で包んでいることを型で固定する。
+    #[test]
+    fn runtime_sender_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<RuntimeSender>();
+    }
+
+    #[test]
+    fn current_defaults_to_idle_for_unknown_session() {
+        let (sender, _rx) = sender_with(&[]);
+        assert_eq!(sender.current("nope"), Idle);
+    }
+
+    #[test]
+    fn send_always_enqueues() {
+        // In::OutputActivity は Running からは遷移しない(next_state は None)。
+        // それでも送信されることが `send` と `note_surface` の違い
+        // (note_surface だけが遷移なし入力を捨てる高速パスを持つ)。
+        let (sender, rx) = sender_with(&[("s1", Running)]);
+        sender.send("s1", In::OutputActivity);
+        let ev = rx.try_recv().expect("送信されるはず");
+        assert_eq!(expect_input(ev), ("s1".to_string(), In::OutputActivity));
+    }
+
+    #[test]
+    fn note_surface_ignores_editor_surface() {
+        let (sender, rx) = sender_with(&[("s1", Running)]);
+        sender.note_surface("s1:editor", In::PtyExited);
+        assert!(
+            rx.try_recv().is_err(),
+            "editor サーフェスは状態機械に届いてはいけない"
+        );
+    }
+
+    #[test]
+    fn note_surface_extracts_session_id_from_agent_surface() {
+        let (sender, rx) = sender_with(&[("s1", Running)]);
+        sender.note_surface("s1:agent", In::PtyExited);
+        let ev = rx.try_recv().expect("送信されるはず");
+        assert_eq!(expect_input(ev), ("s1".to_string(), In::PtyExited));
+    }
+
+    /// 出力チャンク毎・キー入力毎の allocation を避ける高速パス。
+    #[test]
+    fn note_surface_drops_inputs_that_would_not_transition() {
+        let (sender, rx) = sender_with(&[("s1", Running)]);
+        sender.note_surface("s1:agent", In::OutputActivity);
+        sender.note_surface("s1:agent", In::UserInput);
+        assert!(rx.try_recv().is_err(), "running 中の出力/入力は送信しない");
+    }
+
+    #[test]
+    fn note_surface_sends_when_transition_would_happen() {
+        let (sender, rx) = sender_with(&[("s1", WaitingInput)]);
+        sender.note_surface("s1:agent", In::UserInput);
+        let ev = rx.try_recv().expect("送信されるはず");
+        assert_eq!(expect_input(ev).1, In::UserInput);
+    }
+
+    #[test]
+    fn note_surface_ignores_malformed_surface_id() {
+        let (sender, rx) = sender_with(&[("s1", Idle)]);
+        sender.note_surface("no-colon-here", In::OutputActivity);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// UUID にはハイフンが含まれるがコロンは含まれない。区切りは最後のコロン。
+    #[test]
+    fn note_surface_handles_uuid_session_id() {
+        let uuid = "3f2a9c1e-0000-4000-8000-000000000001";
+        let (sender, rx) = sender_with(&[(uuid, Idle)]);
+        sender.note_surface(&format!("{}:agent", uuid), In::OutputActivity);
+        let ev = rx.try_recv().expect("送信されるはず");
+        assert_eq!(expect_input(ev).0, uuid);
     }
 }
