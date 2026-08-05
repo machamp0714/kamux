@@ -95,6 +95,25 @@ pub fn next_state(current: RuntimeState, input: StateInput) -> Option<(RuntimeSt
     }
 }
 
+/// 起動時の正規化。**`RuntimeState::Interrupted` を生成できる唯一の場所**（契約 §2）。
+///
+/// `None` は「据え置き（DB を書き換えない）」を意味する。
+/// `idle` を据え置くのは、スキーマの DEFAULT が 'idle' であり、
+/// 一度も起動していない Backlog のカードまで ⏸ にしないため。
+///
+/// 呼び出し元は `RuntimeStateManager::normalize_on_startup()` ただ1つ。
+pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
+    match last {
+        // アプリ終了時に PTY が死んでいる = 実行中のまま中断された
+        RuntimeState::Running | RuntimeState::WaitingInput => Some(RuntimeState::Interrupted),
+        // `Error` は据え置き（None）。契約 §40.5「❌ は再起動後も残らなければならない」。
+        RuntimeState::Idle
+        | RuntimeState::Exited
+        | RuntimeState::Interrupted
+        | RuntimeState::Error => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +395,45 @@ mod tests {
         // reason は区別できる（UI のツールチップ用）
         let (_, reason) = next_state(Running, In::HookPermission).expect("遷移するはず");
         assert_eq!(reason, StateReason::HookPermission);
+    }
+
+    /// `interrupted` を生成できる唯一の関数（契約 §2 / 提案 2）。
+    #[test]
+    fn normalize_promotes_only_live_states_to_interrupted() {
+        assert_eq!(normalize_startup_state(Running), Some(Interrupted));
+        assert_eq!(normalize_startup_state(WaitingInput), Some(Interrupted));
+    }
+
+    /// 一度も起動していない Backlog カード（DEFAULT 'idle'）を ⏸ にしてはいけない。
+    #[test]
+    fn normalize_leaves_resting_states_untouched() {
+        assert_eq!(normalize_startup_state(Idle), None);
+        assert_eq!(normalize_startup_state(Exited), None);
+        // ⚠️ lane-controller 追加（2026-08-05）: 契約 §40.5
+        //    「❌ は再起動後も残らなければならない」。原文にこの 1 行が無く、
+        //    `Error` を ⏸ に化けさせる実装が緑で通ってしまう。
+        assert_eq!(normalize_startup_state(Error), None);
+    }
+
+    /// 2 回続けて起動しても結果が変わらない。
+    #[test]
+    fn normalize_is_idempotent() {
+        assert_eq!(normalize_startup_state(Interrupted), None);
+        let once = normalize_startup_state(Running).expect("running は正規化される");
+        assert_eq!(normalize_startup_state(once), None);
+    }
+
+    /// 正規化結果は interrupted か据え置きのみ。他の状態を捏造しない。
+    #[test]
+    fn normalize_only_ever_produces_interrupted() {
+        for state in ALL_STATES {
+            if let Some(next) = normalize_startup_state(state) {
+                assert_eq!(
+                    next, Interrupted,
+                    "{:?} が interrupted 以外に正規化された",
+                    state
+                );
+            }
+        }
     }
 }
