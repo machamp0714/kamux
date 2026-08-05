@@ -89,7 +89,7 @@ function readTerminalTheme(): ITheme {
  * 空文字列 / NaN を返す。その場合はキー自体を省略して xterm の既定値に委ねる
  * （hex フォールバックと違い、design token が無いときの防御であって「値を書く」ことにはならない）。
  *
- * **`lineHeight` は意図的に渡さない（RULINGS §25。§23.2 は撤回済み）。**
+ * **`lineHeight` は意図的に渡さない（契約 §58.2）。**
  *
  * xterm の `lineHeight` は CSS の `line-height` と同じ意味の数値ではない。
  * `cell.height = Math.floor(char.height * lineHeight)` であり、`char.height` は

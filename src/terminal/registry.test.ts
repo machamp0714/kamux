@@ -473,7 +473,7 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
   });
 });
 
-describe('readTerminalFont（RULINGS §25: lineHeight は渡さない。§23.2 は撤回済み）', () => {
+describe('readTerminalFont（契約 §58.2: lineHeight は渡さない）', () => {
   afterEach(() => {
     document.documentElement.style.removeProperty('--font-mono');
     document.documentElement.style.removeProperty('--text-sm');
