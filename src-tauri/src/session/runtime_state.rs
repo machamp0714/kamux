@@ -994,8 +994,12 @@ mod tests {
 
         mgr.sender().send("s1", In::Spawned);
 
-        // consumer は同期的に処理するので、猶予を与えたうえで何も変化していないことを確かめる。
-        std::thread::sleep(Duration::from_millis(50));
+        // フックが走った = 先頭ゲートを通過し、レース窓(第二ゲートの手前)に入った陽性の証拠。
+        // 固定タイマーではなく、consumer が実際にここまで到達したことを待って確認する。
+        assert!(wait_until(
+            || persist.first_started() == vec!["s1".to_string()]
+        ));
+
         assert!(
             persist.writes().is_empty(),
             "レース窓で始まった終了は DB へ書いてはいけない"
