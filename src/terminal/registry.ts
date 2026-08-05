@@ -9,8 +9,6 @@ import { encodeBinaryString } from '../ipc/base64';
 import { ackPty, writePty, writePtyBytes } from '../ipc/commands';
 import { AckCoalescer } from './ackCoalescer';
 import { loadAcceleratedRenderer, type RendererKind } from './renderer';
-// SPIKE(§65.5): Task 4 で除去する
-import { installSpikeCapture, logSpikeData } from './spikeCapture';
 import './terminal.css';
 
 /** 設計書 §8-4: エージェント用サーフェスは 10,000 行保持し DB には保存しない */
@@ -226,9 +224,6 @@ export function ensureTerminal(surfaceId: string): Terminal {
     writePty(surfaceId, data).catch(() => {
       // 上記の理由により意図的に無視する
     });
-    // SPIKE(§65.5): Task 4 で除去する。既存の onData ハンドラの中で呼ぶ
-    // （契約 §16: term → PTY の接続は ensureTerminal の中で 1 回だけ。新規に onData を張らない）
-    logSpikeData(surfaceId, data);
   });
   term.onBinary((data) => {
     writePtyBytes(surfaceId, encodeBinaryString(data)).catch(() => {
@@ -242,9 +237,6 @@ export function ensureTerminal(surfaceId: string): Terminal {
     resetKeyDownSeenIfModifierOnly(term, event);
     return !event.metaKey;
   });
-  // SPIKE(§65.5): Task 4 で除去する。手当てではなく、実機で 6 経路のイベント順序を
-  // 測るための使い捨て計装（契約 §65）
-  installSpikeCapture(term);
 
   entries.set(surfaceId, {
     term,
