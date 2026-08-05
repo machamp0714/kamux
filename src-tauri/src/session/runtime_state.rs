@@ -1,8 +1,11 @@
 //! セッションの runtime_state 状態機械。
 //! 遷移判断はこのファイルの純粋関数 `next_state` に閉じ込める。
 
-use crate::model::{RuntimeState, StateReason};
+use crate::error::AppResult;
+use crate::model::{RuntimeState, SessionStatePayload, StateReason};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -128,9 +131,6 @@ pub(crate) fn read_map(m: &RwLock<StateMap>) -> RwLockReadGuard<'_, StateMap> {
     m.read().unwrap_or_else(|e| e.into_inner())
 }
 
-// Task 4 の `RuntimeStateManager`（次タスク）が状態遷移の書き込みに使う。
-// このタスク単体では未使用のため dead_code を明示的に許可する。
-#[expect(dead_code, reason = "Task 4 の RuntimeStateManager が消費する公開 API")]
 pub(crate) fn write_map(m: &RwLock<StateMap>) -> RwLockWriteGuard<'_, StateMap> {
     m.write().unwrap_or_else(|e| e.into_inner())
 }
@@ -197,6 +197,160 @@ impl RuntimeSender {
             return;
         }
         self.send(session_id, input);
+    }
+}
+
+/// `last_runtime_state` の永続化の抽象。本番は `Store`(契約 §17)、テストはフェイクを差す。
+/// メソッド名は契約 §17 の `Store` API に揃える。
+pub trait StatePersist: Send + Sync {
+    fn set_last_runtime_state(&self, session_id: &str, state: RuntimeState) -> AppResult<()>;
+    /// 指定した `last_runtime_state` を持つセッションの id を返す。起動時正規化用。
+    fn list_ids_by_last_runtime_state(&self, state: RuntimeState) -> AppResult<Vec<String>>;
+    /// 最初の PTY spawn 成功を 1 度だけ記録する(契約 §34.5)。
+    /// **時計を引数に取らない** —— 状態機械を時計から切り離すため、`now_ms()` の呼び出しは
+    /// `Store` アダプタ側に閉じる。冪等性は DAO の SQL が担保するので、
+    /// 呼び出し側に「初回か」の判定を持たせないこと。
+    fn mark_first_started(&self, session_id: &str) -> AppResult<()>;
+    /// `error` への遷移を永続化する(契約 §38.8)。`mark_error` の唯一の永続化口。
+    /// `last_runtime_state = 'error'` と `last_runtime_error` を DAO が 1 文で書く。
+    /// **`set_last_runtime_state(id, Error)` は使わない** —— メッセージの無い error 行ができる
+    fn set_runtime_error(&self, session_id: &str, message: &str) -> AppResult<()>;
+}
+
+/// 遷移が確定したあとに呼ばれる。Tauri emit と M2-3 の通知がこれを実装する。
+/// consumer スレッドから同期的に呼ばれるので、重い処理をここでしないこと。
+pub trait StateObserver: Send + Sync {
+    fn on_state(&self, payload: &SessionStatePayload);
+}
+
+type Observers = Arc<RwLock<Vec<Arc<dyn StateObserver>>>>;
+
+/// runtime_state の直列化層。
+/// **DB への `last_runtime_state` 書き込みは、この型の consumer スレッドだけが行う。**
+pub struct RuntimeStateManager {
+    states: Arc<RwLock<StateMap>>,
+    tx: EventTx,
+    persist: Arc<dyn StatePersist>,
+    observers: Observers,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl RuntimeStateManager {
+    /// consumer スレッドを 1 本起動する。`recv()` でブロックするのでポーリングは発生しない。
+    pub fn new(persist: Arc<dyn StatePersist>) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel::<RuntimeEvent>();
+        let mgr = Arc::new(RuntimeStateManager {
+            states: Arc::new(RwLock::new(StateMap::new())),
+            tx: Arc::new(Mutex::new(tx)),
+            persist,
+            observers: Arc::new(RwLock::new(Vec::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        });
+
+        let states = Arc::clone(&mgr.states);
+        let persist = Arc::clone(&mgr.persist);
+        let observers = Arc::clone(&mgr.observers);
+        let shutting_down = Arc::clone(&mgr.shutting_down);
+
+        if let Err(err) = std::thread::Builder::new()
+            .name("kamux-runtime-state".into())
+            .spawn(move || {
+                consume_loop(rx, states, persist, observers, shutting_down);
+            })
+        {
+            // ここが失敗すると runtime_state が一切更新されなくなる。黙って落とさない。
+            eprintln!("[kamux] failed to spawn runtime-state thread: {}", err);
+        }
+
+        mgr
+    }
+
+    pub fn sender(&self) -> RuntimeSender {
+        RuntimeSender::new(Arc::clone(&self.states), Arc::clone(&self.tx))
+    }
+
+    pub fn register_observer(&self, observer: Arc<dyn StateObserver>) {
+        self.observers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(observer);
+    }
+
+    pub fn current(&self, session_id: &str) -> RuntimeState {
+        read_map(&self.states)
+            .get(session_id)
+            .copied()
+            .unwrap_or(RuntimeState::Idle)
+    }
+
+    /// アプリ終了の開始を宣言する。以降、メモリ・DB・observer のいずれも更新しない。
+    /// PTY teardown より前に呼ぶこと(そうしないと `exited` が DB に残り、
+    /// 次回起動時に ⏸ ではなく ⛔ が表示される)。冪等。
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+}
+
+fn consume_loop(
+    rx: mpsc::Receiver<RuntimeEvent>,
+    states: Arc<RwLock<StateMap>>,
+    persist: Arc<dyn StatePersist>,
+    observers: Observers,
+    shutting_down: Arc<AtomicBool>,
+) {
+    while let Ok(ev) = rx.recv() {
+        if shutting_down.load(Ordering::SeqCst) {
+            continue;
+        }
+
+        // 契約 §34.5: Spawned を「観測した時点」で記録する。**遷移表を引く前に置くこと。**
+        // running + Spawned は遷移なし(None)で continue するため、
+        // 遷移後に置くとこの経路が黙って抜ける。
+        // 冪等性は DAO 側の SQL(WHERE first_started_at IS NULL)が担保する。
+        // SurfaceKind::Agent 限定は Spawned の発行元(start_session / resume_session)が
+        // すでに構造的に保証しているので、ここで surface を再チェックしない(§34.5)。
+        if ev.input == StateInput::Spawned {
+            if let Err(err) = persist.mark_first_started(&ev.session_id) {
+                eprintln!(
+                    "[kamux] failed to record first_started_at for {}: {}",
+                    ev.session_id, err
+                );
+            }
+        }
+
+        let current = read_map(&states)
+            .get(&ev.session_id)
+            .copied()
+            .unwrap_or(RuntimeState::Idle);
+
+        let Some((next, reason)) = next_state(current, ev.input) else {
+            continue;
+        };
+
+        // 判定から書き込みまでの間に終了が始まっていたら、ここで捨てる(最後のゲート)。
+        // メモリ・DB・observer のいずれも更新しない(計画 §4.4 の逐語)。
+        if shutting_down.load(Ordering::SeqCst) {
+            continue;
+        }
+
+        write_map(&states).insert(ev.session_id.clone(), next);
+
+        if let Err(err) = persist.set_last_runtime_state(&ev.session_id, next) {
+            // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
+            eprintln!(
+                "[kamux] failed to persist runtime_state for {}: {}",
+                ev.session_id, err
+            );
+        }
+
+        let payload = SessionStatePayload {
+            session_id: ev.session_id,
+            runtime_state: next,
+            reason,
+        };
+        for observer in observers.read().unwrap_or_else(|e| e.into_inner()).iter() {
+            observer.on_state(&payload);
+        }
     }
 }
 
@@ -620,5 +774,316 @@ mod tests {
         sender.note_surface(&format!("{}:agent", uuid), In::OutputActivity);
         let ev = rx.try_recv().expect("送信されるはず");
         assert_eq!(expect_input(ev).0, uuid);
+    }
+
+    use crate::model::SessionStatePayload;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct FakePersist {
+        rows: Mutex<Vec<(String, RuntimeState)>>,
+        writes: Mutex<Vec<(String, RuntimeState)>>,
+        first_started: Mutex<Vec<String>>,
+        errors: Mutex<Vec<(String, String)>>, // 契約 §38.8 の set_runtime_error
+        fail: AtomicBool,
+        /// `mark_first_started` の呼び出し時点で走らせるフック。
+        /// consume_loop の「先頭ゲート通過後・DB 書き込み直前ゲートより前」という
+        /// レース窓を決定的に再現するための注入点(変異検証専用)。
+        on_mark_first_started: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl FakePersist {
+        fn with_rows(rows: &[(&str, RuntimeState)]) -> Arc<Self> {
+            Arc::new(FakePersist {
+                rows: Mutex::new(rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect()),
+                ..Default::default()
+            })
+        }
+        fn writes(&self) -> Vec<(String, RuntimeState)> {
+            self.writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn first_started(&self) -> Vec<String> {
+            self.first_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn set_on_mark_first_started(&self, f: impl Fn() + Send + Sync + 'static) {
+            *self
+                .on_mark_first_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+        }
+    }
+
+    impl StatePersist for FakePersist {
+        fn set_last_runtime_state(
+            &self,
+            session_id: &str,
+            state: RuntimeState,
+        ) -> crate::error::AppResult<()> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Db("boom".into()));
+            }
+            self.writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((session_id.to_string(), state));
+            Ok(())
+        }
+
+        fn mark_first_started(&self, session_id: &str) -> crate::error::AppResult<()> {
+            if let Some(hook) = self
+                .on_mark_first_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                hook();
+            }
+            let mut marks = self.first_started.lock().unwrap_or_else(|e| e.into_inner());
+            if !marks.contains(&session_id.to_string()) {
+                marks.push(session_id.to_string());
+            }
+            Ok(())
+        }
+
+        /// 契約 §38.8。`errors` は `Mutex<Vec<(String, String)>>`（`FakePersist` のフィールド）
+        fn set_runtime_error(
+            &self,
+            session_id: &str,
+            message: &str,
+        ) -> crate::error::AppResult<()> {
+            self.errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((session_id.to_string(), message.to_string()));
+            Ok(())
+        }
+
+        fn list_ids_by_last_runtime_state(
+            &self,
+            state: RuntimeState,
+        ) -> crate::error::AppResult<Vec<String>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(_, s)| *s == state)
+                .map(|(id, _)| id.clone())
+                .collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: Mutex<Vec<(String, RuntimeState, StateReason)>>,
+    }
+
+    impl RecordingObserver {
+        fn seen(&self) -> Vec<(String, RuntimeState, StateReason)> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl StateObserver for RecordingObserver {
+        fn on_state(&self, payload: &SessionStatePayload) {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).push((
+                payload.session_id.clone(),
+                payload.runtime_state,
+                payload.reason,
+            ));
+        }
+    }
+
+    /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    #[test]
+    fn manager_applies_transition_persists_and_notifies() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        mgr.sender().send("s1", In::Spawned);
+
+        assert!(wait_until(|| mgr.current("s1") == Running));
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+        assert_eq!(
+            obs.seen(),
+            vec![("s1".to_string(), Running, StateReason::Spawned)]
+        );
+    }
+
+    /// 契約 §34.5: Spawned は「観測した時点」で記録する。
+    /// running + Spawned は遷移しない(next_state が None)ので、
+    /// 記録を遷移の後ろに置くとこの 2 回目が抜ける —— そこを固定する。
+    #[test]
+    fn spawned_marks_first_started_even_without_a_transition() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        mgr.sender().send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+        assert!(wait_until(
+            || persist.first_started() == vec!["s1".to_string()]
+        ));
+
+        // running 中の 2 回目の Spawned は遷移しないが、記録の呼び出し自体は届く
+        mgr.sender().send("s1", In::Spawned);
+        mgr.sender().send("s1", In::HookStop);
+        assert!(wait_until(|| mgr.current("s1") == Idle));
+        // DAO 側が冪等なので、フェイクも重複を積まない
+        assert_eq!(persist.first_started(), vec!["s1".to_string()]);
+
+        // Spawned 以外では記録しない
+        mgr.sender().send("s2", In::UserInput);
+        assert!(wait_until(|| mgr.current("s2") == Running));
+        assert_eq!(persist.first_started(), vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn manager_ignores_inputs_that_do_not_transition() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        mgr.sender().send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+        // running 中の OutputActivity は遷移しない → 書き込みも配信も増えない
+        mgr.sender().send("s1", In::OutputActivity);
+        mgr.sender().send("s1", In::HookStop);
+
+        assert!(wait_until(|| mgr.current("s1") == Idle));
+        assert_eq!(persist.writes().len(), 2);
+        assert_eq!(obs.seen().len(), 2);
+    }
+
+    /// 計画 §4.4: 「判定から書き込みまでの間に終了が始まった」レース窓を決定的に再現する。
+    /// `mark_first_started` のコールバックから `begin_shutdown()` を呼ぶことで、
+    /// 先頭ゲートは通過済みだが DB 書き込み直前のゲートより前、という窓を毎回同じ場所で作る。
+    /// メモリ・DB・observer のいずれも更新されないことを固定する(§4.4 の逐語)。
+    #[test]
+    fn shutdown_started_mid_event_updates_nothing() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        let mgr_for_hook = Arc::clone(&mgr);
+        persist.set_on_mark_first_started(move || mgr_for_hook.begin_shutdown());
+
+        mgr.sender().send("s1", In::Spawned);
+
+        // consumer は同期的に処理するので、猶予を与えたうえで何も変化していないことを確かめる。
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            persist.writes().is_empty(),
+            "レース窓で始まった終了は DB へ書いてはいけない"
+        );
+        assert!(
+            obs.seen().is_empty(),
+            "レース窓で始まった終了は observer を呼んではいけない"
+        );
+        assert_eq!(
+            mgr.current("s1"),
+            Idle,
+            "レース窓で始まった終了はメモリも更新してはいけない"
+        );
+    }
+
+    /// 正常終了(Cmd+Q)で PTY kill による exited を DB に書かせない。
+    /// DB に running を残すことが、次回起動時の ⏸ の根拠になる。
+    #[test]
+    fn begin_shutdown_stops_persisting_and_notifying() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        mgr.sender().send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+
+        mgr.begin_shutdown();
+        mgr.sender().send("s1", In::PtyExited);
+
+        // consumer が処理する猶予を与えたうえで、何も増えていないことを確かめる
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+        assert_eq!(obs.seen().len(), 1);
+        assert_eq!(mgr.current("s1"), Running);
+    }
+
+    #[test]
+    fn begin_shutdown_is_idempotent() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        mgr.begin_shutdown();
+        mgr.begin_shutdown();
+        mgr.sender().send("s1", In::Spawned);
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(persist.writes().is_empty());
+        assert_eq!(mgr.current("s1"), Idle);
+    }
+
+    /// DB 書き込みが失敗しても consumer スレッドは死なない(契約 §0: panic 経路禁止)。
+    #[test]
+    fn persist_failure_does_not_kill_consumer() {
+        let persist = FakePersist::with_rows(&[]);
+        persist.fail.store(true, Ordering::SeqCst);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        mgr.sender().send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+
+        persist.fail.store(false, Ordering::SeqCst);
+        mgr.sender().send("s1", In::HookStop);
+        assert!(wait_until(|| mgr.current("s1") == Idle));
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Idle)]);
+    }
+
+    /// sender 経由の note_surface が manager のスナップショットを見ていること。
+    #[test]
+    fn sender_shares_snapshot_with_manager() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| sender.current("s1") == Running));
+
+        // running 中の出力は捨てられる
+        sender.note_surface("s1:agent", In::OutputActivity);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
+
+    /// `AppState` に `Arc<RuntimeStateManager>` を載せるため、Tauri の
+    /// `State<'_, T>: Send + Sync + 'static` を満たす必要がある。
+    #[test]
+    fn runtime_state_manager_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<RuntimeStateManager>();
     }
 }
