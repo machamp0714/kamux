@@ -112,14 +112,32 @@ function runControlCheck(): void {
   if (ok) {
     controlResultEl.textContent = 'コントロール OK: 計装は信号を取れている';
     controlResultEl.style.color = '#4caf50';
-  } else {
-    const reason =
-      inputRows.length === 0
-        ? 'input イベントの行が無い'
-        : `input イベントの行は ${inputRows.length} 本あるが _keyDownSeen が true の行が 1 本も無い`;
-    controlResultEl.textContent = `コントロール NG: ${reason}。ここで中止して報告してください`;
-    controlResultEl.style.color = '#f44336';
+    return;
   }
+
+  // レビュー指摘 I3（fix round 1・advisor 再指摘）: input 行が無い／_keyDownSeen が true で
+  // ない原因は「計装が壊れている」ことも「フォーカスが無く打鍵が届かなかった」こともありうる。
+  // dropped 行（pickTerm がどの term にも一致せず捨てた行）はその手がかりの 1 つに過ぎない
+  // —— `installedTerms` は dispose で剪定されない（既知の Minor）ため、open() 前の term が
+  // 残っていると pickTerm 規則 2 でその term に誤帰属し、dropped 行を作らず
+  // `_keyDownSeen: false` のまま記録されうる。**dropped 件数の有無で focus ヒントの
+  // 出し分けをしてはならない**（droppedCount === 0 でもフォーカス漏れの可能性は消えない）。
+  // NG は常に「まずフォーカスを確認してやり直す」を案内し、それでも同じ NG が出るときだけ
+  // 中止させる —— 1 回しか回せない人間ゲートで、確実な失敗と紛らわしいフォーカス漏れを
+  // 同列に扱って早期に中止させない。
+  const droppedCount = step1Lines.filter((row) => row.type === 'dropped').length;
+  let reason: string;
+  if (inputRows.length === 0 && droppedCount > 0) {
+    reason = `input イベントの行が無く、${droppedCount} 件のイベントがどの term にも一致せず捨てられている（dropped）`;
+  } else if (inputRows.length === 0) {
+    reason = 'input イベントの行が無い';
+  } else {
+    reason = `input イベントの行は ${inputRows.length} 本あるが _keyDownSeen が true の行が 1 本も無い`;
+  }
+  controlResultEl.textContent =
+    `コントロール NG: ${reason}。まずターミナル面（黒い画面）をクリックしてフォーカスがあるか確認し、` +
+    `ステップ 1 からやり直してください。それでも同じ NG が出る場合は、そこで中止して報告してください`;
+  controlResultEl.style.color = '#f44336';
 }
 
 function goToStep(n: number): void {
@@ -152,13 +170,29 @@ function preventFocusStealButton(el: HTMLButtonElement): void {
   });
 }
 
+/**
+ * レビュー指摘 I2（PR H1 Task 1 fix round 1）: `navigator.clipboard` が存在しない環境
+ * （WKWebView など）では `navigator.clipboard.writeText` という**プロパティ参照自体**が
+ * 同期的に `TypeError` を投げる。`.writeText(text).catch(...)` の形だとその例外は
+ * `.catch` に届く前に投げられてしまい、フォールバックの `select()` が起動しないまま
+ * 「コピー」ボタンが無反応になる。`try/catch` で同期例外もフォールバックへ倒す。
+ */
 function copyLogToClipboard(): void {
   if (!logTextareaEl) return;
   const text = logTextareaEl.value;
-  navigator.clipboard.writeText(text).catch(() => {
-    // フォールバック: textarea を select() してユーザーに手動コピーさせる
+  try {
+    if (!navigator.clipboard) {
+      logTextareaEl.select();
+      return;
+    }
+    navigator.clipboard.writeText(text).catch(() => {
+      // 非同期の失敗（権限拒否など）のフォールバック
+      logTextareaEl?.select();
+    });
+  } catch {
+    // 同期的な例外（navigator.clipboard.writeText の参照自体が無い等）のフォールバック
     logTextareaEl?.select();
-  });
+  }
 }
 
 /** 3.4: DevTools を開かせない画面オーバーレイ。React には触らず document.body に直接生成する */
@@ -289,9 +323,39 @@ function pickTerm(event: Event): Terminal | undefined {
   return undefined;
 }
 
+/**
+ * レビュー指摘 I3（PR H1 Task 1 fix round 1）: pickTerm がどの規則にも合致せず対象外と
+ * 判断したイベントを、無言で捨てずに `dropped` 行として記録する。実機 spike はシェル
+ * セッション 1 本（open() 済みの term が 1 つ）の構成のため、このイベントが起きるのは
+ * ほぼ「ターミナル面にフォーカスが無い状態で打鍵した」ケースである。3.6 のコントロール
+ * 判定 NG の理由文（runControlCheck）がこの行数を見て、「計装が壊れている」のか
+ * 「フォーカスを取り忘れただけ」なのかを切り分けられるようにする。
+ * `code` 欄に元イベントの `type`（'keydown' 等）を間借りする（onData 行が `code` に
+ * surfaceId を間借りするのと同じ規則。3.3 のフィールド表には dropped 行は無い）。
+ */
+function appendDroppedRow(originalType: string): void {
+  appendRow({
+    step: currentStep,
+    t: relativeMs(),
+    type: 'dropped',
+    key: null,
+    code: originalType,
+    keyCode: null,
+    isComposing: null,
+    inputType: null,
+    data: null,
+    composed: null,
+    _keyDownSeen: null,
+    _keyPressHandled: null,
+  });
+}
+
 function handleCapturedEvent(event: Event): void {
   const term = pickTerm(event);
-  if (!term) return;
+  if (!term) {
+    appendDroppedRow(event.type);
+    return;
+  }
 
   const { keyDownSeen, keyPressHandled } = readCoreFlags(term);
   const kbd = event as Partial<KeyboardEvent>;
