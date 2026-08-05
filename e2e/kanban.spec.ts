@@ -180,7 +180,10 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
 
     // 第1部 §9「表示」: 4 列見出しの件数、カードの CLI アイコン・ブランチ名表示、
-    // runtime バッジが 1 枚も出ないこと（M1-2 は runtimeStates が空のまま。契約 §34.7）。
+    // runtime バッジが 1 枚も出ないこと（フィクスチャは first_started_at === null なので
+    // seedRuntimeStates が除外する。契約 §34.7 / §33.3 Q1）。
+    // 数えるのはバッジ本体（.runtime-badge）である —— .kanban-card__badge は M2-1 Task 10 で
+    // <RuntimeBadge> を置くための空スロットになり、バッジの有無を表さなくなった。
     await expect(page.locator('section[aria-label="Backlog"] .kanban-column__count')).toHaveText(
       '2',
     );
@@ -189,7 +192,7 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     ).toHaveText('0');
     await expect(page.locator('[data-column="backlog"] .kanban-card__cli')).toHaveCount(2);
     await expect(page.locator('[data-column="backlog"] .kanban-card__branch')).toHaveCount(2);
-    await expect(page.locator('.kanban-card__badge')).toHaveCount(0);
+    await expect(page.locator('.runtime-badge')).toHaveCount(0);
   });
 
   test('カードを Backlog から In Progress へドラッグすると move_session が飛び、盤面に反映される', async ({

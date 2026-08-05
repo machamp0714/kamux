@@ -90,7 +90,8 @@
   overflow-y: auto;
 }
 
-.kanban-column__list.is-over {
+/* 状態クラスも BEM の修飾子で書く（契約 §54.1: __ と -- 以外の区切りを使わない） */
+.kanban-column__list--over {
   background: var(--accent-soft);
 }
 
@@ -171,6 +172,10 @@
   border-radius: var(--radius-sm);
   background: var(--bg-app);
   padding: var(--space-3);
+  /* 契約 §42.4「生 stderr を原文で」。改行を保ったまま、長い 1 行でも
+     カードから溢れさせない */
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* components.md「カード」節: kanban-card__actions は「ホバーで出す」。

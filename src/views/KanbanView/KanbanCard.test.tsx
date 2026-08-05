@@ -82,7 +82,7 @@ describe('KanbanCard（要件5: クリック / Enter で開く）', () => {
     const onOpen = vi.fn();
     act(() => {
       root = createRoot(container);
-      root.render(<KanbanCard session={session('s1')} runtimeStates={{}} onOpen={onOpen} />);
+      root.render(<KanbanCard session={session('s1')} onOpen={onOpen} />);
     });
 
     act(() => {
@@ -96,7 +96,7 @@ describe('KanbanCard（要件5: クリック / Enter で開く）', () => {
     const onOpen = vi.fn();
     act(() => {
       root = createRoot(container);
-      root.render(<KanbanCard session={session('s1')} runtimeStates={{}} onOpen={onOpen} />);
+      root.render(<KanbanCard session={session('s1')} onOpen={onOpen} />);
     });
 
     pressEnter(card());
@@ -112,7 +112,7 @@ describe('KanbanCard（要件5: クリック / Enter で開く）', () => {
       root.render(
         <KanbanCard
           session={session('s1')}
-          runtimeStates={{}}
+
           onOpen={onOpen}
           onEdit={onEdit}
           onArchive={vi.fn()}
@@ -132,10 +132,34 @@ describe('KanbanCard（要件5: クリック / Enter で開く）', () => {
   it('onOpen が無いクローン（DragOverlay）はタブストップにならない', () => {
     act(() => {
       root = createRoot(container);
-      root.render(<KanbanCard session={session('s1')} runtimeStates={{}} />);
+      root.render(<KanbanCard session={session('s1')} />);
     });
 
     expect(card().hasAttribute('tabindex')).toBe(false);
+  });
+});
+
+// components.md「カード」節: kanban-card__head は「横並び・両端寄せ。左に CLI チップ、
+// 右にバッジ」= 2 グループである。ここに 3 要素目（title）が混ざると
+// justify-content: space-between の意味が変わり、バッジが中央に落ちる。
+// CSS では検出できない構造なのでマークアップ側で固定する。
+describe('KanbanCard の head（components.md「カード」節）', () => {
+  beforeEach(() => {
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={session('s1')} />);
+    });
+  });
+
+  it('head は左に CLI チップ・右にバッジの 2 要素だけを持つ', () => {
+    const head = card().querySelector('.kanban-card__head');
+    const children = [...(head?.children ?? [])].map((el) => el.className);
+    expect(children).toEqual(['kanban-card__cli', 'kanban-card__badge']);
+  });
+
+  it('title は head の中ではなくカード直下の子要素である', () => {
+    const title = card().querySelector('.kanban-card__title');
+    expect(title?.parentElement).toBe(card());
   });
 });
 
@@ -160,7 +184,7 @@ describe('SortableCard 合成時（カード 1 枚あたりのタブストップ
     return (
       <DndContext sensors={sensors} onDragStart={onDragStart}>
         <SortableContext items={['s1']}>
-          <SortableCard session={session('s1')} runtimeStates={{}} />
+          <SortableCard session={session('s1')} />
         </SortableContext>
       </DndContext>
     );

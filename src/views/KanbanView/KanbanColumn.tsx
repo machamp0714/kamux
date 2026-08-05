@@ -1,6 +1,6 @@
 import { useDroppable } from '@dnd-kit/core';
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
-import type { KanbanStatus, RuntimeState, Session } from '../../types/model';
+import type { KanbanStatus, Session } from '../../types/model';
 import { COLUMN_LABELS } from './columns';
 import { columnDroppableId } from './dragEnd';
 import { SortableCard } from './SortableCard';
@@ -9,10 +9,9 @@ export interface KanbanColumnProps {
   status: KanbanStatus;
   sessionIds: string[];
   sessions: Record<string, Session>;
-  runtimeStates: Record<string, RuntimeState>;
 }
 
-export function KanbanColumn({ status, sessionIds, sessions, runtimeStates }: KanbanColumnProps) {
+export function KanbanColumn({ status, sessionIds, sessions }: KanbanColumnProps) {
   // 空の列にもドロップできるよう、列そのものを droppable にする
   const { setNodeRef, isOver } = useDroppable({ id: columnDroppableId(status) });
 
@@ -25,11 +24,11 @@ export function KanbanColumn({ status, sessionIds, sessions, runtimeStates }: Ka
       <SortableContext items={sessionIds} strategy={verticalListSortingStrategy}>
         <div
           ref={setNodeRef}
-          className={`kanban-column__list${isOver ? ' is-over' : ''}`}
+          className={`kanban-column__list${isOver ? ' kanban-column__list--over' : ''}`}
           data-column={status}
         >
           {sessionIds.map((id) => (
-            <SortableCard key={id} session={sessions[id]} runtimeStates={runtimeStates} />
+            <SortableCard key={id} session={sessions[id]} />
           ))}
         </div>
       </SortableContext>

@@ -9,6 +9,8 @@ export default defineConfig({
   build: { target: 'es2021' },
   test: {
     environment: 'jsdom',
+    // jest-dom のマッチャ登録。vitest の設定はこの 1 箇所だけに置く（vitest.config.ts は作らない）
+    setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     passWithNoTests: true,
   },

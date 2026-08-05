@@ -1,5 +1,6 @@
 import { useShallow } from 'zustand/react/shallow';
 
+import { RuntimeBadge } from '../../components/RuntimeBadge';
 import { useAppStore } from '../../store';
 import { selectTerminalTabs } from '../../store/terminalSlice';
 
@@ -37,6 +38,9 @@ export function SessionTabList(): JSX.Element {
         >
           <span className="kamux-tab__title">{sessions[id]?.title ?? id}</span>
           <span className="kamux-tab__meta">
+            {/* runtimeStates を購読するのはこのバッジの中だけ（契約 §25.5 / §38.3）。
+                タブ列がバッジの変化で再レンダリングされないよう props で渡さない */}
+            <RuntimeBadge sessionId={id} />
             <span className="kamux-tab__cli" aria-hidden>
               {sessions[id]?.cli_kind}
             </span>

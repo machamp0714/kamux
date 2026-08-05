@@ -1,0 +1,30 @@
+/* components.md「実行状態バッジ」節: 横並び・gap: var(--space-3)・
+   背景なし・枠なし（ピル型にしない）。 */
+.runtime-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 0 0 auto;
+}
+
+/* 色の正典は契約 §53.4 の --state-* である。どの状態がどのトークンを指すかは
+   RuntimeBadge.tsx の RUNTIME_STATE_TOKEN が持ち、ルート要素の color に載る。
+   ここではその color を currentColor として受けるだけにしてある ——
+   M3-3 の runtime-badge--estimated（ドットを中空にするが色は変えない）が
+   色の指定に一切触れずに書けるようにするため。 */
+.runtime-badge__dot {
+  /* 8×8 の円は components.md が px で直接指定する部品固有の寸法（尺度ではない） */
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.runtime-badge__label {
+  font-size: var(--text-xs);
+  font-weight: 500;
+  /* components.md「実行状態バッジ」節が直接指定する値 */
+  letter-spacing: 0.2px;
+  color: currentColor;
+}
