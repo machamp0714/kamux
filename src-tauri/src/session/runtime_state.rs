@@ -1165,7 +1165,7 @@ mod tests {
         mgr.register_observer(obs.clone());
 
         mgr.sender().send("s1", In::Spawned);
-        // 1 回目の書き込みは fail=true で失敗するが、observer(:351) は
+        // 1 回目の書き込みは fail=true で失敗するが、observer 通知は
         // 失敗をログしたあとも呼ばれる(最後の副作用)。ここを待ってから
         // fail を倒す。current だけを待つと、consumer が DB 書き込みの
         // 失敗ログ処理中に fail の反転が間に合い、書き込みが成功して
@@ -1193,7 +1193,7 @@ mod tests {
             || persist.writes() == vec![("s1".to_string(), Running)]
         ));
         // このテストの本旨: sender 経由の読み取りが manager の共有スナップショットを
-        // 見ていること。write_map(:336) は persist(:338) より前に確定するので、
+        // 見ていること。write_map(メモリ) は persist(DB) より前に確定するので、
         // writes() が観測できた時点でメモリも安定している。
         assert_eq!(sender.current("s1"), Running);
 
