@@ -60,6 +60,32 @@ db_enum!(SurfaceKind {
     Editor => "editor",
 });
 
+/// 状態を変えた原因。UI のツールチップとデバッグ用（契約 §8）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateReason {
+    Spawned,
+    HookNotification,
+    HookStop,
+    PtyExited,
+    StartupNormalize,
+    BelDetected,
+    SilenceTimeout,
+    UserStopped,
+    OutputActivity, // PTY 出力活動による running 復帰（M2-1）
+    UserInput,      // ユーザーのキー入力による waiting_input 解除（M2-1）
+    HookPermission, // PermissionRequest hook 受信（契約 §12.4）
+    ResumeFailed,   // resume 試行の失敗（M2-4）。StateInput::ResumeFailed から生成（契約 §41.3）
+    SpawnFailed,    // error 状態への遷移（契約 §2。RuntimeSender::mark_error のみが発行。§40.2）
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStatePayload {
+    pub session_id: String,
+    pub runtime_state: RuntimeState,
+    pub reason: StateReason,
+}
+
 /// 契約 §4
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
