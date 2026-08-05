@@ -75,3 +75,27 @@ export interface FocusPayload {
   session_id: string;
   surface_kind: SurfaceKind;
 }
+
+// 契約 §33.2 の正典をそのまま写す。§8 の 13 バリアントと 1:1。
+// 後続フェーズ（M2-4 / M3-3）はこの union に値を足さない
+export type StateReason =
+  | 'spawned'
+  | 'hook_notification'
+  | 'hook_stop'
+  | 'pty_exited'
+  | 'startup_normalize'
+  | 'bel_detected'
+  | 'silence_timeout'
+  | 'user_stopped'
+  | 'output_activity'
+  | 'user_input'
+  | 'hook_permission'
+  | 'resume_failed'
+  | 'spawn_failed';
+
+/** `session://state/{session_id}`（契約 §8）のペイロード。 */
+export interface SessionStatePayload {
+  session_id: string;
+  runtime_state: RuntimeState;
+  reason: StateReason;
+}

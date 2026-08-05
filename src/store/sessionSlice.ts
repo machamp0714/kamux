@@ -7,7 +7,14 @@ import {
   updateSession as updateSessionCmd,
   type CreateSessionArgs,
 } from '../ipc/commands';
-import type { KanbanStatus, RuntimeState, Session, SessionPatch } from '../types/model';
+import type {
+  KanbanStatus,
+  RuntimeState,
+  Session,
+  SessionPatch,
+  SessionStatePayload,
+  StateReason,
+} from '../types/model';
 import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
 
@@ -30,23 +37,45 @@ export interface SessionSlice {
   sessions: Record<string, Session>;
   sessionOrder: Record<KanbanStatus, string[]>;
 
-  /**
-   * runtime バッジの表示枠。M1-2 は型と初期値だけを置き、書き換えない。
-   * 値の導出（applyStateEvent）は M2-1 の担当（契約 §2 / §10）。
-   */
+  /** DB の last_runtime_state とは別管理（契約 §10）。真実は PTY/hooks 由来。 */
   runtimeStates: Record<string, RuntimeState>;
+  /** ツールチップとデバッグ用（契約 §8）。購読者は RuntimeBadge のみ。 */
+  runtimeReasons: Record<string, StateReason>;
+  /**
+   * runtime_state === 'error' のときだけ入る生 stderr（契約 §42.3）。
+   * DB のミラーである sessions[id].last_runtime_error とは別管理にする ——
+   * 失敗時はコマンドが Err を返すので sessions は更新されず、
+   * かつ applyStateEvent は sessions を参照ごと変更してはならない。
+   * 購読してよいのは KanbanCardError だけ（契約 §38.3 の許可リスト）。
+   */
+  runtimeErrors: Record<string, string>;
 
   loadSessions: (projectId: string) => Promise<void>;
   addSession: (args: CreateSessionArgs) => Promise<Session>;
   moveCard: (sessionId: string, to: KanbanStatus, index: number) => Promise<void>;
   editSession: (id: string, patch: SessionPatch) => Promise<Session>;
   archiveSession: (id: string) => Promise<void>;
+  applyStateEvent: (p: SessionStatePayload) => void;
+  /**
+   * last_runtime_state から初期値を埋める。
+   * reset=false（既定）は「未知のキーだけ埋める」。start_session の戻り値で呼んでも
+   * 先に届いた実時間の値を潰さない。reset=true はプロジェクト切替時に総入れ替えする。
+   */
+  seedRuntimeStates: (sessions: Session[], reset?: boolean) => void;
+  /**
+   * start_session / resume_session の catch から setError と同じ場所で呼ぶ（契約 §42.3 規約 4）。
+   * 渡すのは AppError の message —— mark_error が DB へ書くのと同一の文字列である。
+   * 許可リスト（契約 §40.3）の複製はしない。ズレの境界は契約 §42.3.1 が定めている。
+   */
+  setRuntimeError: (sessionId: string, message: string) => void;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
   sessions: {},
   sessionOrder: emptySessionOrder(),
   runtimeStates: {},
+  runtimeReasons: {},
+  runtimeErrors: {},
 
   loadSessions: async (projectId) => {
     // アーカイブ済みは表示しない（復活 UX は M3-4）
@@ -62,6 +91,8 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // seed され、sessions / sessionOrder は現行のまま、という split-brain に戻ってしまう。
     if (get().activeProjectId !== projectId) return;
     set(indexSessions(list));
+    // 起動時正規化済みの last_runtime_state から ⏸ を復元する
+    get().seedRuntimeStates(list, true);
   },
 
   addSession: async (args) => {
@@ -158,4 +189,82 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       throw e;
     }
   },
+
+  applyStateEvent: (p) =>
+    set((s) => {
+      // 契約 §42.3 規約 3: error 以外へ遷移したら生 stderr を捨てる。
+      // DB 側の §17（set_last_runtime_state が state != Error で NULL に戻す）と同じ規則。
+      // error のときは触らない —— メッセージはイベントで来ないので、消すと空になる。
+      const dropError = p.runtime_state !== 'error' && s.runtimeErrors[p.session_id] !== undefined;
+      if (
+        s.runtimeStates[p.session_id] === p.runtime_state &&
+        s.runtimeReasons[p.session_id] === p.reason &&
+        !dropError
+      ) {
+        // 新しいオブジェクトを作らない = 無関係な購読者を再レンダリングさせない
+        return {};
+      }
+      const runtimeErrors = dropError ? { ...s.runtimeErrors } : s.runtimeErrors;
+      if (dropError) delete runtimeErrors[p.session_id];
+      return {
+        runtimeStates: { ...s.runtimeStates, [p.session_id]: p.runtime_state },
+        runtimeReasons: { ...s.runtimeReasons, [p.session_id]: p.reason },
+        runtimeErrors,
+      };
+    }),
+
+  setRuntimeError: (sessionId, message) =>
+    set((s) => ({ runtimeErrors: { ...s.runtimeErrors, [sessionId]: message } })),
+
+  seedRuntimeStates: (list, reset = false) =>
+    set((s) => {
+      if (reset) {
+        const fresh: Record<string, RuntimeState> = {};
+        // 契約 §42.3 規約 1・2: runtimeErrors も同じ規則で作り直す。
+        // §40.5 の 'error' 例外は runtimeErrors にも効く —— 効かせないと再起動後に
+        // ❌ の枠だけが描かれて中身が空になり、§40.5 が防いだ事故が 1 フィールド隣で再発する。
+        const freshErrors: Record<string, string> = {};
+        for (const sess of list) {
+          // 契約 §40.5: 'error' は first_started_at が null でも必ず seed する。
+          // 起動に一度も成功していないセッションの起動が失敗すると first_started_at は
+          // null のまま last_runtime_state だけが 'error' になる。ここで除外すると
+          // 再起動で ❌ が消え、「痕跡がカードに残る」という error の存在理由（契約 §2）が
+          // 最初のユースケースで空振りする。
+          if (sess.first_started_at === null && sess.last_runtime_state !== 'error') {
+            // 一度も起動していない → seed しない（契約 §34.6）。
+            // runtimeStates[id] は undefined のままになり、RuntimeBadge が null を返す。
+            // ただし既にエントリがある場合は消さない —— loadSessions のスナップショット読み取りが
+            // mark_first_started のコミットより先行したとき、実行中のバッジを消さないため。
+            const live = s.runtimeStates[sess.id];
+            if (live !== undefined) fresh[sess.id] = live;
+            const liveErr = s.runtimeErrors[sess.id];
+            if (liveErr !== undefined) freshErrors[sess.id] = liveErr;
+            continue;
+          }
+          fresh[sess.id] = sess.last_runtime_state;
+          // null の要素はキーを作らない（契約 §42.3 規約 1）
+          if (sess.last_runtime_error !== null) freshErrors[sess.id] = sess.last_runtime_error;
+        }
+        return { runtimeStates: fresh, runtimeReasons: {}, runtimeErrors: freshErrors };
+      }
+      // 非 reset には除外を適用しない（契約 §34.6）。呼び出し元は start_session /
+      // resume_session の戻り値だけで、渡されるのは「たった今起動した」セッションに限られる。
+      // 戻り値の Session は mark_first_started の非同期コミットより前に読まれて
+      // first_started_at === null を持ちうるため、ここで除外すると §4.5 の自己修復が壊れる。
+      let changed = false;
+      const next = { ...s.runtimeStates };
+      const nextErrors = { ...s.runtimeErrors };
+      for (const sess of list) {
+        if (next[sess.id] === undefined) {
+          next[sess.id] = sess.last_runtime_state;
+          changed = true;
+        }
+        // 契約 §42.3 規約 1: 非 reset も「未知のキーだけ埋める」。
+        if (nextErrors[sess.id] === undefined && sess.last_runtime_error !== null) {
+          nextErrors[sess.id] = sess.last_runtime_error;
+          changed = true;
+        }
+      }
+      return changed ? { runtimeStates: next, runtimeErrors: nextErrors } : {};
+    }),
 });
