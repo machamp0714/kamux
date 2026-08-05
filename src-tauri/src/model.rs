@@ -60,6 +60,32 @@ db_enum!(SurfaceKind {
     Editor => "editor",
 });
 
+/// 状態を変えた原因。UI のツールチップとデバッグ用（契約 §8）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateReason {
+    Spawned,
+    HookNotification,
+    HookStop,
+    PtyExited,
+    StartupNormalize,
+    BelDetected,
+    SilenceTimeout,
+    UserStopped,
+    OutputActivity, // PTY 出力活動による running 復帰（M2-1）
+    UserInput,      // ユーザーのキー入力による waiting_input 解除（M2-1）
+    HookPermission, // PermissionRequest hook 受信（契約 §12.4）
+    ResumeFailed,   // resume 試行の失敗（M2-4）。StateInput::ResumeFailed から生成（契約 §41.3）
+    SpawnFailed,    // error 状態への遷移（契約 §2。RuntimeSender::mark_error のみが発行。§40.2）
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStatePayload {
+    pub session_id: String,
+    pub runtime_state: RuntimeState,
+    pub reason: StateReason,
+}
+
 /// 契約 §4
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -210,6 +236,37 @@ mod tests {
         assert_roundtrip(RuntimeState::Error, "error"); // 契約 §2 の 6 値目
         assert_roundtrip(SurfaceKind::Agent, "agent");
         assert_roundtrip(SurfaceKind::Editor, "editor");
+    }
+
+    /// `StateReason` は `db_enum!` を使わない手書き enum なので、上の
+    /// `assert_roundtrip` が保証する `db_enum!` 型の一致とは別に固定する必要がある
+    /// （`Deserialize` を持たないため `assert_roundtrip` は使えない）。
+    /// 契約 §33.2 の TS union（13 個の snake_case 文字列）と 1 文字も違わないこと。
+    #[test]
+    fn state_reason_matches_contract_strings() {
+        let cases: [(StateReason, &str); 13] = [
+            (StateReason::Spawned, "spawned"),
+            (StateReason::HookNotification, "hook_notification"),
+            (StateReason::HookStop, "hook_stop"),
+            (StateReason::PtyExited, "pty_exited"),
+            (StateReason::StartupNormalize, "startup_normalize"),
+            (StateReason::BelDetected, "bel_detected"),
+            (StateReason::SilenceTimeout, "silence_timeout"),
+            (StateReason::UserStopped, "user_stopped"),
+            (StateReason::OutputActivity, "output_activity"),
+            (StateReason::UserInput, "user_input"),
+            (StateReason::HookPermission, "hook_permission"),
+            (StateReason::ResumeFailed, "resume_failed"),
+            (StateReason::SpawnFailed, "spawn_failed"),
+        ];
+        for (value, expected) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "StateReason の serde 表現が契約 §33.2 と違う: {value:?}"
+            );
+        }
     }
 
     /// serde 表現（`#[serde(rename_all = "snake_case")]` による自動導出）と
