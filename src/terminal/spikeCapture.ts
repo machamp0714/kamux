@@ -89,7 +89,15 @@ function appendRow(row: SpikeLogRow): void {
   appendLine(JSON.stringify(row));
 }
 
-/** 3.6: ステップ 1 の行を走査し、コントロール判定を行う */
+/**
+ * 3.6: ステップ 1 の行を走査し、コントロール判定を行う。
+ *
+ * brief 3.6 の逐語は「`input` イベントの行が**存在し**、その `_keyDownSeen` が `true`」。
+ * ステップ 1 は「`!` を 2 連打」なので `input` 行は複数出うる（1 打目・2 打目、IME 有効時は
+ * 合成入力の `input` も混ざりうる）。**先頭の 1 行だけを見てはならない** —— 先頭が
+ * たまたま `_keyDownSeen: false` の行でも、後続に `true` の行があれば経路は証明されている。
+ * 存在判定（`some`）を使う。
+ */
 function runControlCheck(): void {
   if (!logTextareaEl || !controlResultEl) return;
   const step1Lines = logTextareaEl.value
@@ -98,17 +106,17 @@ function runControlCheck(): void {
     .map((line) => JSON.parse(line) as SpikeLogRow)
     .filter((row) => row.step === 1);
 
-  const inputRow = step1Lines.find((row) => row.type === 'input');
-  const ok = inputRow !== undefined && inputRow._keyDownSeen === true;
+  const inputRows = step1Lines.filter((row) => row.type === 'input');
+  const ok = inputRows.some((row) => row._keyDownSeen === true);
 
   if (ok) {
     controlResultEl.textContent = 'コントロール OK: 計装は信号を取れている';
     controlResultEl.style.color = '#4caf50';
   } else {
     const reason =
-      inputRow === undefined
+      inputRows.length === 0
         ? 'input イベントの行が無い'
-        : `_keyDownSeen が ${String(inputRow._keyDownSeen)}`;
+        : `input イベントの行は ${inputRows.length} 本あるが _keyDownSeen が true の行が 1 本も無い`;
     controlResultEl.textContent = `コントロール NG: ${reason}。ここで中止して報告してください`;
     controlResultEl.style.color = '#f44336';
   }
