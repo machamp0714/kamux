@@ -1080,15 +1080,19 @@ mod tests {
         mgr.register_observer(obs.clone());
 
         mgr.sender().send("s1", In::Spawned);
-        assert!(wait_until(|| mgr.current("s1") == Running));
+        // 1 回目の書き込みは fail=true で失敗するが、observer(:351) は
+        // 失敗をログしたあとも呼ばれる(最後の副作用)。ここを待ってから
+        // fail を倒す。current だけを待つと、consumer が DB 書き込みの
+        // 失敗ログ処理中に fail の反転が間に合い、書き込みが成功して
+        // しまうレースが起こりうる。
+        assert!(wait_until(|| obs.seen().len() == 1));
+        assert_eq!(mgr.current("s1"), Running);
 
         persist.fail.store(false, Ordering::SeqCst);
         mgr.sender().send("s1", In::HookStop);
-        // observer を assert しないこの経路では DB 書き込みが最後の副作用。それを待つ。
-        assert!(wait_until(
-            || persist.writes() == vec![("s1".to_string(), Idle)]
-        ));
+        assert!(wait_until(|| obs.seen().len() == 2));
         assert_eq!(mgr.current("s1"), Idle);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Idle)]);
     }
 
     /// sender 経由の note_surface が manager のスナップショットを見ていること。
@@ -1103,6 +1107,10 @@ mod tests {
         assert!(wait_until(
             || persist.writes() == vec![("s1".to_string(), Running)]
         ));
+        // このテストの本旨: sender 経由の読み取りが manager の共有スナップショットを
+        // 見ていること。write_map(:336) は persist(:338) より前に確定するので、
+        // writes() が観測できた時点でメモリも安定している。
+        assert_eq!(sender.current("s1"), Running);
 
         // running 中の出力は捨てられる
         sender.note_surface("s1:agent", In::OutputActivity);
