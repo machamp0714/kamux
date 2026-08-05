@@ -1328,9 +1328,13 @@ mod tests {
     }
 
     /// DB 読み出しが失敗したら、状態を捏造せずエラーを返す。
+    /// `Exited` は `normalize_startup_state` で据え置き(None)になり書き込みを一切
+    /// 起こさないので、`fail` が捕まえるのは読み取り経路の失敗だけになる
+    /// （`Running` など昇格する行だと `set_last_runtime_state` 側の失敗伝播と
+    /// 見分けが付かない。PR 13 レビュー I-3）。
     #[test]
     fn normalize_on_startup_propagates_persist_errors() {
-        let persist = FakePersist::with_rows(&[("live", Running)]);
+        let persist = FakePersist::with_rows(&[("dead", Exited)]);
         persist.fail.store(true, Ordering::SeqCst);
         let mgr = RuntimeStateManager::new(persist);
 

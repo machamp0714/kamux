@@ -131,6 +131,69 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CliKind;
+    use crate::session::runtime_state::StatePersist;
+
+    /// `impl StatePersist for Store` の 4 メソッドが正しい DAO へ正しい引数
+    /// （`session.id`。`session.project_id` ではない）で委譲していることを固定する。
+    ///
+    /// PR 13 レビュー I-1: `list_ids_by_last_runtime_state` の `.map(|s| s.id)` を
+    /// `.map(|s| s.project_id)` に変えても `cargo test --workspace` が全緑だった
+    /// （委譲先の DAO は M1 期のテストで固められているが、trait と DAO を繋ぐ
+    /// 30 行だけが型で守られていなかった）。`Session` の id と project_id は
+    /// どちらも `String` なので取り違えがコンパイルを通る。
+    /// `id != project_id`（前者は UUID、後者は `insert_project` が採番）である
+    /// ことを使い、取り違えれば `NotFound` か空の結果になって検出できるようにする。
+    #[test]
+    fn store_state_persist_impl_delegates_with_the_session_id_not_the_project_id() {
+        use crate::model::RuntimeState;
+
+        let (_dir, store) = test_support::open_temp();
+        let project_id = store
+            .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
+            .expect("insert_project")
+            .id;
+        let session = test_support::insert_test_session(&store, &project_id, "a");
+        assert_ne!(
+            session.id, project_id,
+            "このテストは id と project_id が異なることに依存している"
+        );
+
+        // set_last_runtime_state: project_id を渡していれば NotFound になる。
+        StatePersist::set_last_runtime_state(&store, &session.id, RuntimeState::Running)
+            .expect("set_last_runtime_state");
+        assert_eq!(
+            store
+                .get_session(&session.id)
+                .expect("get_session")
+                .last_runtime_state,
+            RuntimeState::Running
+        );
+
+        // list_ids_by_last_runtime_state: project_id を返していれば "kamux" が
+        // 混入するか、id ではなく project_id が返ってきてしまう。
+        let ids = StatePersist::list_ids_by_last_runtime_state(&store, RuntimeState::Running)
+            .expect("list_ids_by_last_runtime_state");
+        assert_eq!(ids, vec![session.id.clone()]);
+
+        // mark_first_started: project_id を渡していれば対象行の first_started_at が
+        // 更新されない（DAO は 0 行更新でも Ok を返すため、直接 get_session で見る）。
+        StatePersist::mark_first_started(&store, &session.id).expect("mark_first_started");
+        assert!(
+            store
+                .get_session(&session.id)
+                .expect("get_session")
+                .first_started_at
+                .is_some(),
+            "first_started_at が更新されていない = project_id を渡している疑い"
+        );
+
+        // set_runtime_error: project_id を渡していれば NotFound になる。
+        StatePersist::set_runtime_error(&store, &session.id, "boom").expect("set_runtime_error");
+        let after_error = store.get_session(&session.id).expect("get_session");
+        assert_eq!(after_error.last_runtime_state, RuntimeState::Error);
+        assert_eq!(after_error.last_runtime_error.as_deref(), Some("boom"));
+    }
 
     // 環境変数はプロセス全体で共有されるため、KAMUX_DB_PATH を触るテストは
     // このひとつだけに閉じ込める（他のテストは Store::open に明示パスを渡す）。
