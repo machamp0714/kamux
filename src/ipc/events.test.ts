@@ -5,8 +5,8 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: (...args: unknown[]) => listen(...args),
 }));
 
-import type { FocusPayload } from '../types/model';
-import { listenFocus, onPtyData, onPtyExit } from './events';
+import type { FocusPayload, SessionStatePayload } from '../types/model';
+import { listenFocus, listenSessionState, onPtyData, onPtyExit } from './events';
 
 beforeEach(() => {
   listen.mockReset();
@@ -96,5 +96,38 @@ describe('ipc/events', () => {
 
     expect(received?.session_id).toBe('s1');
     expect(received?.surface_kind).toBe('editor');
+  });
+
+  // 契約 §8: listenSessionState は session://state トピックの listen ラッパの正典。
+  // トピック文字列のタイプミスはここで止める（useRuntimeStateEvents はモックして使う）。
+  it('listenSessionState が契約どおりのトピック文字列を listen する', async () => {
+    const unlisten = vi.fn();
+    listen.mockResolvedValue(unlisten);
+    const handler = vi.fn();
+
+    const result = await listenSessionState('s1', handler);
+
+    expect(listen).toHaveBeenCalledWith('session://state/s1', expect.any(Function));
+    expect(result).toBe(unlisten);
+  });
+
+  it('listenSessionState のハンドラに session_id / runtime_state / reason（snake_case）を持つ payload が渡る', async () => {
+    let capturedCallback: ((event: { payload: unknown }) => void) | undefined;
+    listen.mockImplementation((_topic: string, callback: (event: { payload: unknown }) => void) => {
+      capturedCallback = callback;
+      return Promise.resolve(vi.fn());
+    });
+
+    let received: SessionStatePayload | undefined;
+    await listenSessionState('s1', (payload) => {
+      received = payload;
+    });
+    capturedCallback?.({
+      payload: { session_id: 's1', runtime_state: 'running', reason: 'spawned' },
+    });
+
+    expect(received?.session_id).toBe('s1');
+    expect(received?.runtime_state).toBe('running');
+    expect(received?.reason).toBe('spawned');
   });
 });

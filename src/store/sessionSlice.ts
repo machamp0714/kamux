@@ -268,3 +268,11 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       return changed ? { runtimeStates: next, runtimeErrors: nextErrors } : {};
     }),
 });
+
+/**
+ * ID 集合を安定した文字列に畳んでから返す。
+ * `Object.keys(...)` をそのまま selector にすると毎回新しい配列になり、
+ * 無関係な set のたびに App 全体が再レンダリングされる。
+ */
+export const selectSessionIdsKey = (s: { sessions: Record<string, unknown> }): string =>
+  Object.keys(s.sessions).sort().join(',');
