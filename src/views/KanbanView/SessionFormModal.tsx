@@ -44,8 +44,6 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
       ? sessionFormValuesFrom(dialogMode.session)
       : initialSessionFormValues(project?.default_cli ?? 'claude'),
   );
-  // 編集時は既存のブランチ名を守るため、最初から追従を止めておく
-  const [branchTouched, setBranchTouched] = useState(dialogMode.kind === 'edit');
   const [busy, setBusy] = useState(false);
 
   // 編集モードで開いている間に対象セッションがストアから消えた場合（アーカイブ等）、
@@ -66,7 +64,7 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
     setValues((v) => ({
       ...v,
       title,
-      branch: branchTouched ? v.branch : (proposeBranchName(title) ?? ''),
+      branch: v.branchTouched ? v.branch : (proposeBranchName(title) ?? ''),
     }));
   };
 
@@ -165,18 +163,22 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
                 </fieldset>
 
                 {values.mode === 'worktree' ? (
-                  <label className="session-form-modal__field session-form-modal__field--mono">
-                    <span>ブランチ名</span>
-                    <input
-                      type="text"
-                      value={values.branch}
-                      placeholder="作成時に自動生成されます"
-                      onChange={(e) => {
-                        setBranchTouched(true);
-                        setValues((v) => ({ ...v, branch: e.target.value }));
-                      }}
-                    />
-                  </label>
+                  <>
+                    <label className="session-form-modal__field session-form-modal__field--mono">
+                      <span>ブランチ名</span>
+                      <input
+                        type="text"
+                        value={values.branch}
+                        placeholder="作成時に自動生成されます"
+                        onChange={(e) =>
+                          setValues((v) => ({ ...v, branch: e.target.value, branchTouched: true }))
+                        }
+                      />
+                    </label>
+                    <p className="session-form-modal__hint">
+                      未編集のまま作成すると、この名前が既に使われていれば作成時に空いている名前が自動で選ばれます。編集すると入力した名前がそのまま使われます。
+                    </p>
+                  </>
                 ) : null}
 
                 <label className="session-form-modal__field">

@@ -48,6 +48,14 @@ export const startSession = (id: string): Promise<Session> => invoke('start_sess
 
 export const stopSession = (id: string): Promise<Session> => invoke('stop_session', { id });
 
+/** ブランチ名の提案。衝突していれば空いている候補が返る。ユーザーは編集できる。
+ *  契約 §60.1.1: 既に id を持つセッション専用。新規作成ダイアログからは呼べない。 */
+export const suggestBranchName = (
+  projectId: string,
+  title: string,
+  sessionId: string,
+): Promise<string> => invoke('suggest_branch_name', { projectId, title, sessionId });
+
 export const writePty = (surfaceId: string, data: string): Promise<void> =>
   invoke('write_pty', { surfaceId, data });
 

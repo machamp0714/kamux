@@ -116,6 +116,25 @@ test.describe('ターミナル画面（Cmd+2 到達 + xterm 配線）', () => {
     await expect(page.locator('.kanban-view')).toHaveCount(0);
   });
 
+  test('カンバンのカードをクリックするとターミナル画面が開き、そのセッションの xterm にフォーカスが当たる', async ({
+    page,
+  }) => {
+    await page.addInitScript(commonInitScript());
+    await page.goto('/');
+    // s2 を選ぶ（既定のペイン割り当てと区別が付く方）
+    const card = page.locator('.kanban-card[data-session-id="s2"]');
+    await expect(card).toBeVisible();
+
+    await card.click();
+
+    // 要件5: クリックした瞬間にターミナル画面へ切り替わり、そのセッションが
+    // アクティブペインに載り、xterm（DOM）にフォーカスが移ること。
+    // ここが「ユニットテストではモックで置き換わる」xterm 越しの継ぎ目である。
+    await expect(page.locator('.kamux-terminal-view')).toBeVisible();
+    await expect(page.locator('[data-session-id="s2"]')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('.xterm-helper-textarea')).toBeFocused();
+  });
+
   test('xterm にフォーカスがある状態で Cmd+J / Cmd+K がタブ移動として効き、write_pty は飛ばない', async ({
     page,
   }) => {
