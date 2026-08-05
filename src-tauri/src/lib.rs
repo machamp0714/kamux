@@ -1204,6 +1204,185 @@ mod tests {
                 "Cmd+Q で exited が焼かれると、次回起動で ⏸ ではなく ⛔ になる（計画 §6.2）"
             );
         }
+
+        // --- M2-1 Task 7: 実 PTY の終了が `sink.rs` 経由で状態機械へ届く ---
+
+        /// `TauriSink` へ委譲したあとで通知するラッパ。
+        ///
+        /// **`inner.on_exit` の戻り後に signal する**ので、受信できた時点で
+        /// `TauriSink::on_exit`（= `note_pty_exit`）は完走している。
+        /// `PtyManager::live_surfaces()` の空判定では代用できない ——
+        /// `RegistrySink::on_exit` はレジストリからの削除を inner への転送より
+        /// **前**に行うため、空になった時点ではまだ `note_pty_exit` が走っていない。
+        struct SinkExitProbe {
+            inner: Arc<dyn crate::pty::surface::PtySink>,
+            tx: std::sync::mpsc::Sender<()>,
+        }
+
+        impl crate::pty::surface::PtySink for SinkExitProbe {
+            fn on_data(&self, surface_id: &str, base64: String, seq: u64) {
+                self.inner.on_data(surface_id, base64, seq);
+            }
+
+            fn on_exit(&self, surface_id: &str, exit_code: Option<i32>) {
+                self.inner.on_exit(surface_id, exit_code);
+                let _ = self.tx.send(());
+            }
+        }
+
+        /// 実 PTY（`/bin/cat`）を **production と同じ `TauriSink`** で 1 本立てる。
+        /// `spawn`（契約 §15）は `AppHandle<Wry>` 固定で `MockRuntime` から呼べないため、
+        /// `spawn_with_sink` に同じ sink を自前で渡して同じ経路を再現する。
+        fn spawn_agent_surface_through_the_real_sink(
+            app: &tauri::App<MockRuntime>,
+            surface_id: &str,
+        ) -> std::sync::mpsc::Receiver<()> {
+            use crate::pty::surface::PtySink;
+            use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let sink: Arc<dyn PtySink> = Arc::new(SinkExitProbe {
+                inner: crate::pty::sink::TauriSink::new(app.handle().clone()),
+                tx,
+            });
+            app.state::<AppState>()
+                .pty
+                .spawn_with_sink(
+                    sink,
+                    SpawnSpec {
+                        surface_id: surface_id.to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn the agent surface for the test");
+            rx
+        }
+
+        fn app_with_one_session() -> (
+            tempfile::TempDir,
+            tauri::App<MockRuntime>,
+            crate::model::Session,
+        ) {
+            let (dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            (dir, app, session)
+        }
+
+        /// 必達 4 の陽性コントロール: `sink.rs` の `on_exit` が実 PTY の終了を
+        /// 状態機械へ届け、DB に `exited` が焼かれる。
+        ///
+        /// `sink.rs` の `note_pty_exit` ブロックを消すと、PTY は死ぬのに
+        /// `last_runtime_state` が `running` のまま残ってここが赤くなる。
+        #[test]
+        fn pty_exit_through_the_sink_marks_the_session_exited() {
+            let (_dir, app, session) = app_with_one_session();
+            let sid = format!("{}:agent", session.id);
+            let exited = spawn_agent_surface_through_the_real_sink(&app, &sid);
+
+            let state = app.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: spawn 前は 🟢 が DB まで届くはず"
+            );
+
+            state.pty.kill(&sid).expect("kill the agent surface");
+            exited
+                .recv_timeout(Duration::from_secs(10))
+                .expect("TauriSink::on_exit must run within 10s of the kill");
+
+            // 契約 §69.1: assert する対象そのもの（DB の値）を待つ
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Exited),
+                "PTY の終了が sink.rs 経由で状態機械へ届いていない"
+            );
+            assert_eq!(state.runtime.current(&session.id), RuntimeState::Exited);
+        }
+
+        /// 必達 5（Task 6 レビュー §6.3 の持ち越し）: **アプリ終了の一括 kill で
+        /// DB に `exited` を焼かない。**
+        ///
+        /// `ShutdownBegun` は「`begin_shutdown()` の**後**に kill する」ことしか
+        /// 強制できない —— `begin_runtime_shutdown` の本体から
+        /// `runtime.begin_shutdown()` を落とし `ShutdownBegun(())` だけを返す形は
+        /// 型では防げない。そこを実行時に塞ぐのがこのテストである。
+        ///
+        /// ここが緩むと Cmd+Q のたびに DB へ `exited` が書かれ、次回起動で
+        /// `normalize_on_startup` は `{running, waiting_input}` しか触らないため
+        /// 全カードが ⏸ ではなく ⛔ で復帰する（計画 §4.4 / §6.2）。
+        ///
+        /// Task 6 の時点では実行時の観測手段が無かった。Task 7 が
+        /// `sink.rs` -> `note_pty_exit` を配線したことで、初めて
+        /// 「実 PTY を殺して、状態機械に届いた入力が捨てられること」を直接見られる。
+        #[test]
+        fn app_teardown_does_not_persist_exited_from_the_pty_it_kills() {
+            let (_dir, app, session) = app_with_one_session();
+            let sid = format!("{}:agent", session.id);
+            let exited = spawn_agent_surface_through_the_real_sink(&app, &sid);
+
+            let state = app.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: teardown 前は 🟢 が DB まで届くはず"
+            );
+
+            super::super::shutdown_runtime_then_kill_pty(&state);
+
+            // teardown の kill 由来の on_exit が `note_pty_exit` まで到達したことを
+            // 確認する。ここを待たずに assert すると、単に「まだ届いていない」だけで
+            // 緑になり、順序の保証を一切検証しないテストになる。
+            exited
+                .recv_timeout(Duration::from_secs(10))
+                .expect("TauriSink::on_exit must run within 10s of the teardown kill");
+
+            // 負の主張なので待つ条件が作れない（契約 §69.2）
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "teardown 由来の PtyExited を DB へ焼くと、次回起動で全カードが ⛔ になる"
+            );
+            assert_eq!(state.runtime.current(&session.id), RuntimeState::Running);
+        }
     }
 
     #[test]
@@ -1725,6 +1904,181 @@ mod tests {
             assert!(
                 !state.pty.is_alive(&agent_surface_id),
                 "stop_session must kill the SurfaceKind::Agent surface for the session"
+            );
+        }
+
+        // --- M2-1 Task 7: コマンドから状態機械への配線 ---
+
+        /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
+        fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            cond()
+        }
+
+        /// テストが自分で 1 本立てる agent サーフェス（`/bin/cat`）。
+        /// `write_pty` は `PtyManager::write` が成功したときだけ `UserInput` を送るので、
+        /// 生きた surface が要る。
+        fn spawn_agent_surface(state: &AppState, agent_surface_id: &str) {
+            use crate::pty::surface::PtySink;
+            use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+            struct NoopSink;
+            impl PtySink for NoopSink {
+                fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+                fn on_exit(&self, _surface_id: &str, _exit_code: Option<i32>) {}
+            }
+
+            state
+                .pty
+                .spawn_with_sink(
+                    std::sync::Arc::new(NoopSink),
+                    SpawnSpec {
+                        surface_id: agent_surface_id.to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn the agent surface directly for the test");
+        }
+
+        /// IPC 越しに project + session を 1 件ずつ作り、session_id を返す。
+        fn create_session_over_ipc(webview: &tauri::WebviewWindow<MockRuntime>) -> String {
+            let project = invoke_ok(
+                webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+            let session = invoke_ok(
+                webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "shell session",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "shell",
+                    "cliCommand": null,
+                }),
+            );
+            session["id"].as_str().expect("session id").to_owned()
+        }
+
+        /// 必達 3: `write_pty` は 🟡 を解除できる唯一の経路である。
+        ///
+        /// `write_pty` から `note_user_input` を落とすと、Claude が承認待ちのまま
+        /// ユーザーが返事を打っても 🟡 が張り付いたままになり、ここが赤くなる。
+        #[test]
+        fn write_pty_notes_user_input_and_clears_waiting_input() {
+            use crate::model::{RuntimeState, SurfaceKind};
+            use crate::pty::surface_id;
+            use crate::session::runtime_state::StateInput;
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let session_id = create_session_over_ipc(&webview);
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let state = app.state::<AppState>();
+            spawn_agent_surface(&state, &agent_surface_id);
+            let sender = state.runtime.sender();
+            sender.send(&session_id, StateInput::Spawned);
+            sender.send(&session_id, StateInput::HookNotification);
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::WaitingInput),
+                "陽性コントロール: 打鍵前は 🟡 のはず"
+            );
+
+            invoke_ok(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": agent_surface_id, "data": "y"}),
+            );
+
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::Running),
+                "write_pty が UserInput を送っていない（🟡 が解除されない）"
+            );
+
+            state.pty.kill(&agent_surface_id).expect("cleanup");
+        }
+
+        /// 必達 6: `stop_session` は kill のあと `UserStopped` を送り、⛔ を確定させる。
+        ///
+        /// 2 回目の停止は `PtyManager::kill` の冪等性（契約 §15）により `Ok` が返り、
+        /// `UserStopped` も送られるが、`exited` + `UserStopped` は遷移なしなので
+        /// DB もバッジも動かない（計画 §6.5）。
+        #[test]
+        fn stop_session_marks_the_session_exited_and_a_second_stop_is_harmless() {
+            use crate::model::{RuntimeState, SurfaceKind};
+            use crate::pty::surface_id;
+            use crate::session::runtime_state::StateInput;
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let session_id = create_session_over_ipc(&webview);
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let state = app.state::<AppState>();
+            spawn_agent_surface(&state, &agent_surface_id);
+            state
+                .runtime
+                .sender()
+                .send(&session_id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: 停止前は 🟢 が DB まで届くはず"
+            );
+
+            invoke_ok(&webview, "stop_session", json!({"id": session_id}));
+
+            // 契約 §69.1: assert する対象そのもの（DB の値）を待つ
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Exited),
+                "stop_session が UserStopped を送っていない"
+            );
+            assert_eq!(state.runtime.current(&session_id), RuntimeState::Exited);
+
+            // 既に死んだセッションへの 2 発目。kill は冪等なので Ok が返る。
+            invoke_ok(&webview, "stop_session", json!({"id": session_id}));
+
+            // 負の主張なので待つ条件が作れない（契約 §69.2）
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(state.runtime.current(&session_id), RuntimeState::Exited);
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Exited
             );
         }
 

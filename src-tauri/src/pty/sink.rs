@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Runtime, Wry};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
 
 use crate::pty::surface::PtySink;
 
@@ -75,13 +75,26 @@ impl<R: Runtime> PtySink for TauriSink<R> {
                 exit_code,
             },
         );
-        // M2-1 がここに次の 3 行を足す（`use tauri::Manager;` が要る）。
-        // agent サーフェスの判定は note_pty_exit の内部に閉じているので、
-        // ここでは surface_id をそのまま渡す。
+        // M2-1: agent サーフェスの終了を状態機械へ。
         //
-        // if let Some(state) = self.app.try_state::<crate::state::AppState>() {
-        //     state.runtime.sender().note_pty_exit(surface_id);
-        // }
+        // **ここにフィルタを書かないこと。** `:editor` を弾く判定は
+        // `RuntimeSender::note_surface` の内部に閉じている（契約 §2）。2 箇所に散ると、
+        // 片方だけ直した瞬間に「nvim を閉じただけでセッションが ⛔ になる」が戻る。
+        //
+        // **ここは PTY 読み取り専用の OS スレッドである。ブロックすると PTY の
+        // 読み取りそのものが止まる。** `note_pty_exit` は `Mutex` を取って
+        // チャネルへ push するだけで、DB 書き込みは consumer スレッドが行う。
+        // これ以上の処理を足さないこと。
+        //
+        // `try_state` が `None` を返す場合（アプリ終了処理中に起こりうる）は黙って
+        // 何もしない —— `begin_shutdown()` 後の遷移を捨てる方針と一致する。
+        //
+        // M2-4 Task 8 がここを `ResumeTracker::classify_exit(surface_id, exit_code)`
+        // による分岐（`note_pty_exit` / `note_resume_failed_exit`）へ置き換える
+        // （契約 §41.3 決定 (3)）。M2-1 では `ResumeTracker` がまだ無い。
+        if let Some(state) = self.app.try_state::<crate::state::AppState>() {
+            state.runtime.sender().note_pty_exit(surface_id);
+        }
     }
 }
 

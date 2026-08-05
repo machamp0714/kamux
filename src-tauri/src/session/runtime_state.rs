@@ -198,6 +198,34 @@ impl RuntimeSender {
         }
         self.send(session_id, input);
     }
+
+    /// PTY 終了の通知。**`sink.rs` の `on_exit` から呼ぶ唯一の入口。**
+    /// `:editor` サーフェスは無視される（nvim を閉じてもセッションは ⛔ にならない。契約 §2）。
+    ///
+    /// フィルタは `note_surface` の内部に閉じたままにすること。呼び出し側にも
+    /// 同じ判定を書くと 2 箇所に散り、片方だけ直した瞬間に「nvim を閉じただけで
+    /// セッションが ⛔ になる」事故が戻ってくる。
+    pub fn note_pty_exit(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::PtyExited);
+    }
+
+    /// resume 失敗と分類された PTY 終了の通知（契約 §40.4 / §41.3）。
+    /// **`note_pty_exit` とまったく同じ分解・同じ `:agent` フィルタを通る。**
+    /// 分類は M2-4 の `ResumeTracker::classify_exit(surface_id, exit_code)` が行い、
+    /// `sink.rs` はその結果でこの 2 本を出し分ける。遷移先は `PtyExited` と同一の
+    /// `exited` で、違うのは `StateReason` だけである。
+    ///
+    /// **M2-1 の時点では呼び出し元が無い**（`ResumeTracker` は M2-4 で入る）。
+    /// 契約 §44.1 により、呼び出し側が無いことを欠陥として扱わない。
+    pub fn note_resume_failed_exit(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::ResumeFailed);
+    }
+
+    /// ユーザーのキー入力の通知。**`write_pty` コマンドから呼ぶ唯一の入口。**
+    /// 🟡 を解除できる唯一の経路であり、`running` 中の打鍵は送信前に捨てられる。
+    pub fn note_user_input(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::UserInput);
+    }
 }
 
 /// `last_runtime_state` の永続化の抽象。本番は `Store`(契約 §17)、テストはフェイクを差す。
@@ -1462,5 +1490,203 @@ mod tests {
         let mgr = RuntimeStateManager::new(persist);
 
         assert!(mgr.normalize_on_startup().is_err());
+    }
+
+    // --- Task 7: `sink.rs` / `write_pty` / `stop_session` から届く入力の形 ---
+    //
+    // 待ち方は契約 §69.1 / §69.2 に従う。副作用の順は memory -> DB(persist) ->
+    // observer なので、正の主張では **assert する対象そのもの**を待つ。
+    // 負の主張（「起きてほしくない作用が起きていない」）には待つ条件が作れないため
+    // 素の `sleep` を使う —— `wait_until` に書き換えると条件成立の瞬間に抜けてしまい、
+    // 誤った作用が後から来ても検出できなくなる（§69.2）。
+
+    /// agent サーフェスの PTY 終了でセッションが ⛔ になる。
+    /// `sink.rs` の `on_exit` は surface_id をそのまま渡してくる。
+    #[test]
+    fn agent_pty_exit_marks_session_exited() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_pty_exit("s1:agent");
+
+        assert!(wait_until(|| persist.writes()
+            == vec![
+                ("s1".to_string(), Running),
+                ("s1".to_string(), Exited)
+            ]));
+        // メモリは DB より先に確定するので、writes() が観測できた時点で安定している
+        assert_eq!(mgr.current("s1"), Exited);
+    }
+
+    /// `stop_session` は kill したあと `UserStopped` を送るが、
+    /// その直後に PTY が実際に死んで `on_exit` から `PtyExited` も届く。
+    /// 2 通目は `exited` + `PtyExited` = 遷移なしなので、DB もイベントも動かない。
+    #[test]
+    fn stop_session_followed_by_pty_exit_writes_only_once() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::UserStopped);
+        // observer が最後の副作用。ここまで届いたことを待ってから負の主張に移る
+        assert!(wait_until(|| obs.seen().len() == 2));
+
+        sender.note_pty_exit("s1:agent");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Exited);
+        assert_eq!(
+            persist.writes(),
+            vec![("s1".to_string(), Running), ("s1".to_string(), Exited)],
+            "PtyExited が後追いで来ても 2 度目の書き込みをしてはいけない"
+        );
+        assert_eq!(obs.seen().len(), 2);
+        // 先に来た UserStopped の reason が残る
+        assert_eq!(obs.seen()[1].2, StateReason::UserStopped);
+    }
+
+    /// 既に ⛔ のセッションへもう一度停止ボタンを撃つ経路。
+    /// `PtyManager::kill` は冪等（契約 §15）なので、登録されていない surface_id でも
+    /// `Ok(())` が返り `stop_session` は `UserStopped` を送る。状態機械は
+    /// `exited` + `UserStopped` を遷移なしで捨てるので、DB もイベントも動かない。
+    #[test]
+    fn a_second_user_stop_after_exit_writes_nothing_more() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::UserStopped);
+        assert!(wait_until(|| obs.seen().len() == 2));
+
+        sender.send("s1", In::UserStopped);
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Exited);
+        assert_eq!(
+            persist.writes(),
+            vec![("s1".to_string(), Running), ("s1".to_string(), Exited)],
+            "2 度目の停止で DB を書き直してはいけない"
+        );
+        assert_eq!(obs.seen().len(), 2, "2 度目の停止でバッジを再更新しない");
+    }
+
+    /// nvim を閉じてもセッションは ⛔ にならない（設計書 §6.4 / 契約 §2）。
+    /// `sink.rs` にはフィルタを書かないので、この判定は note_surface の責務。
+    #[test]
+    fn editor_surface_exit_does_not_change_session_state() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_pty_exit("s1:editor");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Running);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
+
+    /// 契約 §41.3: 再開失敗の終了は `exited` へ落ちるが reason が `ResumeFailed` になる。
+    /// M2-4 のフロントはこの reason だけを見て再試行導線を出すので、
+    /// `PtyExited` に丸めるとリカバリ導線が丸ごと死ぬ。
+    #[test]
+    fn resume_failed_exit_reports_its_own_reason() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist);
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| obs.seen().len() == 1));
+
+        sender.note_resume_failed_exit("s1:agent");
+
+        assert!(wait_until(|| obs.seen().len() == 2));
+        assert_eq!(obs.seen()[1].1, Exited);
+        assert_eq!(obs.seen()[1].2, StateReason::ResumeFailed);
+    }
+
+    /// `note_pty_exit` と同じ `:agent` フィルタを通ることの固定。
+    #[test]
+    fn resume_failed_exit_ignores_the_editor_surface() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_resume_failed_exit("s1:editor");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Running);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
+
+    /// write_pty 由来の UserInput が 🟡 を解除する。出力では解除されない。
+    #[test]
+    fn user_input_clears_waiting_input_but_output_does_not() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist);
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::HookNotification);
+        assert!(wait_until(|| mgr.current("s1") == WaitingInput));
+
+        // TUI の再描画では 🟡 は消えない
+        sender.note_surface("s1:agent", In::OutputActivity);
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), WaitingInput);
+
+        // ユーザーが打鍵したら 🟢 に戻る
+        sender.note_user_input("s1:agent");
+        assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    /// 大量打鍵しても、running 中の UserInput は送信前に捨てられる。
+    #[test]
+    fn repeated_keystrokes_while_running_produce_no_events() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        for _ in 0..1000 {
+            sender.note_user_input("s1:agent");
+        }
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
     }
 }

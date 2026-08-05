@@ -10,6 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::model::{KanbanStatus, Session, SessionPatch, SurfaceKind};
 use crate::pty::launch_env::{probe_login_env, resolve_program, LaunchEnv};
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
 use cli_args::{binary_name, build_launch_command, login_shell, ResumeMode};
 use workspace::{apply_start_kanban_transition, prepare_worktree};
@@ -234,6 +235,17 @@ pub async fn start_session(
     // 担保できない。この 3 行の構造そのもの（`?` の早期リターンが commit の手前にあること）
     // を目視レビューで担保する（レビュー指摘 M-1）。
     state.pty.spawn(&app, spec)?;
+    // kanban_status の backlog -> in_progress は M1-4 の責務（`commit_started_session`）。
+    // ここでは runtime_state だけを動かす。PTY 終了の検知は `sink.rs` が全 spawn 経路を
+    // カバーするので、ここでの登録は不要。
+    //
+    // **この 1 行を `commit_started_session` へ移さないこと。** あちらは
+    // `commit_started_session_never_writes_runtime_state`（判断 7）が
+    // 「last_runtime_state を一切書かない」を固定している。
+    //
+    // 契約 §34.5 の `first_started_at` が記録される唯一の経路でもある
+    // （`consume_loop` が `Spawned` を遷移表より前で拾う）。
+    state.runtime.sender().send(&id, StateInput::Spawned);
     commit_started_session(&state, &mut session)
 }
 
@@ -245,6 +257,10 @@ pub async fn stop_session(state: State<'_, AppState>, id: String) -> AppResult<S
     state
         .pty
         .kill(&surface_id(&session.id, SurfaceKind::Agent))?;
+    // kill は冪等（契約 §15）。既に死んでいても、そもそも登録が無くても Ok が返り、
+    // ここで ⛔ が確定する。少し遅れて `sink.rs` から `PtyExited` も届くが、
+    // `exited` + `PtyExited` は遷移なしなので DB もイベントも動かない（計画 §6.5）。
+    state.runtime.sender().send(&id, StateInput::UserStopped);
     Ok(session)
 }
 
