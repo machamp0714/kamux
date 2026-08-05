@@ -48,7 +48,9 @@ task-reviewer は既定 `sonnet`。差分が大きい／並行処理や PTY 周�
 
 **過去タスクの要約を積み上げて貼らない。** 実セッションで dispatch が 42k 文字に膨れ、その 99% が貼り付けた履歴だった事例がある。
 
-**同一 worktree で実装 implementer を並列に動かさない。1 タスクにつき implementer は 1 人。**
+**実装 implementer を並列に起動しない。1 タスクにつき implementer は 1 人で、レーン内は必ず直列。**
+
+**「作業ツリーを分ければ並列にできる」と考えない —— 1 レーン = 1 worktree であり、あなたが worktree を増やしてはならない。** 分けたところで、統合時に同じ衝突が一度に来る。
 
 - 2026-08-05、M2-1 で Task 4 と Task 5 を並行させ、**同じ `runtime_state.rs` を両者が編集して作業が実際に消失した**（復旧に一時 worktree と `git update-ref` を要した）
 - 消失しなくても**レビュー範囲が汚染される。** Task 4 の再レビューは `runtime_state.rs` を読むが、Task 5 の未コミット 184 行が同じファイルに乗っていると、レビュアーが「Task 4 の差分」として読む対象が実物と食い違う
@@ -72,15 +74,16 @@ task-reviewer は既定 `sonnet`。差分が大きい／並行処理や PTY 周�
 ```bash
 cd <worktree の絶対パス>
 BASE=$(git rev-parse HEAD)
-REPORT=<レポートファイルの絶対パス>
 END=$((SECONDS + 3480))                      # 上限 58 分。必ず有限で抜ける
-until [ "$(git rev-parse HEAD)" != "$BASE" ] || [ -s "$REPORT" ] || [ "$SECONDS" -ge "$END" ]; do
+until [ "$(git rev-parse HEAD)" != "$BASE" ] || [ "$SECONDS" -ge "$END" ]; do
   sleep 60
 done
 echo "--- git log ---"; git log --oneline -3
 echo "--- git status ---"; git status --short
 ```
 
+- **待つ対象は「新しいコミット」である。** 各タスクは完了時に必ずコミットするので、これが唯一の確実な信号になる
+- **レポートファイルの存在を条件にしない。** 骨子を先に置いた瞬間に条件が真になり、**ループは 1 秒で抜ける** —— 起きた側から見ると「まだ始まっていない」と区別がつかない。どうしても併用するなら**完了マーカで判定する**（`grep -q '^STATUS:' "$REPORT"`）。存在や非空では判定しない
 - **上限 58 分を必ず入れる。** 無限ループは起床手段にならない
 - **出力に `git log --oneline -3` と `git status --short` を必ず含める。** 起きた瞬間に「コミットが積まれたのか、未コミットのまま止まったのか」が分かる。これが無いと再確認のためにもう 1 往復かかる
 - ループが上限で抜けたら、コミットも report も無い場合に限り**同じループをもう一度張る**。2 回続けて空なら BLOCKED として team-lead に上げる

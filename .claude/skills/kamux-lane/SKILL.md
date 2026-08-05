@@ -138,6 +138,9 @@ run_in_background: true
 git fetch origin
 git worktree add .claude/worktrees/<フェーズ ID 小文字> -b <ブランチ> origin/main
 (cd .claude/worktrees/<フェーズ ID 小文字> && npm ci)   # node_modules は worktree に無い
+
+# レーンを張り直すときはブランチが既にあるので -b を外す（-b 付きは fatal で落ちる）
+git worktree add .claude/worktrees/<フェーズ ID 小文字> <ブランチ>
 ```
 
 **`docs/superpowers/` と `.superpowers/` は `.git/info/exclude` により git 管理外なので、worktree 側に存在しない。** 計画・契約・ledger は**メイン作業ツリーの絶対パス**で渡す（`/Users/ooidetatsuya/repo/kamux/docs/superpowers/...`）。相対パスで渡すとレーンは「ファイルが無い」と言って止まる。
@@ -232,7 +235,7 @@ cd src-tauri && cargo fmt --all --check && cargo clippy --workspace --all-target
 
 ## 7. やってはいけないこと
 
-- **同一 worktree で実装 implementer を並列に動かす**（レーン内は必ず直列）。2026-08-05、M2-1 の Task 4 と Task 5 の並行編集で**作業が実際に消失した**（復旧に一時 worktree + `git update-ref` を要した）。消失しなくてもレビュー範囲が汚染される
+- **実装 implementer を並列に起動する**（レーン内は必ず直列。**1 レーン = 1 worktree。分ければ並列にできる、ではない**）。2026-08-05、M2-1 の Task 4 と Task 5 の並行編集で**作業が実際に消失した**（復旧に一時 worktree + `git update-ref` を要した）。消失しなくてもレビュー範囲が汚染される
 - **`contract-owner` を並列に起動する**（章番号が衝突し、追記では直せない）
 - **team-lead 自身がコードを直す**（レビューを迂回し、あなたのコンテキストが汚れる）
 - **`00-contracts.md` を lane-controller や implementer に編集させる**（章番号がずれると 12 計画の参照が一斉に陳腐化する）
