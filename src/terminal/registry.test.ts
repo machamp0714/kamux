@@ -640,6 +640,16 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
         for (const event of events) {
           if (event.type === 'keydown') {
             state._keyDownSeen = true;
+            // Minor 2（fix round 3）: `onKeyDown` （呼び出し側では実際の
+            // customKeyEventHandler）の返り値をここで捨てている。現在の fixture
+            // （Shift / 素の英字）では無害（どちらも `!metaKey === true` で xterm 側の
+            // 早期 return を引かない）。だが上流 `_keyDown` は
+            // `if(!this._customKeyEventHandler(e)) return !1;` という早期 return を
+            // 持つ（`_customKeyEventHandler` が false を返すとそこで打ち切る）。
+            // Meta / Cmd の fixture を後から足す場合、この早期 return をこの replay は
+            // 写せていない点に注意すること（返り値を使う実装への作り替えは今回は行わない。
+            // `onKeyDown` の型が `=> void` であること自体が「返り値は使わない」を
+            // 型で強制している箇所でもある）。
             onKeyDown?.(event);
           } else {
             passed = passesUpstreamGuard(state, event);
@@ -659,11 +669,20 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
         { type: 'keydown' as const, key: 'Shift' },
         { type: 'input' as const, data: 'A', inputType: 'insertText', composed: true },
       ];
-      // STEP 4 / 10（対照）: 素の英字 — 先行する Shift の keydown なし
+      // STEP 4 / 10（対照）: 素の英字 — 先行する Shift の keydown なし。
+      // spike-log.txt 実測: input の「後ろ」に文字キー自身の keydown（keyCode 229）が
+      // 来る（beforeinput → input → onData → keydown の順）。これを末尾に含めることで
+      // 「末尾の keydown の後も state._keyDownSeen が true のまま（＝手当ては非修飾キーに
+      // 触らない）」という判別力のあるアサートが書ける（fix round 3 Important）。
       const plainLetterEvents = [
         { type: 'input' as const, data: 'a', inputType: 'insertText', composed: true },
+        { type: 'keydown' as const, key: 'a' },
       ];
 
+      // Minor 1（fix round 3）: 以下のテスト名の「= 0 文字 / 1 文字」はこのモデルからは
+      // 導けない。モデルが写しているのは `_inputEvent` の第 1 ガードの経路だけで、
+      // `_keyDown` 自身の `triggerDataEvent`（この環境の keyCode 229 では発火しない）は
+      // 写していない。文字数の裏取りは spike-log.txt の `onData` の有無という実測である。
       it.each([
         ['! の 1 打目（STEP1）', shiftBangEvents],
         ['Shift+英字（STEP3/9）', shiftLetterEvents],
@@ -698,19 +717,32 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
         expect(passed).toBe(true);
       });
 
-      it('対照（STEP4/10）: 素の a は手当てがあっても 1 文字のまま', () => {
-        const sid = nextSurfaceId();
-        registry.ensureTerminal(sid);
-        const term = fakeOf(sid);
-        const state = { _keyDownSeen: false };
-        term._core = state;
+      it(
+        '対照（STEP4/10）: 素の a は 1 文字通り、末尾の a の keydown でも ' +
+          '_keyDownSeen は true のまま（I2）',
+        () => {
+          // fix round 3 Important: plainLetterEvents は input の後ろに文字キー自身の
+          // keydown（実測。beforeinput→input→onData→keydown）を含むため、この keydown
+          // で実際の customKeyEventHandler が呼ばれる。修飾キーのみの判定（I2）を壊して
+          // 「全キーで戻す」にすると、下の 2 つ目のアサートが赤くなる
+          // （MODIFIER_ONLY_KEYS 判定の判別力の源。§65.6 T2 との重複ではなく、
+          // 同じ性質が replay モデルの上でも成り立つことを確かめる）。
+          const sid = nextSurfaceId();
+          registry.ensureTerminal(sid);
+          const term = fakeOf(sid);
+          const state = { _keyDownSeen: false };
+          term._core = state;
 
-        const passed = replay(plainLetterEvents, state, (event) => {
-          term.customKeyEventHandler?.({ type: event.type, key: event.key });
-        });
+          const passed = replay(plainLetterEvents, state, (event) => {
+            term.customKeyEventHandler?.({ type: event.type, key: event.key });
+          });
 
-        expect(passed).toBe(true);
-      });
+          expect(passed).toBe(true);
+          // 素の a の keydown は修飾キーのみの手当ての対象外（I2）なので、
+          // 末尾の keydown の後でも state._keyDownSeen は true のまま。
+          expect(state._keyDownSeen).toBe(true);
+        },
+      );
     },
   );
 
