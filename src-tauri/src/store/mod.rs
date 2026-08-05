@@ -60,6 +60,38 @@ impl Store {
     }
 }
 
+/// 起動時正規化(契約 §2 / §17)向けの薄いアダプタ。`Store` の DAO メソッドへ委譲するだけ。
+impl crate::session::runtime_state::StatePersist for Store {
+    fn set_last_runtime_state(
+        &self,
+        session_id: &str,
+        state: crate::model::RuntimeState,
+    ) -> AppResult<()> {
+        Store::set_last_runtime_state(self, session_id, state)
+    }
+
+    fn list_ids_by_last_runtime_state(
+        &self,
+        state: crate::model::RuntimeState,
+    ) -> AppResult<Vec<String>> {
+        Ok(self
+            .list_sessions_by_last_runtime_state(state)?
+            .into_iter()
+            .map(|s| s.id)
+            .collect())
+    }
+
+    /// 契約 §34.5: 時計の呼び出しはここに閉じる(トレイトは now を取らない)。
+    fn mark_first_started(&self, session_id: &str) -> AppResult<()> {
+        Store::mark_first_started(self, session_id, now_ms())
+    }
+
+    /// 契約 §38.8。DAO が state と message を 1 文で書く(契約 §17 / §38.1)。
+    fn set_runtime_error(&self, session_id: &str, message: &str) -> AppResult<()> {
+        Store::set_runtime_error(self, session_id, message)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{now_ms, Store};

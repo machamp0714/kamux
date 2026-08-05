@@ -289,6 +289,59 @@ impl RuntimeStateManager {
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
     }
+
+    /// 起動時正規化。**`interrupted` を DB に書き込む唯一の場所**（契約 §2）。
+    ///
+    /// - `running` / `waiting_input` の行を `interrupted` に更新する
+    /// - すべての行でメモリ上のスナップショットを埋める（正規化されなかった行も含む）
+    /// - イベントは emit しない。この時点で WebView はまだ listen していないため。
+    ///   フロントは `list_sessions` の `last_runtime_state`（正規化済み）からシードする
+    ///
+    /// 全行を読み切ってから書き込む。読みながら書くと、interrupted に更新した行を
+    /// 同じ走査の後半（Interrupted のパス）で読み直してしまう。
+    ///
+    /// 戻り値は実際に変更した (session_id, 新しい状態) の一覧。
+    pub fn normalize_on_startup(&self) -> AppResult<Vec<(String, RuntimeState)>> {
+        // RuntimeState は 6 値である(契約 §2)。Error を落とすと**コンパイルは通るが**
+        // last_runtime_state='error' の行がメモリスナップショットに載らず、current(id) が
+        // Idle を返す。次の入力が §2.2 の error 行(Spawned のみ許可)ではなく idle 行で
+        // 評価され、❌ が HookNotification 1 発で 🟡 へ復帰する。フロントは list_sessions
+        // から ❌ を seed するので、Rust 側だけが食い違う split-brain になる。
+        const ALL_STATES: [RuntimeState; 6] = [
+            RuntimeState::Running,
+            RuntimeState::WaitingInput,
+            RuntimeState::Idle,
+            RuntimeState::Exited,
+            RuntimeState::Interrupted,
+            RuntimeState::Error,
+        ];
+
+        // 1) 先に全行を読む
+        let mut rows: Vec<(String, RuntimeState)> = Vec::new();
+        for last in ALL_STATES {
+            for id in self.persist.list_ids_by_last_runtime_state(last)? {
+                rows.push((id, last));
+            }
+        }
+
+        // 2) そのあとで書く
+        let mut changed = Vec::new();
+        let mut map = write_map(&self.states);
+
+        for (id, last) in rows {
+            let effective = match normalize_startup_state(last) {
+                Some(next) => {
+                    self.persist.set_last_runtime_state(&id, next)?;
+                    changed.push((id.clone(), next));
+                    next
+                }
+                None => last,
+            };
+            map.insert(id, effective);
+        }
+
+        Ok(changed)
+    }
 }
 
 fn consume_loop(
@@ -785,6 +838,11 @@ mod tests {
     struct FakePersist {
         rows: Mutex<Vec<(String, RuntimeState)>>,
         writes: Mutex<Vec<(String, RuntimeState)>>,
+        /// `list_ids_by_last_runtime_state` が返した id の履歴(呼ばれた順)。
+        /// 「全行を読み切ってから書く」の分離が崩れていないかを検証するための
+        /// 観測チャネル(変異検証専用)。読みながら書く実装では、昇格した行が
+        /// 同じ走査後半の `Interrupted` パスで再度読まれ、id が重複して現れる。
+        reads: Mutex<Vec<String>>,
         first_started: Mutex<Vec<String>>,
         errors: Mutex<Vec<(String, String)>>, // 契約 §38.8 の set_runtime_error
         fail: AtomicBool,
@@ -811,6 +869,9 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         }
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
         fn first_started(&self) -> Vec<String> {
             self.first_started
                 .lock()
@@ -829,6 +890,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
         }
+        fn replace_rows(&self, rows: &[(&str, RuntimeState)]) {
+            *self.rows.lock().unwrap_or_else(|e| e.into_inner()) =
+                rows.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+        }
     }
 
     impl StatePersist for FakePersist {
@@ -844,6 +909,18 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((session_id.to_string(), state));
+            // 実 DB(UPDATE sessions SET ...)を模す: 書き込みは以降の
+            // list_ids_by_last_runtime_state から見える。normalize_on_startup が
+            // 「全行を読み切ってから書く」を守っているかをこのフェイクだけで検証できるようにする。
+            if let Some(row) = self
+                .rows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter_mut()
+                .find(|(id, _)| id == session_id)
+            {
+                row.1 = state;
+            }
             Ok(())
         }
 
@@ -884,14 +961,22 @@ mod tests {
             &self,
             state: RuntimeState,
         ) -> crate::error::AppResult<Vec<String>> {
-            Ok(self
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(crate::error::AppError::Db("boom".into()));
+            }
+            let ids: Vec<String> = self
                 .rows
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .filter(|(_, s)| *s == state)
                 .map(|(id, _)| id.clone())
-                .collect())
+                .collect();
+            self.reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(ids.iter().cloned());
+            Ok(ids)
         }
     }
 
@@ -1123,5 +1208,132 @@ mod tests {
     fn runtime_state_manager_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync + 'static>() {}
         assert_send_sync::<RuntimeStateManager>();
+    }
+
+    #[test]
+    fn normalize_on_startup_promotes_running_and_waiting_input() {
+        let persist = FakePersist::with_rows(&[
+            ("live", Running),
+            ("waiting", WaitingInput),
+            ("fresh", Idle),
+            ("dead", Exited),
+            ("already", Interrupted),
+        ]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        let mut changed = mgr.normalize_on_startup().expect("normalize");
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            changed,
+            vec![
+                ("live".to_string(), Interrupted),
+                ("waiting".to_string(), Interrupted),
+            ]
+        );
+        // 据え置き分は DB に書かない
+        let mut writes = persist.writes();
+        writes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            writes,
+            vec![
+                ("live".to_string(), Interrupted),
+                ("waiting".to_string(), Interrupted),
+            ]
+        );
+    }
+
+    /// 正規化されなかった行も含め、全セッションのメモリ上スナップショットを埋める。
+    #[test]
+    fn normalize_on_startup_seeds_in_memory_snapshot_for_all_rows() {
+        let persist = FakePersist::with_rows(&[
+            ("live", Running),
+            ("fresh", Idle),
+            ("dead", Exited),
+            ("already", Interrupted),
+        ]);
+        let mgr = RuntimeStateManager::new(persist);
+
+        mgr.normalize_on_startup().expect("normalize");
+
+        assert_eq!(mgr.current("live"), Interrupted);
+        assert_eq!(mgr.current("fresh"), Idle);
+        assert_eq!(mgr.current("dead"), Exited);
+        assert_eq!(mgr.current("already"), Interrupted);
+    }
+
+    /// `error` 行もメモリ上のスナップショットへ必ず載る（契約 §2 / §40.5）。
+    /// `ALL_STATES` から `Error` を落とすと、この行は `list_ids_by_last_runtime_state`
+    /// で一切読まれず `current("broken")` が `Idle` を返す(split-brain)。フロントは
+    /// `list_sessions` から ❌ を seed するため、Rust 側だけが食い違う。
+    #[test]
+    fn normalize_on_startup_seeds_error_rows_into_memory_snapshot() {
+        let persist = FakePersist::with_rows(&[("broken", Error)]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        let changed = mgr.normalize_on_startup().expect("normalize");
+
+        // error は §40.5 のとおり据え置き(promote されない)
+        assert!(changed.is_empty());
+        assert!(persist.writes().is_empty());
+        assert_eq!(mgr.current("broken"), Error);
+    }
+
+    /// 全行を読み切ってから書き込む。正規化で interrupted にした行を
+    /// 同じ走査の中で読み直して二重処理しない。
+    #[test]
+    fn normalize_on_startup_does_not_reprocess_rows_it_just_wrote() {
+        let persist = FakePersist::with_rows(&[("live", Running)]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        let changed = mgr.normalize_on_startup().expect("normalize");
+
+        assert_eq!(changed, vec![("live".to_string(), Interrupted)]);
+        assert_eq!(persist.writes().len(), 1, "同じ行に 2 回書いてはいけない");
+        // 「全行を読み切ってから書く」の分離が保たれているかを読み出し履歴で固定する。
+        // 読みながら書く実装だと、interrupted に更新した "live" が同じ走査後半の
+        // Interrupted パスで再度読まれ、id が重複して現れる。
+        assert_eq!(
+            persist.reads(),
+            vec!["live".to_string()],
+            "昇格した行を同じ走査内で読み直してはいけない"
+        );
+    }
+
+    /// 2 回続けて起動しても結果が変わらない（クラッシュ後の再々起動）。
+    #[test]
+    fn normalize_on_startup_is_idempotent_across_restarts() {
+        let persist = FakePersist::with_rows(&[("live", Running)]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        mgr.normalize_on_startup().expect("1 回目");
+
+        // 1 回目の書き込みを DB 側に反映させたうえで、新しいマネージャで再実行する
+        persist.replace_rows(&[("live", Interrupted)]);
+        let mgr2 = RuntimeStateManager::new(persist.clone());
+        let changed = mgr2.normalize_on_startup().expect("2 回目");
+
+        assert!(changed.is_empty());
+        assert_eq!(mgr2.current("live"), Interrupted);
+    }
+
+    /// 正規化直後に開始すると interrupted -> running へ抜けられる。
+    #[test]
+    fn normalized_session_can_be_restarted() {
+        let persist = FakePersist::with_rows(&[("live", Running)]);
+        let mgr = RuntimeStateManager::new(persist);
+        mgr.normalize_on_startup().expect("normalize");
+
+        mgr.sender().send("live", In::Spawned);
+        assert!(wait_until(|| mgr.current("live") == Running));
+    }
+
+    /// DB 読み出しが失敗したら、状態を捏造せずエラーを返す。
+    #[test]
+    fn normalize_on_startup_propagates_persist_errors() {
+        let persist = FakePersist::with_rows(&[("live", Running)]);
+        persist.fail.store(true, Ordering::SeqCst);
+        let mgr = RuntimeStateManager::new(persist);
+
+        assert!(mgr.normalize_on_startup().is_err());
     }
 }
