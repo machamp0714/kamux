@@ -23,7 +23,6 @@ import './kanban.css';
 export function KanbanView() {
   const sessions = useAppStore((s) => s.sessions);
   const sessionOrder = useAppStore((s) => s.sessionOrder);
-  const runtimeStates = useAppStore((s) => s.runtimeStates);
   const moveCard = useAppStore((s) => s.moveCard);
   const openModal = useAppStore((s) => s.openModal);
   const setError = useAppStore((s) => s.setError);
@@ -81,14 +80,11 @@ export function KanbanView() {
               status={status}
               sessionIds={sessionOrder[status]}
               sessions={sessions}
-              runtimeStates={runtimeStates}
             />
           ))}
         </div>
         <DragOverlay>
-          {dragging === undefined ? null : (
-            <KanbanCard session={dragging} runtimeStates={runtimeStates} />
-          )}
+          {dragging === undefined ? null : <KanbanCard session={dragging} />}
         </DragOverlay>
       </DndContext>
     </div>

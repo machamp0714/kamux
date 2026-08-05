@@ -13,6 +13,7 @@ use tauri::{Manager, State, WindowEvent};
 
 use crate::error::AppResult;
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
+use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
 
@@ -109,18 +110,87 @@ async fn move_session(
     state.store.move_session(&id, to_status, to_index)
 }
 
-// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
-// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
-// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
-// 撃つ設計を選んだのはこの冪等性が前提）。
-//
-// この関数自体（「生きている surface_id を集めて機械的に kill する」という
-// ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
-// 実プロセスの spawn/kill/exit を通しで固定している。
-fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
-    for id in pty.live_surfaces() {
-        let _ = pty.kill(&id);
+/// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
+///
+/// 効いているのはモジュールの private ではなく **`ShutdownBegun` のフィールドの
+/// private** である。タプルフィールドが private なので、コンストラクタもこの
+/// モジュールの外からは見えない（E0603）。したがって `kill_all_pty_surfaces` を
+/// 呼ぶ唯一の方法は `begin_runtime_shutdown` の戻り値を渡すことになる。
+///
+/// **`shutdown_runtime_then_kill_pty` をこのモジュールへ移してはいけない。**
+/// 中に入れるとフィールドが可視になり `kill_all_pty_surfaces(ShutdownBegun(()), ..)`
+/// と書けてしまい、逆順がコンパイルを通る（= 保証が消える）。
+/// 同じ理由で **`ShutdownBegun` をフィールドの無いユニット構造体に戻してはいけない。**
+mod shutdown {
+    use crate::pty::PtyManager;
+    use crate::session::runtime_state::RuntimeStateManager;
+
+    /// 「`RuntimeStateManager::begin_shutdown()` を既に呼んだ」ことの証拠。
+    /// `kill_all_pty_surfaces` はこれを引数に要求する。
+    ///
+    /// **飾りではない。** モジュール外ではこの型を構築できないので、
+    /// `shutdown_runtime_then_kill_pty` の 2 行を逆順に書くと `cargo build` が
+    /// 落ちる（トークンを作れば E0603 / 束縛前に使えば E0425）。
+    ///
+    /// この形にしているのは、**現時点では**順序を実行時に観測する手段が無いため
+    /// である —— `begin_shutdown()` の後に届いた入力は `consume_loop` の先頭ゲートで
+    /// 捨てられ、メモリ・DB・observer のどこにも痕跡を残さない。一方 PTY の kill から
+    /// `PtyExited` が観測されるまでの遅延（子プロセスの死を waiter が拾うまでの数 ms）は、
+    /// 逆順に書いても実測ではまず表面化しない。つまり今は「順序が逆でも緑になるテスト」
+    /// しか書けない。
+    ///
+    /// **これは無期限の事実ではない。** 観測できないのは PTY kill -> 状態機械の入力
+    /// （`pty/sink.rs` の `note_pty_exit`）が **Task 7 でまだ配線されていない**からである。
+    /// Task 7 が入れば「実 PTY を spawn -> teardown -> DB に `exited` が焼かれていない
+    /// こと」で順序を実行時にも固定できる（Task 6 レビュー §6.3 の持ち越し）。
+    /// そのときもこの型を外さないこと —— 型と実行時テストは競合しない。
+    ///
+    /// 順序を間違えたときに実機で起きること: Cmd+Q の一括 kill 由来の `PtyExited` が
+    /// 状態機械に届き、DB に `exited` が焼かれる。次回起動で `normalize_on_startup` は
+    /// `{running, waiting_input}` しか触らないので、全カードが ⏸ ではなく ⛔ で復帰する
+    /// （計画 §4.4 / §6.2）。
+    pub struct ShutdownBegun(());
+
+    pub fn begin_runtime_shutdown(runtime: &RuntimeStateManager) -> ShutdownBegun {
+        runtime.begin_shutdown();
+        ShutdownBegun(())
     }
+
+    /// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
+    /// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
+    /// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
+    /// 撃つ設計を選んだのはこの冪等性が前提）。
+    ///
+    /// この関数自体（「生きている surface_id を集めて機械的に kill する」という
+    /// ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
+    /// 実プロセスの spawn/kill/exit を通しで固定している。トークンを偽造できないので、
+    /// そのテストは唯一の入口である `shutdown_runtime_then_kill_pty` 経由で呼ぶ。
+    pub fn kill_all_pty_surfaces(_begun: ShutdownBegun, pty: &PtyManager) {
+        for id in pty.live_surfaces() {
+            let _ = pty.kill(&id);
+        }
+    }
+}
+
+/// アプリ終了時の後始末。**順序を持つ 2 手をこの 1 箇所に閉じ込める。**
+///
+/// **この関数は `mod shutdown` の外に置くこと。** 中へ移すと `ShutdownBegun` の
+/// フィールドが可視になり、逆順に書いてもコンパイルが通るようになる（`mod shutdown`
+/// の doc コメント参照）。
+///
+/// 呼び出し元は `kill_on_window_destroyed`（窓を閉じる経路）と
+/// `kill_on_run_event_exit`（Cmd+Q の経路）の 2 つ。両方から撃つのは
+/// RULINGS §23.1 が kill について採った設計をそのまま踏襲したもので、
+/// `begin_shutdown()`（`AtomicBool`）も `kill_all_pty_surfaces` も冪等なので
+/// 二重呼び出しは無害である。
+///
+/// **`RunEvent::ExitRequested` には置かない。** Cmd+Q は `terminate:` ->
+/// `applicationWillTerminate:` -> `AppState::exit()` -> `LoopDestroyed` ->
+/// `RunEvent::Exit` と進み、`ExitRequested` を経由しない（`kill_on_run_event_exit`
+/// の doc コメントが依存クレートのソースを追跡して確定させた経路）。
+fn shutdown_runtime_then_kill_pty(state: &AppState) {
+    let begun = shutdown::begin_runtime_shutdown(&state.runtime);
+    shutdown::kill_all_pty_surfaces(begun, &state.pty);
 }
 
 /// 窓が閉じる経路（赤ボタンなど）で PTY の子プロセスを残さない。
@@ -152,12 +222,21 @@ fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
 /// フィールドの無いユニットバリアントであり、enum 全体に付いた
 /// `#[non_exhaustive]` があってもクレート外から構築できる
 /// （`let _ = tauri::WindowEvent::Destroyed;` がこのクレートからコンパイルを
-/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる:
-/// `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`。
+/// 通ることを確認済み）ため、この関数自体は直接呼んで固定できる。この形で
+/// 固定しているテストは 2 本ある:
+/// - `tests::kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`
+///   （PTY の一括 kill。M1-4）
+/// - `tests::wiring::window_destroyed_begins_runtime_shutdown`
+///   （状態機械の shutdown。M2-1 Task 6）
+///
+/// **この制約は E2E でも解消しない。** `MockRuntime` に発火経路が無いのは
+/// テストの書き方の問題ではなくランタイムの実装の問題なので、「E2E なら
+/// Destroyed の配送まで通せるはず」と考えて書き直さないこと。実配送の確認は
+/// 実機の手動スモーク（Task 16）でしか取れない。
 fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
     if matches!(event, WindowEvent::Destroyed) {
         if let Some(state) = window.try_state::<AppState>() {
-            kill_all_pty_surfaces(&state.pty);
+            shutdown_runtime_then_kill_pty(&state);
         }
     }
 }
@@ -183,9 +262,91 @@ fn kill_on_run_event_exit<R: tauri::Runtime>(
 ) {
     if matches!(event, tauri::RunEvent::Exit) {
         if let Some(state) = app_handle.try_state::<AppState>() {
-            kill_all_pty_surfaces(&state.pty);
+            shutdown_runtime_then_kill_pty(&state);
         }
     }
+}
+
+/// `setup` クロージャの本体。
+///
+/// `&mut App<R>` ではなく `&M: Manager<R>` を受けるのは、`tauri::test::mock_builder()`
+/// で組んだ `App<MockRuntime>` から**同じ経路**をテストするため（`R: Runtime` を足す
+/// 理由は `TauriSink` / `kill_on_run_event_exit` と同じで、契約上の型ではない）。
+///
+/// **`AppState` の構築を `Builder::manage(..)` ではなく `setup` の中で行う理由:**
+/// `TauriEmitObserver` に `AppHandle` を渡す必要があり、`AppHandle` は `setup` の
+/// 中でしか取れない。コマンドは `setup` 完了後にしか実行されないので、この置き場所で
+/// `State<'_, AppState>` が未登録になる瞬間は生じない。
+fn install_app_state<R: tauri::Runtime, M: Manager<R>>(manager: &M, store: Arc<Store>) {
+    let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+    install_app_state_with(manager, store, persist);
+}
+
+/// `install_app_state` の注入版（`session::plan_agent_spawn_with` と同じ seam）。
+///
+/// `persist` を引数に出しているのは、起動時正規化の**呼ばれ方**（回数・順序・失敗時の
+/// 扱い）をフェイクで観測するため。実 `Store` を差す結線そのものは `install_app_state`
+/// 側にあり、そちらは DB を読み直すテストで固定する。
+fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    store: Arc<Store>,
+    persist: Arc<dyn StatePersist>,
+) {
+    let runtime = RuntimeStateManager::new(persist);
+    runtime.register_observer(Arc::new(TauriEmitObserver::new(
+        manager.app_handle().clone(),
+    )));
+
+    // 前回 running / waiting_input のまま終了した行を interrupted へ正規化する。
+    //
+    // **`manage` より前に完了させること。** `AppState` が manage された瞬間から、
+    // コマンドと `sink.rs` が `state.runtime.sender()` へ到達して入力を積めるようになる。
+    // `normalize_on_startup` は読み取りフェーズを write lock の外で回してから
+    // `map.insert` を無条件に行うので、その隙間に consumer が進めた状態が
+    // DB 由来の古い値で巻き戻る（PR 13 レビュー I-2）。「順序を守る」ではなく
+    // 「まだ配らない」で塞ぐ —— `sender()` は `&self` なので、返した時点で誰でも
+    // 入力を積めてしまう。
+    //
+    // WebView はまだ listen していないので、ここではイベントを出さない（計画 §4.9）。
+    // フロントは `list_sessions` の戻り値（正規化済みの `last_runtime_state`）から
+    // シードする。
+    match runtime.normalize_on_startup() {
+        Ok(changed) if !changed.is_empty() => {
+            eprintln!(
+                "[kamux] normalized {} interrupted session(s)",
+                changed.len()
+            );
+        }
+        Ok(_) => {}
+        // 走査途中で失敗しても**ログに落として起動を続行する**（Task 6 必達 5 の決定）。
+        // 理由は 3 つ:
+        //   1. 契約 §0 が panic 経路を禁じている。DB の 1 行が書けないだけでアプリが
+        //      起動しないのは過剰な対応である
+        //   2. `consume_loop` が「DB 書き込み失敗で状態機械を止めない」としているのと
+        //      同じ規律。真実はメモリ側にある
+        //   3. 正規化は冪等なので、途中まで書けた状態は次回起動で自己修復する
+        //      （昇格済みの行は `interrupted` として据え置かれ、残った `running` の行が
+        //      改めて昇格する）
+        //
+        // **代償（正確に書く。「⏸ にならないだけ」ではない）:** `normalize_on_startup` は
+        // `set_last_runtime_state` に `?` を使うため、**失敗した行より後ろは `map.insert`
+        // されない**。つまり DB を昇格できないだけでなく、**未走査の行がメモリスナップ
+        // ショットにも載らない** —— たとえば `last_runtime_state='error'` の行に対して
+        // `current(id)` が `Idle` を返す。同関数の doc コメントが警告している split-brain
+        // （❌ のカードが `HookNotification` 1 発で 🟡 へ復帰する）が、**その起動の間ずっと
+        // 残る**。次回起動の正規化で自己修復する。起動失敗より軽いという判断は変わらない。
+        //
+        // 走査を続行して最後にまとめてエラーを返す形（部分シードを無くす）は
+        // `normalize_on_startup` 本体 = PR 13 の改変になるため、Task 6 では入れず
+        // lane-controller への持ち越しとする（Task 6 レビュー I-2）。
+        Err(err) => eprintln!("[kamux] startup normalize failed: {err}"),
+    }
+
+    manager.manage(AppState {
+        store,
+        pty: pty::PtyManager::new(),
+        runtime,
+    });
 }
 
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
@@ -195,10 +356,7 @@ pub fn run() {
         .setup(|app| {
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
-            app.manage(AppState {
-                store,
-                pty: pty::PtyManager::new(),
-            });
+            install_app_state(app, store);
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
@@ -242,10 +400,7 @@ mod tests {
     #[test]
     fn app_state_exposes_the_full_m1_1_crud_path() {
         let (_dir, store) = open_temp();
-        let state = AppState {
-            store: Arc::new(store),
-            pty: crate::pty::PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
 
         let project_a = state
             .store
@@ -390,7 +545,15 @@ mod tests {
             }
         }
 
-        let pty = crate::pty::PtyManager::new();
+        // `ShutdownBegun` はフィールドが private なので `mod shutdown` の外からは
+        // 構築できない（それが逆順をコンパイルエラーにしている当のもの）。テスト用の
+        // 裏口を開けるのではなく、唯一の入口である `shutdown_runtime_then_kill_pty`
+        // 経由で kill ループへ到達する。`begin_shutdown()` は状態機械の入力ゲートを
+        // 閉じるだけで PTY の kill / `on_exit` の配送には触らないので、このテストが
+        // 見ているもの（生きている surface が全部死ぬこと）は変わらない。
+        let (_dir, store) = open_temp();
+        let state = crate::state::test_support::app_state(store);
+        let pty = &state.pty;
         let (tx, rx) = channel();
         let sink: Arc<dyn PtySink> = Arc::new(ExitSink(tx));
         for i in 0..2 {
@@ -414,7 +577,10 @@ mod tests {
             "both surfaces must be live before kill"
         );
 
-        super::kill_all_pty_surfaces(&pty);
+        // このテストは「生きている surface を機械的に kill する」ループを見る。
+        // begin_shutdown との順序は `ShutdownBegun` のフィールド private が
+        // コンパイル時に固定しているので、ここでは実行時に確かめない。
+        super::shutdown_runtime_then_kill_pty(&state);
 
         for _ in 0..2 {
             rx.recv_timeout(Duration::from_secs(10))
@@ -455,10 +621,7 @@ mod tests {
 
         let (_dir, store) = open_temp();
         let app = mock_builder()
-            .manage(AppState {
-                store: Arc::new(store),
-                pty: crate::pty::PtyManager::new(),
-            })
+            .manage(crate::state::test_support::app_state(store))
             .build(mock_context(noop_assets()))
             .expect("build mock app");
 
@@ -556,10 +719,7 @@ mod tests {
 
         let (_dir, store) = open_temp();
         let app = mock_builder()
-            .manage(AppState {
-                store: Arc::new(store),
-                pty: crate::pty::PtyManager::new(),
-            })
+            .manage(crate::state::test_support::app_state(store))
             .build(mock_context(noop_assets()))
             .expect("build mock app");
         WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -606,15 +766,631 @@ mod tests {
         );
     }
 
+    // --- M2-1 Task 6: runtime_state の Tauri 配線 ---
+    //
+    // ここから下の 7 本は「状態機械をアプリの寿命に結線した」ことを固定する。
+    // 順序（`begin_shutdown` -> kill）は `ShutdownBegun` のフィールド private が
+    // コンパイル時に固定している（逆順は `cargo build` が落ちる）ので、ここで見るのは
+    // 「各経路が実際に shutdown を始めるか」「起動時正規化が何回・どの順で・失敗したら
+    // どうなるか」「emit observer が実際に登録されているか」の方である。
+    mod wiring {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
+        use tauri::{AppHandle, Manager, WebviewWindowBuilder};
+
+        use crate::error::{AppError, AppResult};
+        use crate::model::{CliKind, RuntimeState};
+        use crate::session::runtime_state::{StateInput, StatePersist};
+        use crate::state::AppState;
+        use crate::store::test_support::{insert_test_session, open_temp};
+
+        /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
+        fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cond()
+        }
+
+        /// 起動時正規化の**呼ばれ方**を観測するフェイク。
+        ///
+        /// - `queried`: `list_ids_by_last_runtime_state` に渡された state の履歴。
+        ///   同じ state が 2 回現れたら `normalize_on_startup` が 2 回走っている
+        /// - `app_state_visible_during_normalize`: 走査中に `AppState` が
+        ///   `manage` 済みだったか。**`true` になった時点で `sender()` に到達できる**。
+        ///   読み取りフェーズ（`list_ids_by_last_runtime_state`）と書き込みフェーズ
+        ///   （`set_last_runtime_state`）の**両方**で覗く。書き込みフェーズを見るために
+        ///   `Running` の行を 1 件だけ返す
+        /// - `fail`: 走査を `AppError::Db` で失敗させる
+        struct NormalizeProbe {
+            handle: AppHandle<MockRuntime>,
+            queried: Mutex<Vec<RuntimeState>>,
+            app_state_visible_during_normalize: AtomicBool,
+            fail: bool,
+        }
+
+        impl NormalizeProbe {
+            fn new(handle: AppHandle<MockRuntime>, fail: bool) -> Arc<Self> {
+                Arc::new(NormalizeProbe {
+                    handle,
+                    queried: Mutex::new(Vec::new()),
+                    app_state_visible_during_normalize: AtomicBool::new(false),
+                    fail,
+                })
+            }
+
+            fn queried(&self) -> Vec<RuntimeState> {
+                self.queried
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+        }
+
+        impl NormalizeProbe {
+            fn note_app_state_visibility(&self) {
+                if self.handle.try_state::<AppState>().is_some() {
+                    self.app_state_visible_during_normalize
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        impl StatePersist for NormalizeProbe {
+            fn set_last_runtime_state(&self, _id: &str, _state: RuntimeState) -> AppResult<()> {
+                self.note_app_state_visibility();
+                Ok(())
+            }
+
+            fn list_ids_by_last_runtime_state(
+                &self,
+                state: RuntimeState,
+            ) -> AppResult<Vec<String>> {
+                self.note_app_state_visibility();
+                self.queried
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(state);
+                if self.fail {
+                    return Err(AppError::Db("boom".into()));
+                }
+                // 昇格する行を 1 件だけ返し、書き込みフェーズにも probe を到達させる。
+                if state == RuntimeState::Running {
+                    return Ok(vec!["live".to_string()]);
+                }
+                Ok(Vec::new())
+            }
+
+            fn mark_first_started(&self, _id: &str) -> AppResult<()> {
+                Ok(())
+            }
+
+            fn set_runtime_error(&self, _id: &str, _message: &str) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        fn mock_app() -> tauri::App<MockRuntime> {
+            mock_builder()
+                .build(mock_context(noop_assets()))
+                .expect("build mock app")
+        }
+
+        /// 必達 2（PR 13 レビュー I-2）: `normalize_on_startup()` が完了するまで
+        /// `sender()` を配らない。
+        ///
+        /// `normalize_on_startup` は読み取りフェーズを write lock の外で回してから
+        /// `map.insert` を無条件に行うので、その隙間に consumer が進めた状態が
+        /// DB 由来の古い値で巻き戻る。`sender()` は `&self` なので「順序を守る」だけでは
+        /// 守れない —— 返した瞬間に誰でも入力を積める。`AppState` を `manage` する前に
+        /// 正規化を終わらせることで、そもそも到達できなくする。
+        #[test]
+        fn setup_finishes_normalize_before_app_state_becomes_reachable() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), false);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            assert!(
+                !probe
+                    .app_state_visible_during_normalize
+                    .load(Ordering::SeqCst),
+                "正規化の走査中に AppState が manage されていた（sender() へ到達できてしまう）"
+            );
+            // 陽性コントロール: 走査は実際に起きており、manage も最終的には行われている
+            assert!(!probe.queried().is_empty(), "正規化が一度も走っていない");
+            assert!(
+                app.try_state::<AppState>().is_some(),
+                "install_app_state_with は最終的に AppState を manage する"
+            );
+        }
+
+        /// 必達 4（Task 5 レビュー持ち越し）: `normalize_on_startup()` は
+        /// `setup` でちょうど 1 回だけ呼ばれる。
+        ///
+        /// 冪等なので 2 回呼んでも症状が出ない。`ALL_STATES` の増減に引きずられない
+        /// よう、件数ではなく「同じ state が 2 回問い合わされていないこと」で固定する。
+        #[test]
+        fn setup_runs_normalize_exactly_once() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), false);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            let queried = probe.queried();
+            assert!(!queried.is_empty(), "正規化が一度も走っていない");
+            let mut unique = queried.clone();
+            unique.sort_by_key(|s| format!("{s:?}"));
+            unique.dedup();
+            assert_eq!(
+                queried.len(),
+                unique.len(),
+                "同じ state が 2 回問い合わされている = normalize_on_startup が 2 回走った: {queried:?}"
+            );
+            // 昇格対象の 2 状態を見ていること（走査の主目的）
+            assert!(queried.contains(&RuntimeState::Running));
+            assert!(queried.contains(&RuntimeState::WaitingInput));
+        }
+
+        /// 必達 4（Task 5 レビュー持ち越し）: `AppState` に注入される
+        /// `Arc<dyn StatePersist>` が**実際に `Store`** であること。
+        ///
+        /// フェイクを差した上のテストでは、`install_app_state`（ラッパ）が
+        /// `Arc::clone(&store) as Arc<dyn StatePersist>` を渡していることまでは
+        /// 見えない。実 `Store` に `running` の行を仕込み、DB を読み直して
+        /// `interrupted` になっていることで、結線と正規化を同時に固定する。
+        #[test]
+        fn setup_normalizes_running_rows_through_the_real_store() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let live = insert_test_session(&store, &project_id, "live");
+            let resting = insert_test_session(&store, &project_id, "resting");
+            store
+                .set_last_runtime_state(&live.id, RuntimeState::Running)
+                .expect("set_last_runtime_state");
+
+            let app = mock_app();
+            super::super::install_app_state(&app, Arc::new(store));
+
+            let state = app.state::<AppState>();
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&live.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Interrupted,
+                "running のまま終了した行は DB 上で interrupted になる"
+            );
+            assert_eq!(state.runtime.current(&live.id), RuntimeState::Interrupted);
+            // 一度も起動していない行を ⏸ にしない（DEFAULT 'idle' の据え置き）
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&resting.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Idle
+            );
+        }
+
+        /// 必達 5（Task 5 レビュー持ち越し）: 走査途中の書き込み失敗は
+        /// **ログに落として起動を続行する**。
+        ///
+        /// 決定の理由は `install_app_state_with` の doc コメント参照。ここでは
+        /// 「`Err` でも `AppState` が manage される（= アプリが起動する）」ことだけを
+        /// 固定する。`?` で `setup` を失敗させる変異はここで赤くなる。
+        #[test]
+        fn setup_continues_when_startup_normalize_fails() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), true);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            assert!(!probe.queried().is_empty(), "正規化は試みられている");
+            assert!(
+                app.try_state::<AppState>().is_some(),
+                "起動時正規化の失敗でアプリを起動させないのは過剰（契約 §0: panic 経路禁止）"
+            );
+        }
+
+        /// `install_app_state_with` が `TauriEmitObserver` を **`register_observer` で
+        /// 実際に登録している**こと（Task 6 レビュー I-3）。
+        ///
+        /// production の配線 1 行を守る唯一のテスト。
+        /// `runtime_state::tests::tauri_emit_observer_emits_the_payload_on_the_contract_topic`
+        /// は observer を**直接構築**するので、この 1 行を消しても緑のまま通る
+        /// （レビュアーの変異 I で実測済み）。ここでは observer を 1 つも作らず、
+        /// **`sender()` に入力を積んで `session://state/{id}` が届くか**だけを見る。
+        ///
+        /// 消えたときの症状は重い —— イベントが 1 度も発火せず、フロント（Task 8-10）と
+        /// M2-2 以降が丸ごと無反応になる。
+        #[test]
+        fn install_app_state_registers_the_emit_observer_on_the_runtime() {
+            use std::sync::mpsc::channel;
+
+            use tauri::Listener;
+
+            use crate::session::runtime_state::state_topic;
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_app();
+            let (tx, rx) = channel::<String>();
+            app.listen(state_topic(&session.id), move |event| {
+                let _ = tx.send(event.payload().to_string());
+            });
+
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(&app, store, persist);
+
+            app.state::<AppState>()
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+
+            let raw = rx.recv_timeout(Duration::from_secs(5)).expect(
+                "session://state/{id} が届かない: install_app_state_with が \
+                 TauriEmitObserver を register_observer していない",
+            );
+            let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
+            assert_eq!(payload["session_id"], serde_json::json!(session.id));
+            assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// 「この経路は状態機械の shutdown を始めたか」を、実際の遷移で確かめる。
+        ///
+        /// `begin_shutdown()` の効果は「以降の入力を捨てる」ことなので、
+        /// 陽性コントロール（teardown 前の 1 件が通る）と対にして初めて意味を持つ。
+        /// 陽性コントロールが無いと、consumer スレッドが死んでいても緑になる。
+        fn assert_path_begins_runtime_shutdown(
+            app: &tauri::App<MockRuntime>,
+            session_id: &str,
+            drive_teardown: impl FnOnce(&tauri::App<MockRuntime>),
+        ) {
+            {
+                let state = app.state::<AppState>();
+                state.runtime.sender().send(session_id, StateInput::Spawned);
+                assert!(
+                    wait_until(|| state.runtime.current(session_id) == RuntimeState::Running),
+                    "陽性コントロール: teardown 前は遷移が通るはず"
+                );
+            }
+
+            drive_teardown(app);
+
+            let state = app.state::<AppState>();
+            // PTY kill 由来の PtyExited と同じ入力。shutdown 済みなら捨てられる。
+            state
+                .runtime
+                .sender()
+                .send(session_id, StateInput::PtyExited);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state.runtime.current(session_id),
+                RuntimeState::Running,
+                "teardown 後の入力はメモリを更新してはいけない"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_session(session_id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "DB に exited が焼かれると、次回起動で ⏸ ではなく ⛔ になる（計画 §6.2）"
+            );
+        }
+
+        /// 必達 1（Destroyed 側）: 窓を閉じる経路が `begin_shutdown()` を撃つ。
+        ///
+        /// `MockRuntime` は `WindowEvent::Destroyed` を一度も発火しないため、
+        /// M1-4 と同じく関数を直接呼んで固定する（前例:
+        /// `kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`）。
+        #[test]
+        fn window_destroyed_begins_runtime_shutdown() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            assert_path_begins_runtime_shutdown(&app, &session.id, |app| {
+                let window = app.get_window("main").expect("window registered");
+                super::super::kill_on_window_destroyed(&window, &tauri::WindowEvent::Destroyed);
+            });
+        }
+
+        /// 必達 1（Exit 側）: Cmd+Q が通る経路が `begin_shutdown()` を撃つ。
+        ///
+        /// `MockRuntime` は最後の窓が消えたあと必ず `RunEvent::Exit` を発火するので、
+        /// こちらは実イベントで到達する（前例: `run_event_exit_kills_every_live_pty_surface`）。
+        #[test]
+        fn run_event_exit_begins_runtime_shutdown() {
+            use std::sync::mpsc::channel;
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            let window = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let app_handle = app.handle().clone();
+
+            {
+                let state = app_handle.state::<AppState>();
+                state
+                    .runtime
+                    .sender()
+                    .send(&session.id, StateInput::Spawned);
+                assert!(
+                    wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                    "陽性コントロール: teardown 前は遷移が通るはず"
+                );
+            }
+
+            // `RunEvent::Ready` を合図に窓を閉じる（レース回避の理由は
+            // `run_event_exit_kills_every_live_pty_surface` のコメント参照）。
+            let (ready_tx, ready_rx) = channel::<()>();
+            let run_thread = std::thread::spawn(move || {
+                app.run(move |handle, event| {
+                    if matches!(event, tauri::RunEvent::Ready) {
+                        let _ = ready_tx.send(());
+                    }
+                    super::super::kill_on_run_event_exit(handle, event);
+                });
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("event loop must reach RunEvent::Ready before we close the window");
+            window.close().expect("close the only window");
+            run_thread.join().expect("event loop thread must not panic");
+
+            let state = app_handle.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::PtyExited);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state.runtime.current(&session.id),
+                RuntimeState::Running,
+                "RunEvent::Exit 後の入力はメモリを更新してはいけない"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "Cmd+Q で exited が焼かれると、次回起動で ⏸ ではなく ⛔ になる（計画 §6.2）"
+            );
+        }
+
+        // --- M2-1 Task 7: 実 PTY の終了が `sink.rs` 経由で状態機械へ届く ---
+
+        /// `TauriSink` へ委譲したあとで通知するラッパ。
+        ///
+        /// **`inner.on_exit` の戻り後に signal する**ので、受信できた時点で
+        /// `TauriSink::on_exit`（= `note_pty_exit`）は完走している。
+        /// `PtyManager::live_surfaces()` の空判定では代用できない ——
+        /// `RegistrySink::on_exit` はレジストリからの削除を inner への転送より
+        /// **前**に行うため、空になった時点ではまだ `note_pty_exit` が走っていない。
+        struct SinkExitProbe {
+            inner: Arc<dyn crate::pty::surface::PtySink>,
+            tx: std::sync::mpsc::Sender<()>,
+        }
+
+        impl crate::pty::surface::PtySink for SinkExitProbe {
+            fn on_data(&self, surface_id: &str, base64: String, seq: u64) {
+                self.inner.on_data(surface_id, base64, seq);
+            }
+
+            fn on_exit(&self, surface_id: &str, exit_code: Option<i32>) {
+                self.inner.on_exit(surface_id, exit_code);
+                let _ = self.tx.send(());
+            }
+        }
+
+        /// 実 PTY（`/bin/cat`）を **production と同じ `TauriSink`** で 1 本立てる。
+        /// `spawn`（契約 §15）は `AppHandle<Wry>` 固定で `MockRuntime` から呼べないため、
+        /// `spawn_with_sink` に同じ sink を自前で渡して同じ経路を再現する。
+        fn spawn_agent_surface_through_the_real_sink(
+            app: &tauri::App<MockRuntime>,
+            surface_id: &str,
+        ) -> std::sync::mpsc::Receiver<()> {
+            use crate::pty::surface::PtySink;
+            use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let sink: Arc<dyn PtySink> = Arc::new(SinkExitProbe {
+                inner: crate::pty::sink::TauriSink::new(app.handle().clone()),
+                tx,
+            });
+            app.state::<AppState>()
+                .pty
+                .spawn_with_sink(
+                    sink,
+                    SpawnSpec {
+                        surface_id: surface_id.to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn the agent surface for the test");
+            rx
+        }
+
+        fn app_with_one_session() -> (
+            tempfile::TempDir,
+            tauri::App<MockRuntime>,
+            crate::model::Session,
+        ) {
+            let (dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            (dir, app, session)
+        }
+
+        /// 必達 4 の陽性コントロール: `sink.rs` の `on_exit` が実 PTY の終了を
+        /// 状態機械へ届け、DB に `exited` が焼かれる。
+        ///
+        /// `sink.rs` の `note_pty_exit` ブロックを消すと、PTY は死ぬのに
+        /// `last_runtime_state` が `running` のまま残ってここが赤くなる。
+        #[test]
+        fn pty_exit_through_the_sink_marks_the_session_exited() {
+            let (_dir, app, session) = app_with_one_session();
+            let sid = format!("{}:agent", session.id);
+            let exited = spawn_agent_surface_through_the_real_sink(&app, &sid);
+
+            let state = app.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: spawn 前は 🟢 が DB まで届くはず"
+            );
+
+            state.pty.kill(&sid).expect("kill the agent surface");
+            exited
+                .recv_timeout(Duration::from_secs(10))
+                .expect("TauriSink::on_exit must run within 10s of the kill");
+
+            // 契約 §69.1: assert する対象そのもの（DB の値）を待つ
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Exited),
+                "PTY の終了が sink.rs 経由で状態機械へ届いていない"
+            );
+            assert_eq!(state.runtime.current(&session.id), RuntimeState::Exited);
+        }
+
+        /// 必達 5（Task 6 レビュー §6.3 の持ち越し）: **アプリ終了の一括 kill で
+        /// DB に `exited` を焼かない。**
+        ///
+        /// `ShutdownBegun` は「`begin_shutdown()` の**後**に kill する」ことしか
+        /// 強制できない —— `begin_runtime_shutdown` の本体から
+        /// `runtime.begin_shutdown()` を落とし `ShutdownBegun(())` だけを返す形は
+        /// 型では防げない。そこを実行時に塞ぐのがこのテストである。
+        ///
+        /// ここが緩むと Cmd+Q のたびに DB へ `exited` が書かれ、次回起動で
+        /// `normalize_on_startup` は `{running, waiting_input}` しか触らないため
+        /// 全カードが ⏸ ではなく ⛔ で復帰する（計画 §4.4 / §6.2）。
+        ///
+        /// Task 6 の時点では実行時の観測手段が無かった。Task 7 が
+        /// `sink.rs` -> `note_pty_exit` を配線したことで、初めて
+        /// 「実 PTY を殺して、状態機械に届いた入力が捨てられること」を直接見られる。
+        #[test]
+        fn app_teardown_does_not_persist_exited_from_the_pty_it_kills() {
+            let (_dir, app, session) = app_with_one_session();
+            let sid = format!("{}:agent", session.id);
+            let exited = spawn_agent_surface_through_the_real_sink(&app, &sid);
+
+            let state = app.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: teardown 前は 🟢 が DB まで届くはず"
+            );
+
+            super::super::shutdown_runtime_then_kill_pty(&state);
+
+            // teardown の kill 由来の on_exit が `note_pty_exit` まで到達したことを
+            // 確認する。ここを待たずに assert すると、単に「まだ届いていない」だけで
+            // 緑になり、順序の保証を一切検証しないテストになる。
+            exited
+                .recv_timeout(Duration::from_secs(10))
+                .expect("TauriSink::on_exit must run within 10s of the teardown kill");
+
+            // 負の主張なので待つ条件が作れない（契約 §69.2）
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "teardown 由来の PtyExited を DB へ焼くと、次回起動で全カードが ⛔ になる"
+            );
+            assert_eq!(state.runtime.current(&session.id), RuntimeState::Running);
+        }
+    }
+
     #[test]
     fn app_state_store_is_shareable_across_threads() {
         // M1-3 の PtyManager / M2-1 の SessionManager がバックグラウンドスレッドから
         // Store を触るため、Arc<Store> がスレッドを跨げることを固定する。
         let (_dir, store) = open_temp();
-        let state = AppState {
-            store: Arc::new(store),
-            pty: crate::pty::PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         let project = state
             .store
             .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
@@ -636,8 +1412,6 @@ mod tests {
     // JS が実際に送るのと同じ camelCase キーの JSON を tauri::test::get_ipc_response で
     // 投げることで、コマンド本体の引数バインディングそのものを検証する。
     mod ipc {
-        use std::sync::Arc;
-
         use serde_json::{json, Value};
         use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
         use tauri::{ipc::CallbackFn, webview::InvokeRequest, Manager, WebviewWindowBuilder};
@@ -647,10 +1421,7 @@ mod tests {
 
         fn build_app(store: crate::store::Store) -> tauri::App<MockRuntime> {
             mock_builder()
-                .manage(AppState {
-                    store: Arc::new(store),
-                    pty: crate::pty::PtyManager::new(),
-                })
+                .manage(crate::state::test_support::app_state(store))
                 .invoke_handler(tauri::generate_handler![
                     super::super::create_project,
                     super::super::list_projects,
@@ -1133,6 +1904,181 @@ mod tests {
             assert!(
                 !state.pty.is_alive(&agent_surface_id),
                 "stop_session must kill the SurfaceKind::Agent surface for the session"
+            );
+        }
+
+        // --- M2-1 Task 7: コマンドから状態機械への配線 ---
+
+        /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
+        fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            cond()
+        }
+
+        /// テストが自分で 1 本立てる agent サーフェス（`/bin/cat`）。
+        /// `write_pty` は `PtyManager::write` が成功したときだけ `UserInput` を送るので、
+        /// 生きた surface が要る。
+        fn spawn_agent_surface(state: &AppState, agent_surface_id: &str) {
+            use crate::pty::surface::PtySink;
+            use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+
+            struct NoopSink;
+            impl PtySink for NoopSink {
+                fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+                fn on_exit(&self, _surface_id: &str, _exit_code: Option<i32>) {}
+            }
+
+            state
+                .pty
+                .spawn_with_sink(
+                    std::sync::Arc::new(NoopSink),
+                    SpawnSpec {
+                        surface_id: agent_surface_id.to_string(),
+                        program: "/bin/cat".to_string(),
+                        args: Vec::new(),
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        env: Vec::new(),
+                        cols: DEFAULT_COLS,
+                        rows: DEFAULT_ROWS,
+                    },
+                )
+                .expect("spawn the agent surface directly for the test");
+        }
+
+        /// IPC 越しに project + session を 1 件ずつ作り、session_id を返す。
+        fn create_session_over_ipc(webview: &tauri::WebviewWindow<MockRuntime>) -> String {
+            let project = invoke_ok(
+                webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+            let session = invoke_ok(
+                webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "shell session",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "shell",
+                    "cliCommand": null,
+                }),
+            );
+            session["id"].as_str().expect("session id").to_owned()
+        }
+
+        /// 必達 3: `write_pty` は 🟡 を解除できる唯一の経路である。
+        ///
+        /// `write_pty` から `note_user_input` を落とすと、Claude が承認待ちのまま
+        /// ユーザーが返事を打っても 🟡 が張り付いたままになり、ここが赤くなる。
+        #[test]
+        fn write_pty_notes_user_input_and_clears_waiting_input() {
+            use crate::model::{RuntimeState, SurfaceKind};
+            use crate::pty::surface_id;
+            use crate::session::runtime_state::StateInput;
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let session_id = create_session_over_ipc(&webview);
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let state = app.state::<AppState>();
+            spawn_agent_surface(&state, &agent_surface_id);
+            let sender = state.runtime.sender();
+            sender.send(&session_id, StateInput::Spawned);
+            sender.send(&session_id, StateInput::HookNotification);
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::WaitingInput),
+                "陽性コントロール: 打鍵前は 🟡 のはず"
+            );
+
+            invoke_ok(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": agent_surface_id, "data": "y"}),
+            );
+
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::Running),
+                "write_pty が UserInput を送っていない（🟡 が解除されない）"
+            );
+
+            state.pty.kill(&agent_surface_id).expect("cleanup");
+        }
+
+        /// 必達 6: `stop_session` は kill のあと `UserStopped` を送り、⛔ を確定させる。
+        ///
+        /// 2 回目の停止は `PtyManager::kill` の冪等性（契約 §15）により `Ok` が返り、
+        /// `UserStopped` も送られるが、`exited` + `UserStopped` は遷移なしなので
+        /// DB もバッジも動かない（計画 §6.5）。
+        #[test]
+        fn stop_session_marks_the_session_exited_and_a_second_stop_is_harmless() {
+            use crate::model::{RuntimeState, SurfaceKind};
+            use crate::pty::surface_id;
+            use crate::session::runtime_state::StateInput;
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let session_id = create_session_over_ipc(&webview);
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let state = app.state::<AppState>();
+            spawn_agent_surface(&state, &agent_surface_id);
+            state
+                .runtime
+                .sender()
+                .send(&session_id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Running),
+                "陽性コントロール: 停止前は 🟢 が DB まで届くはず"
+            );
+
+            invoke_ok(&webview, "stop_session", json!({"id": session_id}));
+
+            // 契約 §69.1: assert する対象そのもの（DB の値）を待つ
+            assert!(
+                wait_until(|| state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state
+                    == RuntimeState::Exited),
+                "stop_session が UserStopped を送っていない"
+            );
+            assert_eq!(state.runtime.current(&session_id), RuntimeState::Exited);
+
+            // 既に死んだセッションへの 2 発目。kill は冪等なので Ok が返る。
+            invoke_ok(&webview, "stop_session", json!({"id": session_id}));
+
+            // 負の主張なので待つ条件が作れない（契約 §69.2）
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(state.runtime.current(&session_id), RuntimeState::Exited);
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session_id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Exited
             );
         }
 

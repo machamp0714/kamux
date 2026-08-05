@@ -54,7 +54,32 @@ vi.mock('../../terminal/registry', () => ({
 }));
 
 import { useAppStore } from '../../store';
+import type { Session } from '../../types/model';
 import { TerminalPane } from './TerminalPane';
+
+/** start_session の戻り値（DB 行のミラー）を組み立てる最小ヘルパ */
+function makeSession(overrides: Partial<Session> & { id: string }): Session {
+  return {
+    project_id: 'p1',
+    title: overrides.id,
+    description: '',
+    kanban_status: 'in_progress',
+    sort_order: 1,
+    mode: 'worktree',
+    branch: null,
+    worktree_path: null,
+    cli_kind: 'claude',
+    cli_command: null,
+    claude_session_id: null,
+    last_runtime_state: 'idle',
+    last_runtime_error: null,
+    first_started_at: null,
+    archived_at: null,
+    created_at: 0,
+    updated_at: 0,
+    ...overrides,
+  };
+}
 
 /**
  * このプロジェクトは `@types/node` を依存に持たないため、`process` はグローバルに
@@ -111,7 +136,7 @@ beforeEach(() => {
   // 回帰テストが差し替えても、次のテストでは既定の vi.fn() 経由へ必ず戻す
   mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
     mocks.resizePty(surfaceId, cols, rows);
-  useAppStore.setState({ modal: null });
+  useAppStore.setState({ modal: null, runtimeStates: {}, runtimeReasons: {}, runtimeErrors: {} });
   container = document.createElement('div');
   document.body.appendChild(container);
 });
@@ -132,7 +157,7 @@ describe('TerminalPane（不変条件 A）', () => {
         resolveSub = resolve;
       }),
     );
-    mocks.startSession.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(makeSession({ id: 's1' }));
 
     renderPane('s1');
     await flush();
@@ -162,13 +187,62 @@ describe('TerminalPane（不変条件 B・D）', () => {
   });
 });
 
+describe('TerminalPane（契約 §42.3 規約 4: 失敗した起動の痕跡をカードに残す）', () => {
+  it('start_session が reject したら setRuntimeError にトーストと同じ文字列を渡す', async () => {
+    mocks.ensurePtySubscription.mockResolvedValue(undefined);
+    mocks.startSession.mockRejectedValue({
+      code: 'pty_spawn',
+      message: 'claude: command not found',
+    });
+
+    renderPane('s1');
+    await flush();
+
+    // mark_error が DB へ書くのと同一の文字列（AppError の Display）をストアにも残す。
+    // カードの kanban-card__error はこれを読む
+    expect(useAppStore.getState().runtimeErrors['s1']).toBe('claude: command not found');
+  });
+
+  it('許可リスト（契約 §40.3）を複製しない —— どの code で落ちても setRuntimeError を呼ぶ', async () => {
+    // 二重起動ガードの invalid_state は mark_error の許可リストには**無い**が、
+    // フロント側は複製しない（ズレの境界は契約 §42.3.1 が定めている）
+    mocks.ensurePtySubscription.mockResolvedValue(undefined);
+    mocks.startSession.mockRejectedValue({
+      code: 'invalid_state',
+      message: 'session s1 is already running',
+    });
+
+    renderPane('s1');
+    await flush();
+
+    expect(useAppStore.getState().runtimeErrors['s1']).toBe('session s1 is already running');
+  });
+});
+
+describe('TerminalPane（計画 §4.10: コマンドの戻り値でも seedRuntimeStates を呼ぶ）', () => {
+  it('start_session の戻り値の last_runtime_state を seed する（イベント取りこぼしの自己修復）', async () => {
+    mocks.ensurePtySubscription.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(
+      makeSession({ id: 's1', last_runtime_state: 'running', first_started_at: null }),
+    );
+
+    renderPane('s1');
+    await flush();
+
+    // 非 reset 経路なので first_started_at === null の除外は適用しない（契約 §34.6）。
+    // 戻り値の Session は mark_first_started の非同期コミットより前に読まれて
+    // first_started_at === null を持ちうるため、除外すると自己修復が壊れる
+    expect(useAppStore.getState().runtimeStates['s1']).toBe('running');
+  });
+});
+
 describe('TerminalPane（不変条件 C）', () => {
   it('start_session 解決後に invalidateFitCache → fitTerminal の順で再実行する', async () => {
     // isStarted は既定で false（beforeEach）なので、マウント直後の syncSize は
     // Important 1 の門でスキップされる。ここで実行されるのは start_session
     // 解決後の 1 回だけである
     mocks.ensurePtySubscription.mockResolvedValue(undefined);
-    mocks.startSession.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(makeSession({ id: 's1' }));
     const callOrder: string[] = [];
     mocks.invalidateFitCache.mockImplementation(() => {
       callOrder.push('invalidate');
@@ -311,7 +385,7 @@ describe('TerminalPane（Critical: モーダル表示中は実シェルへ focus
 describe('TerminalPane（不変条件 F）', () => {
   it('ペイン再割当で detachTerminal(旧 surface) が呼ばれ、disposeTerminal は呼ばれない', async () => {
     mocks.ensurePtySubscription.mockResolvedValue(undefined);
-    mocks.startSession.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(makeSession({ id: 's1' }));
 
     renderPane('s1');
     await flush();

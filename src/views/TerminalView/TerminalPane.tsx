@@ -65,7 +65,15 @@ export function TerminalPane({ sessionId }: { sessionId: string | null }): JSX.E
         if (isStarted(surface)) return undefined;
         markStarted(surface);
         return startSession(sessionId).then(
-          () => {
+          (session) => {
+            // 計画 §4.10: 戻り値の Session には consumer が DB を更新済みの
+            // last_runtime_state が入っている。イベント（session://state/{id}）を
+            // 取りこぼしても、コマンドの戻り値で表示が自己修復する。
+            // **この非 reset 経路には first_started_at の除外を適用しない**（契約 §34.6）
+            // —— 戻り値は mark_first_started の非同期コミットより前に読まれて
+            // first_started_at === null を持ちうる。除外は seedRuntimeStates 側の
+            // reset 経路にだけある。
+            useAppStore.getState().seedRuntimeStates([session]);
             // 必達 1（契約 §16 registry.ts）: 再起動された PTY は fitTerminal の
             // 直近サイズキャッシュにより resize_pty が飛ばず 80x24 のままになる。
             // キャッシュを無効化してから寸法を取り直す。
@@ -76,6 +84,11 @@ export function TerminalPane({ sessionId }: { sessionId: string | null }): JSX.E
             // spawn 失敗では pty://exit が来ないので、ここで戻さないと再試行できない
             unmarkStarted(surface);
             const appError = toAppError(error);
+            // 契約 §42.3 規約 4: mark_error が DB へ書くのと同一の文字列をストアにも残す。
+            // カードの kanban-card__error はこれを読む。**許可リスト（契約 §40.3）は
+            // 複製しない** —— ズレの境界は契約 §42.3.1 が定めており、許可リストを
+            // 2 箇所に散らして片方だけ更新されるドリフトの方が高くつく。
+            useAppStore.getState().setRuntimeError(sessionId, appError.message);
             writeNotice(
               surface,
               `起動に失敗しました (${appError.code}): ${appError.message}`,

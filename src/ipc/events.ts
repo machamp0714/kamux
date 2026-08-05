@@ -1,6 +1,6 @@
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
-import type { FocusPayload } from '../types/model';
+import type { FocusPayload, SessionStatePayload } from '../types/model';
 
 export interface PtyDataPayload {
   base64: string;
@@ -31,4 +31,15 @@ export const onPtyExit = (
  */
 export function listenFocus(sessionId: string, cb: (p: FocusPayload) => void): Promise<UnlistenFn> {
   return listen<FocusPayload>(`focus://session/${sessionId}`, (e) => cb(e.payload));
+}
+
+/**
+ * `session://state/{session_id}`（契約 §8）の受信。
+ * トピック文字列を組み立てる箇所はここ 1 箇所に閉じる。
+ */
+export function listenSessionState(
+  sessionId: string,
+  cb: (p: SessionStatePayload) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionStatePayload>(`session://state/${sessionId}`, (e) => cb(e.payload));
 }

@@ -1,7 +1,9 @@
 import type { DraggableAttributes, DraggableSyntheticListeners } from '@dnd-kit/core';
 import type { KeyboardEvent, MouseEvent, PointerEvent } from 'react';
-import type { RuntimeState, Session } from '../../types/model';
-import { CLI_ICON, runtimeBadge } from './badge';
+import { RuntimeBadge } from '../../components/RuntimeBadge';
+import type { Session } from '../../types/model';
+import { CLI_ICON } from './badge';
+import { KanbanCardError } from './KanbanCardError';
 
 /**
  * dnd-kit のドラッグ活性化一式。**ラッパ要素ではなくカードのルート要素に載せる。**
@@ -17,7 +19,6 @@ export interface CardDragActivator {
 
 export interface KanbanCardProps {
   session: Session;
-  runtimeStates: Record<string, RuntimeState>;
   onEdit?: (sessionId: string) => void;
   onArchive?: (sessionId: string) => void;
   /** クリック / Enter でセッションを開く（要件5）。 */
@@ -44,16 +45,12 @@ function stopOpen(e: MouseEvent<HTMLButtonElement>) {
  * `dragActivator` も渡さないので、対話性（タブストップ・クリック・キー操作）を
  * 一切持たない見た目だけの複製になる。
  * クリック / Enter でターミナル画面の該当ペインへフォーカスする（要件5・契約 §11）。
+ *
+ * **`runtimeStates` / `runtimeErrors` を購読しない**（契約 §25.5 / §38.3）。
+ * バッジとエラーは葉（`RuntimeBadge` / `KanbanCardError`）が自分で購読するので、
+ * 実行状態が動いてもカード全体は再レンダリングされない。
  */
-export function KanbanCard({
-  session,
-  runtimeStates,
-  onEdit,
-  onArchive,
-  onOpen,
-  dragActivator,
-}: KanbanCardProps) {
-  const badge = runtimeBadge(runtimeStates, session.id);
+export function KanbanCard({ session, onEdit, onArchive, onOpen, dragActivator }: KanbanCardProps) {
   const dragListeners = dragActivator?.listeners;
   // 開ける、またはドラッグできるときだけタブストップにする
   const interactive = onOpen !== undefined || dragActivator !== undefined;
@@ -79,17 +76,18 @@ export function KanbanCard({
       onClick={onOpen === undefined ? undefined : () => onOpen(session.id)}
       onKeyDown={onKeyDown}
     >
+      {/* components.md「カード」節: head は両端寄せの 2 グループ（左に CLI チップ、
+          右にバッジ）。title は head の中ではなくカード直下の子要素である */}
       <div className="kanban-card__head">
-        {badge !== null && (
-          <span className="kanban-card__badge" title={badge.label} aria-label={badge.label}>
-            {badge.glyph}
-          </span>
-        )}
         <span className="kanban-card__cli" title={session.cli_kind} aria-label={session.cli_kind}>
           {CLI_ICON[session.cli_kind]}
         </span>
-        <h3 className="kanban-card__title">{session.title}</h3>
+        <span className="kanban-card__badge">
+          <RuntimeBadge sessionId={session.id} />
+        </span>
       </div>
+
+      <h3 className="kanban-card__title">{session.title}</h3>
 
       {session.description !== '' ? (
         <p className="kanban-card__description">{session.description}</p>
@@ -100,6 +98,8 @@ export function KanbanCard({
           {session.branch}
         </p>
       ) : null}
+
+      <KanbanCardError sessionId={session.id} />
 
       <div className="kanban-card__actions">
         <button

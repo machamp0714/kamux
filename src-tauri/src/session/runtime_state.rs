@@ -135,11 +135,22 @@ pub(crate) fn write_map(m: &RwLock<StateMap>) -> RwLockWriteGuard<'_, StateMap> 
     m.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// チャネルを流れる 1 件の入力。
+/// チャネルを流れる 1 件。
+///
+/// `Error` は**遷移表を引かない帯域外イベント**である（契約 §40.2.1）。
+/// `StateInput` に `SpawnFailed` を足す形は禁止 —— 遷移表の全セルに
+/// 「どこからでも error へ飛べる」経路が生まれ、`exited` / `interrupted` からの
+/// 不正遷移を型で禁じられなくなる（契約 §2.2.1 / §40.8）。
 #[derive(Debug)]
-pub struct RuntimeEvent {
-    pub session_id: String,
-    pub input: StateInput,
+pub enum RuntimeEvent {
+    Input {
+        session_id: String,
+        input: StateInput,
+    },
+    Error {
+        session_id: String,
+        message: String,
+    },
 }
 
 /// `mpsc::Sender` は `Send` だが **`!Sync`** である。
@@ -171,7 +182,7 @@ impl RuntimeSender {
     /// session_id を直接指定して入力を送る。M2-2（hooks）/ M3-3（ヒューリスティック）用。
     /// consumer 側が落ちている場合は黙って捨てる（アプリ終了時に起きうる正常系）。
     pub fn send(&self, session_id: &str, input: StateInput) {
-        let event = RuntimeEvent {
+        let event = RuntimeEvent::Input {
             session_id: session_id.to_string(),
             input,
         };
@@ -197,6 +208,59 @@ impl RuntimeSender {
             return;
         }
         self.send(session_id, input);
+    }
+
+    /// PTY 終了の通知。**`sink.rs` の `on_exit` から呼ぶ唯一の入口。**
+    /// `:editor` サーフェスは無視される（nvim を閉じてもセッションは ⛔ にならない。契約 §2）。
+    ///
+    /// フィルタは `note_surface` の内部に閉じたままにすること。呼び出し側にも
+    /// 同じ判定を書くと 2 箇所に散り、片方だけ直した瞬間に「nvim を閉じただけで
+    /// セッションが ⛔ になる」事故が戻ってくる。
+    pub fn note_pty_exit(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::PtyExited);
+    }
+
+    /// resume 失敗と分類された PTY 終了の通知（契約 §40.4 / §41.3）。
+    /// **`note_pty_exit` とまったく同じ分解・同じ `:agent` フィルタを通る。**
+    /// 分類は M2-4 の `ResumeTracker::classify_exit(surface_id, exit_code)` が行い、
+    /// `sink.rs` はその結果でこの 2 本を出し分ける。遷移先は `PtyExited` と同一の
+    /// `exited` で、違うのは `StateReason` だけである。
+    ///
+    /// **M2-1 の時点では呼び出し元が無い**（`ResumeTracker` は M2-4 で入る）。
+    /// 契約 §44.1 により、呼び出し側が無いことを欠陥として扱わない。
+    pub fn note_resume_failed_exit(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::ResumeFailed);
+    }
+
+    /// ユーザーのキー入力の通知。**`write_pty` コマンドから呼ぶ唯一の入口。**
+    /// 🟡 を解除できる唯一の経路であり、`running` 中の打鍵は送信前に捨てられる。
+    pub fn note_user_input(&self, surface_id: &str) {
+        self.note_surface(surface_id, StateInput::UserInput);
+    }
+
+    /// `error` ❌ の唯一の生成源（契約 §2 / §40）。**遷移表を経由しない。**
+    ///
+    /// 呼んでよいのは `start_session` / `resume_session` の**起動フェーズ**の Err だけで、
+    /// 許可される Err は契約 §40.3 の表（`start_session` は §63.5 が 5 段に更新済み）が
+    /// すべてである。事前条件エラー（二重起動ガードの `InvalidState` など）で呼ぶと、
+    /// `running` の上に `error` が書かれ、`error` 行は `Spawned` しか受け付けず、
+    /// ガードは PTY が生きている限り `InvalidState` を返し続けるので `Spawned` は
+    /// 永遠に来ない —— **カードが ❌ のまま永久に固着する**（契約 §40.3）。
+    /// **`spawn_editor` からは呼ばない**（契約 §40.3 / §40.8。nvim が開けないだけで
+    /// エージェントは生きている。M3-1 の担当箇所）。
+    ///
+    /// `message` は加工しない生 stderr（`AppError` の `Display`）を渡すこと（契約 §2 / §6）。
+    /// 戻り値を持たない —— 状態の確定も永続化も consumer スレッドが行い、DB 書き込みの
+    /// 失敗はログに落ちる（契約 §40.2）。呼び出し元スレッドから `states` / `persist` を
+    /// 直接書くと「DB 書き込みは consumer スレッドだけ」の単一書き手の規律が壊れ、
+    /// consumer の read→write の窓に割り込んだ `error` が上書きされうる（契約 §40.2.1）。
+    pub fn mark_error(&self, session_id: &str, message: &str) {
+        let event = RuntimeEvent::Error {
+            session_id: session_id.to_string(),
+            message: message.to_string(),
+        };
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = tx.send(event);
     }
 }
 
@@ -356,48 +420,86 @@ fn consume_loop(
             continue;
         }
 
-        // 契約 §34.5: Spawned を「観測した時点」で記録する。**遷移表を引く前に置くこと。**
-        // running + Spawned は遷移なし(None)で continue するため、
-        // 遷移後に置くとこの経路が黙って抜ける。
-        // 冪等性は DAO 側の SQL(WHERE first_started_at IS NULL)が担保する。
-        // SurfaceKind::Agent 限定は Spawned の発行元(start_session / resume_session)が
-        // すでに構造的に保証しているので、ここで surface を再チェックしない(§34.5)。
-        if ev.input == StateInput::Spawned {
-            if let Err(err) = persist.mark_first_started(&ev.session_id) {
-                eprintln!(
-                    "[kamux] failed to record first_started_at for {}: {}",
-                    ev.session_id, err
-                );
+        let (session_id, next, reason) = match ev {
+            RuntimeEvent::Input { session_id, input } => {
+                // 契約 §34.5: Spawned を「観測した時点」で記録する。**遷移表を引く前に置くこと。**
+                // running + Spawned は遷移なし(None)で continue するため、
+                // 遷移後に置くとこの経路が黙って抜ける。
+                // 冪等性は DAO 側の SQL(WHERE first_started_at IS NULL)が担保する。
+                // SurfaceKind::Agent 限定は Spawned の発行元(start_session / resume_session)が
+                // すでに構造的に保証しているので、ここで surface を再チェックしない(§34.5)。
+                if input == StateInput::Spawned {
+                    if let Err(err) = persist.mark_first_started(&session_id) {
+                        eprintln!(
+                            "[kamux] failed to record first_started_at for {}: {}",
+                            session_id, err
+                        );
+                    }
+                }
+
+                let current = read_map(&states)
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or(RuntimeState::Idle);
+
+                let Some((next, reason)) = next_state(current, input) else {
+                    continue;
+                };
+
+                // 判定から書き込みまでの間に終了が始まっていたら、ここで捨てる(最後のゲート)。
+                // メモリ・DB・observer のいずれも更新しない(計画 §4.4 の逐語)。
+                if shutting_down.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                write_map(&states).insert(session_id.clone(), next);
+
+                if let Err(err) = persist.set_last_runtime_state(&session_id, next) {
+                    // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
+                    eprintln!(
+                        "[kamux] failed to persist runtime_state for {}: {}",
+                        session_id, err
+                    );
+                }
+
+                (session_id, next, reason)
             }
-        }
 
-        let current = read_map(&states)
-            .get(&ev.session_id)
-            .copied()
-            .unwrap_or(RuntimeState::Idle);
+            // 契約 §40.2.1: 遷移表を引かない。現在状態が何であれ ❌ を確定させる
+            // (`interrupted` からの再開失敗も ❌ になる。契約 §40.4)。
+            // `mark_first_started` は呼ばない —— 起動していないのだから
+            // (契約 §34.5 / §40.5。ここで立てると「最初の spawn **成功**の記録」という
+            // `first_started_at` の意味が壊れ、M3-3 以降が誤読する)。
+            RuntimeEvent::Error {
+                session_id,
+                message,
+            } => {
+                // Input 経路とまったく同じ最後のゲート。ここは先頭ゲートの直後だが、
+                // `shutting_down` は他スレッドがいつでも立てるので、書き込みへ最も
+                // 近い位置での再確認として残す(計画 §4.4 / 契約 §40.2.1「ゲートは
+                // Input 経路とまったく同じにする」)。
+                if shutting_down.load(Ordering::SeqCst) {
+                    continue;
+                }
 
-        let Some((next, reason)) = next_state(current, ev.input) else {
-            continue;
+                write_map(&states).insert(session_id.clone(), RuntimeState::Error);
+
+                // `set_last_runtime_state(id, Error)` は使わない ——
+                // メッセージの無い error 行ができる(契約 §17 / §38.8)。
+                if let Err(err) = persist.set_runtime_error(&session_id, &message) {
+                    // Input 経路と同じ: DB 書き込み失敗で状態機械を止めない。
+                    eprintln!(
+                        "[kamux] failed to persist runtime_error for {}: {}",
+                        session_id, err
+                    );
+                }
+
+                (session_id, RuntimeState::Error, StateReason::SpawnFailed)
+            }
         };
 
-        // 判定から書き込みまでの間に終了が始まっていたら、ここで捨てる(最後のゲート)。
-        // メモリ・DB・observer のいずれも更新しない(計画 §4.4 の逐語)。
-        if shutting_down.load(Ordering::SeqCst) {
-            continue;
-        }
-
-        write_map(&states).insert(ev.session_id.clone(), next);
-
-        if let Err(err) = persist.set_last_runtime_state(&ev.session_id, next) {
-            // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
-            eprintln!(
-                "[kamux] failed to persist runtime_state for {}: {}",
-                ev.session_id, err
-            );
-        }
-
         let payload = SessionStatePayload {
-            session_id: ev.session_id,
+            session_id,
             runtime_state: next,
             reason,
         };
@@ -407,11 +509,58 @@ fn consume_loop(
     }
 }
 
+/// 契約 §8 のトピック表記。`{}` はランタイム置換（`pty/sink.rs` の `data_topic` と同じ形）。
+pub fn state_topic(session_id: &str) -> String {
+    format!("session://state/{session_id}")
+}
+
+/// 確定した遷移を WebView へ配る observer（契約 §8）。
+///
+/// **M2-3 の通知はこの型に行を足す形にしないこと。** 別の `StateObserver` 実装を
+/// `RuntimeStateManager::register_observer` で足す —— それが observer を
+/// `Vec<Arc<dyn StateObserver>>` にしてある理由である。
+///
+/// `R: Runtime` はテストのために足した内部実装の一般化であり、契約上の型ではない
+/// （`TauriSink<R: Runtime = Wry>`（`pty/sink.rs`）と同じ前例）。デフォルト型パラメータが
+/// `Wry` なので production の `TauriEmitObserver::new(app.handle().clone())` という
+/// 呼び出し方は変わらない。`R` を `Wry` に固定すると `tauri::test::mock_builder()`
+/// （`MockRuntime`）で実 emit を検証できない。
+pub struct TauriEmitObserver<R: tauri::Runtime = tauri::Wry> {
+    app: tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> TauriEmitObserver<R> {
+    pub fn new(app: tauri::AppHandle<R>) -> Self {
+        Self { app }
+    }
+}
+
+impl<R: tauri::Runtime> StateObserver for TauriEmitObserver<R> {
+    fn on_state(&self, payload: &SessionStatePayload) {
+        use tauri::Emitter;
+        // 契約 §8: 必ず `Emitter::emit`（グローバル）。`emit_to`（ウィンドウ指定）は使わない。
+        // 送信失敗（WebView 破棄など）は無視する —— `TauriSink` と同じ方針で、
+        // 状態機械を WebView の生死に巻き込まない。
+        let _ = self
+            .app
+            .emit(&state_topic(&payload.session_id), payload.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use RuntimeState::*;
     use StateInput as In;
+
+    /// 契約 §8 のトピック文字列を逐語で守る。`session-state` や `session:state` は禁止（契約 §22）。
+    #[test]
+    fn state_topic_is_contract_verbatim() {
+        assert_eq!(
+            state_topic("3f2a9c1e-0000-4000-8000-000000000001"),
+            "session://state/3f2a9c1e-0000-4000-8000-000000000001"
+        );
+    }
 
     const ALL_STATES: [RuntimeState; 6] = [Running, WaitingInput, Idle, Exited, Interrupted, Error];
 
@@ -745,10 +894,14 @@ mod tests {
         (RuntimeSender::new(states, Arc::new(Mutex::new(tx))), rx)
     }
 
-    /// `RuntimeEvent` は Task 11 で enum になる（契約 §40.2.1）。フィールドアクセスをここへ
-    /// 集約し、enum 化時の書き換え面を 6 箇所から 1 箇所に減らす（lane-controller 指定）。
+    /// `RuntimeEvent` は Task 11 で enum になった（契約 §40.2.1）。フィールドアクセスを
+    /// ここへ集約してあったので、enum 化の書き換え面はこの 1 箇所で済む。
+    /// `Input` 以外が来たら panic する（この節のテストは `Input` しか送らない）。
     fn expect_input(ev: RuntimeEvent) -> (String, StateInput) {
-        (ev.session_id, ev.input)
+        match ev {
+            RuntimeEvent::Input { session_id, input } => (session_id, input),
+            other => panic!("expected Input, got {other:?}"),
+        }
     }
 
     /// `AppState` に `Arc<RuntimeStateManager>` を載せるため、Tauri の
@@ -871,6 +1024,13 @@ mod tests {
         }
         fn reads(&self) -> Vec<String> {
             self.reads.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+        /// 契約 §38.7 の申し送り → §40.6 で確定。`writes()` / `first_started()` と同じ形。
+        fn errors(&self) -> Vec<(String, String)> {
+            self.errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
         fn first_started(&self) -> Vec<String> {
             self.first_started
@@ -1327,6 +1487,82 @@ mod tests {
         assert!(wait_until(|| mgr.current("live") == Running));
     }
 
+    /// 契約 §8: `session://state/{session_id}` を **`Emitter::emit`（グローバル）** で発火する。
+    /// `emit_to`（ウィンドウ指定）へ「最適化」するとフロントの購読と M2-2 以降が壊れる。
+    ///
+    /// トピックに `session_id` を埋めて宛先を表現する設計なので、別セッションの
+    /// トピックへ漏れないことも同時に固定する。
+    #[test]
+    fn tauri_emit_observer_emits_the_payload_on_the_contract_topic() {
+        use std::sync::mpsc::channel;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::Listener;
+
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+
+        let (tx, rx) = channel::<String>();
+        app.listen(state_topic("s1"), move |event| {
+            let _ = tx.send(event.payload().to_string());
+        });
+        let (other_tx, other_rx) = channel::<String>();
+        app.listen(state_topic("s2"), move |event| {
+            let _ = other_tx.send(event.payload().to_string());
+        });
+
+        let observer = TauriEmitObserver::new(app.handle().clone());
+        observer.on_state(&SessionStatePayload {
+            session_id: "s1".to_string(),
+            runtime_state: WaitingInput,
+            reason: StateReason::HookPermission,
+        });
+
+        let raw = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session://state/s1 が発火するはず");
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
+        assert_eq!(payload["session_id"], serde_json::json!("s1"));
+        assert_eq!(payload["runtime_state"], serde_json::json!("waiting_input"));
+        assert_eq!(payload["reason"], serde_json::json!("hook_permission"));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "別セッションのトピックへ流してはいけない"
+        );
+    }
+
+    /// 計画 §4.9: 起動時正規化はイベントを emit しない。
+    ///
+    /// この関数は WebView がまだ `listen` を張っていない時点で走るので、出しても誰も
+    /// 受け取れない。フロントは `list_sessions` の戻り値（正規化済みの
+    /// `last_runtime_state`）からシードする。
+    ///
+    /// `normalize_on_startup` は `&self` から `self.observers` に到達できるため、
+    /// 将来ここに emit を足してもコンパイルは通ってしまう。**この禁止を守っている
+    /// テストはこれ 1 本だけである**（Task 5 レビュー持ち越し / Task 6 必達 3）。
+    #[test]
+    fn normalize_on_startup_notifies_no_observer() {
+        let persist = FakePersist::with_rows(&[
+            ("live", Running),
+            ("waiting", WaitingInput),
+            ("fresh", Idle),
+            ("broken", Error),
+        ]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        let changed = mgr.normalize_on_startup().expect("normalize");
+
+        // 陽性コントロール: 正規化自体は起きている(= emit を足せる遷移が実在する)
+        assert_eq!(changed.len(), 2, "live / waiting が interrupted になるはず");
+        assert!(
+            obs.seen().is_empty(),
+            "起動時正規化は observer を呼んではいけない(計画 §4.9): {:?}",
+            obs.seen()
+        );
+    }
+
     /// DB 読み出しが失敗したら、状態を捏造せずエラーを返す。
     /// `Exited` は `normalize_startup_state` で据え置き(None)になり書き込みを一切
     /// 起こさないので、`fail` が捕まえるのは読み取り経路の失敗だけになる
@@ -1339,5 +1575,292 @@ mod tests {
         let mgr = RuntimeStateManager::new(persist);
 
         assert!(mgr.normalize_on_startup().is_err());
+    }
+
+    // --- Task 7: `sink.rs` / `write_pty` / `stop_session` から届く入力の形 ---
+    //
+    // 待ち方は契約 §69.1 / §69.2 に従う。副作用の順は memory -> DB(persist) ->
+    // observer なので、正の主張では **assert する対象そのもの**を待つ。
+    // 負の主張（「起きてほしくない作用が起きていない」）には待つ条件が作れないため
+    // 素の `sleep` を使う —— `wait_until` に書き換えると条件成立の瞬間に抜けてしまい、
+    // 誤った作用が後から来ても検出できなくなる（§69.2）。
+
+    /// agent サーフェスの PTY 終了でセッションが ⛔ になる。
+    /// `sink.rs` の `on_exit` は surface_id をそのまま渡してくる。
+    #[test]
+    fn agent_pty_exit_marks_session_exited() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_pty_exit("s1:agent");
+
+        assert!(wait_until(|| persist.writes()
+            == vec![
+                ("s1".to_string(), Running),
+                ("s1".to_string(), Exited)
+            ]));
+        // メモリは DB より先に確定するので、writes() が観測できた時点で安定している
+        assert_eq!(mgr.current("s1"), Exited);
+    }
+
+    /// `stop_session` は kill したあと `UserStopped` を送るが、
+    /// その直後に PTY が実際に死んで `on_exit` から `PtyExited` も届く。
+    /// 2 通目は `exited` + `PtyExited` = 遷移なしなので、DB もイベントも動かない。
+    #[test]
+    fn stop_session_followed_by_pty_exit_writes_only_once() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::UserStopped);
+        // observer が最後の副作用。ここまで届いたことを待ってから負の主張に移る
+        assert!(wait_until(|| obs.seen().len() == 2));
+
+        sender.note_pty_exit("s1:agent");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Exited);
+        assert_eq!(
+            persist.writes(),
+            vec![("s1".to_string(), Running), ("s1".to_string(), Exited)],
+            "PtyExited が後追いで来ても 2 度目の書き込みをしてはいけない"
+        );
+        assert_eq!(obs.seen().len(), 2);
+        // 先に来た UserStopped の reason が残る
+        assert_eq!(obs.seen()[1].2, StateReason::UserStopped);
+    }
+
+    /// 既に ⛔ のセッションへもう一度停止ボタンを撃つ経路。
+    /// `PtyManager::kill` は冪等（契約 §15）なので、登録されていない surface_id でも
+    /// `Ok(())` が返り `stop_session` は `UserStopped` を送る。状態機械は
+    /// `exited` + `UserStopped` を遷移なしで捨てるので、DB もイベントも動かない。
+    #[test]
+    fn a_second_user_stop_after_exit_writes_nothing_more() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::UserStopped);
+        assert!(wait_until(|| obs.seen().len() == 2));
+
+        sender.send("s1", In::UserStopped);
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Exited);
+        assert_eq!(
+            persist.writes(),
+            vec![("s1".to_string(), Running), ("s1".to_string(), Exited)],
+            "2 度目の停止で DB を書き直してはいけない"
+        );
+        assert_eq!(obs.seen().len(), 2, "2 度目の停止でバッジを再更新しない");
+    }
+
+    /// nvim を閉じてもセッションは ⛔ にならない（設計書 §6.4 / 契約 §2）。
+    /// `sink.rs` にはフィルタを書かないので、この判定は note_surface の責務。
+    #[test]
+    fn editor_surface_exit_does_not_change_session_state() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_pty_exit("s1:editor");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Running);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
+
+    /// 契約 §41.3: 再開失敗の終了は `exited` へ落ちるが reason が `ResumeFailed` になる。
+    /// M2-4 のフロントはこの reason だけを見て再試行導線を出すので、
+    /// `PtyExited` に丸めるとリカバリ導線が丸ごと死ぬ。
+    #[test]
+    fn resume_failed_exit_reports_its_own_reason() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist);
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| obs.seen().len() == 1));
+
+        sender.note_resume_failed_exit("s1:agent");
+
+        assert!(wait_until(|| obs.seen().len() == 2));
+        assert_eq!(obs.seen()[1].1, Exited);
+        assert_eq!(obs.seen()[1].2, StateReason::ResumeFailed);
+    }
+
+    /// `note_pty_exit` と同じ `:agent` フィルタを通ることの固定。
+    #[test]
+    fn resume_failed_exit_ignores_the_editor_surface() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_resume_failed_exit("s1:editor");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), Running);
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
+
+    /// write_pty 由来の UserInput が 🟡 を解除する。出力では解除されない。
+    #[test]
+    fn user_input_clears_waiting_input_but_output_does_not() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist);
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::HookNotification);
+        assert!(wait_until(|| mgr.current("s1") == WaitingInput));
+
+        // TUI の再描画では 🟡 は消えない
+        sender.note_surface("s1:agent", In::OutputActivity);
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), WaitingInput);
+
+        // ユーザーが打鍵したら 🟢 に戻る
+        sender.note_user_input("s1:agent");
+        assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    // --- Task 11: `mark_error` —— `error` ❌ への唯一の到達経路（契約 §40） ---
+
+    /// ❌ は遷移表を経由せずに確定し、生 stderr が永続化され、SpawnFailed で emit される。
+    #[test]
+    fn mark_error_sets_error_state_with_raw_message() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.mark_error("s1", "claude: command not found\n");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert_eq!(
+            persist.errors(),
+            vec![("s1".to_string(), "claude: command not found\n".to_string())],
+            "stderr は加工せずそのまま渡す（契約 §2 / §6）"
+        );
+        // set_last_runtime_state 経由で書いてはいけない（メッセージの無い error 行ができる）
+        assert!(persist.writes().is_empty());
+        assert!(wait_until(|| obs.seen().len() == 1));
+        assert_eq!(obs.seen()[0].1, RuntimeState::Error);
+        assert_eq!(obs.seen()[0].2, StateReason::SpawnFailed);
+    }
+
+    /// 起動していないのだから first_started_at は立てない（契約 §34.5 / §40.5）。
+    #[test]
+    fn mark_error_does_not_record_first_started() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        mgr.sender().mark_error("s1", "boom");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert!(persist.first_started().is_empty());
+        assert_eq!(persist.first_started_calls(), 0);
+    }
+
+    /// ❌ から抜けられるのは Spawned だけ。他の入力では ❌ のまま。
+    #[test]
+    fn error_state_is_left_only_by_spawned() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.mark_error("s1", "boom");
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+
+        // 遅れて届く PTY 終了や hook で ❌ を上書きしない
+        sender.send("s1", In::PtyExited);
+        sender.send("s1", In::HookNotification);
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), RuntimeState::Error);
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    /// 中断中のセッションの再開失敗も ❌ になる（契約 §40.4。M2-1 §4.12 の決着）。
+    #[test]
+    fn mark_error_overwrites_interrupted() {
+        let persist = FakePersist::with_rows(&[("s1", Running)]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        mgr.normalize_on_startup().expect("normalize");
+        assert_eq!(mgr.current("s1"), RuntimeState::Interrupted);
+
+        mgr.sender().mark_error("s1", "cwd not found");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert_eq!(persist.errors().len(), 1);
+    }
+
+    /// 終了処理が始まったら ❌ も書かない（Input 経路と同じゲート）。
+    #[test]
+    fn mark_error_is_dropped_after_begin_shutdown() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        mgr.begin_shutdown();
+        mgr.sender().mark_error("s1", "boom");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(persist.errors().is_empty());
+        assert_eq!(mgr.current("s1"), RuntimeState::Idle);
+    }
+
+    /// 大量打鍵しても、running 中の UserInput は送信前に捨てられる。
+    #[test]
+    fn repeated_keystrokes_while_running_produce_no_events() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        for _ in 0..1000 {
+            sender.note_user_input("s1:agent");
+        }
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
     }
 }

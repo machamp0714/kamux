@@ -47,6 +47,8 @@ beforeEach(() => {
     sessionOrder: emptyOrder,
     paneAssignment: ['s1', null],
     activePane: 0,
+    runtimeStates: {},
+    runtimeReasons: {},
   });
 
   container = document.createElement('div');
@@ -85,5 +87,59 @@ describe('SessionTabList（必達 5: useShallow）', () => {
     });
 
     expect(renderCount).toBe(1);
+  });
+});
+
+describe('SessionTabList のバッジ（契約 §25.5 / §38.3）', () => {
+  it('タブに RuntimeBadge を描く（runtimeStates に値があるときだけ）', () => {
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionTabList />);
+    });
+    // 一度も起動していないセッションにはバッジを出さない（契約 §34.7）
+    expect(container.querySelector('.runtime-badge')).toBeNull();
+
+    act(() => {
+      useAppStore
+        .getState()
+        .applyStateEvent({ session_id: 's1', runtime_state: 'running', reason: 'spawned' });
+    });
+
+    const badge = container.querySelector('.kamux-tab__meta .runtime-badge');
+    expect(badge?.getAttribute('data-runtime-state')).toBe('running');
+    // バッジは kamux-tab__cli より前に置く（components.md「セッションタブ」節）
+    expect(badge?.nextElementSibling?.className).toBe('kamux-tab__cli');
+  });
+
+  it('実行状態が変わってもタブ列自体は再レンダリングしない', () => {
+    // タブ列が runtimeStates を購読すると、セッション数だけ並ぶタブが全部描き直される。
+    // Profiler は配下（バッジ）の再レンダリングでも発火してしまうため、描画中に読まれる
+    // sessions[id].title の読み取り回数で SessionTabList 自身の再実行を数える。
+    let titleReads = 0;
+    const s1 = session('s1');
+    const probe = Object.defineProperty({ ...s1 }, 'title', {
+      get() {
+        titleReads += 1;
+        return s1.title;
+      },
+    });
+    useAppStore.setState({ sessions: { s1: probe } });
+
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionTabList />);
+    });
+    expect(titleReads).toBe(1);
+
+    act(() => {
+      useAppStore
+        .getState()
+        .applyStateEvent({ session_id: 's1', runtime_state: 'waiting_input', reason: 'hook_stop' });
+    });
+
+    expect(container.querySelector('.runtime-badge')?.getAttribute('data-runtime-state')).toBe(
+      'waiting_input',
+    );
+    expect(titleReads).toBe(1);
   });
 });

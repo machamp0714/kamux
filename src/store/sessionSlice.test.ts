@@ -10,7 +10,7 @@ vi.mock('../ipc/commands', () => ({
   createProject: vi.fn(),
 }));
 
-import type { Session } from '../types/model';
+import type { Session, SessionStatePayload } from '../types/model';
 import { useAppStore } from './index';
 import { buildSessionOrder } from './kanbanOrder';
 import { emptySessionOrder, indexSessions } from './sessionSlice';
@@ -41,8 +41,16 @@ beforeEach(() => {
   listSessions.mockReset();
   createSession.mockReset();
   // activeProjectId は loadSessions のガードが参照するため、前のテストの値が
-  // 漏れないよう毎回リセットする。
-  useAppStore.setState({ sessions: {}, sessionOrder: emptySessionOrder(), activeProjectId: 'p1' });
+  // 漏れないよう毎回リセットする。runtimeStates 系も他 describe との漏れを防ぐため
+  // ここでリセットする（各 describe 側にも専用の beforeEach があるが、重複は無害）。
+  useAppStore.setState({
+    sessions: {},
+    sessionOrder: emptySessionOrder(),
+    activeProjectId: 'p1',
+    runtimeStates: {},
+    runtimeReasons: {},
+    runtimeErrors: {},
+  });
 });
 
 describe('emptySessionOrder', () => {
@@ -180,6 +188,36 @@ describe('loadSessions', () => {
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
     expect(useAppStore.getState().sessions.a1).toBeUndefined();
   });
+
+  // 必達 1: seedRuntimeStates は isStillActiveProject のガードの下でなければならない。
+  // ガードより上に置くと、stale なプロジェクト(pA)の応答だけで runtimeStates が
+  // reset=true で作り直され、盤面(sessions/sessionOrder)は pB のまま runtimeStates だけ
+  // pA 由来という split-brain になる。
+  it('runtimeStates も stale なプロジェクトの応答では書き換えない', async () => {
+    let resolveA: (v: Session[]) => void = () => {};
+    listSessions.mockImplementation((projectId: string) => {
+      if (projectId === 'pA') {
+        return new Promise<Session[]>((r) => {
+          resolveA = r;
+        });
+      }
+      return Promise.resolve([
+        session({ id: 'b1', project_id: 'pB', last_runtime_state: 'idle', first_started_at: 1 }),
+      ]);
+    });
+
+    const pendingA = useAppStore.getState().loadSessions('pA');
+    useAppStore.setState({ activeProjectId: 'pB' });
+    await useAppStore.getState().loadSessions('pB');
+
+    // ここで A が後着する
+    resolveA([
+      session({ id: 'a1', project_id: 'pA', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    await pendingA;
+
+    expect(useAppStore.getState().runtimeStates).toEqual({ b1: 'idle' });
+  });
 });
 
 describe('addSession', () => {
@@ -263,5 +301,166 @@ describe('addSession', () => {
     // だが stale なプロジェクト(p1)の作成結果を B の sessions へ足してはいけない
     expect(useAppStore.getState().sessions).toEqual(bSessions);
     expect(useAppStore.getState().sessionOrder).toEqual(buildSessionOrder(bSessions));
+  });
+});
+
+// firstStartedAt の既定は「起動済み」。未起動を試すケースだけ null を明示する（契約 §34.6）
+const makeSession = (
+  id: string,
+  last: Session['last_runtime_state'],
+  firstStartedAt: number | null = 1,
+): Session => ({
+  id,
+  project_id: 'p1',
+  title: `task ${id}`,
+  description: '',
+  kanban_status: 'backlog',
+  sort_order: 1,
+  mode: 'in_place',
+  branch: null,
+  worktree_path: null,
+  cli_kind: 'shell',
+  cli_command: null,
+  claude_session_id: null,
+  last_runtime_state: last,
+  last_runtime_error: null,
+  first_started_at: firstStartedAt,
+  archived_at: null,
+  created_at: 0,
+  updated_at: 0,
+});
+
+const payload = (
+  id: string,
+  runtime_state: SessionStatePayload['runtime_state'],
+  reason: SessionStatePayload['reason'],
+): SessionStatePayload => ({ session_id: id, runtime_state, reason });
+
+describe('sessionSlice runtimeStates', () => {
+  beforeEach(() => {
+    useAppStore.setState({ runtimeStates: {}, runtimeReasons: {}, runtimeErrors: {} });
+  });
+
+  it('seeds runtimeStates from last_runtime_state', () => {
+    useAppStore
+      .getState()
+      .seedRuntimeStates([makeSession('s1', 'interrupted'), makeSession('s2', 'idle')]);
+    expect(useAppStore.getState().runtimeStates).toEqual({ s1: 'interrupted', s2: 'idle' });
+  });
+
+  it('does not overwrite a live value when seeding', () => {
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    useAppStore.getState().seedRuntimeStates([makeSession('s1', 'interrupted')]);
+    expect(useAppStore.getState().runtimeStates.s1).toBe('running');
+  });
+
+  it('replaces everything when seeding with reset (project switch)', () => {
+    useAppStore.getState().applyStateEvent(payload('old', 'running', 'spawned'));
+    useAppStore.getState().seedRuntimeStates([makeSession('s1', 'idle')], true);
+    expect(useAppStore.getState().runtimeStates).toEqual({ s1: 'idle' });
+    expect(useAppStore.getState().runtimeReasons).toEqual({});
+  });
+
+  // 契約 §34.6 —— 一度も起動していないセッションは seed しない。
+  // runtimeStates[id] が undefined のままになり、RuntimeBadge が null を返す（§33.3 Q1）。
+  it('skips never-started sessions when seeding with reset', () => {
+    useAppStore
+      .getState()
+      .seedRuntimeStates([makeSession('fresh', 'idle', null), makeSession('used', 'idle')], true);
+    expect(useAppStore.getState().runtimeStates).toEqual({ used: 'idle' });
+    expect(useAppStore.getState().runtimeStates.fresh).toBeUndefined();
+  });
+
+  // 除外しても、既に持っているエントリまでは消さない
+  // （loadSessions のスナップショットが mark_first_started のコミットを追い越した場合）
+  it('keeps a live entry for a session whose snapshot has no first_started_at', () => {
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    useAppStore.getState().seedRuntimeStates([makeSession('s1', 'idle', null)], true);
+    expect(useAppStore.getState().runtimeStates.s1).toBe('running');
+  });
+
+  // 非 reset には除外を適用しない（呼び出し元は「たった今起動した」1 件しか渡さない）
+  it('seeds a never-started snapshot when reset is not requested', () => {
+    useAppStore.getState().seedRuntimeStates([makeSession('s1', 'running', null)]);
+    expect(useAppStore.getState().runtimeStates.s1).toBe('running');
+  });
+
+  it('applies a state event', () => {
+    useAppStore.getState().applyStateEvent(payload('s1', 'waiting_input', 'hook_notification'));
+    expect(useAppStore.getState().runtimeStates.s1).toBe('waiting_input');
+    expect(useAppStore.getState().runtimeReasons.s1).toBe('hook_notification');
+  });
+
+  it('keeps object identity when the event changes nothing', () => {
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    const before = useAppStore.getState().runtimeStates;
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    expect(useAppStore.getState().runtimeStates).toBe(before);
+  });
+
+  it('touches only the target session key', () => {
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    useAppStore.getState().applyStateEvent(payload('s2', 'idle', 'hook_stop'));
+    expect(useAppStore.getState().runtimeStates).toEqual({ s1: 'running', s2: 'idle' });
+  });
+
+  // 設計書 §5.3: runtime_state はカードの列を動かさない
+  it('never mutates sessions or sessionOrder', () => {
+    useAppStore.setState({
+      sessions: { s1: makeSession('s1', 'idle') },
+      sessionOrder: { backlog: ['s1'], in_progress: [], review: [], done: [] },
+    });
+    const beforeSessions = useAppStore.getState().sessions;
+    const beforeOrder = useAppStore.getState().sessionOrder;
+
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+
+    expect(useAppStore.getState().sessions).toBe(beforeSessions);
+    expect(useAppStore.getState().sessionOrder).toBe(beforeOrder);
+    expect(useAppStore.getState().sessions.s1.kanban_status).toBe('backlog');
+  });
+});
+
+// 契約 §42: 保存した生 stderr をカードが読むための経路。
+describe('sessionSlice runtimeErrors', () => {
+  const withError = (id: string, message: string | null, firstStartedAt: number | null = 1) => ({
+    ...makeSession(id, message === null ? 'idle' : 'error', firstStartedAt),
+    last_runtime_error: message,
+  });
+
+  beforeEach(() => {
+    useAppStore.setState({ runtimeStates: {}, runtimeReasons: {}, runtimeErrors: {} });
+  });
+
+  // 契約 §42.3 規約 1
+  it('seeds runtimeErrors from last_runtime_error and skips nulls', () => {
+    useAppStore
+      .getState()
+      .seedRuntimeStates(
+        [withError('s1', 'claude: command not found\n'), withError('s2', null)],
+        true,
+      );
+    expect(useAppStore.getState().runtimeErrors).toEqual({ s1: 'claude: command not found\n' });
+  });
+
+  // 契約 §42.3 規約 2 —— §40.5 の 'error' 例外は runtimeErrors にも効く。
+  // これが無いと再起動後に ❌ の枠だけが描かれて中身が空になる。
+  it('seeds the error of a never-started session on reset', () => {
+    useAppStore.getState().seedRuntimeStates([withError('s1', 'boom', null)], true);
+    expect(useAppStore.getState().runtimeStates.s1).toBe('error');
+    expect(useAppStore.getState().runtimeErrors.s1).toBe('boom');
+  });
+
+  // 契約 §42.3 規約 3 —— DB 側の §17 と同じ規則をストアに写したもの。
+  it('clears the error when the session leaves the error state', () => {
+    useAppStore.getState().setRuntimeError('s1', 'boom');
+    useAppStore.getState().applyStateEvent(payload('s1', 'running', 'spawned'));
+    expect(useAppStore.getState().runtimeErrors.s1).toBeUndefined();
+  });
+
+  it('keeps the error while the session stays in the error state', () => {
+    useAppStore.getState().setRuntimeError('s1', 'boom');
+    useAppStore.getState().applyStateEvent(payload('s1', 'error', 'spawn_failed'));
+    expect(useAppStore.getState().runtimeErrors.s1).toBe('boom');
   });
 });
