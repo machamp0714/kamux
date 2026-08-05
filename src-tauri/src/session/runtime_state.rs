@@ -407,11 +407,58 @@ fn consume_loop(
     }
 }
 
+/// 契約 §8 のトピック表記。`{}` はランタイム置換（`pty/sink.rs` の `data_topic` と同じ形）。
+pub fn state_topic(session_id: &str) -> String {
+    format!("session://state/{session_id}")
+}
+
+/// 確定した遷移を WebView へ配る observer（契約 §8）。
+///
+/// **M2-3 の通知はこの型に行を足す形にしないこと。** 別の `StateObserver` 実装を
+/// `RuntimeStateManager::register_observer` で足す —— それが observer を
+/// `Vec<Arc<dyn StateObserver>>` にしてある理由である。
+///
+/// `R: Runtime` はテストのために足した内部実装の一般化であり、契約上の型ではない
+/// （`TauriSink<R: Runtime = Wry>`（`pty/sink.rs`）と同じ前例）。デフォルト型パラメータが
+/// `Wry` なので production の `TauriEmitObserver::new(app.handle().clone())` という
+/// 呼び出し方は変わらない。`R` を `Wry` に固定すると `tauri::test::mock_builder()`
+/// （`MockRuntime`）で実 emit を検証できない。
+pub struct TauriEmitObserver<R: tauri::Runtime = tauri::Wry> {
+    app: tauri::AppHandle<R>,
+}
+
+impl<R: tauri::Runtime> TauriEmitObserver<R> {
+    pub fn new(app: tauri::AppHandle<R>) -> Self {
+        Self { app }
+    }
+}
+
+impl<R: tauri::Runtime> StateObserver for TauriEmitObserver<R> {
+    fn on_state(&self, payload: &SessionStatePayload) {
+        use tauri::Emitter;
+        // 契約 §8: 必ず `Emitter::emit`（グローバル）。`emit_to`（ウィンドウ指定）は使わない。
+        // 送信失敗（WebView 破棄など）は無視する —— `TauriSink` と同じ方針で、
+        // 状態機械を WebView の生死に巻き込まない。
+        let _ = self
+            .app
+            .emit(&state_topic(&payload.session_id), payload.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use RuntimeState::*;
     use StateInput as In;
+
+    /// 契約 §8 のトピック文字列を逐語で守る。`session-state` や `session:state` は禁止（契約 §22）。
+    #[test]
+    fn state_topic_is_contract_verbatim() {
+        assert_eq!(
+            state_topic("3f2a9c1e-0000-4000-8000-000000000001"),
+            "session://state/3f2a9c1e-0000-4000-8000-000000000001"
+        );
+    }
 
     const ALL_STATES: [RuntimeState; 6] = [Running, WaitingInput, Idle, Exited, Interrupted, Error];
 
@@ -1325,6 +1372,82 @@ mod tests {
 
         mgr.sender().send("live", In::Spawned);
         assert!(wait_until(|| mgr.current("live") == Running));
+    }
+
+    /// 契約 §8: `session://state/{session_id}` を **`Emitter::emit`（グローバル）** で発火する。
+    /// `emit_to`（ウィンドウ指定）へ「最適化」するとフロントの購読と M2-2 以降が壊れる。
+    ///
+    /// トピックに `session_id` を埋めて宛先を表現する設計なので、別セッションの
+    /// トピックへ漏れないことも同時に固定する。
+    #[test]
+    fn tauri_emit_observer_emits_the_payload_on_the_contract_topic() {
+        use std::sync::mpsc::channel;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::Listener;
+
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+
+        let (tx, rx) = channel::<String>();
+        app.listen(state_topic("s1"), move |event| {
+            let _ = tx.send(event.payload().to_string());
+        });
+        let (other_tx, other_rx) = channel::<String>();
+        app.listen(state_topic("s2"), move |event| {
+            let _ = other_tx.send(event.payload().to_string());
+        });
+
+        let observer = TauriEmitObserver::new(app.handle().clone());
+        observer.on_state(&SessionStatePayload {
+            session_id: "s1".to_string(),
+            runtime_state: WaitingInput,
+            reason: StateReason::HookPermission,
+        });
+
+        let raw = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session://state/s1 が発火するはず");
+        let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
+        assert_eq!(payload["session_id"], serde_json::json!("s1"));
+        assert_eq!(payload["runtime_state"], serde_json::json!("waiting_input"));
+        assert_eq!(payload["reason"], serde_json::json!("hook_permission"));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "別セッションのトピックへ流してはいけない"
+        );
+    }
+
+    /// 計画 §4.9: 起動時正規化はイベントを emit しない。
+    ///
+    /// この関数は WebView がまだ `listen` を張っていない時点で走るので、出しても誰も
+    /// 受け取れない。フロントは `list_sessions` の戻り値（正規化済みの
+    /// `last_runtime_state`）からシードする。
+    ///
+    /// `normalize_on_startup` は `&self` から `self.observers` に到達できるため、
+    /// 将来ここに emit を足してもコンパイルは通ってしまう。**この禁止を守っている
+    /// テストはこれ 1 本だけである**（Task 5 レビュー持ち越し / Task 6 必達 3）。
+    #[test]
+    fn normalize_on_startup_notifies_no_observer() {
+        let persist = FakePersist::with_rows(&[
+            ("live", Running),
+            ("waiting", WaitingInput),
+            ("fresh", Idle),
+            ("broken", Error),
+        ]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+
+        let changed = mgr.normalize_on_startup().expect("normalize");
+
+        // 陽性コントロール: 正規化自体は起きている(= emit を足せる遷移が実在する)
+        assert_eq!(changed.len(), 2, "live / waiting が interrupted になるはず");
+        assert!(
+            obs.seen().is_empty(),
+            "起動時正規化は observer を呼んではいけない(計画 §4.9): {:?}",
+            obs.seen()
+        );
     }
 
     /// DB 読み出しが失敗したら、状態を捏造せずエラーを返す。

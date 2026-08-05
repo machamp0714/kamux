@@ -277,7 +277,6 @@ mod tests {
     use super::*;
     use crate::model::{CliKind, RuntimeState, SessionMode};
     use crate::pty::surface::PtySink;
-    use crate::pty::PtyManager;
     use crate::session::cli_args::tests::{ShellEnvGuard, ENV_LOCK};
     use crate::store::now_ms;
     use crate::store::test_support::open_temp;
@@ -336,10 +335,7 @@ mod tests {
     ) -> (tempfile::TempDir, AppState, Session) {
         let (dir, store, session) =
             build_project_and_session(repo_path, mode, CliKind::Shell, None);
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         (dir, state, session)
     }
 
@@ -367,10 +363,7 @@ mod tests {
                 worktree_path.to_str().expect("utf8 path"),
             )
             .expect("set worktree");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         (dir, state, session, worktree_path)
     }
 
@@ -580,10 +573,7 @@ mod tests {
             now_ms(),
         );
         let session = store.insert_session(&session).expect("insert session");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
 
         let failing_resolve =
             |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("claude".to_string())) };
@@ -620,10 +610,7 @@ mod tests {
                 missing_path.to_str().expect("utf8 path"),
             )
             .expect("set worktree");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
 
         let err = plan(&state, &session.id).expect_err("must propagate the Git error");
 
@@ -685,10 +672,7 @@ mod tests {
             now_ms(),
         );
         let session = store.insert_session(&session).expect("insert session");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         let sid = surface_id(&session.id, SurfaceKind::Agent);
 
         struct NoopSink;
@@ -730,10 +714,7 @@ mod tests {
         let project = store
             .insert_project("kamux", repo_path, CliKind::Shell)
             .expect("insert project");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         (dir, state, project)
     }
 
@@ -773,10 +754,7 @@ mod tests {
             now_ms(),
         );
         let session = store.insert_session(&session).expect("insert session");
-        let state = AppState {
-            store: Arc::new(store),
-            pty: PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
 
         let (returned, _spec) = plan(&state, &session.id).expect("plan spawn");
 

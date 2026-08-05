@@ -13,6 +13,7 @@ use tauri::{Manager, State, WindowEvent};
 
 use crate::error::AppResult;
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
+use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
 
@@ -117,10 +118,48 @@ async fn move_session(
 // この関数自体（「生きている surface_id を集めて機械的に kill する」という
 // ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
 // 実プロセスの spawn/kill/exit を通しで固定している。
-fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
+fn kill_all_pty_surfaces(_begun: ShutdownBegun, pty: &pty::PtyManager) {
     for id in pty.live_surfaces() {
         let _ = pty.kill(&id);
     }
+}
+
+/// 「`RuntimeStateManager::begin_shutdown()` を既に呼んだ」ことの証拠。
+/// `kill_all_pty_surfaces` はこれを引数に要求する。
+///
+/// **飾りではない。** この 2 つを逆順に書くとコンパイルが通らない。順序を実行時に
+/// 観測する手段が無いためにこの形にしている —— `begin_shutdown()` の後に届いた入力は
+/// `consume_loop` の先頭ゲートで捨てられ、メモリ・DB・observer のどこにも痕跡を
+/// 残さない。一方 PTY の kill から `PtyExited` が観測されるまでの遅延（子プロセスの
+/// 死を waiter が拾うまでの数 ms）は、逆順に書いても実測ではまず表面化しない。
+/// つまり「順序が逆でも緑になるテスト」しか書けない。型で塞ぐ。
+///
+/// 順序を間違えたときに実機で起きること: Cmd+Q の一括 kill 由来の `PtyExited` が
+/// 状態機械に届き、DB に `exited` が焼かれる。次回起動で `normalize_on_startup` は
+/// `{running, waiting_input}` しか触らないので、全カードが ⏸ ではなく ⛔ で復帰する
+/// （計画 §4.4 / §6.2）。
+struct ShutdownBegun;
+
+fn begin_runtime_shutdown(runtime: &RuntimeStateManager) -> ShutdownBegun {
+    runtime.begin_shutdown();
+    ShutdownBegun
+}
+
+/// アプリ終了時の後始末。**順序を持つ 2 手をこの 1 箇所に閉じ込める。**
+///
+/// 呼び出し元は `kill_on_window_destroyed`（窓を閉じる経路）と
+/// `kill_on_run_event_exit`（Cmd+Q の経路）の 2 つ。両方から撃つのは
+/// RULINGS §23.1 が kill について採った設計をそのまま踏襲したもので、
+/// `begin_shutdown()`（`AtomicBool`）も `kill_all_pty_surfaces` も冪等なので
+/// 二重呼び出しは無害である。
+///
+/// **`RunEvent::ExitRequested` には置かない。** Cmd+Q は `terminate:` ->
+/// `applicationWillTerminate:` -> `AppState::exit()` -> `LoopDestroyed` ->
+/// `RunEvent::Exit` と進み、`ExitRequested` を経由しない（`kill_on_run_event_exit`
+/// の doc コメントが依存クレートのソースを追跡して確定させた経路）。
+fn shutdown_runtime_then_kill_pty(state: &AppState) {
+    let begun = begin_runtime_shutdown(&state.runtime);
+    kill_all_pty_surfaces(begun, &state.pty);
 }
 
 /// 窓が閉じる経路（赤ボタンなど）で PTY の子プロセスを残さない。
@@ -157,7 +196,7 @@ fn kill_all_pty_surfaces(pty: &pty::PtyManager) {
 fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
     if matches!(event, WindowEvent::Destroyed) {
         if let Some(state) = window.try_state::<AppState>() {
-            kill_all_pty_surfaces(&state.pty);
+            shutdown_runtime_then_kill_pty(&state);
         }
     }
 }
@@ -183,9 +222,80 @@ fn kill_on_run_event_exit<R: tauri::Runtime>(
 ) {
     if matches!(event, tauri::RunEvent::Exit) {
         if let Some(state) = app_handle.try_state::<AppState>() {
-            kill_all_pty_surfaces(&state.pty);
+            shutdown_runtime_then_kill_pty(&state);
         }
     }
+}
+
+/// `setup` クロージャの本体。
+///
+/// `&mut App<R>` ではなく `&M: Manager<R>` を受けるのは、`tauri::test::mock_builder()`
+/// で組んだ `App<MockRuntime>` から**同じ経路**をテストするため（`R: Runtime` を足す
+/// 理由は `TauriSink` / `kill_on_run_event_exit` と同じで、契約上の型ではない）。
+///
+/// **`AppState` の構築を `Builder::manage(..)` ではなく `setup` の中で行う理由:**
+/// `TauriEmitObserver` に `AppHandle` を渡す必要があり、`AppHandle` は `setup` の
+/// 中でしか取れない。コマンドは `setup` 完了後にしか実行されないので、この置き場所で
+/// `State<'_, AppState>` が未登録になる瞬間は生じない。
+fn install_app_state<R: tauri::Runtime, M: Manager<R>>(manager: &M, store: Arc<Store>) {
+    let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+    install_app_state_with(manager, store, persist);
+}
+
+/// `install_app_state` の注入版（`session::plan_agent_spawn_with` と同じ seam）。
+///
+/// `persist` を引数に出しているのは、起動時正規化の**呼ばれ方**（回数・順序・失敗時の
+/// 扱い）をフェイクで観測するため。実 `Store` を差す結線そのものは `install_app_state`
+/// 側にあり、そちらは DB を読み直すテストで固定する。
+fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    store: Arc<Store>,
+    persist: Arc<dyn StatePersist>,
+) {
+    let runtime = RuntimeStateManager::new(persist);
+    runtime.register_observer(Arc::new(TauriEmitObserver::new(
+        manager.app_handle().clone(),
+    )));
+
+    // 前回 running / waiting_input のまま終了した行を interrupted へ正規化する。
+    //
+    // **`manage` より前に完了させること。** `AppState` が manage された瞬間から、
+    // コマンドと `sink.rs` が `state.runtime.sender()` へ到達して入力を積めるようになる。
+    // `normalize_on_startup` は読み取りフェーズを write lock の外で回してから
+    // `map.insert` を無条件に行うので、その隙間に consumer が進めた状態が
+    // DB 由来の古い値で巻き戻る（PR 13 レビュー I-2）。「順序を守る」ではなく
+    // 「まだ配らない」で塞ぐ —— `sender()` は `&self` なので、返した時点で誰でも
+    // 入力を積めてしまう。
+    //
+    // WebView はまだ listen していないので、ここではイベントを出さない（計画 §4.9）。
+    // フロントは `list_sessions` の戻り値（正規化済みの `last_runtime_state`）から
+    // シードする。
+    match runtime.normalize_on_startup() {
+        Ok(changed) if !changed.is_empty() => {
+            eprintln!(
+                "[kamux] normalized {} interrupted session(s)",
+                changed.len()
+            );
+        }
+        Ok(_) => {}
+        // 走査途中で失敗しても**ログに落として起動を続行する**（Task 6 必達 5 の決定）。
+        // 理由は 3 つ:
+        //   1. 契約 §0 が panic 経路を禁じている。DB の 1 行が書けないだけでアプリが
+        //      起動しないのは過剰な対応である
+        //   2. `consume_loop` が「DB 書き込み失敗で状態機械を止めない」としているのと
+        //      同じ規律。真実はメモリ側にある
+        //   3. 正規化は冪等なので、途中まで書けた状態は次回起動で自己修復する
+        //      （昇格済みの行は `interrupted` として据え置かれ、残った `running` の行が
+        //      改めて昇格する）
+        // 代償は「今回の起動に限り一部のカードが ⏸ にならない」こと。起動失敗より軽い。
+        Err(err) => eprintln!("[kamux] startup normalize failed: {err}"),
+    }
+
+    manager.manage(AppState {
+        store,
+        pty: pty::PtyManager::new(),
+        runtime,
+    });
 }
 
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
@@ -195,10 +305,7 @@ pub fn run() {
         .setup(|app| {
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
-            app.manage(AppState {
-                store,
-                pty: pty::PtyManager::new(),
-            });
+            install_app_state(app, store);
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
@@ -242,10 +349,7 @@ mod tests {
     #[test]
     fn app_state_exposes_the_full_m1_1_crud_path() {
         let (_dir, store) = open_temp();
-        let state = AppState {
-            store: Arc::new(store),
-            pty: crate::pty::PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
 
         let project_a = state
             .store
@@ -414,7 +518,10 @@ mod tests {
             "both surfaces must be live before kill"
         );
 
-        super::kill_all_pty_surfaces(&pty);
+        // このテストは「生きている surface を機械的に kill する」ループだけを見る。
+        // begin_shutdown との順序は `ShutdownBegun` が型で固定しているので、
+        // ここではトークンを直接渡して kill ロジックだけを隔離する。
+        super::kill_all_pty_surfaces(super::ShutdownBegun, &pty);
 
         for _ in 0..2 {
             rx.recv_timeout(Duration::from_secs(10))
@@ -455,10 +562,7 @@ mod tests {
 
         let (_dir, store) = open_temp();
         let app = mock_builder()
-            .manage(AppState {
-                store: Arc::new(store),
-                pty: crate::pty::PtyManager::new(),
-            })
+            .manage(crate::state::test_support::app_state(store))
             .build(mock_context(noop_assets()))
             .expect("build mock app");
 
@@ -556,10 +660,7 @@ mod tests {
 
         let (_dir, store) = open_temp();
         let app = mock_builder()
-            .manage(AppState {
-                store: Arc::new(store),
-                pty: crate::pty::PtyManager::new(),
-            })
+            .manage(crate::state::test_support::app_state(store))
             .build(mock_context(noop_assets()))
             .expect("build mock app");
         WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -606,15 +707,387 @@ mod tests {
         );
     }
 
+    // --- M2-1 Task 6: runtime_state の Tauri 配線 ---
+    //
+    // ここから下の 6 本は「状態機械をアプリの寿命に結線した」ことを固定する。
+    // 順序（`begin_shutdown` -> kill）は `ShutdownBegun` が型で固定しているので、
+    // ここで見るのは「各経路が実際に shutdown を始めるか」「起動時正規化が
+    // 何回・どの順で・失敗したらどうなるか」の方である。
+    mod wiring {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
+        use tauri::{AppHandle, Manager, WebviewWindowBuilder};
+
+        use crate::error::{AppError, AppResult};
+        use crate::model::{CliKind, RuntimeState};
+        use crate::session::runtime_state::{StateInput, StatePersist};
+        use crate::state::AppState;
+        use crate::store::test_support::{insert_test_session, open_temp};
+
+        /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
+        fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cond()
+        }
+
+        /// 起動時正規化の**呼ばれ方**を観測するフェイク。
+        ///
+        /// - `queried`: `list_ids_by_last_runtime_state` に渡された state の履歴。
+        ///   同じ state が 2 回現れたら `normalize_on_startup` が 2 回走っている
+        /// - `app_state_visible_during_normalize`: 走査中に `AppState` が
+        ///   `manage` 済みだったか。**`true` になった時点で `sender()` に到達できる**
+        /// - `fail`: 走査を `AppError::Db` で失敗させる
+        struct NormalizeProbe {
+            handle: AppHandle<MockRuntime>,
+            queried: Mutex<Vec<RuntimeState>>,
+            app_state_visible_during_normalize: AtomicBool,
+            fail: bool,
+        }
+
+        impl NormalizeProbe {
+            fn new(handle: AppHandle<MockRuntime>, fail: bool) -> Arc<Self> {
+                Arc::new(NormalizeProbe {
+                    handle,
+                    queried: Mutex::new(Vec::new()),
+                    app_state_visible_during_normalize: AtomicBool::new(false),
+                    fail,
+                })
+            }
+
+            fn queried(&self) -> Vec<RuntimeState> {
+                self.queried
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+        }
+
+        impl StatePersist for NormalizeProbe {
+            fn set_last_runtime_state(&self, _id: &str, _state: RuntimeState) -> AppResult<()> {
+                Ok(())
+            }
+
+            fn list_ids_by_last_runtime_state(
+                &self,
+                state: RuntimeState,
+            ) -> AppResult<Vec<String>> {
+                if self.handle.try_state::<AppState>().is_some() {
+                    self.app_state_visible_during_normalize
+                        .store(true, Ordering::SeqCst);
+                }
+                self.queried
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(state);
+                if self.fail {
+                    return Err(AppError::Db("boom".into()));
+                }
+                Ok(Vec::new())
+            }
+
+            fn mark_first_started(&self, _id: &str) -> AppResult<()> {
+                Ok(())
+            }
+
+            fn set_runtime_error(&self, _id: &str, _message: &str) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        fn mock_app() -> tauri::App<MockRuntime> {
+            mock_builder()
+                .build(mock_context(noop_assets()))
+                .expect("build mock app")
+        }
+
+        /// 必達 2（PR 13 レビュー I-2）: `normalize_on_startup()` が完了するまで
+        /// `sender()` を配らない。
+        ///
+        /// `normalize_on_startup` は読み取りフェーズを write lock の外で回してから
+        /// `map.insert` を無条件に行うので、その隙間に consumer が進めた状態が
+        /// DB 由来の古い値で巻き戻る。`sender()` は `&self` なので「順序を守る」だけでは
+        /// 守れない —— 返した瞬間に誰でも入力を積める。`AppState` を `manage` する前に
+        /// 正規化を終わらせることで、そもそも到達できなくする。
+        #[test]
+        fn setup_finishes_normalize_before_app_state_becomes_reachable() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), false);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            assert!(
+                !probe
+                    .app_state_visible_during_normalize
+                    .load(Ordering::SeqCst),
+                "正規化の走査中に AppState が manage されていた（sender() へ到達できてしまう）"
+            );
+            // 陽性コントロール: 走査は実際に起きており、manage も最終的には行われている
+            assert!(!probe.queried().is_empty(), "正規化が一度も走っていない");
+            assert!(
+                app.try_state::<AppState>().is_some(),
+                "install_app_state_with は最終的に AppState を manage する"
+            );
+        }
+
+        /// 必達 4（Task 5 レビュー持ち越し）: `normalize_on_startup()` は
+        /// `setup` でちょうど 1 回だけ呼ばれる。
+        ///
+        /// 冪等なので 2 回呼んでも症状が出ない。`ALL_STATES` の増減に引きずられない
+        /// よう、件数ではなく「同じ state が 2 回問い合わされていないこと」で固定する。
+        #[test]
+        fn setup_runs_normalize_exactly_once() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), false);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            let queried = probe.queried();
+            assert!(!queried.is_empty(), "正規化が一度も走っていない");
+            let mut unique = queried.clone();
+            unique.sort_by_key(|s| format!("{s:?}"));
+            unique.dedup();
+            assert_eq!(
+                queried.len(),
+                unique.len(),
+                "同じ state が 2 回問い合わされている = normalize_on_startup が 2 回走った: {queried:?}"
+            );
+            // 昇格対象の 2 状態を見ていること（走査の主目的）
+            assert!(queried.contains(&RuntimeState::Running));
+            assert!(queried.contains(&RuntimeState::WaitingInput));
+        }
+
+        /// 必達 4（Task 5 レビュー持ち越し）: `AppState` に注入される
+        /// `Arc<dyn StatePersist>` が**実際に `Store`** であること。
+        ///
+        /// フェイクを差した上のテストでは、`install_app_state`（ラッパ）が
+        /// `Arc::clone(&store) as Arc<dyn StatePersist>` を渡していることまでは
+        /// 見えない。実 `Store` に `running` の行を仕込み、DB を読み直して
+        /// `interrupted` になっていることで、結線と正規化を同時に固定する。
+        #[test]
+        fn setup_normalizes_running_rows_through_the_real_store() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let live = insert_test_session(&store, &project_id, "live");
+            let resting = insert_test_session(&store, &project_id, "resting");
+            store
+                .set_last_runtime_state(&live.id, RuntimeState::Running)
+                .expect("set_last_runtime_state");
+
+            let app = mock_app();
+            super::super::install_app_state(&app, Arc::new(store));
+
+            let state = app.state::<AppState>();
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&live.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Interrupted,
+                "running のまま終了した行は DB 上で interrupted になる"
+            );
+            assert_eq!(state.runtime.current(&live.id), RuntimeState::Interrupted);
+            // 一度も起動していない行を ⏸ にしない（DEFAULT 'idle' の据え置き）
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&resting.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Idle
+            );
+        }
+
+        /// 必達 5（Task 5 レビュー持ち越し）: 走査途中の書き込み失敗は
+        /// **ログに落として起動を続行する**。
+        ///
+        /// 決定の理由は `install_app_state_with` の doc コメント参照。ここでは
+        /// 「`Err` でも `AppState` が manage される（= アプリが起動する）」ことだけを
+        /// 固定する。`?` で `setup` を失敗させる変異はここで赤くなる。
+        #[test]
+        fn setup_continues_when_startup_normalize_fails() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let probe = NormalizeProbe::new(app.handle().clone(), true);
+
+            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+
+            assert!(!probe.queried().is_empty(), "正規化は試みられている");
+            assert!(
+                app.try_state::<AppState>().is_some(),
+                "起動時正規化の失敗でアプリを起動させないのは過剰（契約 §0: panic 経路禁止）"
+            );
+        }
+
+        /// 「この経路は状態機械の shutdown を始めたか」を、実際の遷移で確かめる。
+        ///
+        /// `begin_shutdown()` の効果は「以降の入力を捨てる」ことなので、
+        /// 陽性コントロール（teardown 前の 1 件が通る）と対にして初めて意味を持つ。
+        /// 陽性コントロールが無いと、consumer スレッドが死んでいても緑になる。
+        fn assert_path_begins_runtime_shutdown(
+            app: &tauri::App<MockRuntime>,
+            session_id: &str,
+            drive_teardown: impl FnOnce(&tauri::App<MockRuntime>),
+        ) {
+            {
+                let state = app.state::<AppState>();
+                state.runtime.sender().send(session_id, StateInput::Spawned);
+                assert!(
+                    wait_until(|| state.runtime.current(session_id) == RuntimeState::Running),
+                    "陽性コントロール: teardown 前は遷移が通るはず"
+                );
+            }
+
+            drive_teardown(app);
+
+            let state = app.state::<AppState>();
+            // PTY kill 由来の PtyExited と同じ入力。shutdown 済みなら捨てられる。
+            state
+                .runtime
+                .sender()
+                .send(session_id, StateInput::PtyExited);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state.runtime.current(session_id),
+                RuntimeState::Running,
+                "teardown 後の入力はメモリを更新してはいけない"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_session(session_id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "DB に exited が焼かれると、次回起動で ⏸ ではなく ⛔ になる（計画 §6.2）"
+            );
+        }
+
+        /// 必達 1（Destroyed 側）: 窓を閉じる経路が `begin_shutdown()` を撃つ。
+        ///
+        /// `MockRuntime` は `WindowEvent::Destroyed` を一度も発火しないため、
+        /// M1-4 と同じく関数を直接呼んで固定する（前例:
+        /// `kill_on_window_destroyed_kills_every_live_pty_surface_when_called_directly`）。
+        #[test]
+        fn window_destroyed_begins_runtime_shutdown() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            assert_path_begins_runtime_shutdown(&app, &session.id, |app| {
+                let window = app.get_window("main").expect("window registered");
+                super::super::kill_on_window_destroyed(&window, &tauri::WindowEvent::Destroyed);
+            });
+        }
+
+        /// 必達 1（Exit 側）: Cmd+Q が通る経路が `begin_shutdown()` を撃つ。
+        ///
+        /// `MockRuntime` は最後の窓が消えたあと必ず `RunEvent::Exit` を発火するので、
+        /// こちらは実イベントで到達する（前例: `run_event_exit_kills_every_live_pty_surface`）。
+        #[test]
+        fn run_event_exit_begins_runtime_shutdown() {
+            use std::sync::mpsc::channel;
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            let window = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let app_handle = app.handle().clone();
+
+            {
+                let state = app_handle.state::<AppState>();
+                state
+                    .runtime
+                    .sender()
+                    .send(&session.id, StateInput::Spawned);
+                assert!(
+                    wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                    "陽性コントロール: teardown 前は遷移が通るはず"
+                );
+            }
+
+            // `RunEvent::Ready` を合図に窓を閉じる（レース回避の理由は
+            // `run_event_exit_kills_every_live_pty_surface` のコメント参照）。
+            let (ready_tx, ready_rx) = channel::<()>();
+            let run_thread = std::thread::spawn(move || {
+                app.run(move |handle, event| {
+                    if matches!(event, tauri::RunEvent::Ready) {
+                        let _ = ready_tx.send(());
+                    }
+                    super::super::kill_on_run_event_exit(handle, event);
+                });
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("event loop must reach RunEvent::Ready before we close the window");
+            window.close().expect("close the only window");
+            run_thread.join().expect("event loop thread must not panic");
+
+            let state = app_handle.state::<AppState>();
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::PtyExited);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state.runtime.current(&session.id),
+                RuntimeState::Running,
+                "RunEvent::Exit 後の入力はメモリを更新してはいけない"
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_session(&session.id)
+                    .expect("get_session")
+                    .last_runtime_state,
+                RuntimeState::Running,
+                "Cmd+Q で exited が焼かれると、次回起動で ⏸ ではなく ⛔ になる（計画 §6.2）"
+            );
+        }
+    }
+
     #[test]
     fn app_state_store_is_shareable_across_threads() {
         // M1-3 の PtyManager / M2-1 の SessionManager がバックグラウンドスレッドから
         // Store を触るため、Arc<Store> がスレッドを跨げることを固定する。
         let (_dir, store) = open_temp();
-        let state = AppState {
-            store: Arc::new(store),
-            pty: crate::pty::PtyManager::new(),
-        };
+        let state = crate::state::test_support::app_state(store);
         let project = state
             .store
             .insert_project("kamux", "/Users/x/repo/kamux", CliKind::Claude)
@@ -636,8 +1109,6 @@ mod tests {
     // JS が実際に送るのと同じ camelCase キーの JSON を tauri::test::get_ipc_response で
     // 投げることで、コマンド本体の引数バインディングそのものを検証する。
     mod ipc {
-        use std::sync::Arc;
-
         use serde_json::{json, Value};
         use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
         use tauri::{ipc::CallbackFn, webview::InvokeRequest, Manager, WebviewWindowBuilder};
@@ -647,10 +1118,7 @@ mod tests {
 
         fn build_app(store: crate::store::Store) -> tauri::App<MockRuntime> {
             mock_builder()
-                .manage(AppState {
-                    store: Arc::new(store),
-                    pty: crate::pty::PtyManager::new(),
-                })
+                .manage(crate::state::test_support::app_state(store))
                 .invoke_handler(tauri::generate_handler![
                     super::super::create_project,
                     super::super::list_projects,
