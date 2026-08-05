@@ -172,6 +172,9 @@
   border-radius: var(--radius-sm);
   background: var(--bg-app);
   padding: var(--space-3);
+  /* <pre> の UA 既定 margin: 1em 0 を消す。カードの子要素は gap だけで離す
+     （__title / __description / __branch と同様に margin: 0 を明示する） */
+  margin: 0;
   /* 契約 §42.4「生 stderr を原文で」。改行を保ったまま、長い 1 行でも
      カードから溢れさせない */
   white-space: pre-wrap;
