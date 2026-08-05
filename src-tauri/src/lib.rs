@@ -110,42 +110,73 @@ async fn move_session(
     state.store.move_session(&id, to_status, to_index)
 }
 
-// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
-// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
-// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
-// 撃つ設計を選んだのはこの冪等性が前提）。
-//
-// この関数自体（「生きている surface_id を集めて機械的に kill する」という
-// ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
-// 実プロセスの spawn/kill/exit を通しで固定している。
-fn kill_all_pty_surfaces(_begun: ShutdownBegun, pty: &pty::PtyManager) {
-    for id in pty.live_surfaces() {
-        let _ = pty.kill(&id);
+/// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
+///
+/// 効いているのはモジュールの private ではなく **`ShutdownBegun` のフィールドの
+/// private** である。タプルフィールドが private なので、コンストラクタもこの
+/// モジュールの外からは見えない（E0603）。したがって `kill_all_pty_surfaces` を
+/// 呼ぶ唯一の方法は `begin_runtime_shutdown` の戻り値を渡すことになる。
+///
+/// **`shutdown_runtime_then_kill_pty` をこのモジュールへ移してはいけない。**
+/// 中に入れるとフィールドが可視になり `kill_all_pty_surfaces(ShutdownBegun(()), ..)`
+/// と書けてしまい、逆順がコンパイルを通る（= 保証が消える）。
+/// 同じ理由で **`ShutdownBegun` をフィールドの無いユニット構造体に戻してはいけない。**
+mod shutdown {
+    use crate::pty::PtyManager;
+    use crate::session::runtime_state::RuntimeStateManager;
+
+    /// 「`RuntimeStateManager::begin_shutdown()` を既に呼んだ」ことの証拠。
+    /// `kill_all_pty_surfaces` はこれを引数に要求する。
+    ///
+    /// **飾りではない。** モジュール外ではこの型を構築できないので、
+    /// `shutdown_runtime_then_kill_pty` の 2 行を逆順に書くと `cargo build` が
+    /// 落ちる（トークンを作れば E0603 / 束縛前に使えば E0425）。
+    ///
+    /// この形にしているのは、**現時点では**順序を実行時に観測する手段が無いため
+    /// である —— `begin_shutdown()` の後に届いた入力は `consume_loop` の先頭ゲートで
+    /// 捨てられ、メモリ・DB・observer のどこにも痕跡を残さない。一方 PTY の kill から
+    /// `PtyExited` が観測されるまでの遅延（子プロセスの死を waiter が拾うまでの数 ms）は、
+    /// 逆順に書いても実測ではまず表面化しない。つまり今は「順序が逆でも緑になるテスト」
+    /// しか書けない。
+    ///
+    /// **これは無期限の事実ではない。** 観測できないのは PTY kill -> 状態機械の入力
+    /// （`pty/sink.rs` の `note_pty_exit`）が **Task 7 でまだ配線されていない**からである。
+    /// Task 7 が入れば「実 PTY を spawn -> teardown -> DB に `exited` が焼かれていない
+    /// こと」で順序を実行時にも固定できる（Task 6 レビュー §6.3 の持ち越し）。
+    /// そのときもこの型を外さないこと —— 型と実行時テストは競合しない。
+    ///
+    /// 順序を間違えたときに実機で起きること: Cmd+Q の一括 kill 由来の `PtyExited` が
+    /// 状態機械に届き、DB に `exited` が焼かれる。次回起動で `normalize_on_startup` は
+    /// `{running, waiting_input}` しか触らないので、全カードが ⏸ ではなく ⛔ で復帰する
+    /// （計画 §4.4 / §6.2）。
+    pub struct ShutdownBegun(());
+
+    pub fn begin_runtime_shutdown(runtime: &RuntimeStateManager) -> ShutdownBegun {
+        runtime.begin_shutdown();
+        ShutdownBegun(())
+    }
+
+    /// 生存中の全 PTY サーフェスを一括 kill する。`PtyManager::kill` は契約 §15 で
+    /// 冪等と規定されているため、この関数自体も何度呼んでも安全（Task 12.5 番外・
+    /// RULINGS §23.1: WindowEvent::Destroyed と RunEvent::Exit の両方から同じ kill を
+    /// 撃つ設計を選んだのはこの冪等性が前提）。
+    ///
+    /// この関数自体（「生きている surface_id を集めて機械的に kill する」という
+    /// ロジック）は `tests::kill_all_pty_surfaces_kills_every_live_surface` が
+    /// 実プロセスの spawn/kill/exit を通しで固定している。トークンを偽造できないので、
+    /// そのテストは唯一の入口である `shutdown_runtime_then_kill_pty` 経由で呼ぶ。
+    pub fn kill_all_pty_surfaces(_begun: ShutdownBegun, pty: &PtyManager) {
+        for id in pty.live_surfaces() {
+            let _ = pty.kill(&id);
+        }
     }
 }
 
-/// 「`RuntimeStateManager::begin_shutdown()` を既に呼んだ」ことの証拠。
-/// `kill_all_pty_surfaces` はこれを引数に要求する。
-///
-/// **飾りではない。** この 2 つを逆順に書くとコンパイルが通らない。順序を実行時に
-/// 観測する手段が無いためにこの形にしている —— `begin_shutdown()` の後に届いた入力は
-/// `consume_loop` の先頭ゲートで捨てられ、メモリ・DB・observer のどこにも痕跡を
-/// 残さない。一方 PTY の kill から `PtyExited` が観測されるまでの遅延（子プロセスの
-/// 死を waiter が拾うまでの数 ms）は、逆順に書いても実測ではまず表面化しない。
-/// つまり「順序が逆でも緑になるテスト」しか書けない。型で塞ぐ。
-///
-/// 順序を間違えたときに実機で起きること: Cmd+Q の一括 kill 由来の `PtyExited` が
-/// 状態機械に届き、DB に `exited` が焼かれる。次回起動で `normalize_on_startup` は
-/// `{running, waiting_input}` しか触らないので、全カードが ⏸ ではなく ⛔ で復帰する
-/// （計画 §4.4 / §6.2）。
-struct ShutdownBegun;
-
-fn begin_runtime_shutdown(runtime: &RuntimeStateManager) -> ShutdownBegun {
-    runtime.begin_shutdown();
-    ShutdownBegun
-}
-
 /// アプリ終了時の後始末。**順序を持つ 2 手をこの 1 箇所に閉じ込める。**
+///
+/// **この関数は `mod shutdown` の外に置くこと。** 中へ移すと `ShutdownBegun` の
+/// フィールドが可視になり、逆順に書いてもコンパイルが通るようになる（`mod shutdown`
+/// の doc コメント参照）。
 ///
 /// 呼び出し元は `kill_on_window_destroyed`（窓を閉じる経路）と
 /// `kill_on_run_event_exit`（Cmd+Q の経路）の 2 つ。両方から撃つのは
@@ -158,8 +189,8 @@ fn begin_runtime_shutdown(runtime: &RuntimeStateManager) -> ShutdownBegun {
 /// `RunEvent::Exit` と進み、`ExitRequested` を経由しない（`kill_on_run_event_exit`
 /// の doc コメントが依存クレートのソースを追跡して確定させた経路）。
 fn shutdown_runtime_then_kill_pty(state: &AppState) {
-    let begun = begin_runtime_shutdown(&state.runtime);
-    kill_all_pty_surfaces(begun, &state.pty);
+    let begun = shutdown::begin_runtime_shutdown(&state.runtime);
+    shutdown::kill_all_pty_surfaces(begun, &state.pty);
 }
 
 /// 窓が閉じる経路（赤ボタンなど）で PTY の子プロセスを残さない。
@@ -296,7 +327,18 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         //   3. 正規化は冪等なので、途中まで書けた状態は次回起動で自己修復する
         //      （昇格済みの行は `interrupted` として据え置かれ、残った `running` の行が
         //      改めて昇格する）
-        // 代償は「今回の起動に限り一部のカードが ⏸ にならない」こと。起動失敗より軽い。
+        //
+        // **代償（正確に書く。「⏸ にならないだけ」ではない）:** `normalize_on_startup` は
+        // `set_last_runtime_state` に `?` を使うため、**失敗した行より後ろは `map.insert`
+        // されない**。つまり DB を昇格できないだけでなく、**未走査の行がメモリスナップ
+        // ショットにも載らない** —— たとえば `last_runtime_state='error'` の行に対して
+        // `current(id)` が `Idle` を返す。同関数の doc コメントが警告している split-brain
+        // （❌ のカードが `HookNotification` 1 発で 🟡 へ復帰する）が、**その起動の間ずっと
+        // 残る**。次回起動の正規化で自己修復する。起動失敗より軽いという判断は変わらない。
+        //
+        // 走査を続行して最後にまとめてエラーを返す形（部分シードを無くす）は
+        // `normalize_on_startup` 本体 = PR 13 の改変になるため、Task 6 では入れず
+        // lane-controller への持ち越しとする（Task 6 レビュー I-2）。
         Err(err) => eprintln!("[kamux] startup normalize failed: {err}"),
     }
 
@@ -503,7 +545,15 @@ mod tests {
             }
         }
 
-        let pty = crate::pty::PtyManager::new();
+        // `ShutdownBegun` はフィールドが private なので `mod shutdown` の外からは
+        // 構築できない（それが逆順をコンパイルエラーにしている当のもの）。テスト用の
+        // 裏口を開けるのではなく、唯一の入口である `shutdown_runtime_then_kill_pty`
+        // 経由で kill ループへ到達する。`begin_shutdown()` は状態機械の入力ゲートを
+        // 閉じるだけで PTY の kill / `on_exit` の配送には触らないので、このテストが
+        // 見ているもの（生きている surface が全部死ぬこと）は変わらない。
+        let (_dir, store) = open_temp();
+        let state = crate::state::test_support::app_state(store);
+        let pty = &state.pty;
         let (tx, rx) = channel();
         let sink: Arc<dyn PtySink> = Arc::new(ExitSink(tx));
         for i in 0..2 {
@@ -527,10 +577,10 @@ mod tests {
             "both surfaces must be live before kill"
         );
 
-        // このテストは「生きている surface を機械的に kill する」ループだけを見る。
-        // begin_shutdown との順序は `ShutdownBegun` が型で固定しているので、
-        // ここではトークンを直接渡して kill ロジックだけを隔離する。
-        super::kill_all_pty_surfaces(super::ShutdownBegun, &pty);
+        // このテストは「生きている surface を機械的に kill する」ループを見る。
+        // begin_shutdown との順序は `ShutdownBegun` のフィールド private が
+        // コンパイル時に固定しているので、ここでは実行時に確かめない。
+        super::shutdown_runtime_then_kill_pty(&state);
 
         for _ in 0..2 {
             rx.recv_timeout(Duration::from_secs(10))
@@ -718,10 +768,11 @@ mod tests {
 
     // --- M2-1 Task 6: runtime_state の Tauri 配線 ---
     //
-    // ここから下の 6 本は「状態機械をアプリの寿命に結線した」ことを固定する。
-    // 順序（`begin_shutdown` -> kill）は `ShutdownBegun` が型で固定しているので、
-    // ここで見るのは「各経路が実際に shutdown を始めるか」「起動時正規化が
-    // 何回・どの順で・失敗したらどうなるか」の方である。
+    // ここから下の 7 本は「状態機械をアプリの寿命に結線した」ことを固定する。
+    // 順序（`begin_shutdown` -> kill）は `ShutdownBegun` のフィールド private が
+    // コンパイル時に固定している（逆順は `cargo build` が落ちる）ので、ここで見るのは
+    // 「各経路が実際に shutdown を始めるか」「起動時正規化が何回・どの順で・失敗したら
+    // どうなるか」「emit observer が実際に登録されているか」の方である。
     mod wiring {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
@@ -954,6 +1005,56 @@ mod tests {
                 app.try_state::<AppState>().is_some(),
                 "起動時正規化の失敗でアプリを起動させないのは過剰（契約 §0: panic 経路禁止）"
             );
+        }
+
+        /// `install_app_state_with` が `TauriEmitObserver` を **`register_observer` で
+        /// 実際に登録している**こと（Task 6 レビュー I-3）。
+        ///
+        /// production の配線 1 行を守る唯一のテスト。
+        /// `runtime_state::tests::tauri_emit_observer_emits_the_payload_on_the_contract_topic`
+        /// は observer を**直接構築**するので、この 1 行を消しても緑のまま通る
+        /// （レビュアーの変異 I で実測済み）。ここでは observer を 1 つも作らず、
+        /// **`sender()` に入力を積んで `session://state/{id}` が届くか**だけを見る。
+        ///
+        /// 消えたときの症状は重い —— イベントが 1 度も発火せず、フロント（Task 8-10）と
+        /// M2-2 以降が丸ごと無反応になる。
+        #[test]
+        fn install_app_state_registers_the_emit_observer_on_the_runtime() {
+            use std::sync::mpsc::channel;
+
+            use tauri::Listener;
+
+            use crate::session::runtime_state::state_topic;
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_app();
+            let (tx, rx) = channel::<String>();
+            app.listen(state_topic(&session.id), move |event| {
+                let _ = tx.send(event.payload().to_string());
+            });
+
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(&app, store, persist);
+
+            app.state::<AppState>()
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+
+            let raw = rx.recv_timeout(Duration::from_secs(5)).expect(
+                "session://state/{id} が届かない: install_app_state_with が \
+                 TauriEmitObserver を register_observer していない",
+            );
+            let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
+            assert_eq!(payload["session_id"], serde_json::json!(session.id));
+            assert_eq!(payload["runtime_state"], serde_json::json!("running"));
         }
 
         /// 「この経路は状態機械の shutdown を始めたか」を、実際の遷移で確かめる。
