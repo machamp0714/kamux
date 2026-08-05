@@ -46,4 +46,31 @@ describe('契約 §65 のカナリア（T4）: @xterm/xterm の private フィ�
       ).toBe('boolean');
     },
   );
+
+  /**
+   * fix round 2 A（team-lead 裁定 2）。
+   *
+   * 「常に false だから固定している」のではない。**`_keyPressHandled` が `true` に
+   * なったら手当ての前提（二重入力が起きない）が崩れるので、そのときに赤くなるために
+   * 固定している。** 上流 `_inputEvent` は `if (this._keyPressHandled) return !1;` で
+   * 早期 return する（契約 §65 逐語）。実測（`.superpowers/sdd/H1-xterm-keydownseen/spike-log.txt`）
+   * ではこの WKWebView で文字入力の `keypress` が 1 件も飛ばず、`_keyPressHandled` は
+   * 全行 `false` だった。`false` である限り、手当てが `_keyDownSeen` を落として `input`
+   * を通しても二重入力にはならない。この版・環境で `true` を取りうるようになれば、
+   * 手当ては文字を二重に入れる側へ回る。
+   *
+   * ⚠️ このテストの射程の限界: これが見ているのは **構築直後の初期値** だけである。
+   * 実機の WKWebView で実行時（文字入力のたびに）`true` にならないことは、
+   * このテストでは一切見ていない。実行時の保証は手動スモークにしかない（契約 §65.11）。
+   */
+  it('term._core._keyPressHandled は構築直後は false である（fix round 2 A）', () => {
+    const term = new Terminal();
+    const core = (term as unknown as TerminalWithCore)._core;
+
+    expect(
+      core._keyPressHandled,
+      '_keyPressHandled が true になった: 手当ての前提（二重入力が起きない）が崩れている' +
+        '可能性がある。この初期値テストは実行時の保証ではない。実機での手動スモークが必要（契約 §65.11）',
+    ).toBe(false);
+  });
 });

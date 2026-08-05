@@ -584,6 +584,136 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     },
   );
 
+  describe(
+    '手当ての射程: !/@ だけでなく Shift+英字も含む（fix round 2 B・team-lead 必須事項 1。' +
+      '上流 _inputEvent 第 1 ガードのモデル）',
+    () => {
+      /**
+       * ⚠️ これは上流 `_inputEvent` の「モデル」であり上流そのものではない。
+       * モデルが実体からずれたらこのテストは緑のまま嘘をつく。フィールド名の存在を
+       * 見張るのは `xtermCanary.test.ts` の T4 の役目である（このテストの役目ではない）。
+       *
+       * `node_modules/@xterm/xterm/lib/xterm.js` の `_inputEvent` 第 1 ガードの逐語
+       * （brief §2 / lane-controller 確認済み）:
+       *
+       *   _inputEvent(e){ if(e.data && "insertText"===e.inputType
+       *                   && (!e.composed || !this._keyDownSeen) && !screenReaderMode){
+       *                     if(this._keyPressHandled) return !1;
+       *                     … this.coreService.triggerDataEvent(e.data,!0) … } }
+       *
+       * `_keyPressHandled` は実測（xtermCanary.test.ts のカナリア）で常に `false` なので
+       * ここでは固定値として扱う。`screenReaderMode` も対象外（false 固定）。
+       */
+      function passesUpstreamGuard(
+        state: { _keyDownSeen: boolean },
+        input: { data: string; inputType: string; composed: boolean },
+      ): boolean {
+        const keyPressHandled = false; // 実測: この環境では常に false
+        if (!input.data) return false;
+        if (input.inputType !== 'insertText') return false; // Cmd+V の insertFromPaste 等を弁別する
+        const guard1 = !input.composed || !state._keyDownSeen;
+        if (!guard1) return false;
+        if (keyPressHandled) return false;
+        return true;
+      }
+
+      /**
+       * 実測イベント列（spike-log.txt）を再生する。`data` / `inputType` / `composed` は
+       * brief §2 の表が指定した実測値をそのまま使う（`key` ではなく `data` を運ぶのが
+       * `input` イベントの実体）。
+       *
+       * 上流 `_keyDown(e)` は `this._keyDownSeen=!0` を **custom handler の呼び出しより
+       * 前に** 書く（brief §2 逐語）。そのため `state._keyDownSeen = true` を先に立てて
+       * から `onKeyDown` を呼ぶ。`onKeyDown` を省略すると「手当てが無い」状態を模す
+       * （手当て前の `attachCustomKeyEventHandler((event) => !event.metaKey)` は
+       * `_keyDownSeen` に一切触れなかったので、コールバック無しと等価）。
+       */
+      function replay(
+        events: Array<
+          | { type: 'keydown'; key: string }
+          | { type: 'input'; data: string; inputType: string; composed: boolean }
+        >,
+        state: { _keyDownSeen: boolean },
+        onKeyDown?: (event: { type: string; key?: string }) => void,
+      ): boolean {
+        let passed = false;
+        for (const event of events) {
+          if (event.type === 'keydown') {
+            state._keyDownSeen = true;
+            onKeyDown?.(event);
+          } else {
+            passed = passesUpstreamGuard(state, event);
+          }
+        }
+        return passed;
+      }
+
+      // STEP 1: `!` の 1 打目 — keydown Shift → input(data:'!', inputType:'insertText', composed:true)
+      const shiftBangEvents = [
+        { type: 'keydown' as const, key: 'Shift' },
+        { type: 'input' as const, data: '!', inputType: 'insertText', composed: true },
+      ];
+      // STEP 3 / 9: Shift+英字（1 文字目）
+      // — keydown Shift → input(data:'A', inputType:'insertText', composed:true)
+      const shiftLetterEvents = [
+        { type: 'keydown' as const, key: 'Shift' },
+        { type: 'input' as const, data: 'A', inputType: 'insertText', composed: true },
+      ];
+      // STEP 4 / 10（対照）: 素の英字 — 先行する Shift の keydown なし
+      const plainLetterEvents = [
+        { type: 'input' as const, data: 'a', inputType: 'insertText', composed: true },
+      ];
+
+      it.each([
+        ['! の 1 打目（STEP1）', shiftBangEvents],
+        ['Shift+英字（STEP3/9）', shiftLetterEvents],
+      ])('%s: 手当てが無いとガードを通らない = 0 文字', (_label, events) => {
+        const state = { _keyDownSeen: false };
+        const passed = replay(events, state);
+        expect(passed).toBe(false);
+      });
+
+      it.each([
+        ['! の 1 打目（STEP1）', shiftBangEvents],
+        ['Shift+英字（STEP3/9）', shiftLetterEvents],
+      ])('%s: 手当てがあるとガードを通る = 1 文字', (_label, events) => {
+        const sid = nextSurfaceId();
+        registry.ensureTerminal(sid);
+        const term = fakeOf(sid);
+        const state = { _keyDownSeen: false };
+        term._core = state; // 実際に ensureTerminal が登録したハンドラと状態を共有する
+
+        const passed = replay(events, state, (event) => {
+          // 実際の customKeyEventHandler を keydown ごとに呼ぶ（モデルの外の
+          // 別ロジックを新たに書かず、テスト対象の実装をそのまま使う）
+          term.customKeyEventHandler?.({ type: event.type, key: event.key });
+        });
+
+        expect(passed).toBe(true);
+      });
+
+      it('対照（STEP4/10）: 素の a は手当てが無くても 1 文字のまま', () => {
+        const state = { _keyDownSeen: false };
+        const passed = replay(plainLetterEvents, state);
+        expect(passed).toBe(true);
+      });
+
+      it('対照（STEP4/10）: 素の a は手当てがあっても 1 文字のまま', () => {
+        const sid = nextSurfaceId();
+        registry.ensureTerminal(sid);
+        const term = fakeOf(sid);
+        const state = { _keyDownSeen: false };
+        term._core = state;
+
+        const passed = replay(plainLetterEvents, state, (event) => {
+          term.customKeyEventHandler?.({ type: event.type, key: event.key });
+        });
+
+        expect(passed).toBe(true);
+      });
+    },
+  );
+
   it('detachTerminal は WebGL アドオンを dispose して DOM レンダラへ降格する（計画 §2.4）', () => {
     const sid = nextSurfaceId();
     const container = document.createElement('div');
