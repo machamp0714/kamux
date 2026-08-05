@@ -46,7 +46,8 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
     }
 
     // 契約 §65.6 T1〜T8: `type` / `key` は手当ての判定に使う。`metaKey` は既存の
-    // Cmd 系テスト（452 行目）のため省略可能のまま残す。
+    // Cmd 系テスト（「attachCustomKeyEventHandler で Cmd 系キーを xterm に処理させない
+    // （契約 §11）」）のため省略可能のまま残す。
     customKeyEventHandler:
       ((event: { type?: string; key?: string; metaKey?: boolean }) => boolean) | null = null;
 
@@ -467,23 +468,37 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     expect(term.customKeyEventHandler?.({ metaKey: false })).toBe(true);
   });
 
-  it(
-    '修飾キーのみの keydown で _core._keyDownSeen を false へ戻し、返り値は true のまま' +
-      '（契約 §65.3 T1 / I1）',
-    () => {
-      const sid = nextSurfaceId();
-      registry.ensureTerminal(sid);
-      const term = fakeOf(sid);
-      term._core = { _keyDownSeen: true };
+  describe('修飾キーのみの keydown で _core._keyDownSeen を戻す（契約 §65.6 T1 / T7 / I1）', () => {
+    // fix round 1・Important: 5 要素（Shift / Control / Alt / Meta / CapsLock）の
+    // うち Shift と CapsLock しか通っていなかった。table 駆動で全要素を回す。
+    // Meta の行だけ metaKey: true を明示している —— 実機で Meta キー自身を押すと
+    // ブラウザは event.metaKey を true にするため、これが I1（修飾キーのみで
+    // _keyDownSeen を戻す）と I3（返り値は !event.metaKey）が交差する唯一の
+    // 組み合わせになる。ここだけ「フラグが false に戻る」と「返り値が false」の
+    // 両方を同時に見る。
+    it.each([
+      { key: 'Shift', metaKey: undefined, expectedReturn: true },
+      { key: 'Control', metaKey: undefined, expectedReturn: true },
+      { key: 'Alt', metaKey: undefined, expectedReturn: true },
+      { key: 'CapsLock', metaKey: undefined, expectedReturn: true },
+      { key: 'Meta', metaKey: true, expectedReturn: false },
+    ])(
+      'key=$key → _core._keyDownSeen: false / 返り値: $expectedReturn',
+      ({ key, metaKey, expectedReturn }) => {
+        const sid = nextSurfaceId();
+        registry.ensureTerminal(sid);
+        const term = fakeOf(sid);
+        term._core = { _keyDownSeen: true };
 
-      const result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+        const result = term.customKeyEventHandler?.({ type: 'keydown', key, metaKey });
 
-      expect(term._core._keyDownSeen).toBe(false);
-      expect(result).toBe(true);
-    },
-  );
+        expect(term._core._keyDownSeen).toBe(false);
+        expect(result).toBe(expectedReturn);
+      },
+    );
+  });
 
-  it('修飾キー以外の keydown では _core._keyDownSeen に触らない（契約 §65.3 T2 / I2）', () => {
+  it('修飾キー以外の keydown では _core._keyDownSeen に触らない（契約 §65.6 T2 / I2）', () => {
     const sid = nextSurfaceId();
     registry.ensureTerminal(sid);
     const term = fakeOf(sid);
@@ -494,7 +509,7 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     expect(term._core._keyDownSeen).toBe(true);
   });
 
-  it('keyup から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.3 T5 / I4）', () => {
+  it('keyup から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.6 T5 / I4）', () => {
     const sid = nextSurfaceId();
     registry.ensureTerminal(sid);
     const term = fakeOf(sid);
@@ -505,7 +520,7 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     expect(term._core._keyDownSeen).toBe(true);
   });
 
-  it('keypress から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.3 T6 / I4）', () => {
+  it('keypress から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.6 T6 / I4）', () => {
     const sid = nextSurfaceId();
     registry.ensureTerminal(sid);
     const term = fakeOf(sid);
@@ -518,7 +533,7 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
 
   it(
     'keypress かつ修飾キー名（Shift）でも _core._keyDownSeen に触らない' +
-      '（契約 §65.3 T6 の判別力を補う。type ガード（I4）が key の一致より先に効くことを確認する）',
+      '（契約 §65.6 T6 の判別力を補う。type ガード（I4）が key の一致より先に効くことを確認する）',
     () => {
       const sid = nextSurfaceId();
       registry.ensureTerminal(sid);
@@ -532,23 +547,8 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
   );
 
   it(
-    'CapsLock も修飾キーのみとして扱い _core._keyDownSeen を false へ戻す' +
-      '（契約 §65.3 T7 / §3.2 のレーンの裁定）',
-    () => {
-      const sid = nextSurfaceId();
-      registry.ensureTerminal(sid);
-      const term = fakeOf(sid);
-      term._core = { _keyDownSeen: true };
-
-      term.customKeyEventHandler?.({ type: 'keydown', key: 'CapsLock' });
-
-      expect(term._core._keyDownSeen).toBe(false);
-    },
-  );
-
-  it(
     '_core を持たない偽 term では例外を投げず、返り値は true のまま' +
-      '（契約 §65.3 T8 / §3.3 の防御）',
+      '（契約 §65.6 T8 / §3.3 の防御）',
     () => {
       const sid = nextSurfaceId();
       registry.ensureTerminal(sid);
@@ -560,6 +560,27 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
         result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
       }).not.toThrow();
       expect(result).toBe(true);
+    },
+  );
+
+  it(
+    '_core はあるが _keyDownSeen が boolean でない偽 term では書き換えず、例外も投げない' +
+      '（契約 §65.6 T8 の亜種・fix round 1 Minor 3。版が上がって型だけ変わった形を模す。' +
+      'hasKeyDownSeenFlag が core != null だけに緩んだ場合の退行を捕まえる）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      // `_core` は在るが `_keyDownSeen` が boolean でない（版が上がって型だけ変わった形）
+      term._core = { _keyDownSeen: 'true' } as unknown as { _keyDownSeen: boolean };
+
+      let result: boolean | undefined;
+      expect(() => {
+        result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+      }).not.toThrow();
+      expect(result).toBe(true);
+      // boolean でない値を書き換えていないこと（'true' の文字列のまま）
+      expect(term._core._keyDownSeen).toBe('true');
     },
   );
 

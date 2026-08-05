@@ -41,6 +41,12 @@ interface XtermCoreKeyState {
   _keyDownSeen: boolean;
 }
 
+/**
+ * `core != null` だけでは緩すぎる（fix round 1 Minor 3）: 版が上がって
+ * `_keyDownSeen` の型だけ変わった場合（例: 文字列やオブジェクトに変わる）を
+ * 弾くために `typeof ... === 'boolean'` まで見る。緩めると §65.6 T8 の亜種
+ * （`_core` はあるが `_keyDownSeen` が boolean でない偽 term）が検出できなくなる。
+ */
 function hasKeyDownSeenFlag(core: unknown): core is XtermCoreKeyState {
   return (
     typeof core === 'object' &&
