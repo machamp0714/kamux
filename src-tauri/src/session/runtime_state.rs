@@ -103,48 +103,134 @@ mod tests {
 
     const ALL_STATES: [RuntimeState; 6] = [Running, WaitingInput, Idle, Exited, Interrupted, Error];
 
+    /// (現在状態, 入力, 遷移先 + reason の期待値)。`next_state` の戻り値の型と揃えている。
+    type TableRow = (
+        RuntimeState,
+        StateInput,
+        Option<(RuntimeState, StateReason)>,
+    );
+
     /// 設計書 M2-1 §2.2 の遷移表そのもの。66 セルすべてを列挙する。
     /// None = 遷移なし（イベント発火なし・DB 書き込みなし）
+    /// Some の第 2 要素（`StateReason`）は `next_state` の戻り値と丸ごと突き合わせる
+    /// ためのリテラル。`StateInput::reason()` から導出しない
+    /// （実装と同じ式で期待値を作ると、reason の取り違えを検出できない）。
     /// ResumeFailed 列は PtyExited 列の逐語コピー（契約 §41.3）。
-    const TABLE: [(RuntimeState, StateInput, Option<RuntimeState>); 66] = [
+    const TABLE: [TableRow; 66] = [
         // running
         (Running, In::Spawned, None),
         (Running, In::OutputActivity, None),
         (Running, In::UserInput, None),
-        (Running, In::HookNotification, Some(WaitingInput)),
-        (Running, In::HookPermission, Some(WaitingInput)),
-        (Running, In::HookStop, Some(Idle)),
-        (Running, In::PtyExited, Some(Exited)),
-        (Running, In::ResumeFailed, Some(Exited)),
-        (Running, In::UserStopped, Some(Exited)),
-        (Running, In::BelDetected, Some(WaitingInput)),
-        (Running, In::SilenceTimeout, Some(Idle)),
+        (
+            Running,
+            In::HookNotification,
+            Some((WaitingInput, StateReason::HookNotification)),
+        ),
+        (
+            Running,
+            In::HookPermission,
+            Some((WaitingInput, StateReason::HookPermission)),
+        ),
+        (Running, In::HookStop, Some((Idle, StateReason::HookStop))),
+        (
+            Running,
+            In::PtyExited,
+            Some((Exited, StateReason::PtyExited)),
+        ),
+        (
+            Running,
+            In::ResumeFailed,
+            Some((Exited, StateReason::ResumeFailed)),
+        ),
+        (
+            Running,
+            In::UserStopped,
+            Some((Exited, StateReason::UserStopped)),
+        ),
+        (
+            Running,
+            In::BelDetected,
+            Some((WaitingInput, StateReason::BelDetected)),
+        ),
+        (
+            Running,
+            In::SilenceTimeout,
+            Some((Idle, StateReason::SilenceTimeout)),
+        ),
         // waiting_input
-        (WaitingInput, In::Spawned, Some(Running)),
+        (
+            WaitingInput,
+            In::Spawned,
+            Some((Running, StateReason::Spawned)),
+        ),
         (WaitingInput, In::OutputActivity, None),
-        (WaitingInput, In::UserInput, Some(Running)),
+        (
+            WaitingInput,
+            In::UserInput,
+            Some((Running, StateReason::UserInput)),
+        ),
         (WaitingInput, In::HookNotification, None),
         (WaitingInput, In::HookPermission, None),
-        (WaitingInput, In::HookStop, Some(Idle)),
-        (WaitingInput, In::PtyExited, Some(Exited)),
-        (WaitingInput, In::ResumeFailed, Some(Exited)),
-        (WaitingInput, In::UserStopped, Some(Exited)),
+        (
+            WaitingInput,
+            In::HookStop,
+            Some((Idle, StateReason::HookStop)),
+        ),
+        (
+            WaitingInput,
+            In::PtyExited,
+            Some((Exited, StateReason::PtyExited)),
+        ),
+        (
+            WaitingInput,
+            In::ResumeFailed,
+            Some((Exited, StateReason::ResumeFailed)),
+        ),
+        (
+            WaitingInput,
+            In::UserStopped,
+            Some((Exited, StateReason::UserStopped)),
+        ),
         (WaitingInput, In::BelDetected, None),
         (WaitingInput, In::SilenceTimeout, None),
         // idle
-        (Idle, In::Spawned, Some(Running)),
-        (Idle, In::OutputActivity, Some(Running)),
-        (Idle, In::UserInput, Some(Running)),
-        (Idle, In::HookNotification, Some(WaitingInput)),
-        (Idle, In::HookPermission, Some(WaitingInput)),
+        (Idle, In::Spawned, Some((Running, StateReason::Spawned))),
+        (
+            Idle,
+            In::OutputActivity,
+            Some((Running, StateReason::OutputActivity)),
+        ),
+        (Idle, In::UserInput, Some((Running, StateReason::UserInput))),
+        (
+            Idle,
+            In::HookNotification,
+            Some((WaitingInput, StateReason::HookNotification)),
+        ),
+        (
+            Idle,
+            In::HookPermission,
+            Some((WaitingInput, StateReason::HookPermission)),
+        ),
         (Idle, In::HookStop, None),
-        (Idle, In::PtyExited, Some(Exited)),
-        (Idle, In::ResumeFailed, Some(Exited)),
-        (Idle, In::UserStopped, Some(Exited)),
-        (Idle, In::BelDetected, Some(WaitingInput)),
+        (Idle, In::PtyExited, Some((Exited, StateReason::PtyExited))),
+        (
+            Idle,
+            In::ResumeFailed,
+            Some((Exited, StateReason::ResumeFailed)),
+        ),
+        (
+            Idle,
+            In::UserStopped,
+            Some((Exited, StateReason::UserStopped)),
+        ),
+        (
+            Idle,
+            In::BelDetected,
+            Some((WaitingInput, StateReason::BelDetected)),
+        ),
         (Idle, In::SilenceTimeout, None),
         // exited
-        (Exited, In::Spawned, Some(Running)),
+        (Exited, In::Spawned, Some((Running, StateReason::Spawned))),
         (Exited, In::OutputActivity, None),
         (Exited, In::UserInput, None),
         (Exited, In::HookNotification, None),
@@ -156,7 +242,11 @@ mod tests {
         (Exited, In::BelDetected, None),
         (Exited, In::SilenceTimeout, None),
         // interrupted
-        (Interrupted, In::Spawned, Some(Running)),
+        (
+            Interrupted,
+            In::Spawned,
+            Some((Running, StateReason::Spawned)),
+        ),
         (Interrupted, In::OutputActivity, None),
         (Interrupted, In::UserInput, None),
         (Interrupted, In::HookNotification, None),
@@ -168,7 +258,7 @@ mod tests {
         (Interrupted, In::BelDetected, None),
         (Interrupted, In::SilenceTimeout, None),
         // error
-        (Error, In::Spawned, Some(Running)),
+        (Error, In::Spawned, Some((Running, StateReason::Spawned))),
         (Error, In::OutputActivity, None),
         (Error, In::UserInput, None),
         (Error, In::HookNotification, None),
@@ -206,21 +296,14 @@ mod tests {
         assert_eq!(non_transitions, 40, "遷移なしセルは 40 件のはず");
     }
 
+    /// `next_state` の戻り値（遷移先 + reason）を TABLE の期待値と丸ごと突き合わせる。
+    /// reason 側の期待値は TABLE にリテラルで書かれているため、
+    /// `StateInput::reason()` 内で reason を取り違える変異もここで検出できる。
     #[test]
     fn next_state_matches_table() {
         for (current, input, expected) in TABLE {
-            let actual = next_state(current, input).map(|(s, _)| s);
+            let actual = next_state(current, input);
             assert_eq!(actual, expected, "{:?} x {:?}", current, input);
-        }
-    }
-
-    #[test]
-    fn reason_follows_input() {
-        for (current, input, expected) in TABLE {
-            if expected.is_some() {
-                let (_, reason) = next_state(current, input).expect("遷移するはず");
-                assert_eq!(reason, input.reason(), "{:?} x {:?}", current, input);
-            }
         }
     }
 

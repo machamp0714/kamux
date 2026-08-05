@@ -238,6 +238,37 @@ mod tests {
         assert_roundtrip(SurfaceKind::Editor, "editor");
     }
 
+    /// `StateReason` は `db_enum!` を使わない手書き enum なので、上の
+    /// `assert_roundtrip` が保証する `db_enum!` 型の一致とは別に固定する必要がある
+    /// （`Deserialize` を持たないため `assert_roundtrip` は使えない）。
+    /// 契約 §33.2 の TS union（13 個の snake_case 文字列）と 1 文字も違わないこと。
+    #[test]
+    fn state_reason_matches_contract_strings() {
+        let cases: [(StateReason, &str); 13] = [
+            (StateReason::Spawned, "spawned"),
+            (StateReason::HookNotification, "hook_notification"),
+            (StateReason::HookStop, "hook_stop"),
+            (StateReason::PtyExited, "pty_exited"),
+            (StateReason::StartupNormalize, "startup_normalize"),
+            (StateReason::BelDetected, "bel_detected"),
+            (StateReason::SilenceTimeout, "silence_timeout"),
+            (StateReason::UserStopped, "user_stopped"),
+            (StateReason::OutputActivity, "output_activity"),
+            (StateReason::UserInput, "user_input"),
+            (StateReason::HookPermission, "hook_permission"),
+            (StateReason::ResumeFailed, "resume_failed"),
+            (StateReason::SpawnFailed, "spawn_failed"),
+        ];
+        for (value, expected) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "StateReason の serde 表現が契約 §33.2 と違う: {value:?}"
+            );
+        }
+    }
+
     /// serde 表現（`#[serde(rename_all = "snake_case")]` による自動導出）と
     /// DB 側の文字列（`db_enum!` 呼び出しごとに手書きする `$s` リテラル）は
     /// マクロが同一性を強制しない独立の source。この macro で、各型ごとに
