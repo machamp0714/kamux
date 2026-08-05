@@ -503,3 +503,143 @@ test('起動時復元: activeProjectId の選択・sort_order 順の描画・不
   );
   await expect(page.locator('.kanban-view')).toBeVisible();
 });
+
+// PR 14 レビュー I-1（.superpowers/sdd/M2-1-runtime-state/pr14-verdict.md）:
+// jsdom は外部 CSS を解決しないため、RuntimeBadge.test.tsx / KanbanCardError.test.tsx は
+// インライン style の var(--state-*) 参照までしか固定できず、実ブラウザでの解決結果
+// （var() の実色 / kanban.css の margin）を検証できない。ここは Vite dev server + 実 CSS +
+// chromium で走る E2E にしかできない正のアサーションを持たせる。
+//
+// 契約 §33.5（ラベル）× §53.4（色トークン）の正典。唯一の非自明点は
+// waiting_input → --state-waiting（トークン名に _input が付かない。RuntimeBadge.tsx 参照）。
+const RUNTIME_STATE_CANON: Array<{
+  sessionId: string;
+  state: string;
+  label: string;
+  token: string;
+}> = [
+  { sessionId: 's-running', state: 'running', label: '実行中', token: '--state-running' },
+  { sessionId: 's-waiting', state: 'waiting_input', label: '入力待ち', token: '--state-waiting' },
+  { sessionId: 's-idle', state: 'idle', label: 'アイドル', token: '--state-idle' },
+  { sessionId: 's-exited', state: 'exited', label: '終了', token: '--state-exited' },
+  { sessionId: 's-interrupted', state: 'interrupted', label: '中断', token: '--state-interrupted' },
+  { sessionId: 's-error', state: 'error', label: 'エラー', token: '--state-error' },
+];
+
+test('runtime バッジが実ブラウザで描かれ、var(--state-*) が実色に解決される（契約 §33.5 / §53.4）', async ({
+  page,
+}) => {
+  await page.addInitScript(
+    tauriMockScript({
+      commands: {
+        list_projects: () => [
+          { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'claude' },
+        ],
+        list_sessions: () =>
+          ['running', 'waiting_input', 'idle', 'exited', 'interrupted', 'error'].map(
+            (state, i) => ({
+              id: `s-${state === 'waiting_input' ? 'waiting' : state}`,
+              project_id: 'p1',
+              title: state,
+              description: '',
+              kanban_status: 'backlog',
+              sort_order: (i + 1) * 1000,
+              cli_kind: 'claude',
+              mode: 'worktree',
+              branch: `branch-${state}`,
+              archived_at: null,
+              last_runtime_state: state,
+              // ❌ の枠は別 spec（.kanban-card__error）の担当。ここでは badge だけを見たいので
+              // 空にしておく（KanbanCardError は message が無ければ描かない）。
+              last_runtime_error: null,
+              first_started_at: 1000,
+            }),
+          ),
+      },
+    }),
+  );
+  await page.goto('/');
+  await expect(page.locator('[data-session-id="s-running"]')).toBeVisible();
+
+  // 負の主張（.runtime-badge が 0 件）は e2e/kanban.spec.ts の共通 beforeEach が別途固定している
+  // （未起動のカードにバッジを出さない、契約 §34.6）。ここはその逆 —— 起動済みの 6 セッションに
+  // 対して実際に 6 枚描かれることを見る正の主張。
+  await expect(page.locator('.runtime-badge')).toHaveCount(RUNTIME_STATE_CANON.length);
+
+  for (const { sessionId, state, label, token } of RUNTIME_STATE_CANON) {
+    const badge = page.locator(`[data-session-id="${sessionId}"] .runtime-badge`);
+    await expect(badge).toHaveAttribute('data-runtime-state', state);
+    await expect(badge.locator('.runtime-badge__label')).toHaveText(label);
+
+    const dotColor = await badge
+      .locator('.runtime-badge__dot')
+      .evaluate((el) => getComputedStyle(el).backgroundColor);
+
+    // var(--state-*) が未解決だと、color は継承チェーンへフォールバックし
+    // token 固有の色とはズレた（が一見もっともらしい）rgb() を返す —— 「空文字/透明かどうか」
+    // だけでは検出できない。同じトークン名を直接参照した probe 要素の解決結果と
+    // 一致することだけを見る（特定の色値をハードコードしないので、テーマが変わっても通る）。
+    const expectedColor = await page.evaluate((t) => {
+      const probe = document.createElement('div');
+      probe.style.color = `var(${t})`;
+      document.body.appendChild(probe);
+      const value = getComputedStyle(probe).color;
+      probe.remove();
+      return value;
+    }, token);
+
+    expect(dotColor).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
+    expect(dotColor).toBe(expectedColor);
+  }
+});
+
+test('.kanban-card__error が実ブラウザで描かれ、生 stderr が原文で出て margin が潰れている（契約 §42.4）', async ({
+  page,
+}) => {
+  // tauriMockScript の commands はブラウザ側で toString() 経由で再評価される
+  // （外側の変数を参照するとブラウザ側では undefined になる。tauriMock.ts のコメント参照）。
+  // そのため文字列リテラルは mock 側とアサーション側の両方に重複して書く。
+  const rawStderr = 'error: failed to spawn\n  caused by: ENOENT';
+
+  await page.addInitScript(
+    tauriMockScript({
+      commands: {
+        list_projects: () => [
+          { id: 'p1', name: 'kamux', repo_path: '/tmp/kamux', default_cli: 'claude' },
+        ],
+        list_sessions: () => [
+          {
+            id: 's1',
+            project_id: 'p1',
+            title: 'fix login',
+            description: '',
+            kanban_status: 'backlog',
+            sort_order: 1000,
+            cli_kind: 'claude',
+            mode: 'worktree',
+            branch: 'fix-login',
+            archived_at: null,
+            last_runtime_state: 'error',
+            last_runtime_error: 'error: failed to spawn\n  caused by: ENOENT',
+            // 契約 §40.5: 起動に一度も成功していないセッションでも 'error' は必ず seed される
+            // （first_started_at === null の除外例外）。
+            first_started_at: null,
+          },
+        ],
+      },
+    }),
+  );
+  await page.goto('/');
+  await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
+
+  const errorBox = page.locator('.kanban-card__error');
+  await expect(errorBox).toBeVisible();
+  // toHaveText はデフォルトで空白を正規化するため、改行を含む原文の一致確認には使わない
+  // （契約 §42.4「生 stderr を原文で」）。
+  expect(await errorBox.textContent()).toBe(rawStderr);
+
+  // Task 10 fix1（kanban.css）が足した `margin: 0` の固定。<pre> の UA 既定
+  // margin: 1em 0 が復活していないこと。jsdom は外部 CSS を解決しないため
+  // KanbanCardError.test.tsx では原理的に検出できない（このテストの本題）。
+  expect(await errorBox.evaluate((el) => getComputedStyle(el).margin)).toBe('0px');
+});
