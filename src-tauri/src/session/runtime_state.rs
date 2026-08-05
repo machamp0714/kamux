@@ -135,11 +135,22 @@ pub(crate) fn write_map(m: &RwLock<StateMap>) -> RwLockWriteGuard<'_, StateMap> 
     m.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// チャネルを流れる 1 件の入力。
+/// チャネルを流れる 1 件。
+///
+/// `Error` は**遷移表を引かない帯域外イベント**である（契約 §40.2.1）。
+/// `StateInput` に `SpawnFailed` を足す形は禁止 —— 遷移表の全セルに
+/// 「どこからでも error へ飛べる」経路が生まれ、`exited` / `interrupted` からの
+/// 不正遷移を型で禁じられなくなる（契約 §2.2.1 / §40.8）。
 #[derive(Debug)]
-pub struct RuntimeEvent {
-    pub session_id: String,
-    pub input: StateInput,
+pub enum RuntimeEvent {
+    Input {
+        session_id: String,
+        input: StateInput,
+    },
+    Error {
+        session_id: String,
+        message: String,
+    },
 }
 
 /// `mpsc::Sender` は `Send` だが **`!Sync`** である。
@@ -171,7 +182,7 @@ impl RuntimeSender {
     /// session_id を直接指定して入力を送る。M2-2（hooks）/ M3-3（ヒューリスティック）用。
     /// consumer 側が落ちている場合は黙って捨てる（アプリ終了時に起きうる正常系）。
     pub fn send(&self, session_id: &str, input: StateInput) {
-        let event = RuntimeEvent {
+        let event = RuntimeEvent::Input {
             session_id: session_id.to_string(),
             input,
         };
@@ -225,6 +236,31 @@ impl RuntimeSender {
     /// 🟡 を解除できる唯一の経路であり、`running` 中の打鍵は送信前に捨てられる。
     pub fn note_user_input(&self, surface_id: &str) {
         self.note_surface(surface_id, StateInput::UserInput);
+    }
+
+    /// `error` ❌ の唯一の生成源（契約 §2 / §40）。**遷移表を経由しない。**
+    ///
+    /// 呼んでよいのは `start_session` / `resume_session` の**起動フェーズ**の Err だけで、
+    /// 許可される Err は契約 §40.3 の表（`start_session` は §63.5 が 5 段に更新済み）が
+    /// すべてである。事前条件エラー（二重起動ガードの `InvalidState` など）で呼ぶと、
+    /// `running` の上に `error` が書かれ、`error` 行は `Spawned` しか受け付けず、
+    /// ガードは PTY が生きている限り `InvalidState` を返し続けるので `Spawned` は
+    /// 永遠に来ない —— **カードが ❌ のまま永久に固着する**（契約 §40.3）。
+    /// **`spawn_editor` からは呼ばない**（契約 §40.3 / §40.8。nvim が開けないだけで
+    /// エージェントは生きている。M3-1 の担当箇所）。
+    ///
+    /// `message` は加工しない生 stderr（`AppError` の `Display`）を渡すこと（契約 §2 / §6）。
+    /// 戻り値を持たない —— 状態の確定も永続化も consumer スレッドが行い、DB 書き込みの
+    /// 失敗はログに落ちる（契約 §40.2）。呼び出し元スレッドから `states` / `persist` を
+    /// 直接書くと「DB 書き込みは consumer スレッドだけ」の単一書き手の規律が壊れ、
+    /// consumer の read→write の窓に割り込んだ `error` が上書きされうる（契約 §40.2.1）。
+    pub fn mark_error(&self, session_id: &str, message: &str) {
+        let event = RuntimeEvent::Error {
+            session_id: session_id.to_string(),
+            message: message.to_string(),
+        };
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = tx.send(event);
     }
 }
 
@@ -384,48 +420,86 @@ fn consume_loop(
             continue;
         }
 
-        // 契約 §34.5: Spawned を「観測した時点」で記録する。**遷移表を引く前に置くこと。**
-        // running + Spawned は遷移なし(None)で continue するため、
-        // 遷移後に置くとこの経路が黙って抜ける。
-        // 冪等性は DAO 側の SQL(WHERE first_started_at IS NULL)が担保する。
-        // SurfaceKind::Agent 限定は Spawned の発行元(start_session / resume_session)が
-        // すでに構造的に保証しているので、ここで surface を再チェックしない(§34.5)。
-        if ev.input == StateInput::Spawned {
-            if let Err(err) = persist.mark_first_started(&ev.session_id) {
-                eprintln!(
-                    "[kamux] failed to record first_started_at for {}: {}",
-                    ev.session_id, err
-                );
+        let (session_id, next, reason) = match ev {
+            RuntimeEvent::Input { session_id, input } => {
+                // 契約 §34.5: Spawned を「観測した時点」で記録する。**遷移表を引く前に置くこと。**
+                // running + Spawned は遷移なし(None)で continue するため、
+                // 遷移後に置くとこの経路が黙って抜ける。
+                // 冪等性は DAO 側の SQL(WHERE first_started_at IS NULL)が担保する。
+                // SurfaceKind::Agent 限定は Spawned の発行元(start_session / resume_session)が
+                // すでに構造的に保証しているので、ここで surface を再チェックしない(§34.5)。
+                if input == StateInput::Spawned {
+                    if let Err(err) = persist.mark_first_started(&session_id) {
+                        eprintln!(
+                            "[kamux] failed to record first_started_at for {}: {}",
+                            session_id, err
+                        );
+                    }
+                }
+
+                let current = read_map(&states)
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or(RuntimeState::Idle);
+
+                let Some((next, reason)) = next_state(current, input) else {
+                    continue;
+                };
+
+                // 判定から書き込みまでの間に終了が始まっていたら、ここで捨てる(最後のゲート)。
+                // メモリ・DB・observer のいずれも更新しない(計画 §4.4 の逐語)。
+                if shutting_down.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                write_map(&states).insert(session_id.clone(), next);
+
+                if let Err(err) = persist.set_last_runtime_state(&session_id, next) {
+                    // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
+                    eprintln!(
+                        "[kamux] failed to persist runtime_state for {}: {}",
+                        session_id, err
+                    );
+                }
+
+                (session_id, next, reason)
             }
-        }
 
-        let current = read_map(&states)
-            .get(&ev.session_id)
-            .copied()
-            .unwrap_or(RuntimeState::Idle);
+            // 契約 §40.2.1: 遷移表を引かない。現在状態が何であれ ❌ を確定させる
+            // (`interrupted` からの再開失敗も ❌ になる。契約 §40.4)。
+            // `mark_first_started` は呼ばない —— 起動していないのだから
+            // (契約 §34.5 / §40.5。ここで立てると「最初の spawn **成功**の記録」という
+            // `first_started_at` の意味が壊れ、M3-3 以降が誤読する)。
+            RuntimeEvent::Error {
+                session_id,
+                message,
+            } => {
+                // Input 経路とまったく同じ最後のゲート。ここは先頭ゲートの直後だが、
+                // `shutting_down` は他スレッドがいつでも立てるので、書き込みへ最も
+                // 近い位置での再確認として残す(計画 §4.4 / 契約 §40.2.1「ゲートは
+                // Input 経路とまったく同じにする」)。
+                if shutting_down.load(Ordering::SeqCst) {
+                    continue;
+                }
 
-        let Some((next, reason)) = next_state(current, ev.input) else {
-            continue;
+                write_map(&states).insert(session_id.clone(), RuntimeState::Error);
+
+                // `set_last_runtime_state(id, Error)` は使わない ——
+                // メッセージの無い error 行ができる(契約 §17 / §38.8)。
+                if let Err(err) = persist.set_runtime_error(&session_id, &message) {
+                    // Input 経路と同じ: DB 書き込み失敗で状態機械を止めない。
+                    eprintln!(
+                        "[kamux] failed to persist runtime_error for {}: {}",
+                        session_id, err
+                    );
+                }
+
+                (session_id, RuntimeState::Error, StateReason::SpawnFailed)
+            }
         };
 
-        // 判定から書き込みまでの間に終了が始まっていたら、ここで捨てる(最後のゲート)。
-        // メモリ・DB・observer のいずれも更新しない(計画 §4.4 の逐語)。
-        if shutting_down.load(Ordering::SeqCst) {
-            continue;
-        }
-
-        write_map(&states).insert(ev.session_id.clone(), next);
-
-        if let Err(err) = persist.set_last_runtime_state(&ev.session_id, next) {
-            // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
-            eprintln!(
-                "[kamux] failed to persist runtime_state for {}: {}",
-                ev.session_id, err
-            );
-        }
-
         let payload = SessionStatePayload {
-            session_id: ev.session_id,
+            session_id,
             runtime_state: next,
             reason,
         };
@@ -820,10 +894,14 @@ mod tests {
         (RuntimeSender::new(states, Arc::new(Mutex::new(tx))), rx)
     }
 
-    /// `RuntimeEvent` は Task 11 で enum になる（契約 §40.2.1）。フィールドアクセスをここへ
-    /// 集約し、enum 化時の書き換え面を 6 箇所から 1 箇所に減らす（lane-controller 指定）。
+    /// `RuntimeEvent` は Task 11 で enum になった（契約 §40.2.1）。フィールドアクセスを
+    /// ここへ集約してあったので、enum 化の書き換え面はこの 1 箇所で済む。
+    /// `Input` 以外が来たら panic する（この節のテストは `Input` しか送らない）。
     fn expect_input(ev: RuntimeEvent) -> (String, StateInput) {
-        (ev.session_id, ev.input)
+        match ev {
+            RuntimeEvent::Input { session_id, input } => (session_id, input),
+            other => panic!("expected Input, got {other:?}"),
+        }
     }
 
     /// `AppState` に `Arc<RuntimeStateManager>` を載せるため、Tauri の
@@ -946,6 +1024,13 @@ mod tests {
         }
         fn reads(&self) -> Vec<String> {
             self.reads.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+        /// 契約 §38.7 の申し送り → §40.6 で確定。`writes()` / `first_started()` と同じ形。
+        fn errors(&self) -> Vec<(String, String)> {
+            self.errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
         fn first_started(&self) -> Vec<String> {
             self.first_started
@@ -1667,6 +1752,95 @@ mod tests {
         // ユーザーが打鍵したら 🟢 に戻る
         sender.note_user_input("s1:agent");
         assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    // --- Task 11: `mark_error` —— `error` ❌ への唯一の到達経路（契約 §40） ---
+
+    /// ❌ は遷移表を経由せずに確定し、生 stderr が永続化され、SpawnFailed で emit される。
+    #[test]
+    fn mark_error_sets_error_state_with_raw_message() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        sender.mark_error("s1", "claude: command not found\n");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert_eq!(
+            persist.errors(),
+            vec![("s1".to_string(), "claude: command not found\n".to_string())],
+            "stderr は加工せずそのまま渡す（契約 §2 / §6）"
+        );
+        // set_last_runtime_state 経由で書いてはいけない（メッセージの無い error 行ができる）
+        assert!(persist.writes().is_empty());
+        assert!(wait_until(|| obs.seen().len() == 1));
+        assert_eq!(obs.seen()[0].1, RuntimeState::Error);
+        assert_eq!(obs.seen()[0].2, StateReason::SpawnFailed);
+    }
+
+    /// 起動していないのだから first_started_at は立てない（契約 §34.5 / §40.5）。
+    #[test]
+    fn mark_error_does_not_record_first_started() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        mgr.sender().mark_error("s1", "boom");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert!(persist.first_started().is_empty());
+        assert_eq!(persist.first_started_calls(), 0);
+    }
+
+    /// ❌ から抜けられるのは Spawned だけ。他の入力では ❌ のまま。
+    #[test]
+    fn error_state_is_left_only_by_spawned() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.mark_error("s1", "boom");
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+
+        // 遅れて届く PTY 終了や hook で ❌ を上書きしない
+        sender.send("s1", In::PtyExited);
+        sender.send("s1", In::HookNotification);
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(mgr.current("s1"), RuntimeState::Error);
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    /// 中断中のセッションの再開失敗も ❌ になる（契約 §40.4。M2-1 §4.12 の決着）。
+    #[test]
+    fn mark_error_overwrites_interrupted() {
+        let persist = FakePersist::with_rows(&[("s1", Running)]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        mgr.normalize_on_startup().expect("normalize");
+        assert_eq!(mgr.current("s1"), RuntimeState::Interrupted);
+
+        mgr.sender().mark_error("s1", "cwd not found");
+
+        assert!(wait_until(|| mgr.current("s1") == RuntimeState::Error));
+        assert_eq!(persist.errors().len(), 1);
+    }
+
+    /// 終了処理が始まったら ❌ も書かない（Input 経路と同じゲート）。
+    #[test]
+    fn mark_error_is_dropped_after_begin_shutdown() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+
+        mgr.begin_shutdown();
+        mgr.sender().mark_error("s1", "boom");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(persist.errors().is_empty());
+        assert_eq!(mgr.current("s1"), RuntimeState::Idle);
     }
 
     /// 大量打鍵しても、running 中の UserInput は送信前に捨てられる。

@@ -54,111 +54,143 @@ fn plan_agent_spawn_with(
     let mut session = state.store.get_session(id)?;
     let project = state.store.get_project(&session.project_id)?;
 
-    // 実行ファイルを解決する（契約 §18。claude/codex 未検出はここで CliNotFound）。
-    // `binary_name` は Claude / Codex だけ `Some` を返す。Shell と Custom は**両方**
-    // `None` を返す —— Custom は `cli_args::build_launch_command` の Custom の腕が
-    // `$SHELL -l -c "<cli_command>"` を組む（シェル経由起動）ため、Shell と同じ
-    // ログインシェルへ意図的に相乗りさせている。`None` を「シェルだから」と早合点して
-    // Custom を別経路に倒すと、Custom セッションが誤ったプログラムへ飛ぶ
-    // （Task 7 レビューが名指しで警告した事故）。
+    // ここから下が「起動フェーズ」= これから PTY を上げようとして上げられなかった区間
+    // である。**この即時実行クロージャの中で起きた `Err` だけが ❌ になる**
+    // （契約 §40.3 の許可リスト。`start_session` の列挙は §63.5 が 5 段に更新した:
+    // `resolve_program` / `prepare_worktree` / `set_worktree` / `build_launch_command` /
+    // `PtyManager::spawn`。5 段目だけはこの関数の外（`start_session`）にある）。
     //
-    // **`prepare_worktree`（下）より前に解決すること。** 根拠は「`claude` 未検出という
-    // 最も日常的な失敗で、worktree という副作用（git ブランチ作成・ディレクトリ作成）を
-    // 作らずに済むこと」である（契約 §63.4 の 1 段目の理由）。ここが `prepare_worktree`
-    // より後ろだと、claude 未インストール環境で「worktree はディスク上に作られたが
-    // CliNotFound で spawn まで届かない」状態になる。
+    // **上の二重起動ガード（`InvalidState`）と `get_session` / `get_project` を
+    // ここへ入れてはいけない。** 判定基準は「その `Err` の時点でセッションが起動して
+    // いないことが確実か」であり（契約 §40.3。§63.5 でも 1 文字も変わっていない）、
+    // 事前条件エラーは「すでに上がっている」ことの表明である。生きているセッションに
+    // ❌ を書くと、`error` 行は `Spawned` しか受け付けず、ガードは PTY が生きている
+    // 限り `InvalidState` を返し続けるので `Spawned` は永遠に来ない —— カードが ❌ の
+    // まま永久に固着する。
     //
-    // `branch` は NULL でありうる（契約 §62 案 D）。ユーザーがブランチ欄を編集していなければ
-    // `sessionForm.ts` は `create_session` へ `branch: null` を送る —— `proposeBranchName`
-    // の出力は入力欄の表示にのみ使われ、DB へは焼かれない。`prepare_worktree` は
-    // `session.branch == None` のとき `suggest_branch_name` で空いている名前を確定する。
-    //
-    // `set_worktree`（下）は `prepare_worktree` の直後、spawn より前で呼ばれる
-    // （契約 §63.1 / §63.4）。設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）
-    // の適用範囲は契約 §63.1 により `kanban_status` / `sort_order` に限定されている
-    // —— `branch` / `worktree_path` はこの解決の直後、spawn 成功より前に永続化される。
-    //
-    // `start_session` の起動フェーズの順序（契約 §63.4。順序の根拠はコード上ここにしか
-    // 無い —— 契約 §63.6 は `prepare_worktree` に `&Store` を持たせるチョークポイント化を
-    // 却下し、代わりに置くものとしてこの順序規則そのものを選んだ）:
-    //   1. resolve_program（副作用が無く cwd にも依存しないので最初に置く）
-    //   2. prepare_worktree
-    //   3. Store::set_worktree
-    //   4. build_launch_command
-    //   5. PtyManager::spawn
-    let program = match binary_name(session.cli_kind) {
-        Some(name) => resolve(name)?.display().to_string(),
-        None => login_shell(),
-    };
+    // cwd の `is_dir()` 検証（下）は §40.3 が名前で列挙した 5 段のどれでもないが、
+    // `set_worktree` と `build_launch_command` の**間**にある起動フェーズの一部であり、
+    // spawn より前なのでセッションは確実に起動していない。§40.3 の判定基準に照らして
+    // クロージャの中に置く（そもそも portable-pty が cwd を黙って $HOME へ倒すのを
+    // 防ぐための spawn の前提条件チェックであり、5 段目の一部と読むのが素直である）。
+    let planned = (|| -> AppResult<SpawnSpec> {
+        // 実行ファイルを解決する（契約 §18。claude/codex 未検出はここで CliNotFound）。
+        // `binary_name` は Claude / Codex だけ `Some` を返す。Shell と Custom は**両方**
+        // `None` を返す —— Custom は `cli_args::build_launch_command` の Custom の腕が
+        // `$SHELL -l -c "<cli_command>"` を組む（シェル経由起動）ため、Shell と同じ
+        // ログインシェルへ意図的に相乗りさせている。`None` を「シェルだから」と早合点して
+        // Custom を別経路に倒すと、Custom セッションが誤ったプログラムへ飛ぶ
+        // （Task 7 レビューが名指しで警告した事故）。
+        //
+        // **`prepare_worktree`（下）より前に解決すること。** 根拠は「`claude` 未検出という
+        // 最も日常的な失敗で、worktree という副作用（git ブランチ作成・ディレクトリ作成）を
+        // 作らずに済むこと」である（契約 §63.4 の 1 段目の理由）。ここが `prepare_worktree`
+        // より後ろだと、claude 未インストール環境で「worktree はディスク上に作られたが
+        // CliNotFound で spawn まで届かない」状態になる。
+        //
+        // `branch` は NULL でありうる（契約 §62 案 D）。ユーザーがブランチ欄を編集していなければ
+        // `sessionForm.ts` は `create_session` へ `branch: null` を送る —— `proposeBranchName`
+        // の出力は入力欄の表示にのみ使われ、DB へは焼かれない。`prepare_worktree` は
+        // `session.branch == None` のとき `suggest_branch_name` で空いている名前を確定する。
+        //
+        // `set_worktree`（下）は `prepare_worktree` の直後、spawn より前で呼ばれる
+        // （契約 §63.1 / §63.4）。設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）
+        // の適用範囲は契約 §63.1 により `kanban_status` / `sort_order` に限定されている
+        // —— `branch` / `worktree_path` はこの解決の直後、spawn 成功より前に永続化される。
+        //
+        // `start_session` の起動フェーズの順序（契約 §63.4。順序の根拠はコード上ここにしか
+        // 無い —— 契約 §63.6 は `prepare_worktree` に `&Store` を持たせるチョークポイント化を
+        // 却下し、代わりに置くものとしてこの順序規則そのものを選んだ）:
+        //   1. resolve_program（副作用が無く cwd にも依存しないので最初に置く）
+        //   2. prepare_worktree
+        //   3. Store::set_worktree
+        //   4. build_launch_command
+        //   5. PtyManager::spawn
+        let program = match binary_name(session.cli_kind) {
+            Some(name) => resolve(name)?.display().to_string(),
+            None => login_shell(),
+        };
 
-    // worktree モードなら必要に応じて worktree を作る/再利用し、in_place ならそのまま
-    // repo_path を返す（契約 §13 / 設計判断 8）。`session.branch` / `session.worktree_path`
-    // をここで in-memory に確定させる。
-    let cwd = prepare_worktree(&project, &mut session)?;
+        // worktree モードなら必要に応じて worktree を作る/再利用し、in_place ならそのまま
+        // repo_path を返す（契約 §13 / 設計判断 8）。`session.branch` / `session.worktree_path`
+        // をここで in-memory に確定させる。
+        let cwd = prepare_worktree(&project, &mut session)?;
 
-    // 契約 §63.1 / §63.4: `branch` / `worktree_path` の永続化は `prepare_worktree` が
-    // `Ok` を返した直後、これ以降のどの失敗しうる処理（cwd の `is_dir()` 検証・
-    // `build_launch_command`・`PtyManager::spawn`）よりも前に行う。
-    //
-    // 設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）は
-    // `kanban_status` / `sort_order` にのみ適用される —— 判断 6 が守ろうとしたのは
-    // 「カードが In Progress へ飛ぶのは DB が嘘をつくことに等しい」であり、対象は
-    // 列移動だけである。`branch` / `worktree_path` は性質が逆で、ディスク上に実在する
-    // worktree を DB に記録するのだから、書けば DB は真実に近づき、書かなければ嘘を
-    // つく。ここで書かずに `build_launch_command` や `spawn` が失敗すると、worktree と
-    // git ブランチはディスク上に残ったまま DB には記録されず、`resolve_cwd`（M3-1 の
-    // エディタ）がリポジトリ直上を開く・resume（M2-4）が `InvalidState` で弾かれる・
-    // 判断 8 の再利用腕が同じ branch で `create_worktree` を再試行して
-    // 「branch already exists」により恒久的に起動不能になる、という害が生じる
-    // （契約 §63 が実測した 5 つの消費者のうち複数）。
-    //
-    // `Store::update_session` の SET 句は title/description/kanban_status/sort_order/
-    // archived_at/updated_at だけで branch/worktree_path を含まない
-    // （`session_dao.rs` 実測）。`set_worktree` を別途呼ばない限りここで確定させた値は
-    // DB に残らず、次回起動でまた新規 worktree を作ってしまう。worktree モードなら
-    // 常に両方 Some、in_place なら常に両方 None なので `if let` の両側同時成立だけを
-    // 見ればよい。失敗（`AppError::NotFound` 等）は `?` で中断し、セッションを
-    // 起動しない —— DB に書けなかった worktree で起動を続けると、この関数が
-    // 埋めようとした真実性の穴がそのまま残る。
-    if let (Some(branch), Some(worktree_path)) = (&session.branch, &session.worktree_path) {
-        state
-            .store
-            .set_worktree(&session.id, branch, worktree_path)?;
-    }
+        // 契約 §63.1 / §63.4: `branch` / `worktree_path` の永続化は `prepare_worktree` が
+        // `Ok` を返した直後、これ以降のどの失敗しうる処理（cwd の `is_dir()` 検証・
+        // `build_launch_command`・`PtyManager::spawn`）よりも前に行う。
+        //
+        // 設計判断 6（「spawn が `Ok` を返した後にのみ DB を更新する」）は
+        // `kanban_status` / `sort_order` にのみ適用される —— 判断 6 が守ろうとしたのは
+        // 「カードが In Progress へ飛ぶのは DB が嘘をつくことに等しい」であり、対象は
+        // 列移動だけである。`branch` / `worktree_path` は性質が逆で、ディスク上に実在する
+        // worktree を DB に記録するのだから、書けば DB は真実に近づき、書かなければ嘘を
+        // つく。ここで書かずに `build_launch_command` や `spawn` が失敗すると、worktree と
+        // git ブランチはディスク上に残ったまま DB には記録されず、`resolve_cwd`（M3-1 の
+        // エディタ）がリポジトリ直上を開く・resume（M2-4）が `InvalidState` で弾かれる・
+        // 判断 8 の再利用腕が同じ branch で `create_worktree` を再試行して
+        // 「branch already exists」により恒久的に起動不能になる、という害が生じる
+        // （契約 §63 が実測した 5 つの消費者のうち複数）。
+        //
+        // `Store::update_session` の SET 句は title/description/kanban_status/sort_order/
+        // archived_at/updated_at だけで branch/worktree_path を含まない
+        // （`session_dao.rs` 実測）。`set_worktree` を別途呼ばない限りここで確定させた値は
+        // DB に残らず、次回起動でまた新規 worktree を作ってしまう。worktree モードなら
+        // 常に両方 Some、in_place なら常に両方 None なので `if let` の両側同時成立だけを
+        // 見ればよい。失敗（`AppError::NotFound` 等）は `?` で中断し、セッションを
+        // 起動しない —— DB に書けなかった worktree で起動を続けると、この関数が
+        // 埋めようとした真実性の穴がそのまま残る。
+        if let (Some(branch), Some(worktree_path)) = (&session.branch, &session.worktree_path) {
+            state
+                .store
+                .set_worktree(&session.id, branch, worktree_path)?;
+        }
 
-    // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:502-507）は
-    // cwd を `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリ
-    // でなければ `.unwrap_or(home.as_ref())`（cmdbuilder.rs:507）で chdir を一度も試みず
-    // 黙って $HOME へフォールバックする（stderr も出ない）。したがって spawn 前のここでの
-    // 検証だけが、この経路でユーザーに失敗を報告できる唯一の手段になる。述語は
-    // portable-pty の filter と逐語で一致させる必要があり、`exists()` にすると通常ファイルの
-    // cwd がここを素通りして結局 $HOME に落ちる（直したつもりの再発）ため `is_dir()` を使う。
-    //
-    // worktree モードでは `prepare_worktree` 自身が既に cwd の実在を保証している
-    // （新規作成は git が、既存の再利用は `is_dir()` チェックが担う）ので、この安全網が
-    // 実際に効くのは in_place モードで `project.repo_path` が消えている場合だけである
-    // （`prepare_worktree` の in_place 腕は検証せずそのまま返すため）。
-    if !cwd.is_dir() {
-        return Err(AppError::InvalidState(format!(
-            "working directory does not exist or is not a directory: {}",
-            cwd.display()
-        )));
-    }
+        // portable-pty 0.9.0 の `CommandBuilder::as_command()`（cmdbuilder.rs:502-507）は
+        // cwd を `.filter(|dir| std::path::Path::new(dir).is_dir())` で検証し、ディレクトリ
+        // でなければ `.unwrap_or(home.as_ref())`（cmdbuilder.rs:507）で chdir を一度も試みず
+        // 黙って $HOME へフォールバックする（stderr も出ない）。したがって spawn 前のここでの
+        // 検証だけが、この経路でユーザーに失敗を報告できる唯一の手段になる。述語は
+        // portable-pty の filter と逐語で一致させる必要があり、`exists()` にすると通常ファイルの
+        // cwd がここを素通りして結局 $HOME に落ちる（直したつもりの再発）ため `is_dir()` を使う。
+        //
+        // worktree モードでは `prepare_worktree` 自身が既に cwd の実在を保証している
+        // （新規作成は git が、既存の再利用は `is_dir()` チェックが担う）ので、この安全網が
+        // 実際に効くのは in_place モードで `project.repo_path` が消えている場合だけである
+        // （`prepare_worktree` の in_place 腕は検証せずそのまま返すため）。
+        if !cwd.is_dir() {
+            return Err(AppError::InvalidState(format!(
+                "working directory does not exist or is not a directory: {}",
+                cwd.display()
+            )));
+        }
 
-    // 起動コマンドを組み立てる（契約 §23 の純粋関数）。
-    // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
-    let launch = build_launch_command(&session, &program, &cwd, launch_env, ResumeMode::None)?;
+        // 起動コマンドを組み立てる（契約 §23 の純粋関数）。
+        // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
+        let launch = build_launch_command(&session, &program, &cwd, launch_env, ResumeMode::None)?;
 
-    let spec = SpawnSpec {
-        surface_id: sid,
-        program: launch.program.to_string_lossy().into_owned(),
-        // KAMUX_SESSION_ID / PATH / LANG は build_launch_command が入れている。
-        // ここでは push しない（契約 §23「呼び出し側は一切 push しない」）。
-        env: launch.env,
-        args: launch.args,
-        cwd: launch.cwd,
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
+        Ok(SpawnSpec {
+            surface_id: sid,
+            program: launch.program.to_string_lossy().into_owned(),
+            // KAMUX_SESSION_ID / PATH / LANG は build_launch_command が入れている。
+            // ここでは push しない（契約 §23「呼び出し側は一切 push しない」）。
+            env: launch.env,
+            args: launch.args,
+            cwd: launch.cwd,
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+        })
+    })();
+
+    let spec = match planned {
+        Ok(spec) => spec,
+        Err(err) => {
+            // 契約 §40.3 / §63.5: 起動フェーズの Err を ❌ にする唯一の場所。
+            // 生 stderr（`AppError` の `Display`）を加工せずそのまま残す（契約 §2 / §6）。
+            // トーストは数秒で消えるがカードには痕跡が残る —— それが `error` の存在理由。
+            state.runtime.sender().mark_error(id, &err.to_string());
+            return Err(err);
+        }
     };
 
     Ok((session, spec))
@@ -228,13 +260,24 @@ pub async fn start_session(
     app: AppHandle,
     id: String,
 ) -> AppResult<Session> {
+    // 起動フェーズ 1〜4 段（`resolve_program` / `prepare_worktree` / `set_worktree` /
+    // `build_launch_command`）の Err に対する `mark_error` は `plan_agent_spawn_with` の
+    // 中で済んでいる（契約 §40.3 / §63.5）。事前条件（二重起動ガード）と
+    // `get_session` / `get_project` の Err はそこで ❌ の対象から外れている。
     let (mut session, spec) = plan_agent_spawn(&state, &id)?;
     // AppHandle に依存する行はこの 1 行だけ（設計判断 6: spawn 成功後にのみ DB を書く）。
     // `state.pty.spawn` が Wry 固定（契約 §15）で MockRuntime に登録できないため、
     // 「spawn 成功後にのみ commit_started_session を呼ぶ」という順序はユニットテストでは
     // 担保できない。この 3 行の構造そのもの（`?` の早期リターンが commit の手前にあること）
     // を目視レビューで担保する（レビュー指摘 M-1）。
-    state.pty.spawn(&app, spec)?;
+    //
+    // **起動フェーズの 5 段目**（契約 §63.4 / §63.5）。ここだけは `plan_agent_spawn_with`
+    // の外にあるので、`mark_error` もここで呼ぶ。同じ理由（Wry 固定）でユニットテストから
+    // 到達できないため、この 4 行も目視レビューで担保する。
+    if let Err(err) = state.pty.spawn(&app, spec) {
+        state.runtime.sender().mark_error(&id, &err.to_string());
+        return Err(err);
+    }
     // kanban_status の backlog -> in_progress は M1-4 の責務（`commit_started_session`）。
     // ここでは runtime_state だけを動かす。PTY 終了の検知は `sink.rs` が全 spawn 経路を
     // カバーするので、ここでの登録は不要。
@@ -1084,6 +1127,196 @@ mod tests {
             reloaded.last_runtime_state,
             RuntimeState::Running,
             "M1-4 は last_runtime_state を書いてはならない（判断 7）"
+        );
+    }
+
+    // ---- Task 11: mark_error の許可リスト（契約 §40.3 + §63.5）----
+    //
+    // `mark_error` は非同期（consumer スレッド）なので、正の主張は成立を待ち、
+    // 負の主張は素の sleep で待つ（契約 §69.1 / §69.2）。
+
+    /// 正の主張用。consumer が ❌ を確定させるまで待つ。
+    fn wait_for_error_state(state: &AppState, session_id: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state.runtime.current(session_id) == RuntimeState::Error {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        state.runtime.current(session_id) == RuntimeState::Error
+    }
+
+    /// 契約 §40.3 の恒久ハングの入口。**このテストが許可リストの本体を守っている。**
+    ///
+    /// 生きているセッションのカードを二度押しすると二重起動ガードが
+    /// `AppError::InvalidState` を返す。ここで `mark_error` を呼ぶと `running` の上に
+    /// `error` が書かれ、`error` 行は `Spawned` しか受け付けず、ガードは PTY が生きて
+    /// いる限り `InvalidState` を返し続けるので `Spawned` は永遠に来ない。`PtyExited` も
+    /// `error` からは禁止で、`normalize_on_startup` は `{running, waiting_input}` しか
+    /// 触らないため再起動でも消えない —— **カードが ❌ のまま永久に固着する。**
+    #[test]
+    fn plan_agent_spawn_does_not_mark_error_when_the_double_start_guard_rejects() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = TestRepo::new();
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project("kamux", repo.path().to_str().expect("utf8"), CliKind::Shell)
+            .expect("insert project");
+        let session = Session::new_backlog(
+            &project.id,
+            "fix login bug",
+            "",
+            SessionMode::Worktree,
+            None,
+            CliKind::Shell,
+            None,
+            1.0,
+            now_ms(),
+        );
+        let session = store.insert_session(&session).expect("insert session");
+        let state = crate::state::test_support::app_state(store);
+        let sid = surface_id(&session.id, SurfaceKind::Agent);
+
+        struct NoopSink;
+        impl PtySink for NoopSink {
+            fn on_data(&self, _surface_id: &str, _base64: String, _seq: u64) {}
+            fn on_exit(&self, _surface_id: &str, _exit_code: Option<i32>) {}
+        }
+        state
+            .pty
+            .spawn_with_sink(
+                Arc::new(NoopSink),
+                SpawnSpec {
+                    surface_id: sid.clone(),
+                    program: "/bin/cat".to_string(),
+                    args: Vec::new(),
+                    cwd: PathBuf::from("/tmp"),
+                    env: Vec::new(),
+                    cols: DEFAULT_COLS,
+                    rows: DEFAULT_ROWS,
+                },
+            )
+            .expect("spawn stub surface");
+        // 生きているセッションが 🟢 であることを模す（❌ が「上書き」になる状況を作る）
+        state
+            .runtime
+            .sender()
+            .send(&session.id, StateInput::Spawned);
+        assert!(
+            {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                let mut seen = false;
+                while std::time::Instant::now() < deadline && !seen {
+                    seen = state.runtime.current(&session.id) == RuntimeState::Running;
+                    if !seen {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                seen
+            },
+            "前提: 二度押しの前にセッションが running になっていること"
+        );
+
+        let err = plan(&state, &session.id).expect_err("must reject the double start");
+        assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            state.runtime.current(&session.id),
+            RuntimeState::Running,
+            "二重起動ガードの InvalidState で ❌ を書いてはいけない（契約 §40.3 の恒久ハング）"
+        );
+        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        assert_eq!(reloaded.last_runtime_error, None);
+
+        state.pty.kill(&sid).expect("cleanup stub surface");
+    }
+
+    /// 許可リストの「呼ばない」側 2 件目: `get_session` の `NotFound`（契約 §40.3）。
+    #[test]
+    fn plan_agent_spawn_does_not_mark_error_when_the_session_is_not_found() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, _session) =
+            build_state_without_worktree("/tmp/kamux-test-repo", SessionMode::InPlace);
+
+        let err = plan(&state, "no-such-session").expect_err("must fail with NotFound");
+        assert!(matches!(err, AppError::NotFound(_)), "actual: {err:?}");
+
+        // 負の主張なので待つ条件が作れない（契約 §69.2）
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            state.runtime.current("no-such-session"),
+            RuntimeState::Idle,
+            "get_session の NotFound は起動フェーズではない（契約 §40.3）"
+        );
+    }
+
+    /// 起動フェーズ 1 段目（`resolve_program`）の Err は ❌ になる。
+    /// 生 stderr（`AppError` の `Display`）を加工せずそのまま渡すことも固定する
+    /// （契約 §2 / §6 / §40.3）。
+    #[test]
+    fn plan_agent_spawn_marks_error_when_the_binary_cannot_be_resolved() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+
+        let failing_resolve =
+            |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("claude".to_string())) };
+        let err = plan_agent_spawn_with(&state, &session.id, &fake_launch_env(), failing_resolve)
+            .expect_err("must fail when the binary cannot be resolved");
+
+        assert!(wait_for_error_state(&state, &session.id));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reloaded = state.store.get_session(&session.id).expect("get_session");
+        while std::time::Instant::now() < deadline && reloaded.last_runtime_error.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            reloaded = state.store.get_session(&session.id).expect("get_session");
+        }
+        assert_eq!(
+            reloaded.last_runtime_error,
+            Some(err.to_string()),
+            "AppError の Display をそのまま残す（契約 §2 / §6）"
+        );
+        assert_eq!(reloaded.last_runtime_state, RuntimeState::Error);
+    }
+
+    /// **契約 §63.5 の 5 段目**（§40.3 の表は「4 つ」のままだが、`set_worktree` が
+    /// spawn より前へ移った分だけ起動フェーズが 1 つ増えている）。
+    ///
+    /// `set_worktree` は `prepare_worktree` の直後・spawn より前なので、その `Err` の
+    /// 時点でセッションは**確実に起動していない** —— §40.3 の判定基準に照らして ❌ の
+    /// 対象である。`PRAGMA query_only` は接続ごとの設定で、読みは通し書きだけを
+    /// `SQLITE_READONLY` で落とすため、`get_session` / `get_project` を通過させた上で
+    /// `set_worktree` だけを決定的に失敗させられる（実 DB を壊さない唯一の seam）。
+    #[test]
+    fn plan_agent_spawn_marks_error_when_set_worktree_fails() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Shell, None);
+
+        state
+            .store
+            .conn()
+            .expect("conn")
+            .execute_batch("PRAGMA query_only = ON;")
+            .expect("enable query_only");
+
+        let err = plan(&state, &session.id).expect_err("set_worktree must fail");
+        assert!(matches!(err, AppError::Db(_)), "actual: {err:?}");
+
+        assert!(
+            wait_for_error_state(&state, &session.id),
+            "set_worktree の Err は起動フェーズの失敗なので ❌ にする（契約 §63.5）"
         );
     }
 }
