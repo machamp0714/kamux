@@ -45,11 +45,20 @@ const { FakeTerminal, FakeFitAddon, FakeWebglAddon, FakeCanvasAddon } = vi.hoist
       this.onBinaryHandlers.push(cb);
     }
 
-    customKeyEventHandler: ((event: { metaKey: boolean }) => boolean) | null = null;
+    // 契約 §65.6 T1〜T8: `type` / `key` は手当ての判定に使う。`metaKey` は既存の
+    // Cmd 系テスト（452 行目）のため省略可能のまま残す。
+    customKeyEventHandler:
+      ((event: { type?: string; key?: string; metaKey?: boolean }) => boolean) | null = null;
 
-    attachCustomKeyEventHandler(handler: (event: { metaKey: boolean }) => boolean): void {
+    attachCustomKeyEventHandler(
+      handler: (event: { type?: string; key?: string; metaKey?: boolean }) => boolean,
+    ): void {
       this.customKeyEventHandler = handler;
     }
+
+    // 契約 §65.12: 実体は `_core` の下にある。初期値は未設定（T8 が検査する
+    // 「_core を持たない偽 term」はこのデフォルトのままにする）。
+    _core?: { _keyDownSeen: boolean };
 
     open(): void {
       // jsdom では実描画しない
@@ -457,6 +466,102 @@ describe('契約規定の配線（fix round 1 で追加）', () => {
     expect(term.customKeyEventHandler?.({ metaKey: true })).toBe(false);
     expect(term.customKeyEventHandler?.({ metaKey: false })).toBe(true);
   });
+
+  it(
+    '修飾キーのみの keydown で _core._keyDownSeen を false へ戻し、返り値は true のまま' +
+      '（契約 §65.3 T1 / I1）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term._core = { _keyDownSeen: true };
+
+      const result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+
+      expect(term._core._keyDownSeen).toBe(false);
+      expect(result).toBe(true);
+    },
+  );
+
+  it('修飾キー以外の keydown では _core._keyDownSeen に触らない（契約 §65.3 T2 / I2）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keydown', key: 'a' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it('keyup から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.3 T5 / I4）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keyup', key: 'Shift' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it('keypress から呼ばれたときは _core._keyDownSeen に触らない（契約 §65.3 T6 / I4）', () => {
+    const sid = nextSurfaceId();
+    registry.ensureTerminal(sid);
+    const term = fakeOf(sid);
+    term._core = { _keyDownSeen: true };
+
+    term.customKeyEventHandler?.({ type: 'keypress', key: 'a' });
+
+    expect(term._core._keyDownSeen).toBe(true);
+  });
+
+  it(
+    'keypress かつ修飾キー名（Shift）でも _core._keyDownSeen に触らない' +
+      '（契約 §65.3 T6 の判別力を補う。type ガード（I4）が key の一致より先に効くことを確認する）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term._core = { _keyDownSeen: true };
+
+      term.customKeyEventHandler?.({ type: 'keypress', key: 'Shift' });
+
+      expect(term._core._keyDownSeen).toBe(true);
+    },
+  );
+
+  it(
+    'CapsLock も修飾キーのみとして扱い _core._keyDownSeen を false へ戻す' +
+      '（契約 §65.3 T7 / §3.2 のレーンの裁定）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      term._core = { _keyDownSeen: true };
+
+      term.customKeyEventHandler?.({ type: 'keydown', key: 'CapsLock' });
+
+      expect(term._core._keyDownSeen).toBe(false);
+    },
+  );
+
+  it(
+    '_core を持たない偽 term では例外を投げず、返り値は true のまま' +
+      '（契約 §65.3 T8 / §3.3 の防御）',
+    () => {
+      const sid = nextSurfaceId();
+      registry.ensureTerminal(sid);
+      const term = fakeOf(sid);
+      // term._core は未設定のまま（デフォルトで undefined）
+
+      let result: boolean | undefined;
+      expect(() => {
+        result = term.customKeyEventHandler?.({ type: 'keydown', key: 'Shift' });
+      }).not.toThrow();
+      expect(result).toBe(true);
+    },
+  );
 
   it('detachTerminal は WebGL アドオンを dispose して DOM レンダラへ降格する（計画 §2.4）', () => {
     const sid = nextSurfaceId();
