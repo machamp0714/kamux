@@ -9,6 +9,7 @@ import { listenFocus } from './ipc/events';
 import { bootstrap, useAppStore } from './store';
 import { selectSessionIdsKey } from './store/sessionSlice';
 import { toAppError } from './store/uiSlice';
+import { EditorView } from './views/EditorView';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
 import { TerminalView } from './views/TerminalView';
@@ -53,9 +54,7 @@ export default function App() {
       <ProjectBar />
       {view === 'kanban' ? <KanbanView /> : null}
       {view === 'terminal' && <TerminalView />}
-      {view === 'editor' ? (
-        <div className="app__placeholder">エディタ画面は M3-1 で実装します</div>
-      ) : null}
+      {view === 'editor' && <EditorView />}
       <SessionFormModal />
       <ErrorToast />
     </div>

@@ -348,7 +348,10 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     // （M1-3 以降が Cmd+2 を足したら、そちらから戻るケースを追加する）。
     await page.keyboard.press('Meta+1');
     await expect(board).toBeVisible();
-    await expect(page.locator('.app__placeholder')).toHaveCount(0);
+    // M3-1 Task 7 が .app__placeholder（view === 'editor' の仮表示）を実物の
+    // EditorView に置き換えたので、同じ意図（エディタ画面へ落ちていないこと）を
+    // そのクラス名で見る。消えたクラスを見続けると恒真の assert になる
+    await expect(page.locator('.kamux-editor-view')).toHaveCount(0);
   });
 });
 

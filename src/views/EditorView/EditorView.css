@@ -1,0 +1,118 @@
+/* 値の正典は src/styles/tokens.css、寸法と役割の正典は
+   .claude/skills/kamux-design-system/components.md（契約 §53.3 / §53.5）。
+   色・余白・文字サイズ・角丸・影・フォントの literal を書かない。
+   テーマ分岐（@media (prefers-color-scheme)）も書かない —— tokens.css が持っている。 */
+
+.kamux-editor-view {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  /* xterm の下地なのでターミナル面のトークン（テーマ非依存） */
+  background: var(--bg-terminal);
+}
+
+/* attachTerminal に渡すコンテナ。中の .kamux-term-host には触らない（契約 §57.4） */
+.editor-surface {
+  position: absolute;
+  inset: 0;
+}
+
+/* 終了・エラー・上限の 3 種で共有する下部オーバーレイ。
+   PTY 終了直前の画面を背後に残すため半透明にする（設計判断 D4） */
+.editor-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-scrim);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-6) var(--space-8);
+  background: var(--scrim);
+  /* --scrim はテーマ非依存（常に暗い）。テーマ追従の --text-primary を乗せると
+     light テーマでコントラストが崩れるので、ターミナル面のトークン系統を使う
+     （TerminalView.css の .terminal-pane-slot__empty と同じ理由） */
+  color: var(--text-term);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+}
+
+.editor-overlay p {
+  margin: 0;
+}
+
+.editor-overlay code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-term);
+}
+
+.editor-overlay__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* components.md「トースト」: 生の stderr は原文のまま --bg-terminal のブロックへ */
+.editor-overlay__detail {
+  align-self: stretch;
+  margin: 0;
+  padding: var(--space-4);
+  overflow: auto;
+  background: var(--bg-terminal);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-term-dim);
+  white-space: pre-wrap;
+}
+
+/* components.md「ボタン」の 主（控えめ）。--accent-soft と --accent は同じテーマ側で
+   組になるので、テーマ非依存のスクリムの上でも組み合わせのコントラストが保たれる */
+.editor-overlay button {
+  padding: var(--space-4) var(--space-7);
+  border: none;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* components.md「空状態」: 縦積み。説明は「何ができるか」を書く。
+   ここはターミナル面ではなくアプリの地（--bg-app）の上に出るのでテーマ追従のトークン */
+.editor-empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-7);
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+}
+
+.editor-empty p {
+  margin: 0;
+}
+
+.editor-empty kbd {
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+}
