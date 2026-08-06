@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { resizePty, spawnEditor } from '../../ipc/commands';
 import { onPtyExit } from '../../ipc/events';
@@ -45,10 +45,16 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
   // 当てる。「マウント時に 1 度評価する」ではなく modal の遷移に追従する必要があるため、
   // ここで購読してフォーカス専用 effect の依存にする（下の第 2 effect）
   const modal = useAppStore((s) => s.modal);
+  // フォーカスは attachTerminal の**後**でしか効かない（それまで host は display:none で、
+  // xterm の textarea も term.open() されるまで存在しない）。EditorSurface の attach は
+  // 購読の解決を待つぶん effect の同期部分より後ろにずれるので、その完了を状態にして
+  // フォーカス effect の依存に入れる。TerminalPane は attach が同期なのでこれが要らない
+  const [attached, setAttached] = useState(false);
 
   useEffect(() => {
     const sid = surfaceId(sessionId, 'editor');
     let cancelled = false;
+    setAttached(false);
     let unlistenExit: (() => void) | null = null;
 
     const run = async () => {
@@ -88,7 +94,9 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
         attachTerminal(sid, container);
         fitAndResize(sid, container);
         // ★ term.focus() はここでは呼ばない（契約 §16 / §11.4.6）。
-        //   フォーカスは下の「フォーカス専用 effect」が modal の遷移に追従して当てる
+        //   フォーカスは下の「フォーカス専用 effect」が modal の遷移に追従して当てる。
+        //   ここでは「当てられる状態になった」ことだけを伝える
+        setAttached(true);
       }
 
       // 起動済み / 起動中 / エラー確定なら spawn しない（リトライループを作らない）。
@@ -147,10 +155,11 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
   // detach → attach が走り、契約 §16 が定めた detach/attach の用途から外れる）。
   // nvim はフォーカスが来ないと一切操作できない。
   // 実装の形は src/views/TerminalView/TerminalPane.tsx の第 2 effect に合わせてある
+  // （attached の段だけが追加分。上の useState のコメントを参照）
   useEffect(() => {
-    if (modal !== null) return;
+    if (!attached || modal !== null) return;
     getTerminal(surfaceId(sessionId, 'editor'))?.focus();
-  }, [sessionId, modal]);
+  }, [sessionId, modal, attached]);
 
   return <div ref={containerRef} className="editor-surface" />;
 }

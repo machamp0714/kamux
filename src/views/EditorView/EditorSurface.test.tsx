@@ -271,6 +271,35 @@ describe('EditorSurface（契約 §16 / §11.4.6: modal === null のときにだ
     expect(focus).toHaveBeenCalledTimes(1);
   });
 
+  /**
+   * TerminalPane は attachTerminal を effect の同期部分で呼ぶので、後続の
+   * フォーカス effect が走る時点で host は既に開いている。EditorSurface の
+   * attachTerminal は購読の解決を待つ（契約 §16）ぶんだけ後ろにずれるため、
+   * マウント直後に focus() しても display:none の host に当たって何も起きない
+   * ——「effect は走ったのにフォーカスは無い」という一番気づきにくい形になる。
+   */
+  it('attachTerminal が済むまでフォーカスを当てない（済んだ直後に当てる）', async () => {
+    const focus = vi.fn();
+    mocks.getTerminal.mockReturnValue({ focus });
+    let resolveSub: () => void = () => {};
+    mocks.ensurePtySubscription.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveSub = resolve;
+      }),
+    );
+
+    renderSurface('s1');
+    await flush();
+    expect(mocks.attachTerminal).not.toHaveBeenCalled();
+    expect(focus).not.toHaveBeenCalled();
+
+    resolveSub();
+    await flush();
+
+    expect(mocks.attachTerminal).toHaveBeenCalledWith('s1:editor', expect.any(HTMLElement));
+    expect(focus).toHaveBeenCalledTimes(1);
+  });
+
   it('modal が開いていれば focus しない（打鍵が nvim へ流れるのを防ぐ）', async () => {
     const focus = vi.fn();
     mocks.getTerminal.mockReturnValue({ focus });
