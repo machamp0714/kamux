@@ -1863,4 +1863,89 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
     }
+
+    /// 事故 1: nvim を :q してもカードが ⛔ にならない（契約 §2）。
+    #[test]
+    fn editor_exit_does_not_mark_the_session_exited() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+
+        // ユーザーが nvim を :qa した
+        sender.note_pty_exit("s1:editor");
+        // 「起きてほしくない遷移」への猶予。wait_until にできない(契約 §69.2)
+        std::thread::sleep(Duration::from_millis(50));
+
+        // claude はまだ動いているので 🟢 のまま
+        assert_eq!(mgr.current("s1"), Running);
+    }
+
+    /// 事故 2: エディタの出力活動が idle を running に戻さない（契約 §2）。
+    /// nvim はカーソル移動のたびに出力するため、これを弾かないと
+    /// 「エディタを開いているだけで永遠に 🟢」になり ⚪ / 🟡 バッジが無意味になる。
+    #[test]
+    fn editor_output_does_not_revive_an_idle_session() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+        sender.send("s1", In::HookStop);
+        assert!(wait_until(|| mgr.current("s1") == Idle));
+
+        // エディタでカーソルを動かし続けた相当
+        for _ in 0..100 {
+            sender.note_surface("s1:editor", In::OutputActivity);
+        }
+        // 同上。負の主張なので待つ条件が作れない(契約 §69.2)
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(mgr.current("s1"), Idle);
+    }
+
+    /// 対照群: 同じ入力でも agent サーフェスなら遷移する（フィルタが効き過ぎていない）。
+    #[test]
+    fn agent_output_does_revive_an_idle_session() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+        sender.send("s1", In::HookStop);
+        assert!(wait_until(|| mgr.current("s1") == Idle));
+
+        sender.note_surface("s1:agent", In::OutputActivity);
+        assert!(wait_until(|| mgr.current("s1") == Running));
+    }
+
+    /// エディタ由来の事象は DB にも書かれない（設計書 §12「DB が嘘をつかない」）。
+    #[test]
+    fn editor_events_never_reach_the_database() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let sender = mgr.sender();
+
+        sender.send("s1", In::Spawned);
+        // 契約 §69: 観測対象は persist なので、persist が期待値に達するまで待つ。
+        // mgr.current() を待って persist を assert すると、副作用順が
+        // memory → DB である分だけ DB 書き込みが遅れ、CI 負荷で落ちる。
+        assert!(wait_until(
+            || persist.writes() == vec![("s1".to_string(), Running)]
+        ));
+
+        sender.note_surface("s1:editor", In::OutputActivity);
+        sender.note_pty_exit("s1:editor");
+        // ここの sleep は「起きてほしくない作用」への猶予である(待つ条件が作れない)。
+        // wait_until に置き換えないこと —— 置き換えると条件成立と同時に抜けてしまい、
+        // 誤った書き込みが後から来ても検出できなくなる(契約 §69.2)。
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Spawned による 1 回だけ。エディタ由来の書き込みは 1 件も無い
+        assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+    }
 }
