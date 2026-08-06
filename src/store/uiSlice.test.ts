@@ -9,7 +9,7 @@ vi.mock('../ipc/commands', () => ({
 }));
 
 import { useAppStore } from './index';
-import { toAppError } from './uiSlice';
+import { reduceEditorSurfaces, toAppError, type EditorSurfaceStatus } from './uiSlice';
 
 // createUiSlice が実際に生成する初期値をプリミティブとして捕獲する。
 // beforeEach で 'kanban' を書き戻すと「初期ビューはカンバン」テストが
@@ -162,6 +162,51 @@ describe('uiSlice のエラー', () => {
     expect(useAppStore.getState().lastError).toEqual({ code: 'db', message: 'disk full' });
     useAppStore.getState().setError(null);
     expect(useAppStore.getState().lastError).toBeNull();
+  });
+});
+
+describe('reduceEditorSurfaces', () => {
+  it('新しい状態を追加する', () => {
+    expect(reduceEditorSurfaces({}, 's1', { kind: 'spawning' })).toEqual({
+      s1: { kind: 'spawning' },
+    });
+  });
+
+  it('他のセッションの状態を壊さない', () => {
+    const current: Record<string, EditorSurfaceStatus> = { s1: { kind: 'live' } };
+    const next = reduceEditorSurfaces(current, 's2', { kind: 'spawning' });
+    expect(next.s1).toEqual({ kind: 'live' });
+    expect(next.s2).toEqual({ kind: 'spawning' });
+    expect(next).not.toBe(current);
+  });
+
+  it('null で削除する', () => {
+    const current: Record<string, EditorSurfaceStatus> = {
+      s1: { kind: 'live' },
+      s2: { kind: 'live' },
+    };
+    expect(reduceEditorSurfaces(current, 's1', null)).toEqual({ s2: { kind: 'live' } });
+  });
+
+  it('存在しないキーの削除は同じ参照を返す（再描画しない）', () => {
+    const current: Record<string, EditorSurfaceStatus> = { s1: { kind: 'live' } };
+    expect(reduceEditorSurfaces(current, 's2', null)).toBe(current);
+  });
+
+  it('同じ内容の再設定は同じ参照を返す', () => {
+    const current: Record<string, EditorSurfaceStatus> = { s1: { kind: 'live' } };
+    expect(reduceEditorSurfaces(current, 's1', { kind: 'live' })).toBe(current);
+
+    const exited: Record<string, EditorSurfaceStatus> = { s1: { kind: 'exited', exitCode: 0 } };
+    expect(reduceEditorSurfaces(exited, 's1', { kind: 'exited', exitCode: 0 })).toBe(exited);
+  });
+
+  it('内容が変われば新しい参照を返す', () => {
+    const exited: Record<string, EditorSurfaceStatus> = { s1: { kind: 'exited', exitCode: 0 } };
+    expect(reduceEditorSurfaces(exited, 's1', { kind: 'exited', exitCode: 1 })).not.toBe(exited);
+
+    const errored: Record<string, EditorSurfaceStatus> = { s1: { kind: 'error', message: 'a' } };
+    expect(reduceEditorSurfaces(errored, 's1', { kind: 'error', message: 'b' })).not.toBe(errored);
   });
 });
 
