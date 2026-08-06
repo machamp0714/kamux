@@ -4,10 +4,10 @@ use crate::pty::launch_env::LaunchEnv;
 pub const EDITOR_FALLBACK_LANG: &str = "en_US.UTF-8";
 
 // EDITOR_TERM / EDITOR_COLORTERM は**置かない**(契約 §60.6 / §60.8)。
-// TERM / COLORTERM の所有は PtySurface::spawn であり、src-tauri/src/pty/surface.rs の
-// `cmd.env("TERM", …)` の隣に 1 行ずつ並ぶ。ここに定数を置くと真実源が 2 箇所になり、
-// spec.env が後から適用される(cmd.env(key, value) のループがそれより後にある)ぶん、
-// 契約に行を持たない側が黙って勝つ。
+// TERM / COLORTERM はここに入れない。所有は `PtySurface::spawn`(契約 §60.6.1 / §60.6.2)。
+// あちらの env 設定行の隣に 1 行ずつ並ぶ。ここに定数を置くと真実源が 2 箇所になり、
+// spec.env はその設定より後に適用される(spec.env を書き込むループがそれより後にある)
+// ぶん、契約に行を持たない側が黙って勝つ。
 // 検査 10(契約 §60.6.4)が「TERM / COLORTERM を設定するファイルはちょうど 1 つ」を見ている。
 
 /// nvim 用 PTY に注入する環境変数(契約 §15: 既存環境を継承した上で上書きされる)。
