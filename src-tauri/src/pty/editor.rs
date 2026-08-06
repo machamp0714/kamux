@@ -82,8 +82,11 @@ pub fn decide_editor_spawn(target: &str, live: &[String], max: usize) -> EditorS
 /// 呼び出し側が `state.pty.spawn(&app, spec)` を呼ぶ。この分割は `session/mod.rs` の
 /// `plan_agent_spawn_with` と同じ理由による —— 契約 §15 の `PtyManager::spawn` は
 /// `AppHandle<Wry>` 固定で `MockRuntime` から呼べないため、それより前の組み立てだけを
-/// 切り出せばユニットテストで固定できる(契約 §60.4 の注入版 seam。フェーズ境界を
-/// 越えて参照されないためモジュール内部に留める)。
+/// 切り出せばユニットテストで固定できる。§60.4 が M3-1 向けに名指しした注入版 seam は
+/// `resolve_program_in` / `probe_login_env_with`(§18 の追補)であり、この `plan_*_with`
+/// 形式そのものではない —— ここで §60.4 に従っているのは「フェーズ境界を越えて
+/// 参照されないため非公開に留める」という原則の部分であり、`session/mod.rs:33` の
+/// `plan_agent_spawn_with` と同形の DI を plan 層に置いた、というのが正確な言い方。
 #[derive(Debug)]
 enum EditorSpawnPlan {
     AlreadyLive(String),
@@ -155,8 +158,9 @@ fn plan_editor_spawn_with(
     }))
 }
 
-/// `plan_editor_spawn_with` の実環境版。契約 §18 の公開 API へ委譲する薄いラッパ
-/// (契約 §60.4)。
+/// `plan_editor_spawn_with` の実環境版。`session/mod.rs:199` の `plan_agent_spawn` と
+/// 同型の薄いラッパで、契約 §18 の公開 API(`probe_login_env` / `resolve_program`)へ
+/// 委譲する。
 fn plan_editor_spawn(state: &AppState, session_id: &str) -> AppResult<EditorSpawnPlan> {
     plan_editor_spawn_with(state, session_id, probe_login_env(), resolve_program)
 }
@@ -269,6 +273,10 @@ mod tests {
         assert!(is_editor_surface("abc:editor"));
         assert!(!is_editor_surface("abc:agent"));
         assert!(!is_editor_surface("editor"));
+        // Task 3 レビュー Minor #4: ":editor" を「末尾」ではなく「部分文字列」として
+        // 含むだけの入力("abc:editorial" は ":editor" を substring に持つ)。
+        // `ends_with` → `contains` の変異はこの入力が無いと生き残る。
+        assert!(!is_editor_surface("abc:editorial"));
         let live = ids(&["a:agent", "a:editor", "b:agent", "b:editor", "c:agent"]);
         assert_eq!(count_live_editor_surfaces(&live), 2);
     }
@@ -353,20 +361,37 @@ mod tests {
     /// テスト用に実 session/project を 1 件挿入した `AppState` を返す。
     /// `repo_path` は呼び出し側が既存/不在いずれのパスも渡せる
     /// (存在検証は `plan_editor_spawn_with` 側の仕事なので、ここでは検証しない)。
-    fn app_state_with_session(repo_path: &str) -> (tempfile::TempDir, AppState, Session) {
+    ///
+    /// `worktree` が `Some((branch, worktree_path))` なら `store.set_worktree` を当てて
+    /// `resolve_cwd`(契約 §23)の `Some` 分岐(worktree モード)を、`None` なら
+    /// `repo_path` を使う分岐(in_place)を踏む。I-1 レビュー指摘: 新規 4 テストの
+    /// フィクスチャが `worktree_path: None` しか作っていなかったため、
+    /// `resolve_cwd(&session, &project.repo_path)` を `PathBuf::from(&project.repo_path)`
+    /// に変異させても全緑のまま通っていた。この 1 つの関数の型に両方の分岐を持たせ、
+    /// 呼び出し側が明示的に選ぶ形にする。
+    fn app_state_with_session(
+        repo_path: &str,
+        worktree: Option<(&str, &str)>,
+    ) -> (tempfile::TempDir, AppState, Session) {
         let (dir, store) = open_temp();
         let project_id = store
             .insert_project("kamux", repo_path, CliKind::Claude)
             .expect("insert_project")
             .id;
         let session = insert_test_session(&store, &project_id, "edit target");
+        if let Some((branch, worktree_path)) = worktree {
+            store
+                .set_worktree(&session.id, branch, worktree_path)
+                .expect("set_worktree");
+        }
         (dir, app_state(store), session)
     }
 
     #[test]
     fn plan_editor_spawn_with_builds_a_spawn_spec_from_the_resolved_program_and_repo_cwd() {
         let repo = tempfile::tempdir().expect("tempdir");
-        let (_dir, state, session) = app_state_with_session(repo.path().to_str().expect("utf8"));
+        let (_dir, state, session) =
+            app_state_with_session(repo.path().to_str().expect("utf8"), None);
 
         let plan = plan_editor_spawn_with(
             &state,
@@ -399,11 +424,72 @@ mod tests {
         assert_eq!(env_of(&spec.env, "LANG").as_deref(), Some("ja_JP.UTF-8"));
     }
 
+    /// I-1: `_and_repo_cwd`(上のテスト)と対になる worktree 側。契約 §23 の
+    /// `resolve_cwd` は `worktree_path` が `Some` ならそちらを、`None` なら
+    /// `repo_path` を返す(00-contracts.md:6518: 取り違えると「エディタが worktree
+    /// ではなくリポジトリ直上で開く」障害になり、ユーザーは気づけない)。
+    /// リポジトリ側の `repo_path` はあえて worktree とは別の(存在しない)場所にし、
+    /// `resolve_cwd` を `PathBuf::from(&project.repo_path)` に取り違えたら
+    /// `cwd.is_dir()` チェックで Err になって検出できるようにする。
+    #[test]
+    fn plan_editor_spawn_with_builds_a_spawn_spec_from_the_resolved_program_and_worktree_cwd() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let non_worktree_repo_path = repo_root.path().join("repo-path-must-not-be-used");
+        let worktree = tempfile::tempdir().expect("tempdir");
+        let (_dir, state, session) = app_state_with_session(
+            non_worktree_repo_path.to_str().expect("utf8"),
+            Some((
+                "session/fix-editor-cwd",
+                worktree.path().to_str().expect("utf8"),
+            )),
+        );
+
+        let plan = plan_editor_spawn_with(
+            &state,
+            &session.id,
+            &launch("/usr/bin", "ja_JP.UTF-8"),
+            |_| Ok(PathBuf::from("/fake/bin/nvim")),
+        )
+        .expect("plan");
+
+        let spec = match plan {
+            EditorSpawnPlan::Spawn(spec) => spec,
+            EditorSpawnPlan::AlreadyLive(sid) => panic!("expected Spawn, got AlreadyLive({sid})"),
+        };
+        assert_eq!(spec.cwd, worktree.path());
+    }
+
+    /// I-2: 契約 §18(M3-1 は独自のガイド文を組み立てない)/ §19(nvim 未検出は
+    /// `CliNotFound`)。`resolve("nvim")?` の `Err` を `AppError::InvalidState` へ
+    /// 包み直すと、上限超過(同じ `InvalidState` 型。editor.rs 107 行目)と
+    /// 見分けが付かなくなる(118-119 行目のコメントが警戒している症状そのもの)。
+    /// `session/mod.rs:637`
+    /// (`plan_agent_spawn_does_not_create_a_worktree_when_the_binary_cannot_be_resolved`)
+    /// と同型の透過確認。
+    #[test]
+    fn plan_editor_spawn_with_lets_cli_not_found_pass_through_unwrapped() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (_dir, state, session) =
+            app_state_with_session(repo.path().to_str().expect("utf8"), None);
+
+        let failing_resolve =
+            |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("nvim".to_string())) };
+        let err = plan_editor_spawn_with(
+            &state,
+            &session.id,
+            &launch("/usr/bin", "C"),
+            failing_resolve,
+        )
+        .expect_err("must fail when nvim cannot be resolved");
+
+        assert!(matches!(err, AppError::CliNotFound(_)), "actual: {err:?}");
+    }
+
     #[test]
     fn plan_editor_spawn_with_rejects_when_the_work_tree_directory_is_missing() {
         let repo = tempfile::tempdir().expect("tempdir");
         let missing = repo.path().join("does-not-exist");
-        let (_dir, state, session) = app_state_with_session(missing.to_str().expect("utf8"));
+        let (_dir, state, session) = app_state_with_session(missing.to_str().expect("utf8"), None);
 
         let err = plan_editor_spawn_with(&state, &session.id, &launch("/usr/bin", "C"), |_| {
             panic!("must not resolve nvim before the cwd check")
