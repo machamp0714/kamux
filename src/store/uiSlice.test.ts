@@ -210,6 +210,30 @@ describe('reduceEditorSurfaces', () => {
   });
 });
 
+describe('setEditorSurface（ストア action。reduceEditorSurfaces への配線を守る）', () => {
+  beforeEach(() => {
+    useAppStore.setState({ editorSurfaces: {} });
+  });
+
+  it('setEditorSurface がストアの editorSurfaces を更新する', () => {
+    useAppStore.getState().setEditorSurface('s1', { kind: 'spawning' });
+    expect(useAppStore.getState().editorSurfaces).toEqual({ s1: { kind: 'spawning' } });
+  });
+
+  it('setEditorSurface(id, null) でそのセッションのエントリを削除する（再起動経路が使う）', () => {
+    useAppStore.setState({ editorSurfaces: { s1: { kind: 'live' }, s2: { kind: 'live' } } });
+    useAppStore.getState().setEditorSurface('s1', null);
+    expect(useAppStore.getState().editorSurfaces).toEqual({ s2: { kind: 'live' } });
+  });
+
+  it('同じ内容の再設定はストアの editorSurfaces を同じ参照のまま保つ（§25.5 の不変条件）', () => {
+    useAppStore.setState({ editorSurfaces: { s1: { kind: 'live' } } });
+    const before = useAppStore.getState().editorSurfaces;
+    useAppStore.getState().setEditorSurface('s1', { kind: 'live' });
+    expect(useAppStore.getState().editorSurfaces).toBe(before);
+  });
+});
+
 describe('toAppError', () => {
   it('Rust から来た AppError 形状はそのまま通す', () => {
     expect(toAppError({ code: 'git', message: 'fatal: bad revision' })).toEqual({
