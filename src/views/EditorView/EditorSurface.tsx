@@ -126,6 +126,12 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
       //   再起動する以外に復旧手段が無くなる
       try {
         await spawnEditor(sessionId);
+        // exited を上書きしないための epoch ガードは意図的に置いていない。
+        // pty://exit は spawn_editor が生成した子プロセスの終了後に emit されるため、
+        // その発生はこの spawnEditor 呼び出しの応答より厳密に後であり、exited が
+        // 先に書かれる経路が無い(Rust 側 src-tauri/src/pty/editor.rs の
+        // EditorSpawnPlan::Spawn の返却地点に対になる注記がある)。
+        // spawn_editor が子プロセス起動の直後に返らなくなったら、この前提は崩れる。
         useAppStore.getState().setEditorSurface(sessionId, { kind: 'live' });
       } catch (e) {
         useAppStore
