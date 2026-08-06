@@ -67,3 +67,7 @@ export const resizePty = (surfaceId: string, cols: number, rows: number): Promis
 
 export const ackPty = (surfaceId: string, seq: number): Promise<void> =>
   invoke('ack_pty', { surfaceId, seq });
+
+/** nvim 用 PTY を遅延起動し surface_id を返す。既に起動済みなら同じ値を返す。 */
+export const spawnEditor = (sessionId: string): Promise<string> =>
+  invoke('spawn_editor', { sessionId });

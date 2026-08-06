@@ -375,6 +375,7 @@ pub fn run() {
             session::start_session,
             session::stop_session,
             session::suggest_branch_name,
+            crate::pty::editor::spawn_editor,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build kamux");
