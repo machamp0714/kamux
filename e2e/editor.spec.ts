@@ -2,19 +2,20 @@ import { expect, test, type Page } from '@playwright/test';
 import { tauriMockScript } from './support/tauriMock';
 
 /**
- * M3-1 Task 7 の E2E。守るのは 3 本だけである（契約 §26.3: E2E はユニットテストの
- * 代替ではない。純関数に切り出せるものは vitest 側で見る）。
+ * M3-1 Task 7 の E2E。**DOM とライブラリと実 CSS を跨ぐ経路だけ**を置く
+ * （契約 §26.3: E2E はユニットテストの代替ではない。純関数に切り出せるものは vitest 側）。
  *
  *  1. モーダル表示中はエディタへ打鍵が飛ばない（契約 §16 の modal === null 規則）
  *  2. モーダルを閉じた後は飛ぶ（同規則の「modal の遷移に追従する」側）
- *  3. 手動スモーク 33-a: spawn_editor が CliNotFound で reject したとき、
+ *  3. EditorView.css が実ブラウザで解決され、xterm のコンテナがビューを埋める
+ *     （契約 §76.6。fix round 1 で追加）
+ *  4. 手動スモーク 33-a: spawn_editor が CliNotFound で reject したとき、
  *     ガイド付きエラーが描画されアプリが落ちない（契約 §80.2 の層 2）
  *
  * 再起動経路（pty://exit → 再起動オーバーレイ）はここでは踏まない。
- * tauriMock の `plugin:event|unlisten` はイベント名ごとにハンドラ配列を丸ごと消すため、
- * `pty://exit/{sid}` に載る 2 ハンドラ（ptyBridge と EditorSurface）が
- * EditorSurface の cleanup 1 回で両方死ぬ。合成 emit の経路はモック都合の
- * 挙動を見ることになるので、再起動は EditorView.test.tsx（vitest）側で守る。
+ * `pty://exit/{sid}` には ptyBridge と EditorSurface の 2 者が購読しており、
+ * 合成 emit と解除の順序・id の対応がモック実装の都合に依存する。
+ * 再起動は EditorView.test.tsx（vitest）側で守る。
  */
 
 /** 契約 §5: surface_id は `${sessionId}:${kind}`。エディタ画面は 'editor' サーフェス。 */
@@ -167,13 +168,40 @@ test.describe('エディタ画面（Cmd+3 到達 + フォーカスの段）', ()
           ).length,
       )
       .toBe(1);
+  });
 
-    // 打鍵は届いているのに画面が潰れている、を拾える唯一の地点。
-    // xterm の helper textarea は寸法ゼロでもフォーカスできるため、上の assert だけでは
-    // レイアウト崩れ（.kamux-editor-view の高さが 0）を検出できない
-    const box = await page.locator('.editor-surface').boundingBox();
-    expect(box?.height ?? 0).toBeGreaterThan(0);
-    expect(box?.width ?? 0).toBeGreaterThan(0);
+  /**
+   * `EditorView.css` が実ブラウザで解決されていることを見る（契約 §76.6: 「実 CSS が
+   * 解決されること」は E2E で自動化する。Vite dev server + 実 CSS + chromium）。
+   *
+   * **`height > 0` では守れない。** xterm は自前の CSS を持つので、`EditorView.css` を
+   * 外しても `.editor-surface` は xterm の内容分の高さ（既定 80x24 ぶん）を持つ
+   * ——「高さがある」は「レイアウトが効いている」ではない（実測: 665 → 288 に退化しても
+   * `> 0` は緑のまま）。
+   *
+   * **viewport 依存の絶対値は固定しない**（次にレイアウトを触った人に理由の分からない
+   * 赤を出さないため）。代わりに、このスタイルシートだけが与える 2 つの関係を見る:
+   *   - `.kamux-editor-view` が `position: relative`（オーバーレイの包含ブロック）
+   *   - `.editor-surface` が `position: absolute` + `inset: 0` の結果として**親を埋める**
+   */
+  test('EditorView.css が解決され、xterm のコンテナがビューを埋める', async ({ page }) => {
+    await page.addInitScript(commonInitScript());
+    await gotoEditorView(page);
+
+    const view = page.locator('.kamux-editor-view');
+    const surface = page.locator('.editor-surface');
+
+    // オーバーレイ（終了・エラー・上限）の絶対配置はこの包含ブロックに依存する
+    await expect(view).toHaveCSS('position', 'relative');
+    await expect(surface).toHaveCSS('position', 'absolute');
+
+    const viewBox = await view.boundingBox();
+    const surfaceBox = await surface.boundingBox();
+    // 退化の検出用。ヘッダ 1 本ぶんより明らかに大きいことだけを要求する
+    expect(viewBox?.height ?? 0).toBeGreaterThan(100);
+    // inset: 0 の帰結。親の高さ / 幅と一致する（絶対値ではなく関係を見ている）
+    expect(surfaceBox?.height ?? 0).toBeCloseTo(viewBox?.height ?? -1, 0);
+    expect(surfaceBox?.width ?? 0).toBeCloseTo(viewBox?.width ?? -1, 0);
   });
 });
 

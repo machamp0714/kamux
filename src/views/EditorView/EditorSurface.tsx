@@ -116,15 +116,21 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
       if (store.editorSurfaces[sessionId] !== undefined) return;
       store.setEditorSurface(sessionId, { kind: 'spawning' });
 
+      // ★ ここには cancelled ガードを置かない（fix round 1・Important 1）。
+      //   cancelled が守るのは「アンマウント済みコンポーネントの DOM 操作」であって、
+      //   editorSurfaces は sessionId をキーにしたグローバルストアであり
+      //   コンポーネントの寿命とは無関係である。in-flight 中に Cmd+2 で画面を離れると、
+      //   抑止した場合は spawning のまま固まる —— 再び Cmd+3 しても上の「登録済み」
+      //   ガードで再試行されず、starting にはオーバーレイが無いのでエラー表示も
+      //   再試行ボタンも出ない。editorSurfaces は永続化されないため、アプリを
+      //   再起動する以外に復旧手段が無くなる
       try {
         await spawnEditor(sessionId);
-        if (!cancelled) useAppStore.getState().setEditorSurface(sessionId, { kind: 'live' });
+        useAppStore.getState().setEditorSurface(sessionId, { kind: 'live' });
       } catch (e) {
-        if (!cancelled) {
-          useAppStore
-            .getState()
-            .setEditorSurface(sessionId, { kind: 'error', message: toAppError(e).message });
-        }
+        useAppStore
+          .getState()
+          .setEditorSurface(sessionId, { kind: 'error', message: toAppError(e).message });
       }
     };
 

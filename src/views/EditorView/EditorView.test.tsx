@@ -198,6 +198,33 @@ describe('EditorView（上限エラー: 枠を空ける導線を出す）', () =
     expect(useAppStore.getState().view).toBe('editor');
   });
 
+  /**
+   * 一覧に出してよいのは `live` だけである。`spawning`（まだ枠を取れていない）や
+   * `error`（自分自身の失敗）を混ぜると、「そこで :qa すれば枠が空く」という案内が
+   * 嘘になる —— とくに先頭に出るのは**いま失敗しているセッション自身**である。
+   */
+  it('一覧に出るのは live のものだけ（起動中・失敗したものは出さない）', async () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session('s1', 'セッション 1'),
+        s2: session('s2', 'セッション 2'),
+        s3: session('s3', 'セッション 3'),
+      },
+      editorSurfaces: {
+        s1: { kind: 'error', message: 'editor limit reached: at most 3 nvim instances' },
+        s2: { kind: 'live' },
+        s3: { kind: 'spawning' },
+      },
+    });
+
+    await render();
+
+    const items = Array.from(container.querySelectorAll('.editor-overlay__list button')).map(
+      (b) => b.textContent,
+    );
+    expect(items).toEqual(['セッション 2']);
+  });
+
   it('上限エラーでは生の message を貼らない（案内文で置き換える）', async () => {
     await render();
 

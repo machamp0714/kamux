@@ -350,8 +350,12 @@ test.describe('カンバン操作（共通の 1 プロジェクト・2 セッシ
     await expect(board).toBeVisible();
     // M3-1 Task 7 が .app__placeholder（view === 'editor' の仮表示）を実物の
     // EditorView に置き換えたので、同じ意図（エディタ画面へ落ちていないこと）を
-    // そのクラス名で見る。消えたクラスを見続けると恒真の assert になる
-    await expect(page.locator('.kamux-editor-view')).toHaveCount(0);
+    // そのクラス名で見る。**両方の姿を見ること** —— EditorView は
+    // focusedSessionId の有無で .kamux-editor-view / .editor-empty のどちらかを描く。
+    // この経路ではカードを 1 枚もクリックしていないので focusedSessionId は null であり、
+    // .kamux-editor-view だけを見ると App.tsx の view 分岐を外す変異でも緑のまま
+    // （= 恒真の assert）になる。実測して赤くなることを確認済み（fix round 1）
+    await expect(page.locator('.kamux-editor-view, .editor-empty')).toHaveCount(0);
   });
 });
 

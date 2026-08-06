@@ -193,6 +193,62 @@ describe('EditorSurface（遅延起動は 1 セッション 1 回）', () => {
     expect(mocks.attachTerminal).toHaveBeenCalledWith('s1:editor', expect.any(HTMLElement));
   });
 
+  /**
+   * `cancelled` は「アンマウント済みコンポーネントの DOM 操作を避ける」ための旗であって、
+   * `editorSurfaces` はコンポーネントの寿命と無関係なグローバルストア（キーは sessionId）
+   * である。in-flight 中に Cmd+2 で画面を離れると、書き込みを抑止した場合は
+   * `spawning` のまま固まる —— 再び Cmd+3 しても「登録済み」ガードで再試行されず、
+   * `starting` にはオーバーレイが無いのでエラー表示も再試行ボタンも出ない。
+   * `editorSurfaces` は永続化されないため、アプリ再起動以外に復旧手段が無くなる。
+   */
+  it('spawn_editor の in-flight 中にアンマウントされても live をストアへ書く', async () => {
+    let resolveSpawn: (sid: string) => void = () => {};
+    mocks.spawnEditor.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveSpawn = resolve;
+      }),
+    );
+
+    renderSurface('s1');
+    await flush();
+    expect(mocks.spawnEditor).toHaveBeenCalledTimes(1);
+
+    // Cmd+2 などで EditorView ごと画面を離れた状態（PTY は生きている）
+    act(() => {
+      root.render(<div />);
+    });
+
+    resolveSpawn('s1:editor');
+    await flush();
+
+    expect(useAppStore.getState().editorSurfaces['s1']).toEqual({ kind: 'live' });
+  });
+
+  it('spawn_editor の in-flight 中にアンマウントされても error をストアへ書く', async () => {
+    let rejectSpawn: (e: unknown) => void = () => {};
+    mocks.spawnEditor.mockReturnValue(
+      new Promise<string>((_resolve, reject) => {
+        rejectSpawn = reject;
+      }),
+    );
+
+    renderSurface('s1');
+    await flush();
+
+    act(() => {
+      root.render(<div />);
+    });
+
+    rejectSpawn({ code: 'cli_not_found', message: '`nvim` が見つかりませんでした。' });
+    await flush();
+
+    // ここを抑止すると spawning のまま固まり、再試行の導線が一切出なくなる
+    expect(useAppStore.getState().editorSurfaces['s1']).toEqual({
+      kind: 'error',
+      message: '`nvim` が見つかりませんでした。',
+    });
+  });
+
   it('spawn_editor が reject したら error を message ごとストアへ残す', async () => {
     mocks.spawnEditor.mockRejectedValue({
       code: 'cli_not_found',
