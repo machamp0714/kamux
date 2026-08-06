@@ -10,6 +10,7 @@ use crate::pty::sink::TauriSink;
 
 pub mod backpressure;
 pub mod commands;
+pub mod editor;
 pub mod launch_env;
 pub mod sink;
 pub mod surface;
