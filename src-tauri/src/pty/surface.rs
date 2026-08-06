@@ -167,6 +167,9 @@ impl PtySurface {
         cmd.cwd(&spec.cwd);
         // CommandBuilder は親環境を引き継ぐが、TERM は明示して端末種別を確定させる
         cmd.env("TERM", "xterm-256color");
+        // COLORTERM は truecolor 対応を宣言する。所有はここ(契約 §60.6.2)。
+        // nvim / claude / codex いずれの TUI も同じ端末に描くため全 surface に適用する
+        cmd.env("COLORTERM", "truecolor");
         for (key, value) in &spec.env {
             cmd.env(key, value);
         }

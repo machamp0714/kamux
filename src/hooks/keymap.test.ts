@@ -81,9 +81,28 @@ describe('resolveKeymap', () => {
   });
 
   it('M3 系の未実装キーは null を返す', () => {
-    // 契約 §11 のうち M3-1 / M3-2 / M3-4 の担当外。後続フェーズがこのユニオンに variant を足す
-    for (const key of ['3', 'p', 'd', '[', ']']) {
+    // 契約 §11 のうち M3-2 / M3-4 の担当外。後続フェーズがこのユニオンに variant を足す
+    for (const key of ['p', 'd', '[', ']']) {
       expect(resolveKeymap({ key, metaKey: true }, closed)).toBeNull();
     }
+  });
+
+  it('Cmd+3 で editor 画面へ切り替える（契約 §11 / §11.4.2: view 条件なし・モーダル表示中も発火）', () => {
+    expect(resolveKeymap({ key: '3', metaKey: true }, closed)).toEqual({
+      type: 'set_view',
+      view: 'editor',
+    });
+    // §11.4.2: Cmd+3 は view 条件を持たない
+    expect(resolveKeymap({ key: '3', metaKey: true }, terminalView)).toEqual({
+      type: 'set_view',
+      view: 'editor',
+    });
+    // §11.4.1 規則 M: モーダルが開いていても発火する
+    expect(resolveKeymap({ key: '3', metaKey: true }, open)).toEqual({
+      type: 'set_view',
+      view: 'editor',
+    });
+    // Cmd を伴わなければ null
+    expect(resolveKeymap({ key: '3', metaKey: false }, closed)).toBeNull();
   });
 });

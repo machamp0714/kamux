@@ -11,6 +11,7 @@ import {
   listSessions,
   moveSession,
   resizePty,
+  spawnEditor,
   startSession,
   stopSession,
   suggestBranchName,
@@ -141,5 +142,14 @@ describe('ipc/commands', () => {
       sessionId: 'sess-1',
     });
     expect(got).toBe('session/fix-login-bug');
+  });
+
+  it('spawnEditor が sessionId を camelCase で渡し、surface_id を返す', async () => {
+    invoke.mockResolvedValue('s1:editor');
+
+    const got = await spawnEditor('s1');
+
+    expect(invoke).toHaveBeenCalledWith('spawn_editor', { sessionId: 's1' });
+    expect(got).toBe('s1:editor');
   });
 });
