@@ -175,7 +175,10 @@ export function ensureTerminal(surfaceId: string): Terminal {
   });
   // Cmd 系は window のキーマップに渡す（契約 §11）。
   // Cmd+C / Cmd+V はブラウザのネイティブ処理なので、ここで止めても効く。
-  // 返り値の意味は変えない（I3）。フラグの書き戻しは副作用として行う（契約 §65.3）。
+  // _keyDownSeen の書き戻し（副作用、契約 §65.3）は keyRouting.ts の
+  // createTerminalKeyEventHandler が持つ（本ファイルには無い）。設定点をここ 1 箇所に
+  // 保つのが契約 §65.6 I3 / §16 の不変条件であり、消費側は attachCustomKeyEventHandler
+  // を呼ばないこと（再設定すると副作用が上書きで落ちる）。
   term.attachCustomKeyEventHandler(createTerminalKeyEventHandler(term));
 
   entries.set(surfaceId, {

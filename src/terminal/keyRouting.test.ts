@@ -54,14 +54,20 @@ describe('createTerminalKeyEventHandler', () => {
     expect(handler(new KeyboardEvent('keydown', { key: '3', metaKey: true }))).toBe(false);
   });
 
-  it('修飾キーのみの keydown で _keyDownSeen を false へ戻す（契約 §65.6 I1 / T1）', () => {
-    const term = fakeTerm();
-    const handler = createTerminalKeyEventHandler(term);
-    expect(handler(new KeyboardEvent('keydown', { key: 'Shift' }))).toBe(true);
-    expect((term as unknown as { _core: { _keyDownSeen: boolean } })._core._keyDownSeen).toBe(
-      false,
-    );
-  });
+  // MODIFIER_ONLY_KEYS の 5 値すべてを踏む（Shift だけでは Control / Alt / Meta /
+  // CapsLock を落とす変異が検出できない。registry.test.ts 側の table 駆動テストに
+  // 守りを預けず、副作用の正典であるこのファイル単体で 5 値を守る）。
+  it.each(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock'])(
+    '修飾キー %s のみの keydown で _keyDownSeen を false へ戻す（契約 §65.6 I1 / T1）',
+    (modifierKey) => {
+      const term = fakeTerm();
+      const handler = createTerminalKeyEventHandler(term);
+      expect(handler(new KeyboardEvent('keydown', { key: modifierKey }))).toBe(true);
+      expect((term as unknown as { _core: { _keyDownSeen: boolean } })._core._keyDownSeen).toBe(
+        false,
+      );
+    },
+  );
 
   it('素のキーの keydown では触らない（契約 §65.6 I2 / T2）', () => {
     const term = fakeTerm();
