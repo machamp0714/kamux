@@ -51,7 +51,7 @@ vi.mock('../../terminal/registry', () => ({
 
 import { useAppStore } from '../../store';
 import type { PtyExitPayload } from '../../ipc/events';
-import { EditorSurface } from './EditorSurface';
+import { EditorSurface, resetEditorExitSubscriptionsForTest } from './EditorSurface';
 
 /**
  * このプロジェクトは `@types/node` を依存に持たないため、`process` はグローバルに
@@ -95,6 +95,10 @@ function renderSurface(sessionId: string): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // F3: pty://exit の購読はモジュールスコープで sid ごとに 1 度だけ生かす設計にした
+  // ため、テスト間で持ち越さないようここでリセットする（毎テスト 's1' を使い回すので、
+  // リセットを忘れると 2 本目以降の onPtyExit 呼び出しが黙って skip される）
+  resetEditorExitSubscriptionsForTest();
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
   FakeResizeObserver.callbacks = [];
   // jsdom の offsetWidth / offsetHeight は常に 0 なので、実寸ガード（設計判断 D7）を
@@ -325,7 +329,14 @@ describe('EditorSurface（再起動 UI 用の pty://exit 購読）', () => {
     expect(useAppStore.getState().editorSurfaces['s1']).toEqual({ kind: 'exited', exitCode: 0 });
   });
 
-  it('アンマウントで exit 購読を解除し、detachTerminal だけを呼ぶ（dispose は呼ばない）', async () => {
+  /**
+   * F3（PR 単位レビュー）による再ピン: 以前はここでアンマウント時に exit 購読を
+   * unlisten していたが、それこそが「アンマウント中に nvim が死ぬと復旧できない」
+   * 欠陥の原因だった（購読が消えるので exited イベントを取りこぼす）。detachTerminal
+   * だけを呼ぶ（dispose はしない）という契約 §16 の不変条件は変わらないので、
+   * その半分は据え置いたまま、unlisten を呼ばなくなったことを固定し直す。
+   */
+  it('アンマウントでは exit 購読を維持したまま detachTerminal だけを呼ぶ（dispose は呼ばない）', async () => {
     const unlisten = vi.fn();
     mocks.onPtyExit.mockResolvedValue(unlisten);
 
@@ -336,10 +347,60 @@ describe('EditorSurface（再起動 UI 用の pty://exit 購読）', () => {
       root.render(<div />);
     });
 
-    expect(unlisten).toHaveBeenCalledTimes(1);
+    expect(unlisten).not.toHaveBeenCalled();
     expect(mocks.detachTerminal).toHaveBeenCalledWith('s1:editor');
     // registry / ptyBridge のモックには disposeTerminal / disposePtySubscription を
     // 生やしていない。実装が呼べば「関数ではない」で例外になりこのテストが落ちる
+  });
+
+  /**
+   * F3【実在の不具合。テストの穴ではない】: アンマウント中（Cmd+2 などで画面を
+   * 離れている間）に nvim が終了すると、旧実装は exit 購読ごと消えていたため
+   * イベントを取りこぼし、再訪しても `live` のまま固まって再起動 UI に到達
+   * できなかった（`editorSurfaces` は永続化されないグローバルストアなので、
+   * アプリ再起動以外に復旧手段が無くなる）。ここでは purposefully アンマウント
+   * →（未マウント中に）exit イベント発火 → 再マウント、という順で操作し、
+   * 状態が `exited` として記録され続けること・再マウントで購読が二重登録
+   * されないことの両方を固定する。
+   */
+  it('アンマウント中に nvim が終了しても、次に開いたとき exited として扱われる', async () => {
+    let handler: ((p: PtyExitPayload) => void) | null = null;
+    mocks.onPtyExit.mockImplementation((_sid: string, h: (p: PtyExitPayload) => void) => {
+      handler = h;
+      return Promise.resolve(() => {});
+    });
+
+    renderSurface('s1');
+    await flush();
+    expect(handler).not.toBeNull();
+
+    // Cmd+2 などで画面を離れる（EditorSurface がアンマウントされる）
+    act(() => {
+      root.render(<div />);
+    });
+
+    // その間に nvim が死ぬ
+    act(() => {
+      handler?.({ surface_id: 's1:editor', exit_code: 1 });
+    });
+
+    expect(useAppStore.getState().editorSurfaces['s1']).toEqual({ kind: 'exited', exitCode: 1 });
+
+    // Cmd+3 で戻る（同じ root を使い回して再マウントする。renderSurface は
+    // createRoot からやり直すため、二重 createRoot の警告が出て afterEach の
+    // unmount も片方しか効かなくなる）
+    act(() => {
+      root.render(<EditorSurface sessionId="s1" />);
+    });
+    await flush();
+
+    // 既に exited が記録されているので再マウントでは再 spawn しない（呼び出しは
+    // 最初のマウント分の 1 回のまま増えない）。EditorView 側の
+    // deriveEditorViewState が exited を受けて再起動オーバーレイを出す
+    expect(mocks.spawnEditor).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().editorSurfaces['s1']).toEqual({ kind: 'exited', exitCode: 1 });
+    // 再マウントで購読を二重登録していない（sid ごとに 1 度だけ）
+    expect(mocks.onPtyExit).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -21,6 +21,29 @@ interface Props {
 }
 
 /**
+ * pty://exit の購読はサーフェスごとに 1 度だけ確立し、EditorSurface の
+ * mount/unmount をまたいで生かす。
+ *
+ * F3（PR 単位レビュー）: 従来はこの購読を effect の cleanup で毎回 unlisten して
+ * いたため、アンマウント中（Cmd+2 などで画面を離れている間）に nvim が終了すると
+ * イベントを取りこぼしていた。`editorSurfaces` は永続化されないグローバルストア
+ * なので、取りこぼすと `live` のまま固まり、再訪しても再 spawn されず（"登録済み"
+ * ガード）、再起動オーバーレイにも到達できなくなる。
+ *
+ * ptyBridge.ensurePtySubscription の「登録は 1 回、以後は生存させる」設計に揃え、
+ * ここでも sid ごとに 1 度だけ登録して以後は解除しない。Rust 側は世代の古い
+ * pty://exit をフロントへ転送しない（src-tauri/src/pty/mod.rs の
+ * RegistrySink::on_exit、still_current 判定）ため、D4 の再起動（同じ sid で
+ * spawn_editor をやり直す）を跨いでも誤発火しない。
+ */
+const liveExitSubscriptions = new Set<string>();
+
+/** テスト専用。モジュールスコープの購読状態を初期化する。 */
+export function resetEditorExitSubscriptionsForTest(): void {
+  liveExitSubscriptions.clear();
+}
+
+/**
  * コンテナが実寸を持つときだけ fit して PTY へ反映する（設計判断 D7）。
  * 呼び出し元は 3 箇所あり、resize_pty の成否はそれぞれ異なる:
  *   1. 購読解決直後（spawn_editor より前）— PTY がまだ存在せず NotFound で reject する
@@ -64,7 +87,6 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
     const sid = surfaceId(sessionId, 'editor');
     let cancelled = false;
     setAttached(false);
-    let unlistenExit: (() => void) | null = null;
 
     const run = async () => {
       // ensurePtySubscription も内部で ensureTerminal を呼ぶが、出力が届く前に
@@ -77,20 +99,26 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
       // ハンドラ引数を取らないため、終了の通知はここで別に受ける。
       // pty://exit は 1 回しか発火せず、ハンドラもストアを更新するだけなので、
       // 契約 §16 が禁じている「出力の二重購読」「打鍵の二重送信」にはあたらない。
-      // ただしアンマウント時に必ず unlisten すること（下の cleanup）
-      const un = await onPtyExit(sid, (payload) => {
-        // editor PTY の終了は runtime_state を変えない（契約 §2。Rust 側は M2-1 の
-        // RuntimeSender::note_surface が弾き、Task 8 がその不変条件を固定している）。
-        // ここは再起動 UI を出すためだけに使う
-        useAppStore
-          .getState()
-          .setEditorSurface(sessionId, { kind: 'exited', exitCode: payload.exit_code });
-      });
-      if (cancelled) {
-        un();
-        return;
+      // 購読自体は sid ごとに 1 度だけ（F3。上の liveExitSubscriptions のコメント参照）。
+      // 既に生存中ならここでは何もしない
+      if (!liveExitSubscriptions.has(sid)) {
+        const un = await onPtyExit(sid, (payload) => {
+          // editor PTY の終了は runtime_state を変えない（契約 §2。Rust 側は M2-1 の
+          // RuntimeSender::note_surface が弾き、Task 8 がその不変条件を固定している）。
+          // ここは再起動 UI を出すためだけに使う
+          useAppStore
+            .getState()
+            .setEditorSurface(sessionId, { kind: 'exited', exitCode: payload.exit_code });
+        });
+        if (cancelled) {
+          // StrictMode の setup → cleanup → setup で、この setup が中断された側
+          // （2 回目の setup が生き残る）。ここは「生存中」に数えていないので、
+          // 中断された自分の登録だけを解除する
+          un();
+          return;
+        }
+        liveExitSubscriptions.add(sid);
       }
-      unlistenExit = un;
 
       // ★契約 §16: pty://data の購読が完了するまで spawn_editor を投げない。
       // 待たないと nvim の初回の全画面描画がリスナ不在で捨てられ、
@@ -169,10 +197,12 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
     return () => {
       cancelled = true;
       observer.disconnect();
-      // 終了購読だけ外す。pty://data の購読（ptyBridge）は残す —— PTY は生かしたまま
-      // なので、購読を切ると再表示までの出力を取りこぼす。disposePtySubscription は
-      // disposeTerminal と対で、D4 の再起動経路でのみ呼ぶ（契約 §16）
-      unlistenExit?.();
+      // F3: pty://exit の購読はここでは外さない。detachTerminal は DOM から
+      // 切り離すだけで PTY 自体・pty://data の購読（ptyBridge）は生かしたままなので、
+      // アンマウント中に nvim が終了しても liveExitSubscriptions に登録済みの
+      // ハンドラが exited をストアへ書き続ける。再訪したとき editorSurfaces が
+      // exited のまま残るので、EditorView の再起動オーバーレイに到達できる
+      // （購読を切っていた旧実装ではここで取りこぼしていた）
       detachTerminal(sid);
     };
   }, [sessionId]);
