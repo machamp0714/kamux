@@ -41,6 +41,7 @@ vi.mock('../../terminal/registry', () => ({
 
 import { useAppStore } from '../../store';
 import type { Session } from '../../types/model';
+import { resetEditorExitSubscriptionsForTest } from './EditorSurface';
 import { EditorView } from './index';
 
 function session(id: string, title: string): Session {
@@ -101,6 +102,11 @@ function buttonByText(text: string): HTMLButtonElement {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // F3（EditorSurface.tsx）: pty://exit の購読は sid ごとにモジュールスコープで
+  // 1 度だけ生かす設計にしたため、このファイルも複数の it() で 's1' を使い回す
+  // 以上はテスト間で持ち越さないようリセットする（無ければ 2 本目以降の
+  // レンダリングが黙って onPtyExit をスキップし、テスト同士が結合してしまう）
+  resetEditorExitSubscriptionsForTest();
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
   mocks.ensureTerminal.mockImplementation(() => ({ options: {} }));
   mocks.onPtyExit.mockResolvedValue(() => {});
