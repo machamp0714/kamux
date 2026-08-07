@@ -181,6 +181,33 @@ describe('EditorSurface（StrictMode での冪等性）', () => {
     expect(mocks.spawnEditor).toHaveBeenCalledTimes(1);
     expect(useAppStore.getState().editorSurfaces['s1']).toEqual({ kind: 'live' });
   });
+
+  /**
+   * F4（PR 単位レビュー）: `if (cancelled) { un(); return; }`（EditorSurface.tsx:90）
+   * は 1 回目の setup（StrictMode の cleanup で即座に cancelled になる方）が
+   * 登録した pty://exit の購読を後始末する行である。`un()` を消しても既存の
+   * どのテストも赤くならなかった —— どのテストも「その購読が実際に解除されたか」
+   * を見ていなかったため。1 回目・2 回目の setup に同じ unlisten スパイを
+   * 返させ、最終的にちょうど 1 回（1 回目の後始末ぶんだけ）呼ばれることを固定する。
+   */
+  it('1 回目の setup が cancelled で中断されたら、その pty://exit 購読を unlisten する', async () => {
+    const unlisten = vi.fn();
+    mocks.onPtyExit.mockResolvedValue(unlisten);
+
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        <StrictMode>
+          <EditorSurface sessionId="s1" />
+        </StrictMode>,
+      );
+    });
+    await flush();
+
+    // 1 回目の setup が中断された後始末で 1 回だけ呼ばれる。
+    // 2 回目（生き残る側）の購読はアンマウントしていないので解除されない
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('EditorSurface（遅延起動は 1 セッション 1 回）', () => {
@@ -428,6 +455,11 @@ describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効
     await flush();
 
     expect(callOrder.slice(-2)).toEqual(['invalidate', 'fit']);
+    // F1（PR 単位レビュー）: 呼び出し順だけを見ていると `invalidateFitCache(sid)` を
+    // `invalidateFitCache(sessionId)` に取り違えても緑のまま通る（同じスコープに同じ
+    // 型の値が 2 本あり、キャッシュが別キーで消えるだけで順序は変わらない）。
+    // サーフェス ID（`s1:editor`）で呼ばれたことを引数レベルで固定する
+    expect(mocks.invalidateFitCache).toHaveBeenCalledWith('s1:editor');
   });
 
   it('spawn_editor が reject した経路では invalidateFitCache を呼ばない', async () => {
@@ -440,6 +472,32 @@ describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効
     await flush();
 
     expect(mocks.invalidateFitCache).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * F2（PR 単位レビュー）: 計画 D7 の却下案 A が明文で警告した失敗モードの検査。
+ * 非表示中の要素（`display: none` や未レイアウトの状態）は幅・高さが 0 になり、
+ * `FitAddon` が 0 または 1 の cols/rows を返しうる。その値を `resize_pty` に送ると
+ * nvim が SIGWINCH で 1 桁幅にレイアウトを潰す。`beforeEach` は offsetWidth/Height を
+ * 800/600 に固定しているため、このテストだけ 0 に上書きしてガードの境界を踏む。
+ */
+describe('EditorSurface（fix D7: コンテナが 0 サイズのときは fit / resize しない）', () => {
+  it('offsetWidth/offsetHeight が 0 なら fitTerminal も resizePty も呼ばない', async () => {
+    Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+      configurable: true,
+      value: 0,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      value: 0,
+    });
+
+    renderSurface('s1');
+    await flush();
+
+    expect(mocks.fitTerminal).not.toHaveBeenCalled();
+    expect(mocks.resizePty).not.toHaveBeenCalled();
   });
 });
 
