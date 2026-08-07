@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   disposeTerminal: vi.fn(),
   fitTerminal: vi.fn(),
   getTerminal: vi.fn(),
+  invalidateFitCache: vi.fn(),
 }));
 
 vi.mock('../../ipc/commands', () => ({
@@ -35,6 +36,7 @@ vi.mock('../../terminal/registry', () => ({
   disposeTerminal: mocks.disposeTerminal,
   fitTerminal: mocks.fitTerminal,
   getTerminal: mocks.getTerminal,
+  invalidateFitCache: mocks.invalidateFitCache,
 }));
 
 import { useAppStore } from '../../store';

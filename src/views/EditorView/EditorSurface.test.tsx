@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => {
     detachTerminal: vi.fn(),
     fitTerminal: vi.fn(),
     getTerminal: vi.fn(),
+    invalidateFitCache: vi.fn(),
   };
 });
 
@@ -45,6 +46,7 @@ vi.mock('../../terminal/registry', () => ({
   detachTerminal: mocks.detachTerminal,
   fitTerminal: mocks.fitTerminal,
   getTerminal: mocks.getTerminal,
+  invalidateFitCache: mocks.invalidateFitCache,
 }));
 
 import { useAppStore } from '../../store';
@@ -384,6 +386,45 @@ describe('EditorSurface（契約 §16 / §11.4.6: modal === null のときにだ
     await flush();
 
     expect(focus).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * PR 24 / #56 の人間ゲートで発見: spawn_editor は固定 80x24 で PTY を作るため、
+ * 起動成功直後にキャッシュを無効化して測り直さないと、xterm の実寸が PTY に一度も
+ * 届かず nvim が 80x24 のまま描画される（TerminalPane.test.tsx の「不変条件 C」と
+ * 同じ穴）。
+ */
+describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効化して測り直す）', () => {
+  it('spawn_editor 解決後に invalidateFitCache → fitTerminal の順で呼ぶ', async () => {
+    const callOrder: string[] = [];
+    mocks.invalidateFitCache.mockImplementation(() => {
+      callOrder.push('invalidate');
+    });
+    mocks.fitTerminal.mockImplementation(() => {
+      callOrder.push('fit');
+      return null;
+    });
+
+    renderSurface('s1');
+    await flush();
+
+    // attach 直後の fitAndResize でも fitTerminal が 1 回呼ばれる（invalidate より前）。
+    // ここで検証したいのは spawn_editor 解決後の呼び出しが invalidate → fit の順で
+    // 隣接することなので、callOrder 末尾の 2 件を見る
+    expect(callOrder.slice(-2)).toEqual(['invalidate', 'fit']);
+  });
+
+  it('spawn_editor が reject した経路では invalidateFitCache を呼ばない', async () => {
+    mocks.spawnEditor.mockRejectedValue({
+      code: 'cli_not_found',
+      message: '`nvim` が見つかりませんでした。',
+    });
+
+    renderSurface('s1');
+    await flush();
+
+    expect(mocks.invalidateFitCache).not.toHaveBeenCalled();
   });
 });
 

@@ -12,6 +12,7 @@ import {
   ensureTerminal,
   fitTerminal,
   getTerminal,
+  invalidateFitCache,
 } from '../../terminal/registry';
 import { surfaceId } from '../../types/model';
 
@@ -126,6 +127,15 @@ export function EditorSurface({ sessionId }: Props): JSX.Element {
       //   再起動する以外に復旧手段が無くなる
       try {
         await spawnEditor(sessionId);
+        // PR 24 / #56 の人間ゲートで発見: spawn_editor は固定 80x24 で PTY を作る
+        // （src-tauri/src/pty/editor.rs）。起動前に飛んだ resize_pty は PTY 不在で
+        // NotFound になり握り潰されるため、xterm の実寸が PTY に一度も届かない。
+        // fitTerminal は直近サイズキャッシュ（entry.lastSize）と同寸なら null を返して
+        // resize_pty を飛ばすので、キャッシュを無効化してから測り直す
+        // （TerminalPane.tsx の start_session 解決後と同じ形。registry.ts のドキュメント
+        // コメントが同じ失敗形を記録している）。
+        invalidateFitCache(sid);
+        fitAndResize(sid, containerRef.current);
         // exited を上書きしないための epoch ガードは意図的に置いていない。
         // pty://exit は spawn_editor が生成した子プロセスの終了後に emit されるため、
         // その発生はこの spawnEditor 呼び出しの応答より厳密に後であり、exited が
