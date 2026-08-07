@@ -1924,6 +1924,17 @@ mod tests {
     }
 
     /// エディタ由来の事象は DB にも書かれない（設計書 §12「DB が嘘をつかない」）。
+    ///
+    /// 前半（Running 起点）は `note_pty_exit` の kind フィルタ（`:editor` を無視する）を見ている
+    /// —— `PtyExited` は Running から遷移が起きるはずの入力なので、フィルタを丸ごと消せば
+    /// `Exited` が書かれて検出できる。
+    ///
+    /// 後半（Idle 起点）は `note_surface` の `OutputActivity` フィルタを見ている。
+    /// **Running から `OutputActivity` を送っても弁別力は無い** —— `next_state(Running,
+    /// OutputActivity)` は遷移なし(`None`)を返す高速パスに乗るため、フィルタの有無に
+    /// 関わらず DB は書かれない。対照群 `agent_output_does_revive_an_idle_session` と同じく
+    /// Idle へ落としてから送ることで、フィルタが外れたときに Running への書き込みが
+    /// 起きる状態を作っている。
     #[test]
     fn editor_events_never_reach_the_database() {
         let persist = FakePersist::with_rows(&[]);
@@ -1947,5 +1958,21 @@ mod tests {
 
         // Spawned による 1 回だけ。エディタ由来の書き込みは 1 件も無い
         assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
+
+        // Idle へ落とす。ここでの HookStop は agent 由来の正当な遷移であり、
+        // この書き込みはエディタフィルタとは無関係。
+        sender.send("s1", In::HookStop);
+        assert!(wait_until(|| {
+            persist.writes() == vec![("s1".to_string(), Running), ("s1".to_string(), Idle)]
+        }));
+
+        sender.note_surface("s1:editor", In::OutputActivity);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Idle からの OutputActivity はフィルタが効いていれば Running へ書き込まない。
+        assert_eq!(
+            persist.writes(),
+            vec![("s1".to_string(), Running), ("s1".to_string(), Idle)]
+        );
     }
 }
