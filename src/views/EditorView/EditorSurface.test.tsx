@@ -397,6 +397,18 @@ describe('EditorSurface（契約 §16 / §11.4.6: modal === null のときにだ
  */
 describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効化して測り直す）', () => {
   it('spawn_editor 解決後に invalidateFitCache → fitTerminal の順で呼ぶ', async () => {
+    // callOrder.slice(-2) だけを見ると、invalidateFitCache(sid); fitAndResize(...); を
+    // attach 直後（spawn_editor より前）へ丸ごと移す変異でも隣接した
+    // ['invalidate', 'fit'] が末尾に残り、テストが通ってしまう。それは PTY がまだ
+    // 存在しない時点で invalidate するだけの元の欠陥そのものなので、
+    // 「spawn_editor が解決するまで invalidateFitCache は 1 度も呼ばれない」ことを
+    // 明示的に固定する（spawnEditor を pending のまま止めて検証する）
+    let resolveSpawn: (sid: string) => void = () => {};
+    mocks.spawnEditor.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveSpawn = resolve;
+      }),
+    );
     const callOrder: string[] = [];
     mocks.invalidateFitCache.mockImplementation(() => {
       callOrder.push('invalidate');
@@ -408,10 +420,13 @@ describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効
 
     renderSurface('s1');
     await flush();
+    expect(mocks.invalidateFitCache).not.toHaveBeenCalled();
+    // attach 直後の fitAndResize で fitTerminal は 1 回呼ばれている（invalidate より前）
+    expect(callOrder).toEqual(['fit']);
 
-    // attach 直後の fitAndResize でも fitTerminal が 1 回呼ばれる（invalidate より前）。
-    // ここで検証したいのは spawn_editor 解決後の呼び出しが invalidate → fit の順で
-    // 隣接することなので、callOrder 末尾の 2 件を見る
+    resolveSpawn('s1:editor');
+    await flush();
+
     expect(callOrder.slice(-2)).toEqual(['invalidate', 'fit']);
   });
 
@@ -429,9 +444,11 @@ describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効
 });
 
 /**
- * `resize_pty` は spawn_editor より前（購読解決の直後）に飛ぶので、PTY がまだ存在せず
- * NotFound で reject する。registry.ts の ackPty / writePty、TerminalPane の syncSize と
- * 同じ理由で握り潰さないと、エディタを開くたびに unhandled promise rejection が出る。
+ * `fitAndResize` は複数箇所から呼ばれ、そのうち購読解決直後（spawn_editor より前）の
+ * 呼び出しは PTY がまだ存在せず NotFound で reject する（このテストは resizePtyImpl を
+ * 常に reject させることで、どの呼び出し元由来でも握り潰しが効くことを見る）。
+ * registry.ts の ackPty / writePty、TerminalPane の syncSize と同じ理由で握り潰さないと、
+ * エディタを開くたびに unhandled promise rejection が出る。
  */
 describe('EditorSurface（resize_pty の reject が unhandled rejection にならない）', () => {
   it('まだ存在しない PTY への resize_pty が reject しても unhandled rejection にならない', async () => {

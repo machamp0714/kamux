@@ -20,15 +20,23 @@ interface Props {
   sessionId: string;
 }
 
-/** コンテナが実寸を持つときだけ fit して PTY へ反映する（設計判断 D7）。 */
+/**
+ * コンテナが実寸を持つときだけ fit して PTY へ反映する（設計判断 D7）。
+ * 呼び出し元は 3 箇所あり、resize_pty の成否はそれぞれ異なる:
+ *   1. 購読解決直後（spawn_editor より前）— PTY がまだ存在せず NotFound で reject する
+ *   2. spawn_editor 成功直後（PR 24 / #56 の fix）— PTY が存在するので成功する。
+ *      xterm の実寸を初めて PTY へ届けるのがこの呼び出しである
+ *   3. ResizeObserver 発火時 — マウント中ずっと張られているので、PTY 終了後に
+ *      リサイズされると再び NotFound で reject しうる
+ * 1 と 3 は「まだ存在しない / もう存在しない PTY への通知」なので失敗しても
+ * 何も壊れない。resizePty の catch はこれら全経路に共通の握り潰しであり、
+ * 2 の成功を妨げるものではない（void のままだと開くたびに unhandled rejection が出る）。
+ * registry.ts の ackPty / writePty、TerminalPane の syncSize と同じ理由。
+ */
 function fitAndResize(sid: string, container: HTMLElement | null): void {
   if (!container || container.offsetWidth === 0 || container.offsetHeight === 0) return;
   const size = fitTerminal(sid);
   if (size === null) return;
-  // この resize_pty は spawn_editor より前（購読解決の直後）に飛ぶので、PTY がまだ
-  // 存在せず NotFound で reject する。registry.ts の ackPty / writePty、TerminalPane の
-  // syncSize と同じ理由（まだ存在しない / もう存在しない PTY への通知なので、失敗しても
-  // 何も壊れない）で握り潰す。void のままだと開くたびに unhandled rejection が出る
   resizePty(sid, size.cols, size.rows).catch(() => {
     // 上記の理由により意図的に無視する
   });
