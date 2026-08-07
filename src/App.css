@@ -39,13 +39,3 @@ select,
 textarea {
   font-family: inherit;
 }
-
-.app__placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 1;
-  min-height: 0;
-  font-size: var(--text-md);
-  color: var(--text-muted);
-}

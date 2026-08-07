@@ -55,6 +55,13 @@ export function tauriMockScript(spec: TauriMockSpec): string {
     window.__TAURI_INTERNALS__.__kamuxCalls = [];
     window.__TAURI_INTERNALS__.__kamuxEventHandlers = {};
     const handlers = { ${entries} };
+    // listen() が返す id は下の 'plugin:event|listen' が返す配列長（= index + 1）である。
+    // 解除しても配列は詰めない（詰めると既に配布済みの id が別のハンドラを指す）。
+    const removeListener = (event, eventId) => {
+      const list = window.__TAURI_INTERNALS__.__kamuxEventHandlers[event];
+      if (!list || typeof eventId !== 'number') return;
+      if (list[eventId - 1] !== undefined) list[eventId - 1] = () => {};
+    };
     window.__TAURI_INTERNALS__.invoke = (cmd, args) => {
       window.__TAURI_INTERNALS__.__kamuxCalls.push({ cmd, args });
       if (cmd === 'plugin:event|listen') {
@@ -66,8 +73,7 @@ export function tauriMockScript(spec: TauriMockSpec): string {
         return Promise.resolve(list.length);
       }
       if (cmd === 'plugin:event|unlisten') {
-        const event = (args || {}).event;
-        delete window.__TAURI_INTERNALS__.__kamuxEventHandlers[event];
+        removeListener((args || {}).event, (args || {}).eventId);
         return Promise.resolve(null);
       }
       const h = handlers[cmd];
@@ -75,6 +81,16 @@ export function tauriMockScript(spec: TauriMockSpec): string {
       return Promise.resolve(h(args || {}));
     };
     window.__TAURI_INTERNALS__.transformCallback = (cb) => cb;
+    // @tauri-apps/api v2 の unlisten は invoke の前に
+    // window.__TAURI_EVENT_PLUGIN_INTERNALS__.unregisterListener() を**同期に**呼ぶ
+    // （node_modules/@tauri-apps/api/event.js の _unlisten）。これを用意しないと
+    // 解除のたびに TypeError になり、呼び出し側から見ると unlisten が失敗する
+    // （M3-1 Task 7 の EditorSurface が StrictMode の再マウントで踏んだ）
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener: (event, eventId) => {
+        removeListener(event, eventId);
+      },
+    };
     window.__TAURI_INTERNALS__.__kamuxEmit = (event, payload) => {
       const list = window.__TAURI_INTERNALS__.__kamuxEventHandlers[event] || [];
       list.forEach((handler) => handler({ event, id: 0, payload }));

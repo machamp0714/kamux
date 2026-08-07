@@ -177,6 +177,14 @@ pub async fn spawn_editor(
         EditorSpawnPlan::Spawn(spec) => {
             let sid = spec.surface_id.clone();
             state.pty.spawn(&app, spec)?;
+            // ここで pty.spawn() の直後に返ることに、フロント側の live 書き込みの
+            // 正しさが依存している。pty://exit は、いま起こした子プロセスが実際に
+            // 終了した後にしか emit されないため、このコマンド応答のエンキューより
+            // 厳密に後になる。ここへ待ちを伴う処理を足すと、pty://exit がコマンド
+            // 応答を追い越し、exited を live が上書きしうる —— UI は live だが
+            // PTY は死んでいる状態になり、画面が黒く再起動ボタンも出ない。
+            // 足す場合はフロント側(EditorSurface.tsx)に epoch ガード(live を
+            // 書くのは現在が spawning のときだけ)を入れること。
             Ok(sid)
         }
     }

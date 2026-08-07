@@ -6,6 +6,36 @@ import type { AppStore } from './index';
 /** 開いているモーダルの種類。M3-4 の Cmd+P で variant を追加する。 */
 export type ModalState = { kind: 'create_session' } | { kind: 'edit_session'; sessionId: string };
 
+/** nvim エディタサーフェスの状態（M3-1）。EditorView が spawn/live/exited/error を判別するために使う。 */
+export type EditorSurfaceStatus =
+  | { kind: 'spawning' }
+  | { kind: 'live' }
+  | { kind: 'exited'; exitCode: number | null }
+  | { kind: 'error'; message: string };
+
+function sameStatus(a: EditorSurfaceStatus | undefined, b: EditorSurfaceStatus): boolean {
+  if (a === undefined || a.kind !== b.kind) return false;
+  if (a.kind === 'exited' && b.kind === 'exited') return a.exitCode === b.exitCode;
+  if (a.kind === 'error' && b.kind === 'error') return a.message === b.message;
+  return true;
+}
+
+/** status が null ならそのセッションのエントリを削除する。変化が無ければ同じ参照を返す。 */
+export function reduceEditorSurfaces(
+  current: Record<string, EditorSurfaceStatus>,
+  sessionId: string,
+  status: EditorSurfaceStatus | null,
+): Record<string, EditorSurfaceStatus> {
+  if (status === null) {
+    if (!(sessionId in current)) return current;
+    const next = { ...current };
+    delete next[sessionId];
+    return next;
+  }
+  if (sameStatus(current[sessionId], status)) return current;
+  return { ...current, [sessionId]: status };
+}
+
 /** invoke が投げた未知の値を AppError（契約 §6）へ正規化する。 */
 export function toAppError(e: unknown): AppError {
   if (
@@ -37,6 +67,8 @@ export interface UiSlice {
   closeModal: () => void;
   lastError: AppError | null;
   setError: (e: AppError | null) => void;
+  editorSurfaces: Record<string, EditorSurfaceStatus>;
+  setEditorSurface: (sessionId: string, status: EditorSurfaceStatus | null) => void;
 }
 
 export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set) => ({
@@ -62,4 +94,8 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set) => (
   closeModal: () => set({ modal: null }),
   lastError: null,
   setError: (e) => set({ lastError: e }),
+
+  editorSurfaces: {},
+  setEditorSurface: (sessionId, status) =>
+    set((s) => ({ editorSurfaces: reduceEditorSurfaces(s.editorSurfaces, sessionId, status) })),
 });
