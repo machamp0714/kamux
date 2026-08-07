@@ -450,6 +450,40 @@ describe('EditorSurface（fix: spawn_editor 成功後にキャッシュを無効
  * registry.ts の ackPty / writePty、TerminalPane の syncSize と同じ理由で握り潰さないと、
  * エディタを開くたびに unhandled promise rejection が出る。
  */
+/**
+ * fix round 1（task-reviewer の Important 1 件）: `resizePty` の呼び出し自体は R2 で
+ * 守られたが、`cols` / `rows` を取り違える・呼び出しごと消す変異はどちらも既存 25 本
+ * を通過した。既存テストは `mocks.fitTerminal` を `null` 返しにしているため
+ * `resizePty` の行を一度も踏まない。cols と rows に異なる値を与え、実際に PTY へ渡る
+ * 引数の並びを固定する。
+ */
+describe('EditorSurface（fix round 1: resizePty へ渡る引数の並び）', () => {
+  it('spawn_editor 解決後、fitTerminal の実寸で resizePty(sid, cols, rows) を呼ぶ', async () => {
+    // fitAndResize は attach 直後（spawn_editor より前、PTY 不在）でも 1 回呼ばれる。
+    // spawnEditor を pending のまま止め、その呼び出しを resolveSpawn 前に流し切ってから
+    // mockClear することで、以降の assertion を「spawn 解決後の 1 回」だけに絞る
+    // （mockClear は実装だけを消し mockResolvedValue は保持するので resolveSpawn は使える）
+    let resolveSpawn: (sid: string) => void = () => {};
+    mocks.spawnEditor.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveSpawn = resolve;
+      }),
+    );
+    // cols と rows を同じ値にすると入れ替え変異が素通りしてしまうため、必ず異なる値にする
+    mocks.fitTerminal.mockReturnValue({ cols: 120, rows: 40 });
+
+    renderSurface('s1');
+    await flush();
+    mocks.resizePty.mockClear();
+
+    resolveSpawn('s1:editor');
+    await flush();
+
+    expect(mocks.resizePty).toHaveBeenCalledTimes(1);
+    expect(mocks.resizePty).toHaveBeenCalledWith('s1:editor', 120, 40);
+  });
+});
+
 describe('EditorSurface（resize_pty の reject が unhandled rejection にならない）', () => {
   it('まだ存在しない PTY への resize_pty が reject しても unhandled rejection にならない', async () => {
     mocks.resizePtyImpl = (): Promise<void> =>
