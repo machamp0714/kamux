@@ -439,6 +439,13 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
 
     render();
     await flush();
+    // マウント時点で usePaneFit の状態変化 effect も 1 度発火し、rAF が 1 本
+    // ペンディングになる。flush() はマイクロタスクしか進めないので、ここで先に
+    // 実 rAF（jsdom は ~16ms の実タイマーで実装している）を解決してから
+    // mockClear() しないと、次の向き変更とは無関係なマウント起因の flush が
+    // 後続のアサーションに紛れ込む
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flush();
     mocks.resizePty.mockClear();
 
     act(() => {
