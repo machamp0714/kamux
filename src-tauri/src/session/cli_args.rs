@@ -124,6 +124,60 @@ pub fn resolve_cwd(session: &Session, repo_path: &str) -> PathBuf {
     }
 }
 
+/// kamux が購読する hook イベント（契約 §12.4）。
+///
+/// `PermissionRequest` は「ユーザーの承認待ち」の最も直接的な信号なので
+/// `Notification` と併せて必ず登録する。
+/// `PermissionDenied` は対応する runtime_state が契約 §2 に無いため登録しない
+/// （§83.6.1 / §84.5）。
+pub const HOOK_EVENTS: [&str; 4] = ["SessionStart", "Notification", "PermissionRequest", "Stop"];
+
+/// hook 1 個あたりの制限時間（秒）。既定の 600 秒でぶら下がるのを避ける。
+pub const HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// hook の command は sh -c 経由で実行される。パスに空白が含まれても壊れないよう包む。
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `--settings` に渡す JSON を組み立てる（設計 §4）。
+///
+/// 契約 §12.2: この設定はユーザーの settings.json を**置換しない**。マージされる。
+/// ユーザー自身の Stop / Notification hook も同時に発火する前提で、
+/// kamux 側の hook は副作用のない転送だけを行う。
+pub fn build_hook_settings(relay_bin: &Path) -> serde_json::Value {
+    let quoted = shell_single_quote(&relay_bin.to_string_lossy());
+
+    let mut hooks = serde_json::Map::new();
+    for event in HOOK_EVENTS {
+        hooks.insert(
+            event.to_string(),
+            serde_json::json!([{
+                "hooks": [{
+                    "type": "command",
+                    // hook 種別を argv 第 1 引数で渡す（契約 §84.1）。
+                    "command": format!("{quoted} {event}"),
+                    "timeout": HOOK_TIMEOUT_SECS,
+                }]
+            }]),
+        );
+    }
+
+    serde_json::json!({ "hooks": serde_json::Value::Object(hooks) })
+}
+
+/// settings JSON をファイルへ書く。アプリ起動につき 1 回。
+pub fn write_hook_settings_file(path: &Path, relay_bin: &Path) -> AppResult<()> {
+    let text = serde_json::to_string_pretty(&build_hook_settings(relay_bin))
+        .map_err(|e| AppError::Io(format!("failed to serialize hook settings: {e}")))?;
+    std::fs::write(path, text).map_err(|e| {
+        AppError::Io(format!(
+            "failed to write hook settings {}: {e}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -607,5 +661,85 @@ pub(crate) mod tests {
             Some("ja_JP.UTF-8".to_string()),
             "空 LANG は日本語ファイル名を化けさせる"
         );
+    }
+
+    // ---- Task 9: --settings に渡す hooks 設定 JSON の生成（契約 §12.2 / §12.4） ----
+
+    #[test]
+    fn quotes_plain_paths() {
+        assert_eq!(
+            shell_single_quote("/usr/local/bin/kamux-relay"),
+            "'/usr/local/bin/kamux-relay'"
+        );
+    }
+
+    #[test]
+    fn quotes_paths_with_spaces() {
+        assert_eq!(
+            shell_single_quote("/Applications/My App.app/Contents/MacOS/kamux-relay"),
+            "'/Applications/My App.app/Contents/MacOS/kamux-relay'"
+        );
+    }
+
+    #[test]
+    fn escapes_embedded_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/tmp/it's/relay"),
+            r#"'/tmp/it'\''s/relay'"#
+        );
+    }
+
+    #[test]
+    fn builds_settings_for_the_four_hook_events() {
+        let v = build_hook_settings(Path::new("/opt/kamux/kamux-relay"));
+
+        let hooks = v["hooks"].as_object().expect("hooks object");
+        assert_eq!(
+            hooks.len(),
+            4,
+            "SessionStart / Notification / PermissionRequest / Stop"
+        );
+        // 契約 §12.4: PermissionRequest は waiting_input の最も直接的な信号なので必須。
+        // このキー名が実際に有効かは未確認（表 #13b）。Task 17 Step 4 が発火で検証する。
+        assert!(hooks.contains_key("PermissionRequest"));
+        // PermissionDenied は登録しない（対応する runtime_state が無い。契約 §83.6.1 / §84.5）
+        assert!(!hooks.contains_key("PermissionDenied"));
+
+        for event in HOOK_EVENTS {
+            let entries = hooks[event].as_array().expect("array of matcher groups");
+            assert_eq!(entries.len(), 1);
+            // matcher は書かない（設計 §4 / 未確認事実 #11）
+            assert!(
+                entries[0].get("matcher").is_none(),
+                "{event} must not carry a matcher"
+            );
+
+            let inner = entries[0]["hooks"].as_array().expect("array of hooks");
+            assert_eq!(inner.len(), 1);
+            assert_eq!(inner[0]["type"], "command");
+            assert_eq!(
+                inner[0]["command"],
+                format!("'/opt/kamux/kamux-relay' {event}")
+            );
+            assert_eq!(inner[0]["timeout"], 5);
+        }
+    }
+
+    #[test]
+    fn settings_json_is_written_to_disk_and_reparses() {
+        let path =
+            std::env::temp_dir().join(format!("kamux-settings-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        write_hook_settings_file(&path, Path::new("/opt/kamux/kamux-relay")).expect("write");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/opt/kamux/kamux-relay' Stop"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
