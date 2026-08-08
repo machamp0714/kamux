@@ -171,4 +171,24 @@ mod tests {
         assert!(!is_valid_session_id("3f2a0000-0000-4000-8000-000000009c1")); // 35 文字
         assert!(!is_valid_session_id("3f2a0000-0000-4000-8000-00000000-c1e")); // 非 hex
     }
+
+    #[test]
+    fn rejects_non_hex_characters_with_correct_layout() {
+        // レイアウト（8-4-4-4-12、ハイフン位置）は正しいが、最後のセグメントに
+        // hex ではない文字 `z` を含む。レイアウト検査だけでは弾けない。
+        assert!(!is_valid_session_id("3f2a0000-0000-4000-8000-00000000zz1e"));
+    }
+
+    #[test]
+    fn truncated_forces_null_payload_even_when_json_is_valid() {
+        // truncated: true のときは、たとえ stdin が有効な JSON としてパースできても
+        // 中身を見ずに payload を null にする（切り詰めで壊れたデータを誤って
+        // 完全なものとして扱わないため）。
+        let raw = br#"{"a":1}"#;
+        let s = build_wire_message("3f2a0000-0000-4000-8000-000000009c1e", "Stop", raw, true);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&s).expect("wire message must be valid JSON");
+        assert!(v["payload"].is_null());
+    }
 }
