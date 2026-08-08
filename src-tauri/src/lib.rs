@@ -358,6 +358,77 @@ pub fn run() {
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
             install_app_state(app, store);
+
+            // Task 7 スパイク（M2-3 PR 19）: KAMUX_NOTIFY_SPIKE=1 のときだけ動く。
+            // Task 10 で本番の配線に置き換えるため、Task 10 のコミットで削除する。
+            if std::env::var("KAMUX_NOTIFY_SPIKE").is_err() {
+                return Ok(());
+            }
+
+            // 要検証 1: バンドル ID があるか
+            match notify_rust::check_bundle() {
+                Ok(()) => println!("[OK] check_bundle"),
+                Err(e) => println!("[NG] check_bundle failed: {e}"),
+            }
+
+            // 要検証 4-a: 起動経路で権限読み取りがハングしないか（起動 1 秒未満の制約）
+            let t0 = std::time::Instant::now();
+            match notify_rust::get_notification_settings_blocking() {
+                Ok(s) => println!(
+                    "[--] authorization_status = {:?} ({} ms)",
+                    s.authorization_status,
+                    t0.elapsed().as_millis()
+                ),
+                Err(e) => println!("[NG] get_notification_settings: {e}"),
+            }
+
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let granted = notify_rust::request_auth_blocking().unwrap_or(false);
+                println!("[--] request_auth -> {granted}");
+
+                let want_id = "kamux-session-spike".to_string();
+                let mut n = notify_rust::Notification::new();
+                n.summary("入力待ち: spike")
+                    .body("kamux · session/spike")
+                    .id(notify_rust::NotificationId::Mac(want_id.clone()))
+                    .timeout(notify_rust::Timeout::Milliseconds(30_000));
+
+                let h = match n.show() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        println!("[NG] show failed: {e}");
+                        return;
+                    }
+                };
+
+                // 要検証 3-a: 指定した id がそのまま採用されるか
+                //（採用されないと「同一 id で置き換え」も close_delivered も効かない）
+                match h.id() {
+                    notify_rust::NotificationId::Mac(ref got) if *got == want_id => {
+                        println!("[OK] notification id round-trips: {got}")
+                    }
+                    other => println!("[NG] notification id was rewritten: {other:?}"),
+                }
+
+                let r = h.wait_for_response(|resp: &notify_rust::NotificationResponse| {
+                    println!(
+                        "[--] response = {resp:?} (is_default_action = {})",
+                        resp.is_default_action()
+                    );
+                });
+                println!("[--] wait_for_response returned: {r:?}");
+
+                // 要検証 4-b: Dock バッジ
+                use tauri::Manager;
+                if let Some(w) = handle.get_webview_window("main") {
+                    let _ = w.set_badge_count(Some(3));
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let _ = w.set_badge_count(None);
+                    println!("[--] badge: 3 を 3 秒表示したあと None で消した");
+                }
+                println!("[OK] spike finished without hanging");
+            });
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)

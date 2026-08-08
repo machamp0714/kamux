@@ -2,7 +2,7 @@
 name = "kamux"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 
 [lib]
 name = "kamux"
@@ -20,6 +20,9 @@ uuid = { version = "1", features = ["v4"] }
 portable-pty = "0.9"
 base64 = "0.22"
 libc = "0.2"
+notify-rust = { version = "4.18", features = ["preview-macos-un"] }
+mac-usernotifications = "0.3"
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
