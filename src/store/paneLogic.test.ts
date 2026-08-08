@@ -100,9 +100,18 @@ describe('setLayoutReducer', () => {
 
 describe('setActivePaneReducer', () => {
   it('split2 ではアクティブペインを移す', () => {
-    const next = setActivePaneReducer(S('split2', ['a', 'b'], 0), 1);
+    const before = S('split2', ['a', 'b'], 0);
+    const next = setActivePaneReducer(before, 1);
     expect(next.activePane).toBe(1);
     expect(next.paneAssignment).toEqual(['a', 'b']);
+    expect(next.paneAssignment).toBe(before.paneAssignment);
+
+    // isSplit() 経由であることの証跡: split2-v でも同じ結果になる（契約 §28.2）。
+    const beforeV = S('split2-v', ['a', 'b'], 0);
+    const nextV = setActivePaneReducer(beforeV, 1);
+    expect(nextV.activePane).toBe(1);
+    expect(nextV.paneAssignment).toEqual(['a', 'b']);
+    expect(nextV.paneAssignment).toBe(beforeV.paneAssignment);
   });
 
   it('single では no-op（同一オブジェクトを返す）', () => {
