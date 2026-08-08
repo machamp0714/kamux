@@ -116,10 +116,82 @@ pub fn notify_kind_for(next: RuntimeState, reason: StateReason) -> Option<Notify
     }
 }
 
+/// 「そのセッションを今ユーザーが見ているか」。
+///
+/// ウィンドウがフォーカスされ、ターミナル画面が表示され、かつ表示中ペインに
+/// 割り当てられているときだけ true。エディタ画面は nvim であり agent の出力は
+/// 見えていないので、抑制対象にしない。
+pub fn is_session_visible(session_id: &str, v: &VisibilityContext) -> bool {
+    v.window_focused
+        && matches!(v.view, Some(ViewKind::Terminal))
+        && v.visible_session_ids.iter().any(|id| id == session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{RuntimeState, StateReason};
+
+    fn ctx(focused: bool, view: Option<ViewKind>, ids: &[&str]) -> VisibilityContext {
+        VisibilityContext {
+            window_focused: focused,
+            view,
+            visible_session_ids: ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn visible_when_focused_on_terminal_and_assigned_to_a_pane() {
+        assert!(is_session_visible(
+            "s1",
+            &ctx(true, Some(ViewKind::Terminal), &["s1"])
+        ));
+    }
+
+    #[test]
+    fn visible_when_assigned_to_the_second_pane() {
+        assert!(is_session_visible(
+            "s2",
+            &ctx(true, Some(ViewKind::Terminal), &["s1", "s2"])
+        ));
+    }
+
+    #[test]
+    fn not_visible_when_window_is_in_background() {
+        assert!(!is_session_visible(
+            "s1",
+            &ctx(false, Some(ViewKind::Terminal), &["s1"])
+        ));
+    }
+
+    #[test]
+    fn not_visible_on_kanban_even_if_focused() {
+        assert!(!is_session_visible(
+            "s1",
+            &ctx(true, Some(ViewKind::Kanban), &["s1"])
+        ));
+    }
+
+    #[test]
+    fn not_visible_on_editor_because_agent_output_is_hidden() {
+        assert!(!is_session_visible(
+            "s1",
+            &ctx(true, Some(ViewKind::Editor), &["s1"])
+        ));
+    }
+
+    #[test]
+    fn not_visible_when_another_session_occupies_the_pane() {
+        assert!(!is_session_visible(
+            "s1",
+            &ctx(true, Some(ViewKind::Terminal), &["s9"])
+        ));
+    }
+
+    #[test]
+    fn not_visible_when_frontend_has_not_reported_yet() {
+        assert!(!is_session_visible("s1", &ctx(true, None, &["s1"])));
+    }
 
     #[test]
     fn hook_notification_into_waiting_input_is_a_waiting_notification() {
