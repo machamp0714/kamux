@@ -253,7 +253,11 @@ mod tests {
         }
 
         fn event(&self, event: &tracing::Event<'_>) {
-            CAPTURE_SINK.with(|cell| {
+            // `register_callsite` が `always` を返すので、この `event` は
+            // **テストバイナリの全スレッド**から呼ばれる（従来は NoSubscriber が
+            // 落としていた）。スレッド終了処理中に鳴るイベントもありうるため、
+            // TLS 破棄後に panic する `with` ではなく `try_with` を使う。
+            let _ = CAPTURE_SINK.try_with(|cell| {
                 let borrowed = cell.borrow();
                 let Some(sink) = borrowed.as_ref() else {
                     return;
@@ -305,7 +309,8 @@ mod tests {
 
     impl Drop for SinkGuard {
         fn drop(&mut self) {
-            CAPTURE_SINK.with(|cell| *cell.borrow_mut() = None);
+            // panic の巻き戻し中にも走るので、ここでも panic しない形にする。
+            let _ = CAPTURE_SINK.try_with(|cell| *cell.borrow_mut() = None);
         }
     }
 
