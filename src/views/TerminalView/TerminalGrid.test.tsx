@@ -607,7 +607,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     expect(mocks.resizePty).not.toHaveBeenCalled();
   });
 
-  it('アンマウント後に保留中の fit 要求が発火しても resize_pty を呼ばない（scheduler.cancel）', async () => {
+  it('アンマウント後は保留中の fit 要求も新しい window resize も resize_pty を呼ばない（scheduler.cancel / removeEventListener）', async () => {
     mocks.isStarted.mockReturnValue(true);
     mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
 
@@ -620,6 +620,15 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     });
     act(() => {
       root.unmount();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(mocks.resizePty).not.toHaveBeenCalled();
+
+    // removeEventListener が抜けていると、アンマウント後の resize でも
+    // scheduler.request() が呼ばれ続けてしまう
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
     });
     await new Promise((resolve) => setTimeout(resolve, 150));
 
