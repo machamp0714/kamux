@@ -250,6 +250,22 @@ describe('TerminalGrid（アクティブペインの移動）', () => {
     expect(slots().map((el) => el.dataset.active)).toEqual(['false', 'true']);
   });
 
+  it('ペイン内へ DOM フォーカスが入ると activePane がそちらへ移る（フォーカス層からの復路）', async () => {
+    // クリックだけが activePane を動かすのではない。Task 9 の useActivePaneFocus は
+    // term.focus() をスロットの中へ当てるので、その復路（onFocusCapture）が無いと
+    // DOM フォーカスと activePane が食い違ったまま残る。React は onFocus 系を
+    // focusin として受け取る
+    setPanes('split2', ['s1', 's2'], 1);
+    render();
+    await flush();
+
+    act(() => {
+      hostOf(0)?.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    });
+
+    expect(useAppStore.getState().activePane).toBe(0);
+  });
+
   it('打鍵の宛先はアクティブペインだけ（非アクティブ側のターミナルに focus しない）', async () => {
     // 分割時に「どちらへキー入力が行くか」の実体。isActive を渡し忘れる / true 固定に
     // すると、後から effect が走ったペインが必ずフォーカスを奪う
