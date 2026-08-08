@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   isStarted: vi.fn(),
   markStarted: vi.fn(),
   unmarkStarted: vi.fn(),
+  ensureTerminal: vi.fn(),
   attachTerminal: vi.fn(),
   detachTerminal: vi.fn(),
   fitTerminal: vi.fn(),
@@ -31,6 +32,7 @@ vi.mock('../../terminal/ptyBridge', () => ({
   unmarkStarted: mocks.unmarkStarted,
 }));
 vi.mock('../../terminal/registry', () => ({
+  ensureTerminal: mocks.ensureTerminal,
   attachTerminal: mocks.attachTerminal,
   detachTerminal: mocks.detachTerminal,
   fitTerminal: mocks.fitTerminal,
@@ -169,7 +171,7 @@ describe('TerminalView（要件5: focusedSessionId の xterm へフォーカス�
    * 初期描画では TerminalPane 側の focus effect も同じ surface を引く。
    * 「既にペインに載っているセッションへの再フォーカス」＝ paneAssignment が変わらない
    * 遷移だけを見ることで、TerminalView 自身の effect を分離して検証する
-   * （TerminalPane の deps は [sessionId, modal] なのでこの遷移では再実行されない）。
+   * （TerminalPane の deps は [sessionId, isActive, modal] なのでこの遷移では再実行されない）。
    */
   async function renderThenReset(terms: ReturnType<typeof fakeTerminals>) {
     act(() => {

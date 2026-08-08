@@ -1,0 +1,73 @@
+/* 契約 §28.4: CSS Grid であって flex ではない（flex-direction は存在しない）。
+   トランジション禁止（設計 §3.4）——アニメーション中に fit() すると中間サイズが PTY に飛ぶ */
+.terminal-grid {
+  display: grid;
+  /* 親 .kamux-terminal-view は display: flex で、タブ列が flex: 0 0 220px を取る。
+     残り全幅を取る伸び代はグリッド側が持つ（M1-3 では .terminal-pane-slot が
+     持っていたが、スロットはグリッドアイテムになったのでここへ移した） */
+  flex: 1 1 auto;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  /* ペインの区切り線。1px は「線の太さ」であり尺度ではないためトークン化しない
+     （border / outline の幅と同じ扱い）。色は区切り線のトークンを使う */
+  gap: 1px;
+  background: var(--border);
+}
+
+.terminal-grid[data-layout='single'] {
+  grid-template-columns: 1fr;
+}
+.terminal-grid[data-layout='split2'] {
+  grid-template-columns: 1fr 1fr;
+}
+.terminal-grid[data-layout='split2-v'] {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+/* 契約 §57.3。M1-3 の単一ペインが作った 2 要素構造をそのまま各ペインへ複製したもの
+   （旧称は §25.3 の禁止列を参照） */
+.terminal-pane-slot {
+  position: relative;
+  /* 両方必要（契約 §28.4）。min-height を欠くと行方向のグリッドアイテムが
+     既定の min-height: auto で縮まず、上下分割で xterm がスロットからはみ出す */
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  /* xterm の下地なのでターミナル面のトークン（テーマ非依存） */
+  background: var(--bg-terminal);
+}
+
+/* フォーカス中のペイン（components.md「ターミナル面」節: 2px solid var(--accent)）。
+   outline は要素の外側に描かれ overflow: hidden で切られるので、負のオフセットで
+   内側に寄せる。single では「どちらへキー入力が行くか」を示す必要が無いので出さない
+   （§57.5 がペインヘッダを分割時の手がかりと位置づけているのと同じ理由） */
+.terminal-grid:not([data-layout='single']) .terminal-pane-slot[data-active='true'] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* attachTerminal のコンテナ。契約 §57.3 でこの要素に固定されている。
+   絶対配置の包含ブロックは祖先の padding「エッジ」で区切られる箱なので、
+   inset: 0 の子は padding 領域まで覆う（= 親に padding を置いても効かない。
+   headless Chromium で実測済み）。余白が要る場合は親の padding ではなく、
+   この要素の inset の値で与えること */
+.terminal-pane-slot__host {
+  position: absolute;
+  inset: 0;
+}
+
+.terminal-pane-slot__empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* この要素はターミナル面（--bg-terminal、テーマ非依存）に直接乗るので、
+     テーマ追従の --text-muted ではなくターミナル面専用のトークン系統を使う
+     （M1-3 fix round 1、light: --text-muted だと 3.17:1 だった） */
+  color: var(--text-term-dim);
+  font-size: var(--text-sm);
+  pointer-events: none;
+}
