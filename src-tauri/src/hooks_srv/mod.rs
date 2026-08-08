@@ -917,13 +917,59 @@ mod tests {
             PERSISTENT_FAILURES,
             "each persistent accept failure must wait exactly once: {waits:?}"
         );
-        assert!(
-            waits.iter().all(|d| *d > Duration::ZERO),
-            "no-wait spin must not happen: {waits:?}"
+        // `> Duration::ZERO` は「非ゼロなら何でも通る」恒真に近い述語で、線形増加も
+        // 上限への張り付きも守らない。取り違えたら別物になる具体値と突き合わせる。
+        let expected: Vec<Duration> = (1..=PERSISTENT_FAILURES as u32)
+            .map(|n| {
+                ACCEPT_ERROR_BACKOFF_UNIT
+                    .saturating_mul(n)
+                    .min(ACCEPT_ERROR_BACKOFF_MAX)
+            })
+            .collect();
+        assert_eq!(
+            waits, expected,
+            "backoff must grow linearly with consecutive failures and cap at ACCEPT_ERROR_BACKOFF_MAX: {waits:?}"
         );
-        assert!(
-            waits.iter().all(|d| *d <= ACCEPT_ERROR_BACKOFF_MAX),
-            "backoff must stay capped even after many consecutive failures: {waits:?}"
+    }
+
+    /// 契約 §0 の手当てが「連続失敗回数」を数えていることの裏付け:
+    /// 成功した接続を挟むと、直後の失敗の待機は積み上がった回数からではなく
+    /// `UNIT`（1 回目相当）から数え直す。`UnixStream::pair()` で作った片方を
+    /// `Ok` として `incoming` に混ぜ、相手側は即座に drop して `handle_connection`
+    /// が空バッファで即 return するようにする。
+    #[test]
+    fn accept_loop_resets_backoff_after_a_successful_connection() {
+        let (accepted, peer) = UnixStream::pair().expect("pair");
+        drop(peer);
+
+        let items: Vec<std::io::Result<UnixStream>> = vec![
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            Ok(accepted),
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+        ];
+
+        let sink: Arc<dyn HookSink> = Arc::new(RecordingSink::default());
+        let waits: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits_for_sleep = Arc::clone(&waits);
+
+        accept_loop_with(
+            items.into_iter(),
+            sink,
+            Arc::new(AtomicBool::new(false)),
+            move |d| waits_for_sleep.lock().expect("lock").push(d),
+        );
+
+        let waits = waits.lock().expect("lock").clone();
+        // `Ok` 分岐は sleep を呼ばないので、記録は Err の 3 回分だけ。
+        assert_eq!(
+            waits,
+            vec![
+                ACCEPT_ERROR_BACKOFF_UNIT,
+                ACCEPT_ERROR_BACKOFF_UNIT.saturating_mul(2),
+                ACCEPT_ERROR_BACKOFF_UNIT,
+            ],
+            "a successful connection must reset consecutive_errors, not merely pause it: {waits:?}"
         );
     }
 }
