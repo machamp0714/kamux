@@ -12,6 +12,7 @@ import { attachTerminal, detachTerminal, ensureTerminal } from '../../terminal/r
 import { surfaceId } from '../../types/model';
 import { syncPaneSize } from './paneSize';
 import { TerminalPane } from './TerminalPane';
+import { useActivePaneFocus } from './useActivePaneFocus';
 import './TerminalGrid.css';
 
 /** リサイズ通知のデバウンス。ドラッグ中の resize_pty 連打を抑える */
@@ -20,11 +21,16 @@ const RESIZE_DEBOUNCE_MS = 60;
 /**
  * 1〜2 面のペイングリッド（契約 §28.4 / §57.3）。
  *
- * 責務は「グリッドの DOM」と「表示集合の差分による attach/detach」の 2 つだけで、
- * PTY のライフサイクル（起動・購読・実行状態の seed）は各スロット内の
- * `TerminalPane`（DOM を描かない層）が持つ（契約 §85.5）。
+ * 責務は「グリッドの DOM」「表示集合の差分による attach/detach」「terminal 面の
+ * DOM フォーカス（`useActivePaneFocus`）」の 3 つで、PTY のライフサイクル
+ * （起動・購読・実行状態の seed）は各スロット内の `TerminalPane`
+ * （DOM を描かない層）が持つ（契約 §85.5）。
  */
 export function TerminalGrid(): JSX.Element {
+  // terminal 面の唯一のフォーカス層（契約 §85.3 / §85.6）。DOM フォーカスは
+  // activePane / modal の変化に追従してここから当たる
+  useActivePaneFocus();
+
   const layout = useAppStore((s) => s.layout);
   const paneAssignment = useAppStore((s) => s.paneAssignment);
   const activePane = useAppStore((s) => s.activePane);
@@ -143,7 +149,7 @@ export function TerminalGrid(): JSX.Element {
                 左のタブからセッションを選択してください
               </div>
             ) : (
-              <TerminalPane sessionId={sessionId} isActive={pane === activePane} />
+              <TerminalPane sessionId={sessionId} />
             )}
             <div
               className="terminal-pane-slot__host"

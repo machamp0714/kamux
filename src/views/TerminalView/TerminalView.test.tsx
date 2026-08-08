@@ -81,25 +81,6 @@ async function flush(times = 4): Promise<void> {
   });
 }
 
-/** フォーカスは requestAnimationFrame 越しに当たるので 1 フレーム進める。 */
-async function flushFrame(): Promise<void> {
-  await act(async () => {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  });
-}
-
-/**
- * surface_id をキーに引ける xterm のダミー。`getTerminal` が undefined を返すままだと
- * 「レジストリのキーが session_id に化けた」変異が focus の欠落として現れない。
- */
-function fakeTerminals() {
-  const s1 = { focus: vi.fn() };
-  const s2 = { focus: vi.fn() };
-  const terms: Record<string, { focus: () => void }> = { 's1:agent': s1, 's2:agent': s2 };
-  mocks.getTerminal.mockImplementation((key: string) => terms[key]);
-  return { s1, s2 };
-}
-
 let container: HTMLDivElement;
 let root: Root;
 
@@ -166,54 +147,9 @@ describe('TerminalView（不変条件 E・F）', () => {
   });
 });
 
-describe('TerminalView（要件5: focusedSessionId の xterm へフォーカスする）', () => {
-  /**
-   * 初期描画では TerminalPane 側の focus effect も同じ surface を引く。
-   * 「既にペインに載っているセッションへの再フォーカス」＝ paneAssignment が変わらない
-   * 遷移だけを見ることで、TerminalView 自身の effect を分離して検証する
-   * （TerminalPane の deps は [sessionId, isActive, modal] なのでこの遷移では再実行されない）。
-   */
-  async function renderThenReset(terms: ReturnType<typeof fakeTerminals>) {
-    act(() => {
-      root = createRoot(container);
-      root.render(<TerminalView />);
-    });
-    await flush();
-    await flushFrame();
-    vi.clearAllMocks();
-    terms.s1.focus.mockClear();
-    terms.s2.focus.mockClear();
-  }
-
-  it('ペインに載ったままのセッションを再フォーカスすると、その surface_id の xterm に focus が当たる', async () => {
-    const terms = fakeTerminals();
-    await renderThenReset(terms);
-
-    act(() => {
-      useAppStore.getState().focusSession('s1', 'terminal');
-    });
-    await flushFrame();
-
-    // 契約 §16: レジストリのキーは surface_id（session_id ではない）
-    expect(mocks.getTerminal).toHaveBeenCalledWith('s1:agent');
-    expect(terms.s1.focus).toHaveBeenCalledTimes(1);
-  });
-
-  it('モーダル表示中は実シェルへ DOM フォーカスを渡さない', async () => {
-    const terms = fakeTerminals();
-    await renderThenReset(terms);
-
-    act(() => {
-      useAppStore.setState({ modal: { kind: 'create_session' } });
-    });
-    await flushFrame();
-    terms.s1.focus.mockClear();
-
-    act(() => {
-      useAppStore.getState().focusSession('s1', 'terminal');
-    });
-    await flushFrame();
-
-    expect(terms.s1.focus).not.toHaveBeenCalled();
-  });
-});
+// 要件5（focus:// / カードクリックの着地点でのフォーカス）は、層 2（この effect）が
+// `useActivePaneFocus` へ統合されて消えたため（契約 §85.5.1 / §85.6）、
+// src/views/TerminalView/useActivePaneFocus.test.tsx の
+// 「§85.5 条件 2: focus:// / カードクリックの着地点を失わない」に移設した。
+// `fakeTerminals` / `flushFrame` は移設先で使わなくなったため、この移設に伴って
+// 未使用になった場合は本ファイルから削除すること

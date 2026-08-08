@@ -25,7 +25,6 @@ const mocks = vi.hoisted(() => {
     markStarted: vi.fn(),
     unmarkStarted: vi.fn(),
     fitTerminal: vi.fn(),
-    getTerminal: vi.fn(),
     invalidateFitCache: vi.fn(),
     writeNotice: vi.fn(),
   };
@@ -42,12 +41,12 @@ vi.mock('../../terminal/ptyBridge', () => ({
   markStarted: mocks.markStarted,
   unmarkStarted: mocks.unmarkStarted,
 }));
-// attachTerminal / detachTerminal は意図的に生やさない。この層は DOM を持たず
-// attach/detach を行わない（契約 §85.5。駆動は TerminalGrid の集合差分に一本化）ため、
-// 実装が呼べば「関数ではない」で例外になりテストが失敗する
+// attachTerminal / detachTerminal / getTerminal は意図的に生やさない。この層は
+// DOM を持たず attach/detach を行わず、フォーカスも当てない（契約 §85.5 / §85.6。
+// 駆動は TerminalGrid の集合差分、フォーカスは useActivePaneFocus に一本化）ため、
+// 実装がどれかを呼べば「関数ではない」で例外になりテストが失敗する
 vi.mock('../../terminal/registry', () => ({
   fitTerminal: mocks.fitTerminal,
-  getTerminal: mocks.getTerminal,
   invalidateFitCache: mocks.invalidateFitCache,
   writeNotice: mocks.writeNotice,
 }));
@@ -104,10 +103,10 @@ async function flush(times = 4): Promise<void> {
 let container: HTMLDivElement;
 let root: Root;
 
-function renderPane(sessionId: string, isActive = true): void {
+function renderPane(sessionId: string): void {
   act(() => {
     root = createRoot(container);
-    root.render(<TerminalPane sessionId={sessionId} isActive={isActive} />);
+    root.render(<TerminalPane sessionId={sessionId} />);
   });
 }
 
@@ -115,7 +114,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.isStarted.mockReturnValue(false);
   mocks.fitTerminal.mockReturnValue(null);
-  mocks.getTerminal.mockReturnValue(undefined);
   mocks.resizePty.mockResolvedValue(undefined);
   // 回帰テストが差し替えても、次のテストでは既定の vi.fn() 経由へ必ず戻す
   mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
@@ -290,82 +288,10 @@ describe('TerminalPane（Important 1: resize_pty の reject が unhandled reject
   });
 });
 
-describe('TerminalPane（Critical: モーダル表示中は実シェルへ focus を渡さない）', () => {
-  it('modal が null なら getTerminal(surface).focus() を呼ぶ', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: null });
-
-    renderPane('s1');
-    await flush();
-
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-
-  it('modal が開いていれば focus しない（実シェルへ打鍵が流れるのを防ぐ）', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: { kind: 'create_session' } });
-
-    renderPane('s1');
-    await flush();
-
-    expect(focus).not.toHaveBeenCalled();
-  });
-
-  it('非アクティブなペインには focus を当てない（2 ペインで後発が奪わない）', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: null });
-
-    renderPane('s1', false);
-    await flush();
-
-    expect(focus).not.toHaveBeenCalled();
-  });
-
-  it('アクティブになった瞬間に（再マウントなしで）フォーカスが移る', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-
-    renderPane('s1', false);
-    await flush();
-    expect(focus).not.toHaveBeenCalled();
-
-    act(() => {
-      root.render(<TerminalPane sessionId="s1" isActive />);
-    });
-    await flush();
-
-    // 契約 §16: レジストリのキーは surface_id（session_id ではない）
-    expect(mocks.getTerminal).toHaveBeenCalledWith('s1:agent');
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-
-  it('モーダルを閉じると（再マウントなしで）フォーカスが戻る', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: { kind: 'create_session' } });
-
-    renderPane('s1');
-    await flush();
-    expect(focus).not.toHaveBeenCalled();
-
-    // TerminalPane を作り直すのではなく、購読しているストアの modal だけを更新する
-    // ——「マウント時に 1 度評価する」ではなく modal の遷移に追従することの検証
-    act(() => {
-      useAppStore.setState({ modal: null });
-    });
-    await flush();
-
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-});
+// 契約 §85.6: フォーカスは `useActivePaneFocus` に統合され、この層はもう当てない
+// （src/views/TerminalView/useActivePaneFocus.test.tsx に移設した）。
+// registry モックに getTerminal を生やしていないので、実装がまだ focus() を
+// 呼んでいれば「関数ではない」で例外になり、退行の検出器として働く
 
 describe('TerminalPane（ペインの載せ替え）', () => {
   it('sessionId が変わると新しいセッションを起動する（旧セッションは止めない）', async () => {
@@ -377,7 +303,7 @@ describe('TerminalPane（ペインの載せ替え）', () => {
     expect(mocks.startSession).toHaveBeenCalledWith('s1');
 
     act(() => {
-      root.render(<TerminalPane sessionId="s2" isActive />);
+      root.render(<TerminalPane sessionId="s2" />);
     });
     await flush();
 
@@ -402,7 +328,7 @@ describe('TerminalPane（必達 7: StrictMode での冪等性）', () => {
       root = createRoot(container);
       root.render(
         <StrictMode>
-          <TerminalPane sessionId="s1" isActive />
+          <TerminalPane sessionId="s1" />
         </StrictMode>,
       );
     });

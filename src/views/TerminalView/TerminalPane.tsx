@@ -1,14 +1,14 @@
 import { useEffect } from 'react';
 
 import { startSession } from '../../ipc/commands';
-import { useAppStore } from '../../store';
 import {
   ensurePtySubscription,
   isStarted,
   markStarted,
   unmarkStarted,
 } from '../../terminal/ptyBridge';
-import { getTerminal, invalidateFitCache, writeNotice } from '../../terminal/registry';
+import { invalidateFitCache, writeNotice } from '../../terminal/registry';
+import { useAppStore } from '../../store';
 import { toAppError } from '../../store/uiSlice';
 import { surfaceId } from '../../types/model';
 import { syncPaneSize } from './paneSize';
@@ -23,19 +23,11 @@ import { syncPaneSize } from './paneSize';
  * `TerminalGrid` は各スロットの中でこれを 1 つずつ描くので、2 ペインでは 2 つ生きる。
  * 門（`isStarted`）は surface 単位（`{session_id}:agent`）なので、スワップで同じ
  * セッションが別のペインへ載り替えても start_session は 1 回のままである。
+ *
+ * **フォーカスはここでは当てない。** terminal 面の DOM フォーカスは
+ * `useActivePaneFocus` の 1 層に統合されている（契約 §85.3 / §85.6）。
  */
-export function TerminalPane({
-  sessionId,
-  isActive,
-}: {
-  sessionId: string;
-  isActive: boolean;
-}): null {
-  // 契約 §16: フォーカスは呼び出し側の責務であり、modal === null のときにのみ当てる。
-  // 「マウント時に 1 度評価する」ではなく modal の遷移に追従する必要があるため、
-  // ここで購読してフォーカス専用 effect の依存にする（下の第 2 effect）
-  const modal = useAppStore((s) => s.modal);
-
+export function TerminalPane({ sessionId }: { sessionId: string }): null {
   useEffect(() => {
     const surface = surfaceId(sessionId, 'agent');
 
@@ -88,23 +80,6 @@ export function TerminalPane({
         writeNotice(surface, `PTY イベントの購読に失敗しました: ${String(error)}`, 'error');
       });
   }, [sessionId]);
-
-  // Critical（PR 10 fix round 1・契約 §16）: attachTerminal はもう term.focus() しない。
-  // フォーカスは呼び出し側の責務であり、modal === null のときにのみ当てる。
-  // モーダル表示中は実シェルへ DOM フォーカスを渡さない（Cmd+2 やタブクリックで
-  // この層が（再）マウントされても、モーダルは view 分岐の外にあるため残ったままになりうる）。
-  //
-  // 上の起動 effect とは別 effect にしているのは、「マウント時に 1 度評価する」のではなく
-  // modal の遷移そのものに追従させるため——モーダルを閉じた瞬間（modal: 非null → null）
-  // にも、この層が再マウントされることなくフォーカスを戻す必要がある。
-  //
-  // isActive の門は 2 ペインで要る。無いと後から効果が走ったペイン（pane 1）が
-  // 必ずフォーカスを奪い、Cmd+[ / Cmd+] で選んだペインに打鍵が行かなくなる。
-  // **この層は Task 9 の useActivePaneFocus に統合されて消える**（契約 §85.6）。
-  useEffect(() => {
-    if (!isActive || modal !== null) return;
-    getTerminal(surfaceId(sessionId, 'agent'))?.focus();
-  }, [sessionId, isActive, modal]);
 
   return null;
 }

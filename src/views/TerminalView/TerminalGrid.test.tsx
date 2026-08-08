@@ -157,7 +157,16 @@ beforeEach(() => {
   mocks.resizePty.mockResolvedValue(undefined);
   mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
     mocks.resizePty(surfaceId, cols, rows);
-  useAppStore.setState({ modal: null, runtimeStates: {}, runtimeReasons: {}, runtimeErrors: {} });
+  // view: 'terminal' は useActivePaneFocus のガード（契約 §85.4）が要求する。本番では
+  // TerminalGrid は view === 'terminal' のときにしか App.tsx からマウントされないが、
+  // ここでは TerminalGrid を直接マウントするので明示しておく必要がある
+  useAppStore.setState({
+    view: 'terminal',
+    modal: null,
+    runtimeStates: {},
+    runtimeReasons: {},
+    runtimeErrors: {},
+  });
   setPanes('single', ['s1', null], 0);
   container = document.createElement('div');
   document.body.appendChild(container);
