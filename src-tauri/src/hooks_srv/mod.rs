@@ -1,0 +1,150 @@
+use std::path::{Path, PathBuf};
+
+use crate::error::{AppError, AppResult};
+
+/// macOS の sockaddr_un.sun_path は 104 バイト。
+pub const SUN_PATH_MAX: usize = 104;
+
+const RUNTIME_PREFIX: &str = "kamux-hooks-";
+const SOCKET_SUFFIX: &str = ".sock";
+const SETTINGS_SUFFIX: &str = ".settings.json";
+
+/// 契約 §12.1: $TMPDIR/kamux-hooks-{pid}.sock
+pub fn hooks_socket_path() -> AppResult<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "{RUNTIME_PREFIX}{}{SOCKET_SUFFIX}",
+        std::process::id()
+    ));
+    if path.as_os_str().len() >= SUN_PATH_MAX {
+        return Err(AppError::Io(format!(
+            "hooks socket path exceeds sun_path limit ({} >= {SUN_PATH_MAX}): {}",
+            path.as_os_str().len(),
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// --settings に渡す JSON の置き場所。ソケットと同じライフサイクル。
+pub fn hooks_settings_path() -> AppResult<PathBuf> {
+    Ok(std::env::temp_dir().join(format!(
+        "{RUNTIME_PREFIX}{}{SETTINGS_SUFFIX}",
+        std::process::id()
+    )))
+}
+
+/// kamux-hooks-{pid}.sock / kamux-hooks-{pid}.settings.json から pid を取り出す。
+pub fn runtime_file_pid(file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(RUNTIME_PREFIX)?;
+    let digits = rest
+        .strip_suffix(SOCKET_SUFFIX)
+        .or_else(|| rest.strip_suffix(SETTINGS_SUFFIX))?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+/// アプリが異常終了した回の残骸を掃除する。削除した件数を返す。
+/// 設計 §6-6。
+pub fn sweep_stale_runtime_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = runtime_file_pid(name) else {
+            continue;
+        };
+        if is_pid_alive(pid) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// kill(pid, 0) で存在確認する。権限エラー(EPERM)は「生きている」とみなす。
+fn is_pid_alive(pid: u32) -> bool {
+    // SAFETY: シグナル 0 の kill は副作用がなく、存在確認のみを行う。
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_is_in_tmpdir_and_contains_pid() {
+        let p = hooks_socket_path().expect("socket path");
+        assert!(p.starts_with(std::env::temp_dir()));
+        let name = p.file_name().expect("name").to_string_lossy().into_owned();
+        assert_eq!(name, format!("kamux-hooks-{}.sock", std::process::id()));
+        assert!(
+            p.as_os_str().len() < SUN_PATH_MAX,
+            "path too long for sun_path: {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn settings_path_sits_next_to_the_socket() {
+        let s = hooks_settings_path().expect("settings path");
+        let name = s.file_name().expect("name").to_string_lossy().into_owned();
+        assert_eq!(
+            name,
+            format!("kamux-hooks-{}.settings.json", std::process::id())
+        );
+    }
+
+    #[test]
+    fn extracts_pid_from_runtime_file_names() {
+        assert_eq!(runtime_file_pid("kamux-hooks-4321.sock"), Some(4321));
+        assert_eq!(
+            runtime_file_pid("kamux-hooks-4321.settings.json"),
+            Some(4321)
+        );
+        assert_eq!(runtime_file_pid("kamux-hooks-.sock"), None);
+        assert_eq!(runtime_file_pid("kamux-hooks-abc.sock"), None);
+        assert_eq!(runtime_file_pid("unrelated.sock"), None);
+        assert_eq!(runtime_file_pid("kamux-relay-test-1.sock"), None);
+    }
+
+    #[test]
+    fn sweeps_only_dead_pids() {
+        let dir = std::env::temp_dir().join(format!("kamux-sweep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // 生きている pid（自分自身）→ 残す
+        let alive = dir.join(format!("kamux-hooks-{}.sock", std::process::id()));
+        std::fs::write(&alive, b"").expect("write");
+
+        // 存在しない pid → 消す。pid 上限を超えた値を使う
+        let dead_sock = dir.join("kamux-hooks-4194303.sock");
+        let dead_settings = dir.join("kamux-hooks-4194303.settings.json");
+        std::fs::write(&dead_sock, b"").expect("write");
+        std::fs::write(&dead_settings, b"").expect("write");
+
+        // 無関係なファイル → 残す
+        let unrelated = dir.join("something-else.sock");
+        std::fs::write(&unrelated, b"").expect("write");
+
+        let removed = sweep_stale_runtime_files(&dir);
+
+        assert_eq!(removed, 2);
+        assert!(alive.exists());
+        assert!(!dead_sock.exists());
+        assert!(!dead_settings.exists());
+        assert!(unrelated.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
