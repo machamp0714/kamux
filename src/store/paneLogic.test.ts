@@ -382,6 +382,11 @@ describe('visibleAgentSurfaces', () => {
     expect(visibleAgentSurfaces(S('single', ['a', 'b'], 1))).toEqual(['b:agent']);
   });
 
+  it('split2-v でも両ペインを上から返す（軸 A: 向きで集合が変わらない）', () => {
+    expect(visibleAgentSurfaces(S('split2-v', ['a', 'b'], 0))).toEqual(['a:agent', 'b:agent']);
+    expect(visibleAgentSurfaces(S('split2-v', ['a', 'b'], 1))).toEqual(['a:agent', 'b:agent']);
+  });
+
   it('未割当のペインを飛ばす', () => {
     expect(visibleAgentSurfaces(S('split2', ['a', null], 0))).toEqual(['a:agent']);
     expect(visibleAgentSurfaces(S('single', [null, null], 0))).toEqual([]);

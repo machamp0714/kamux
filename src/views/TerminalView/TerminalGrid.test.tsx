@@ -277,6 +277,18 @@ describe('TerminalGrid（アクティブペインの移動）', () => {
     expect(Math.max(...attachOrder)).toBeLessThan(focusOrder[0]);
   });
 
+  it('activePane=1 から 0 側のスロットを押しても移る（軸 B: 逆向き）', async () => {
+    setPanes('split2', ['s1', 's2'], 1);
+    render();
+    await flush();
+
+    act(() => {
+      slots()[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    });
+
+    expect(useAppStore.getState().activePane).toBe(0);
+  });
+
   it('アクティブ側を押しても activePane は動かない', async () => {
     setPanes('split2', ['s1', 's2'], 1);
     render();
