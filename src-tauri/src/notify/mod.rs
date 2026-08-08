@@ -187,6 +187,9 @@ impl Notifier {
             // この項は set_permission が permission_requested を立てるのと冗長であり、
             // 公開 API 経由では単独では到達不能なのでテストで守れない（PR 18 単位レビュー I-1）。
             // 設計 §5.6 の「権限が未知のときに 1 回だけ訊く」を式の上に残すために意図的に置いている。
+            // ⚠️ PR 19 で set_permission の呼び出し方が増える（read_permission() の結果を流す）。
+            //    その時点で「公開 API 経由では到達不能」の前提を再検証すること。
+            //    Granted → Unknown → Spawned の経路が実際に発生しうる。
             && inner.permission == NotifyPermission::Unknown
             && !inner.permission_requested;
         if request_permission {
