@@ -1085,4 +1085,35 @@ mod tests {
             "unexpected error: {err:?}"
         );
     }
+
+    /// `resolve_relay_bin()`（実環境版）の配線を守る。§81.2 カテゴリ3: 同じ
+    /// スコープに `exe`（実行ファイル自身）と `exe_dir`（その親ディレクトリ、
+    /// `exe` から導出）という 2 本の `PathBuf` があり、`resolve_relay_bin_from`
+    /// へ渡す際に取り違えても型検査は通る。`KAMUX_RELAY_BIN` の分岐は
+    /// `exe_dir` に触れず早期 return するので、この配線はその分岐を経由する
+    /// テストでは守れない —— ここでは「隣に置く」経路そのものを実行する。
+    ///
+    /// 注意: このテストはプロセス全体で共有される
+    /// `current_exe().parent()/kamux-relay` というパスに書き込む。他のテストが
+    /// 同じパスへ触れるようになったら競合しうる（現時点では本テストのみ）。
+    #[test]
+    fn resolve_relay_bin_looks_in_the_directory_containing_the_executable() {
+        // KAMUX_RELAY_BIN が外から設定されていると env override 分岐が先に
+        // 返り、exe_dir 経路を一度も通らない。その場合このテストは何も守ら
+        // ないので、黙って緑になるのではなく前提として固定する。
+        assert!(
+            std::env::var_os("KAMUX_RELAY_BIN").is_none(),
+            "this test observes the exe_dir branch; KAMUX_RELAY_BIN must not be set"
+        );
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_dir = exe.parent().expect("parent").to_path_buf();
+        let fixture = exe_dir.join(RELAY_BIN_NAME);
+        std::fs::write(&fixture, b"").expect("write fixture");
+
+        let got = resolve_relay_bin();
+
+        let _ = std::fs::remove_file(&fixture);
+        assert_eq!(got.expect("resolve"), fixture);
+    }
 }
