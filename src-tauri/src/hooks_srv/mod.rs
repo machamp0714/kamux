@@ -134,9 +134,480 @@ fn is_pid_alive_with(pid: u32, kill: impl Fn(libc::pid_t, libc::c_int) -> libc::
     classify_kill_result(rc, errno)
 }
 
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// 1 メッセージの受け入れ上限。Stop の last_assistant_message は長くなりうる。
+const MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
+/// 悪意ある/切れた接続が accept ループを止められる時間の上限。
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// hooks_srv → 状態機械の唯一の依存。本番実装は HookHandler（Task 12）。
+pub trait HookSink: Send + Sync + 'static {
+    fn on_hook(&self, event: HookEvent);
+}
+
+/// Unix ソケットの accept ループを持つ。Drop で停止とファイル削除を行う。
+pub struct HooksServer {
+    socket_path: PathBuf,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HooksServer {
+    pub fn start(socket_path: PathBuf, sink: Arc<dyn HookSink>) -> AppResult<Self> {
+        // 前回の残骸（同 pid の再利用など）があれば消してから bind する。
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path).map_err(|e| {
+            AppError::Io(format!(
+                "failed to bind hooks socket {}: {e}",
+                socket_path.display()
+            ))
+        })?;
+
+        // umask 依存にせず明示的に 0600 にする（設計 §6-6）。
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| AppError::Io(format!("failed to chmod hooks socket: {e}")))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+
+        let handle = std::thread::Builder::new()
+            .name("kamux-hooks-srv".into())
+            .spawn(move || accept_loop(listener, sink, stop_for_thread))
+            .map_err(|e| AppError::Io(format!("failed to spawn hooks thread: {e}")))?;
+
+        Ok(Self {
+            socket_path,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// 冪等。二重に呼んでも安全。
+    pub fn shutdown(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::SeqCst);
+        // ブロッキング accept を起こすためだけの接続。
+        let _ = UnixStream::connect(&self.socket_path);
+        let _ = handle.join();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+impl Drop for HooksServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// ブロッキング accept。待機中は CPU を消費しない（契約 §0）。
+/// 受信処理をインラインで行うことでイベント順序を保存する（設計 §6-4）。
+fn accept_loop(listener: UnixListener, sink: Arc<dyn HookSink>, stop: Arc<AtomicBool>) {
+    for stream in listener.incoming() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match stream {
+            Ok(stream) => handle_connection(stream, sink.as_ref()),
+            Err(e) => {
+                tracing::warn!(error = %e, "hooks socket accept failed");
+            }
+        }
+    }
+}
+
+fn handle_connection(stream: UnixStream, sink: &dyn HookSink) {
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+
+    let mut buf = Vec::new();
+    // 読み取りが途中でタイムアウトしても、取れた分だけパースを試みる。
+    let _ = stream.take(MAX_MESSAGE_BYTES).read_to_end(&mut buf);
+    if buf.is_empty() {
+        return;
+    }
+    // read_to_end は上限に当たっても Ok を返す。切り詰めは後段の parse 失敗として
+    // 現れるだけなので、原因が分かる警告をここで出す。
+    if buf.len() as u64 == MAX_MESSAGE_BYTES {
+        tracing::warn!(
+            limit = MAX_MESSAGE_BYTES,
+            "hook message hit the size cap and was likely truncated"
+        );
+    }
+
+    match parse_hook_event(&buf) {
+        Ok(event) => sink.on_hook(event),
+        Err(e) => {
+            // 握りつぶさず生 JSON を残す（契約 §12.5）。
+            tracing::warn!(
+                error = %e,
+                raw = %String::from_utf8_lossy(&buf),
+                "failed to parse hook wire message"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<HookEvent>>,
+    }
+
+    impl RecordingSink {
+        fn snapshot(&self) -> Vec<HookEvent> {
+            self.events.lock().expect("lock").clone()
+        }
+    }
+
+    impl HookSink for RecordingSink {
+        fn on_hook(&self, event: HookEvent) {
+            self.events.lock().expect("lock").push(event);
+        }
+    }
+
+    fn test_socket_path(tag: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("kamux-srvtest-{}-{}.sock", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn send(path: &Path, message: &str) {
+        let mut s = UnixStream::connect(path).expect("connect");
+        s.write_all(message.as_bytes()).expect("write");
+        s.flush().expect("flush");
+        s.shutdown(std::net::Shutdown::Write).expect("shutdown");
+    }
+
+    fn wait_for<F: Fn() -> bool>(cond: F) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("condition not met within 2s");
+    }
+
+    #[test]
+    fn creates_socket_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_socket_path("perm");
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink).expect("start");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "socket must be owner-only, got {mode:o}");
+
+        drop(server);
+    }
+
+    #[test]
+    fn delivers_events_in_arrival_order() {
+        let path = test_socket_path("order");
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink.clone()).expect("start");
+
+        for kind in ["SessionStart", "Notification", "Stop"] {
+            send(
+                &path,
+                &format!(
+                    r#"{{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"{kind}","payload":{{"session_id":"550e8400"}}}}"#
+                ),
+            );
+        }
+
+        wait_for(|| sink.snapshot().len() == 3);
+        let events = sink.snapshot();
+        assert_eq!(events[0].kind, HookKind::SessionStart);
+        assert_eq!(events[1].kind, HookKind::Notification);
+        assert_eq!(events[2].kind, HookKind::Stop);
+        assert_eq!(events[2].claude_session_id.as_deref(), Some("550e8400"));
+        // §81.3: kamux_session_id と claude_session_id は同じ String 型で名前が
+        // 同義に読める。上のアサートは claude_session_id しか見ておらず、2 つの
+        // フィールドが取り違えられても検出できない。ここで kamux_session_id も
+        // 固定し、取り違えたら別物になる具体値（wire の "3f2a0000-..." と
+        // payload の "550e8400"）で区別する。
+        assert_eq!(
+            events[2].kamux_session_id,
+            "3f2a0000-0000-4000-8000-000000009c1e"
+        );
+
+        drop(server);
+    }
+
+    #[test]
+    fn broken_message_is_dropped_and_the_loop_survives() {
+        let path = test_socket_path("broken");
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink.clone()).expect("start");
+
+        send(&path, "this is not json");
+        send(
+            &path,
+            r#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Stop","payload":null}"#,
+        );
+
+        wait_for(|| sink.snapshot().len() == 1);
+        assert_eq!(sink.snapshot()[0].kind, HookKind::Stop);
+
+        drop(server);
+    }
+
+    #[test]
+    fn shutdown_unlinks_the_socket() {
+        let path = test_socket_path("unlink");
+        let sink = Arc::new(RecordingSink::default());
+        let mut server = HooksServer::start(path.clone(), sink).expect("start");
+        assert!(path.exists());
+
+        server.shutdown();
+
+        assert!(!path.exists(), "socket file must be removed on shutdown");
+        // 二重 shutdown が panic しないこと（Drop でもう一度呼ばれる）
+        server.shutdown();
+    }
+
+    #[test]
+    fn start_replaces_a_stale_socket_file() {
+        let path = test_socket_path("stale");
+        std::fs::write(&path, b"leftover").expect("write stale file");
+
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink.clone()).expect("start over stale file");
+
+        send(
+            &path,
+            r#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Notification","payload":null}"#,
+        );
+        wait_for(|| sink.snapshot().len() == 1);
+
+        drop(server);
+    }
+
+    /// PR 15 からの持ち越し 1（brief 冒頭）: relay の実出力を `parse_hook_event` が
+    /// 受ける E2E テストを 1 本置く。手書き JSON リテラルだけでは、relay 側の
+    /// wire フォーマット変更に誰も気づけない。
+    ///
+    /// 実 `kamux-relay` バイナリを起動し、素の `UnixListener` でバイト列を採取
+    /// してから `parse_hook_event` へ渡す（サーバの accept ループを経由しない
+    /// ことで、「relay の出力」と「hooks_srv の読み取り」を別々に固定できる）。
+    fn e2e_relay_bin_path() -> PathBuf {
+        let exe = std::env::current_exe().expect("current_exe for the test binary itself");
+        let profile_dir = exe
+            .parent() // .../target/debug/deps/
+            .and_then(Path::parent) // .../target/debug/
+            .expect("test binary must live under target/<profile>/deps/");
+        let candidate = profile_dir.join("kamux-relay");
+        assert!(
+            candidate.exists(),
+            "kamux-relay binary not found at {} (run `cargo build --workspace` first)",
+            candidate.display()
+        );
+        candidate
+    }
+
+    /// 実 relay プロセスを起動し、素のソケットで 1 メッセージ分のバイト列を採取する。
+    /// accept と read の両方を 1 つの上限（10 秒）の内側に収める
+    /// （契約の並行処理要件・§3 と同じ形。relay が繋がらない/送らないケースを
+    /// 無期限ハングさせない）。
+    fn capture_one_relay_message(sock: &Path, hook_kind: &str, stdin: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        let listener = UnixListener::bind(sock).expect("bind capture listener");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<Vec<u8>> {
+                let (mut stream, _) = listener.accept()?;
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf)?;
+                Ok(buf)
+            })();
+            let _ = tx.send(result);
+        });
+
+        let relay = e2e_relay_bin_path();
+        let sock_for_child = sock.to_path_buf();
+        let stdin_owned = stdin.to_vec();
+        let hook_kind_owned = hook_kind.to_string();
+        let child = std::thread::spawn(move || {
+            let mut proc = std::process::Command::new(relay)
+                .arg(hook_kind_owned)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("KAMUX_SESSION_ID", "3f2a0000-0000-4000-8000-000000009c1e")
+                .env("KAMUX_HOOKS_SOCK", &sock_for_child)
+                .spawn()
+                .expect("spawn relay");
+            let _ = proc.stdin.as_mut().expect("stdin").write_all(&stdin_owned);
+            proc.wait_with_output().expect("wait")
+        });
+
+        let buf = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => panic!("listener.accept() または read_to_end が失敗した: {e}"),
+            Err(_) => panic!(
+                "relay が 10 秒以内にソケットへ接続しなかった \
+                 (relay が接続していないか、接続後に何も送っていない可能性がある)"
+            ),
+        };
+
+        let out = child.join().expect("join relay process");
+        assert_eq!(out.status.code(), Some(0), "relay must always exit 0");
+        assert!(out.stdout.is_empty());
+        assert!(out.stderr.is_empty());
+
+        let _ = std::fs::remove_file(sock);
+        buf
+    }
+
+    /// `real_relay_output_is_understood_by_parse_hook_event_for_each_registered_hook_kind`
+    /// の 1 ケース分。フィールドが多いタプルは clippy::type_complexity に触れるため
+    /// 名前付き構造体にする。
+    struct RegisteredHookCase {
+        hook_kind: &'static str,
+        stdin: &'static [u8],
+        expected_kind: HookKind,
+        expected_claude_session_id: Option<&'static str>,
+        expected_source: Option<&'static str>,
+    }
+
+    /// kamux が登録する 4 種の hook（契約 §12.4）それぞれについて、実 relay が
+    /// 生成したバイト列が `parse_hook_event` で正しく読めることを固定する。
+    /// PR 単位レビュー（brief 冒頭・持ち越し 1）が手作業で確認した内容の恒久化。
+    #[test]
+    fn real_relay_output_is_understood_by_parse_hook_event_for_each_registered_hook_kind() {
+        let cases = [
+            RegisteredHookCase {
+                hook_kind: "SessionStart",
+                stdin: br#"{"session_id":"550e8400-e29b-41d4-a716-446655440000","hook_event_name":"SessionStart","source":"startup"}"#,
+                expected_kind: HookKind::SessionStart,
+                expected_claude_session_id: Some("550e8400-e29b-41d4-a716-446655440000"),
+                expected_source: Some("startup"),
+            },
+            RegisteredHookCase {
+                hook_kind: "Notification",
+                stdin: br#"{"totally":"unknown","shape":[1,2,3]}"#,
+                expected_kind: HookKind::Notification,
+                expected_claude_session_id: None,
+                expected_source: None,
+            },
+            RegisteredHookCase {
+                hook_kind: "PermissionRequest",
+                stdin: br#"{"shape":"entirely unknown"}"#,
+                expected_kind: HookKind::PermissionRequest,
+                expected_claude_session_id: None,
+                expected_source: None,
+            },
+            RegisteredHookCase {
+                hook_kind: "Stop",
+                stdin: br#"{"session_id":"abc123","hook_event_name":"Stop","stop_hook_active":false}"#,
+                expected_kind: HookKind::Stop,
+                expected_claude_session_id: Some("abc123"),
+                expected_source: None,
+            },
+        ];
+
+        for case in cases {
+            let hook_kind = case.hook_kind;
+            let sock = test_socket_path(&format!("e2e-{hook_kind}"));
+            let buf = capture_one_relay_message(&sock, hook_kind, case.stdin);
+
+            // 契約 §84.3: 6 フィールドすべてが名前・省略可否まで一致すること。
+            // 成功系（payload が解釈できた）では raw_base64 / truncated は現れない。
+            let value: serde_json::Value = serde_json::from_slice(&buf).expect("wire is JSON");
+            assert_eq!(value["v"], 1);
+            assert_eq!(
+                value["kamux_session_id"],
+                "3f2a0000-0000-4000-8000-000000009c1e"
+            );
+            assert_eq!(value["hook_kind"], hook_kind);
+            assert!(value["payload"].is_object());
+            assert!(
+                value.get("raw_base64").is_none(),
+                "raw_base64 must be absent when payload parses: {value}"
+            );
+            assert!(
+                value.get("truncated").is_none(),
+                "truncated must be absent for a non-truncated message: {value}"
+            );
+
+            let event = parse_hook_event(&buf).expect("real relay bytes must parse");
+            assert_eq!(event.kind, case.expected_kind, "hook_kind={hook_kind}");
+            assert_eq!(
+                event.kamux_session_id, "3f2a0000-0000-4000-8000-000000009c1e",
+                "hook_kind={hook_kind}"
+            );
+            assert_eq!(
+                event.claude_session_id.as_deref(),
+                case.expected_claude_session_id,
+                "hook_kind={hook_kind}"
+            );
+            assert_eq!(
+                event.source.as_deref(),
+                case.expected_source,
+                "hook_kind={hook_kind}"
+            );
+        }
+    }
+
+    /// 契約 §84.3: relay が stdin の読み取り上限（1 MiB）に当たったとき、
+    /// `raw_base64` は先頭 4 KiB（5464 base64 文字）に切り詰められ、`payload` は
+    /// null になる。それでも `hook_kind` は argv 由来なので `parse_hook_event` は
+    /// 正しい種別を返す（PR 単位レビュー・持ち越し 1 の確認の恒久化）。
+    #[test]
+    fn real_relay_truncated_output_flows_through_parse_hook_event_with_capped_raw_base64() {
+        const OVER_MAX_STDIN_BYTES: usize = 1024 * 1024 + 1;
+        let oversized = vec![b'x'; OVER_MAX_STDIN_BYTES];
+
+        let sock = test_socket_path("e2e-truncated");
+        let buf = capture_one_relay_message(&sock, "Stop", &oversized);
+
+        let value: serde_json::Value = serde_json::from_slice(&buf).expect("wire is JSON");
+        assert_eq!(value["truncated"], true);
+        assert!(value["payload"].is_null());
+        let raw_base64 = value["raw_base64"].as_str().expect("raw_base64 present");
+        assert_eq!(
+            raw_base64.len(),
+            5464,
+            "raw_base64 must be capped to exactly 4 KiB (5464 base64 chars), got {}",
+            raw_base64.len()
+        );
+
+        let event = parse_hook_event(&buf).expect("truncated bytes must still parse");
+        assert_eq!(event.kind, HookKind::Stop);
+        assert_eq!(
+            event.kamux_session_id,
+            "3f2a0000-0000-4000-8000-000000009c1e"
+        );
+        assert_eq!(event.claude_session_id, None);
+    }
 
     #[test]
     fn socket_path_is_in_tmpdir_and_contains_pid() {
