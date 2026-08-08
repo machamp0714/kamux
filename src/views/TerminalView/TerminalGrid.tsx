@@ -91,8 +91,11 @@ export function TerminalGrid(): JSX.Element {
   // 複数回発火しても resize_pty の重複送信にはならない。
   //
   // ResizeObserver はサイズが変化したときにしか発火しない（ポーリングではない）。
-  // 表示中のペインが入れ替わる（= ホスト要素が増減する）のは layout / activePane の
-  // 変化時なので、その 2 つで張り直す。割当だけの変化ではホスト要素は変わらない
+  // deps の layout は「表示中のホスト要素の集合が増減しうる」ため必要
+  // （single ⇔ split2 でスロット数が変わる）。activePane はここでは no-op —— 分割中
+  // （isSplit(layout)）にしか動かず（paneLogic.ts の不変条件 4）、分割中は両スロットが
+  // key={pane} で維持されたままなのでホスト要素の集合は activePane の変化前後で
+  // 同一である。それでも防御として残す。割当だけの変化ではホスト要素は変わらない
   useEffect(() => {
     const observer = new ResizeObserver(() => {
       fitScheduler.request();

@@ -78,6 +78,17 @@ export function usePaneFit(): FitScheduler {
   // ペイン数が変わらないため、visiblePanes(s) や paneAssignment にキーイングすると
   // 向き変更で再 fit が走らず、xterm が横向きの cols/rows を保持したまま
   // resize_pty に誤ったジオメトリを送る。表示は崩れないので発覚が遅れる
+  //
+  // TerminalGrid.tsx の attach useLayoutEffect も [layout, paneAssignment, activePane]
+  // を deps に持ち、多くの遷移ではここと冗長に同じ syncPaneSize を呼ぶ。ただし
+  // 冗長なのは「両方が isStarted=true を見られる」場合だけである。single → split2 で
+  // 新しく可視になるペインのように、親の attach effect が走った時点ではまだ
+  // isStarted=false（PTY 起動要求がまだ解決していない）のことがある。その場合
+  // attach effect は syncPaneSize をスキップし、子の passive effect で
+  // isStarted が true になるのは次のフレームである。このフレーム差を埋めるのは
+  // この layout dep だけであり、外すと新ペインが旧ジオメトリのまま固定される
+  // （Task 10 レビュー Important 1、§89.1.1 で実測確認済み。
+  // TerminalGrid.test.tsx の「single → split2 の直後に...」が固定する）
   useEffect(() => {
     if (view !== 'terminal') return;
     scheduler.request();

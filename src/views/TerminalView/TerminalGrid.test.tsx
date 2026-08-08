@@ -473,13 +473,15 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     expect(mocks.fitTerminal).toHaveBeenCalledWith('s1:agent');
   });
 
-  it('レイアウトの向きだけが変わっても（split2 → split2-v）可視ペインへ resize_pty が送られる（契約 §28.2）', async () => {
+  it('レイアウトの向きだけが変わっても（split2 → split2-v）可視ペインへ resize_pty が届く（経路は問わない）', async () => {
     // paneAssignment / activePane は不変のまま layout だけが split2 → split2-v へ
-    // 変わる向き変更。usePaneFit の useEffect deps から layout を外す「最適化」は
-    // 契約 §28.2 が名指しで禁止している —— 外すと xterm が横向きの cols/rows を
-    // 保持したまま resize_pty に誤ったジオメトリが飛ぶ（表示は崩れないので発覚が
-    // 遅れる）。ここではシステム全体としてこの向き変更が re-fit をトリガすることを
-    // 固定する
+    // 変わる向き変更。usePaneFit の layout dep と TerminalGrid の attach
+    // useLayoutEffect の layout dep（[layout, paneAssignment, activePane]）が
+    // この遷移では独立に同じ syncPaneSize を呼べてしまうため、このテストは
+    // 「システム全体としてこの向き変更が re-fit をトリガする」の固定であって、
+    // usePaneFit 側の layout dep 単独を検出するものではない
+    // （§28.2 単独の防衛は次のテストを見ること —— どちらの経路が effect を
+    // 走らせても表示は崩れないので、この 1 本だけでは片方が壊れても気づけない）
     mocks.isStarted.mockReturnValue(true);
     mocks.fitTerminal.mockReturnValue({ cols: 40, rows: 60 });
     setPanes('split2', ['s1', 's2'], 0);
@@ -500,6 +502,38 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     await rafTick();
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s1:agent', 40, 60);
+    expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 40, 60);
+  });
+
+  it('single → split2 の直後に門が開いた新ペインへ、次のフレームで resize_pty が飛ぶ（契約 §28.2 / usePaneFit の layout dep 単独の防衛）', async () => {
+    // 本番の順序: 親 TerminalGrid の attach useLayoutEffect が走る時点では、子
+    // TerminalPane の passive effect（markStarted、TerminalPane.tsx）はまだ走って
+    // いない。markStarted は ensurePtySubscription().then() の中なのでさらに
+    // 1 マイクロタスク遅い。したがって「layout 変更の瞬間は isStarted=false、
+    // 次フレームには true」は実在する入力であり（single → split2 で新しく可視に
+    // なるペインの PTY がまだ起動要求中のとき）、attach effect は isStarted=false で
+    // syncPaneSize をスキップするので、このフレーム差を埋められるのは usePaneFit の
+    // layout dep だけである。usePaneFit の deps から layout を外すと、この遷移では
+    // 誰も再 fit を要求しないまま新ペインが旧ジオメトリで固定される
+    // （Task 10 レビュー Important 1、§89.1.1 で実測確認済み）
+    mocks.isStarted.mockReturnValue(false);
+    mocks.fitTerminal.mockReturnValue({ cols: 40, rows: 60 });
+    setPanes('single', ['s1', 's2'], 0);
+
+    render();
+    await flush();
+    await rafTick();
+    mocks.resizePty.mockClear();
+
+    act(() => {
+      useAppStore.getState().setLayout('split2');
+    });
+    // attach layout effect は isStarted=false で syncPaneSize をスキップした。
+    // ここで初めて start_session が解決し、門が開く
+    mocks.isStarted.mockReturnValue(true);
+
+    await rafTick();
+
     expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 40, 60);
   });
 
