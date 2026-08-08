@@ -506,7 +506,6 @@ mod notifier_tests {
     #[test]
     fn badge_counts_two_waiting_sessions() {
         let (_sink, n) = fixture();
-        n.set_permission(NotifyPermission::Granted);
         let first = n.on_state(
             &payload(
                 "s1",
