@@ -337,34 +337,75 @@ impl PtySurface {
         let Ok(pid_t) = i32::try_from(pid) else {
             return Ok(());
         };
-        // Safety: `guard` を保持したままここに到達している。waiter スレッドは
+        // `guard` を保持したままここに到達している。waiter スレッドは
         // `child.wait()` から復帰した直後、この同じ Mutex を保持してからでない
         // と `pid` を `None` に書き換えられない(上のコメント参照)。つまり
         // このロックを握っている間、waiter はまだ pid を書き換え中でないことが
         // 保証され、「reap 済みで OS が pid を再利用した後の別プロセス
         // (グループ)を誤って殺す」という論理ハザードの窓は、`wait()` 復帰〜
-        // ロック取得までの短い区間に縮小される(完全には消えない)。
-        // `libc::kill` 自体は任意の整数値に対してメモリ安全な呼び出しであり、
-        // 危険なのは UB ではなくこの論理ハザードの方である。
-        let result = unsafe { libc::kill(-pid_t, libc::SIGKILL) };
+        // ロック取得までの短い区間に縮小される(完全には消えない)。errno の
+        // 読み取り(`kill_with` 内)もこのロックの下で行うため、窓はスレッド
+        // ローカル変数を 1 回読む分だけ僅かに広がるが、syscall もロック取得も
+        // 伴わないためデッドロックの経路は増えない。
+        let outcome = kill_with(pid_t, real_kill);
         drop(guard);
-        if result == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            // ESRCH/EPERM いずれも「シグナルできる相手が 1 つも無かった」を
-            // 意味し、契約 §15 の冪等性で Ok に落とすべきケース。根拠は
-            // is_nothing_left_to_signal() のドキュメントコメント参照。
-            Some(errno) if is_nothing_left_to_signal(errno) => Ok(()),
-            _ => Err(AppError::Io(err.to_string())),
-        }
+        outcome
     }
 }
 
-/// 対象(プロセス/プロセスグループ)へ「シグナルを届けられる相手が 1 つも
-/// 残っていない」という**状態**を判定する。契約 §15: `PtySurface::kill()`
-/// は完全に冪等でなければならない。正典はこの**状態の集合**であり
+/// `libc::kill` の実呼び出し。注入の継ぎ目をこの 1 行に閉じ込める。ここには
+/// 分岐も値の加工も無いので、テストできない部分は「判断の無い受け渡し」
+/// だけになる(契約 §96.4 の到達不能領域として名前を付けて残す。
+/// `kill_with` にどんな `kill` を注入しても、実際に呼ばれるのが本当に
+/// `real_kill`(生の syscall)であることまではテストで確認できない)。
+///
+/// Safety: `libc::kill` 自体は任意の整数値に対してメモリ安全な呼び出しで
+/// あり、危険なのは UB ではなく呼び出し元([`PtySurface::kill`]が説明する)
+/// pid 再利用の論理ハザードの方である。
+fn real_kill(pid_t: libc::pid_t, sig: libc::c_int) -> libc::c_int {
+    unsafe { libc::kill(pid_t, sig) }
+}
+
+/// [`PtySurface::kill`] の判断本体。契約 §96.4: 副作用の順序に依存する処理は
+/// `run()`/`.setup()` 相当の関数の外へ出し、出した先を直接テストする。
+///
+/// 契約 §98.3 の安全性論証が全面的に依存する 2 つの性質がここに同居する:
+/// - **符号**: `kill` へ渡すのは `-pid_t`。子は portable-pty が `pre_exec`
+///   で `setsid()` しており pgid == pid のプロセスグループリーダーになって
+///   いるため、負の pid を渡すと `killpg` 相当になり子が生んだ孫プロセスも
+///   まとめて終わらせられる([`PtySurface::kill`] のドキュメント参照)。
+/// - **ガードの向き**: `rc != 0` のとき、errno が
+///   [`is_nothing_left_to_signal`] なら `Ok`(冪等)に倒す(契約 §15 /
+///   §98.2 規則 K)。
+///
+/// `kill` そのものを注入する(`(rc, errno)` の組を返す関数にしない)のは
+/// `src-tauri/src/hooks_srv/mod.rs` の `is_pid_alive_with` と同じ理由:
+/// 組を返す形にすると errno を読む判断が注入側へ移動し、守りたい配線が
+/// テスト対象の外へ出てしまう。
+fn kill_with(
+    pid_t: libc::pid_t,
+    kill: impl Fn(libc::pid_t, libc::c_int) -> libc::c_int,
+) -> AppResult<()> {
+    let result = kill(-pid_t, libc::SIGKILL);
+    if result == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // ESRCH/EPERM いずれも「シグナルできる相手が 1 つも無かった」を
+        // 意味し、契約 §15 の冪等性で Ok に落とすべきケース。根拠は
+        // is_nothing_left_to_signal() のドキュメントコメント参照。
+        Some(errno) if is_nothing_left_to_signal(errno) => Ok(()),
+        _ => Err(AppError::Io(err.to_string())),
+    }
+}
+
+/// プロセスグループ宛(`kill(-pgid, …)`)の**シグナル送信結果**を判定する。
+/// 正の pid での `kill` には使えない —— 契約 §98.4.1 のとおり `EPERM` の
+/// 意味が逆になる(正の pid の `EPERM` は「存在するが権限が無い」＝生きて
+/// いる。`src-tauri/src/hooks_srv/mod.rs` の `classify_kill_result` 参照)。
+/// 契約 §15: `PtySurface::kill()` は完全に冪等でなければならない。
+/// 正典はこの**状態の集合**であり
 /// (契約 §98.2 の規則 K。状態 4「終了処理中・未 reap」と状態 5「reap 済み
 /// だが `pid` がまだ `None` になっていない」が該当する)、errno はその状態の
 /// **帰結**にすぎない。
@@ -1687,5 +1728,57 @@ mod tests {
     #[test]
     fn is_nothing_left_to_signal_is_false_for_einval() {
         assert!(!is_nothing_left_to_signal(libc::EINVAL));
+    }
+
+    // --- `kill_with` の配線を守るテスト -----------------------------------
+    // `kill_with` は `PtySurface::kill()` の判断本体(符号 + ガードの向き)を
+    // まるごと含む。`kill` を注入することで、実 syscall/実セッションの
+    // ライフサイクルに一切頼らず、決定的に 1 回で赤にできる(契約 §96.4)。
+
+    #[test]
+    fn kill_with_signals_the_negative_pid_group() {
+        let seen_pid = std::cell::Cell::new(0);
+        let outcome = kill_with(1234, |pid, sig| {
+            seen_pid.set(pid);
+            assert_eq!(
+                sig,
+                libc::SIGKILL,
+                "契約 §15: SIGKILL 相当でなければならない"
+            );
+            0
+        });
+        assert!(outcome.is_ok());
+        assert_eq!(
+            seen_pid.get(),
+            -1234,
+            "プロセスグループ宛(負の pid)でなければ契約 §98.3 の安全性論証が成立しない"
+        );
+    }
+
+    /// `errno` を明示的に立てる。macOS 前提(`libc::__error()` はこのスレッドの
+    /// errno を指すポインタ。書き込みはスレッドローカルなので並行実行しても
+    /// 安全)。同じ手法を `src-tauri/src/hooks_srv/mod.rs` の `fake_kill` が
+    /// 既に使っている。
+    fn fake_kill_errno(
+        rc: libc::c_int,
+        errno: libc::c_int,
+    ) -> impl Fn(libc::pid_t, libc::c_int) -> libc::c_int {
+        move |_pid, _sig| {
+            // SAFETY: __error() はこのスレッドの errno を指す。書き込みはスレッドローカル。
+            unsafe { *libc::__error() = errno };
+            rc
+        }
+    }
+
+    #[test]
+    fn kill_with_treats_eperm_as_ok() {
+        let outcome = kill_with(1234, fake_kill_errno(-1, libc::EPERM));
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn kill_with_treats_einval_as_err() {
+        let outcome = kill_with(1234, fake_kill_errno(-1, libc::EINVAL));
+        assert!(outcome.is_err());
     }
 }
