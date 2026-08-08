@@ -7,6 +7,8 @@ export type CliKind = 'claude' | 'codex' | 'shell' | 'custom';
 export type RuntimeState =
   'running' | 'waiting_input' | 'idle' | 'exited' | 'interrupted' | 'error'; // 契約 §2 の 6 値
 export type SurfaceKind = 'agent' | 'editor';
+/** 契約 §28.1。'split2' = 左右分割 / 'split2-v' = 上下分割。 */
+export type Layout = 'single' | 'split2' | 'split2-v';
 
 /** カンバンの列の表示順。DB の並び順ではなくこれが表示の正典。 */
 export const KANBAN_STATUSES: KanbanStatus[] = ['backlog', 'in_progress', 'review', 'done'];
