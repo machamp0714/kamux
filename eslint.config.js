@@ -8,7 +8,7 @@ export default tseslint.config(
       'dist/',
       // 無視パターンが特定の場所を焼き込んでいると、その場所が動いたときに黙って死ぬ
       // （Cargo ワークスペース化で target/ が src-tauri/target/ から repo root へ移り、
-      // 'target/' がトップレベルにしか一致せず 9 エラーになった）。
+      // 旧パス 'src-tauri/target/' が一致しなくなって 9 エラーになった）。
       // '**/target/' は任意の階層に一致するため、場所を焼き込まずに両方を覆う。
       '**/target/',
       'playwright-report/',
