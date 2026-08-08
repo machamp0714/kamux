@@ -115,17 +115,17 @@ fn real_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
 /// kill(pid, 0) で存在確認する。権限エラー(EPERM)は「生きている」とみなす。
 ///
 /// 注入するのは **`kill` そのもの**であり、`(rc, errno)` の組を返す関数ではない。
-/// 組を返す形にすると「`rc != 0` のときだけ errno を読む」という判断が注入側へ
-/// 移動し、守りたい配線がテスト対象の外へ出てしまう。errno の読み取りをここに
-/// 残すことで、`classify_kill_result` への配線そのものを観測できる。
+/// 組を返す形にすると errno を読む判断が注入側へ移動し、守りたい配線がテスト
+/// 対象の外へ出てしまう。errno の読み取りをここに残すことで、`rc != 0` の
+/// ときに errno が `classify_kill_result` まで実際に届くことを観測できる
+/// （`rc == 0` のとき errno を読まない側の分岐は、`classify_kill_result` が
+/// `rc` を先に見るため、この配線からは観測できない。下の分岐のコメント参照）。
 fn is_pid_alive_with(pid: u32, kill: impl Fn(libc::pid_t, libc::c_int) -> libc::c_int) -> bool {
     let rc = kill(pid as libc::pid_t, 0);
-    // 防御的分岐: `classify_kill_result` は `rc == 0` を errno より先に見て
-    // 即 `true` を返すため、「`rc == 0` のとき errno を読まない」という
-    // この分岐自体は `classify_kill_result` 越しには観測できない
+    // 防御的分岐: `classify_kill_result` は `rc == 0` を errno より先に見るため、
+    // ここで errno を読まないことは同関数越しには観測できない
     // (`classify(0, Some(_))` も `classify(0, None)` も `true`)。それでも
-    // 「直前の syscall の errno を生存判定に混入させない」という意図を
-    // コードの形として残すために、この分岐は消さずに残している。
+    // 直前の syscall の errno を生存判定に混入させない意図で残している。
     let errno = if rc == 0 {
         None
     } else {
