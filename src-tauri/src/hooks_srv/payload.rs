@@ -7,7 +7,8 @@
 //! イベントが丸ごと落ちるリスクがある。
 //!
 //! 「デシリアライズが失敗しえない」構造にした代わりに、契約 §84.1.1 が義務化した
-//! 3 経路の `tracing::warn!` を [`parse_hook_event`] の中に持つ。
+//! 3 経路 + §91.1.1 が追加した条件 1-4（内側のデシリアライズ失敗）の計 4 経路の
+//! `tracing::warn!` を [`parse_hook_event`] の中に持つ。
 
 use serde::Deserialize;
 
@@ -505,6 +506,12 @@ mod tests {
             "unexpected message: {}",
             events[0].message
         );
+        // 契約 §91.1.1 は逐語で「生 JSON を warn! に残す」と定めている。raw_json を
+        // 落とす変異は上のアサートだけでは無検出になるため、値まで固定する。
+        assert_eq!(
+            events[0].fields.get("raw_json").map(String::as_str),
+            Some("[1,2,3]")
+        );
     }
 
     /// 契約 §91.1.1: `payload` が object であっても、既知フィールドの型が違えば
@@ -525,6 +532,10 @@ mod tests {
                 .contains("could not be deserialized into HookEnvelope"),
             "unexpected message: {}",
             events[0].message
+        );
+        assert_eq!(
+            events[0].fields.get("raw_json").map(String::as_str),
+            Some(r#"{"hook_event_name":42}"#)
         );
     }
 
