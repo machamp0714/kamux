@@ -186,6 +186,7 @@ describe('setLayout', () => {
     expect(store.getState().layout).toBe('single');
     store.getState().setLayout('split2');
     expect(store.getState().layout).toBe('split2');
+    expect(store.getState().focusedSessionId).toBeNull();
   });
 });
 
