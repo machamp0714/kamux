@@ -129,7 +129,15 @@ mod tests {
 
     #[test]
     fn truncated_input_is_flagged_and_base64_is_capped() {
-        let raw = vec![b'x'; 10_000];
+        // 全バイトが同じ入力（`vec![b'x'; 10_000]`）だと、切り出す位置を変える変異
+        // （先頭 4 KiB → 末尾 4 KiB）を長さだけでは区別できない。先頭 4096 バイトと
+        // それ以降が判別できる入力にする。
+        const TAIL_MARKER: &[u8] = b"TAILMARKER";
+        let mut raw = vec![b'x'; RAW_DEBUG_CAP];
+        raw.resize(10_000 - TAIL_MARKER.len(), b'y');
+        raw.extend_from_slice(TAIL_MARKER);
+        assert_eq!(raw.len(), 10_000);
+
         let s = build_wire_message("3f2a0000-0000-4000-8000-000000009c1e", "Stop", &raw, true);
 
         let v: serde_json::Value =
@@ -145,6 +153,15 @@ mod tests {
             5464,
             "raw_base64 must be capped to exactly 4 KiB (5464 base64 chars), got {}",
             encoded.len()
+        );
+        // 契約 §84.3 は「**先頭** 4 KiB まで」と位置まで明文指定している。長さだけを
+        // 見ると末尾を運ぶ実装に化けても気づけない。JSON の破損原因はほぼ常に先頭側
+        // （開始括弧・BOM・シェルのゴミ出力）にあるため、位置が狂うと「4 KiB 取れて
+        // いるのに原因が写っていない」という最も気づきにくい形で失敗する。
+        assert_eq!(
+            encoded,
+            base64::engine::general_purpose::STANDARD.encode(&raw[..RAW_DEBUG_CAP]),
+            "raw_base64 must carry the HEAD 4 KiB, not the tail"
         );
     }
 

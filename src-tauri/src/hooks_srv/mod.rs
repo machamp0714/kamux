@@ -58,6 +58,17 @@ pub fn runtime_file_pid(file_name: &str) -> Option<u32> {
 /// アプリが異常終了した回の残骸を掃除する。削除した件数を返す。
 /// 設計 §6-6。
 pub fn sweep_stale_runtime_files(dir: &Path) -> usize {
+    sweep_stale_runtime_files_with(dir, real_kill)
+}
+
+/// `sweep_stale_runtime_files` の本体。`socket_path_from` と同じ作法で、
+/// テストから固定したい境界（ここでは `kill` の 3 値）を引数へ出す。
+/// これが無いと `kill` の第 3 の結果である `EPERM` を通る掃除経路に
+/// 観測点を 1 つも置けない（uid に依存せず EPERM を返させる手段が無いため）。
+fn sweep_stale_runtime_files_with(
+    dir: &Path,
+    kill: impl Fn(libc::pid_t, libc::c_int) -> libc::c_int,
+) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -68,7 +79,7 @@ pub fn sweep_stale_runtime_files(dir: &Path) -> usize {
         let Some(pid) = runtime_file_pid(name) else {
             continue;
         };
-        if is_pid_alive(pid) {
+        if is_pid_alive_with(pid, &kill) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
@@ -94,10 +105,21 @@ fn classify_kill_result(rc: libc::c_int, errno: Option<i32>) -> bool {
     errno == Some(libc::EPERM)
 }
 
-/// kill(pid, 0) で存在確認する。権限エラー(EPERM)は「生きている」とみなす。
-fn is_pid_alive(pid: u32) -> bool {
+/// `kill(pid, 0)` の実呼び出し。注入の継ぎ目をこの 1 行に閉じ込める。
+/// ここには分岐も値の加工も無いので、テストできない部分は「判断の無い受け渡し」だけになる。
+fn real_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
     // SAFETY: シグナル 0 の kill は副作用がなく、存在確認のみを行う。
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    unsafe { libc::kill(pid, sig) }
+}
+
+/// kill(pid, 0) で存在確認する。権限エラー(EPERM)は「生きている」とみなす。
+///
+/// 注入するのは **`kill` そのもの**であり、`(rc, errno)` の組を返す関数ではない。
+/// 組を返す形にすると「`rc != 0` のときだけ errno を読む」という判断が注入側へ
+/// 移動し、守りたい配線がテスト対象の外へ出てしまう。errno の読み取りをここに
+/// 残すことで、`classify_kill_result` への配線そのものを観測できる。
+fn is_pid_alive_with(pid: u32, kill: impl Fn(libc::pid_t, libc::c_int) -> libc::c_int) -> bool {
+    let rc = kill(pid as libc::pid_t, 0);
     let errno = if rc == 0 {
         None
     } else {
@@ -197,6 +219,66 @@ mod tests {
     #[test]
     fn classify_kill_result_treats_esrch_as_dead() {
         assert!(!classify_kill_result(-1, Some(libc::ESRCH)));
+    }
+
+    /// `kill` を `rc` と errno の組で偽装する。uid に一切依存しない。
+    ///
+    /// `libc::__error()` は macOS の errno 変数へのポインタ（契約 §0: 対象 OS は
+    /// macOS のみ。`cfg` 分岐は導入しない）。同ファイルは既に `SUN_PATH_MAX = 104`
+    /// と生の `libc::kill` で macOS を前提にしている。
+    fn fake_kill(
+        rc: libc::c_int,
+        errno: libc::c_int,
+    ) -> impl Fn(libc::pid_t, libc::c_int) -> libc::c_int {
+        move |_pid, _sig| {
+            // SAFETY: __error() はこのスレッドの errno を指す。書き込みはスレッドローカル。
+            unsafe { *libc::__error() = errno };
+            rc
+        }
+    }
+
+    /// 配線の守り: `kill` が `EPERM` を返したとき、errno が
+    /// `classify_kill_result` まで実際に届くこと。
+    /// errno の取得を潰す変異（両分岐とも `None`）でここが赤になる。
+    #[test]
+    fn is_pid_alive_with_reads_eperm_from_errno() {
+        assert!(is_pid_alive_with(4_194_303, fake_kill(-1, libc::EPERM)));
+    }
+
+    /// 同じ配線の裏側。`ESRCH` は「死んでいる」として届くこと。
+    #[test]
+    fn is_pid_alive_with_reads_esrch_from_errno() {
+        assert!(!is_pid_alive_with(4_194_303, fake_kill(-1, libc::ESRCH)));
+    }
+
+    /// `rc == 0` のときは errno を見ない。直前の syscall が残した errno
+    /// （ここでは `ESRCH`）に引きずられて「死んでいる」と判定しないこと。
+    #[test]
+    fn is_pid_alive_with_ignores_stale_errno_when_kill_succeeds() {
+        assert!(is_pid_alive_with(4_194_303, fake_kill(0, libc::ESRCH)));
+    }
+
+    /// `sweeps_only_dead_pids` のフィクスチャには `kill` の第 3 の結果である
+    /// `EPERM` が無い（自 pid の `rc == 0` と存在しない pid の `ESRCH` だけ）。
+    /// EPERM を返す pid のファイルが掃除経路で残ることをここで固定する。
+    #[test]
+    fn sweep_keeps_files_whose_pid_reports_eperm() {
+        let dir = std::env::temp_dir().join(format!(
+            "kamux-sweep-eperm-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let eperm_sock = dir.join("kamux-hooks-4194303.sock");
+        std::fs::write(&eperm_sock, b"").expect("write");
+
+        let removed = sweep_stale_runtime_files_with(&dir, fake_kill(-1, libc::EPERM));
+
+        assert_eq!(removed, 0, "EPERM は生存扱いなので消してはならない");
+        assert!(eperm_sock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
