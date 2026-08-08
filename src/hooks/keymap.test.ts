@@ -200,13 +200,13 @@ describe('resolveKeymap', () => {
     });
   });
 
-  it('Ctrl 併用の Cmd+D / Cmd+[ / Cmd+] は無視する（ターミナルへ通す）', () => {
+  it('Ctrl 併用の Cmd+D / Cmd+[ / Cmd+] は無視する（アプリが消費しない。契約 §97.2）', () => {
     expect(resolveKeymap(ev({ key: 'd', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
     expect(resolveKeymap(ev({ key: '[', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
     expect(resolveKeymap(ev({ key: ']', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
   });
 
-  it('Ctrl 併用の Cmd+J / Cmd+K は無視する（ターミナルへ通す。brief Step 1 指定）', () => {
+  it('Ctrl 併用の Cmd+J / Cmd+K は無視する（アプリが消費しない。契約 §97.2。brief Step 1 指定）', () => {
     expect(resolveKeymap(ev({ key: 'j', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
     expect(resolveKeymap(ev({ key: 'k', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
   });

@@ -195,7 +195,7 @@ describe('handleKeymapKeyDown', () => {
     expect(event.defaultPrevented).toBe(false);
   });
 
-  it('ターミナル画面での Ctrl+Cmd+D / Ctrl+Cmd+[ は無視する（preventDefault せずターミナルへ通す）', () => {
+  it('ターミナル画面での Ctrl+Cmd+D / Ctrl+Cmd+[ は無視する（preventDefault せず、アプリが消費しない。契約 §97.2）', () => {
     const setLayout = vi.fn();
     const setActivePane = vi.fn();
     useAppStore.setState({ view: 'terminal', layout: 'single', setLayout, setActivePane });

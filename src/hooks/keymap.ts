@@ -21,7 +21,7 @@ export type KeymapAction =
 export interface KeymapEvent {
   key: string;
   metaKey: boolean;
-  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] の判定に使う（Ctrl 併用はターミナルへ通す。契約 §11 Task 11 Note） */
+  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] の判定に使う（Ctrl 併用時はアプリが消費しない。契約 §97.2 規則 C） */
   ctrlKey: boolean;
   /** Cmd+Alt+←/→（Cmd+[/] のフォールバック）の判定に使う */
   altKey: boolean;
