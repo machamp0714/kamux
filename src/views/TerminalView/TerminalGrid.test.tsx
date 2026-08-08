@@ -61,19 +61,32 @@ declare const process: {
   off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
 };
 
-/** ResizeObserver 経路の門を手動発火で検証するため、コールバックを保持する */
+/**
+ * ResizeObserver 経路の門を手動発火で検証するため、コールバックを保持する。
+ *
+ * disconnect() は自分の cb を callbacks から外す（Task 8/9 の観測穴: 剪定しない
+ * 実装だと、TerminalGrid.tsx が cleanup で observer.disconnect() を呼び忘れても
+ * どのテストも赤にならない。実測で 3 本の死んだ observer が積み上がり、
+ * resizePty が 6 回出た）。observed は剪定しない —— 剪定すると `:442` / `:468`
+ * 付近の「observe された要素」の検証を書き直す必要が出て差分が広がる。
+ */
 class FakeResizeObserver {
   static callbacks: Array<() => void> = [];
   static observed: Element[] = [];
 
+  private readonly cb: () => void;
+
   constructor(cb: () => void) {
+    this.cb = cb;
     FakeResizeObserver.callbacks.push(cb);
   }
 
   observe(el: Element): void {
     FakeResizeObserver.observed.push(el);
   }
-  disconnect(): void {}
+  disconnect(): void {
+    FakeResizeObserver.callbacks = FakeResizeObserver.callbacks.filter((cb) => cb !== this.cb);
+  }
 }
 
 async function flush(times = 4): Promise<void> {
@@ -487,6 +500,90 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s3:agent', 100, 30);
     expect(mocks.resizePty).not.toHaveBeenCalledWith('s1:agent', 100, 30);
+  });
+
+  it('レイアウトを2回変更しても、生きている ResizeObserver は現在の1本だけ（Task 8/9 の観測穴: disconnect の剪定漏れを塞ぐ）', async () => {
+    // Task 8 のレビューが実測した形: FakeResizeObserver.disconnect() が空実装だと
+    // 死んだ observer が callbacks に積み上がり、レイアウト変更を重ねるたびに
+    // resizePty が可視ペイン数の倍数で増えていく（実測: 3 本の死んだ observer ×
+    // 2 ペイン = 6 回）。disconnect が正しく自分を剪定していれば、何度レイアウトを
+    // 変えても生きている observer は常に 1 本であり、resize_pty は可視ペイン数
+    // ぶんしか出ない
+    mocks.isStarted.mockReturnValue(true);
+    mocks.fitTerminal.mockReturnValue({ cols: 100, rows: 30 });
+    setPanes('split2', ['s1', 's2'], 0);
+
+    render();
+    await flush();
+
+    act(() => {
+      useAppStore.getState().setLayout('single');
+    });
+    await flush();
+    act(() => {
+      useAppStore.getState().setLayout('split2');
+    });
+    await flush();
+
+    // ここまでで RO effect は 3 回張られている（初回マウント + レイアウト変更 2 回）。
+    // 生きている observer は最後の 1 本だけのはず
+    expect(FakeResizeObserver.callbacks).toHaveLength(1);
+
+    mocks.resizePty.mockClear();
+    FakeResizeObserver.callbacks.forEach((cb) => {
+      cb();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await flush();
+
+    // 6 回（3 本の死んだ observer × 2 ペイン）ではなく、可視ペイン数ぶんの 2 回
+    expect(mocks.resizePty).toHaveBeenCalledTimes(2);
+  });
+
+  it('usePaneFit の flush（window resize 経由）も isStarted の門を通す（新しい呼び出し口）', async () => {
+    // usePaneFit の flush は fitTerminal → resizePty の呼び出し口が TerminalGrid の
+    // 中で 3 つ目になる（attach 直後の即時同期 / ResizeObserver / ここ）。
+    // paneSize.ts の syncPaneSize は意図的に門を持たないので、呼び出し側の
+    // usePaneFit がここで門を通していないと未起動 PTY へ resize_pty が飛ぶ
+    mocks.isStarted.mockReturnValue(false);
+    mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+
+    render();
+    await flush();
+    mocks.resizePty.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await flush();
+
+    expect(mocks.resizePty).not.toHaveBeenCalled();
+  });
+
+  it('アンマウント後に保留中の fit 要求が発火しても resize_pty を呼ばない（scheduler.cancel）', async () => {
+    mocks.isStarted.mockReturnValue(true);
+    mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
+
+    render();
+    await flush();
+    mocks.resizePty.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
+    act(() => {
+      root.unmount();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(mocks.resizePty).not.toHaveBeenCalled();
+
+    // 以降の afterEach で二重 unmount しないように貼り直す
+    act(() => {
+      root = createRoot(container);
+      root.render(<TerminalGrid />);
+    });
   });
 
   it('isStarted の門を通った resize_pty が reject しても unhandled rejection にならない', async () => {

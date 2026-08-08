@@ -10,13 +10,11 @@ import {
 import { isStarted } from '../../terminal/ptyBridge';
 import { attachTerminal, detachTerminal, ensureTerminal } from '../../terminal/registry';
 import { surfaceId } from '../../types/model';
+import { usePaneFit } from './fitScheduler';
 import { syncPaneSize } from './paneSize';
 import { TerminalPane } from './TerminalPane';
 import { useActivePaneFocus } from './useActivePaneFocus';
 import './TerminalGrid.css';
-
-/** リサイズ通知のデバウンス。ドラッグ中の resize_pty 連打を抑える */
-const RESIZE_DEBOUNCE_MS = 60;
 
 /**
  * 1〜2 面のペイングリッド（契約 §28.4 / §57.3）。
@@ -31,6 +29,12 @@ export function TerminalGrid(): JSX.Element {
   // activePane / modal の変化に追従してここから当たる
   useActivePaneFocus();
 
+  // レイアウト・割当・ウィンドウリサイズを rAF で畳み込んで fit → resize_pty する
+  // （契約 §28 の反映、Task 10）。下の ResizeObserver（ホスト寸法の変化）も同じ
+  // scheduler.request() へ合流させる —— 2 つの独立した debounce がそれぞれ
+  // resize_pty を送ると、片方がリークしたときに重複送信になる（Task 8/9 の実測）。
+  const fitScheduler = usePaneFit();
+
   const layout = useAppStore((s) => s.layout);
   const paneAssignment = useAppStore((s) => s.paneAssignment);
   const activePane = useAppStore((s) => s.activePane);
@@ -43,10 +47,6 @@ export function TerminalGrid(): JSX.Element {
 
   const state: PaneState = { layout, paneAssignment, activePane };
   const panes = visiblePanes(state);
-
-  /** ResizeObserver のコールバックから最新の割当を読むための箱。 */
-  const stateRef = useRef<PaneState>(state);
-  stateRef.current = state;
 
   // 表示集合の差分で attach/detach を駆動する（設計 §3.9）。
   // disposeTerminal は絶対に呼ばない（契約 §16）。
@@ -84,30 +84,18 @@ export function TerminalGrid(): JSX.Element {
     attached.current = next;
   }, [layout, paneAssignment, activePane]);
 
-  // Task 10 で usePaneFit が入ると、この ResizeObserver と usePaneFit の window.resize
-  // 経路が二重になる。どちらを残すかは Task 10 で決めること。契約 §28 は「usePaneFit の
-  // useEffect deps から layout を外す最適化」を禁止している —— 外すと向き変更時に xterm が
-  // 横向きの cols/rows を保持したまま resize_pty に誤ったジオメトリが飛ぶ。表示は崩れないので
-  // 発覚が遅れる。
+  // ホストのサイズが変化したら usePaneFit の scheduler へ委ねる（Task 10）。
+  // 実際の isStarted 門・fitTerminal・resize_pty 呼び出しは fitScheduler.ts の
+  // flush 側に閉じているので、ここでは request() を呼ぶだけでよい。request() は
+  // 同一フレーム内なら何度呼んでも rAF が 1 本しか積まれないため、ここが仮に
+  // 複数回発火しても resize_pty の重複送信にはならない。
   //
   // ResizeObserver はサイズが変化したときにしか発火しない（ポーリングではない）。
   // 表示中のペインが入れ替わる（= ホスト要素が増減する）のは layout / activePane の
   // 変化時なので、その 2 つで張り直す。割当だけの変化ではホスト要素は変わらない
   useEffect(() => {
-    let timer: number | null = null;
     const observer = new ResizeObserver(() => {
-      if (timer !== null) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        timer = null;
-        // pty://exit の後もこのグリッドはマウントされたまま残りうる。exit 後に
-        // ウィンドウ / コンテナがリサイズされると、存在しない PTY へ resize_pty を
-        // 投げてしまう。attach 直後の呼び出しと同じ isStarted の門をここにも通す
-        for (const sid of visibleAgentSurfaces(stateRef.current)) {
-          if (isStarted(sid)) {
-            syncPaneSize(sid);
-          }
-        }
-      }, RESIZE_DEBOUNCE_MS);
+      fitScheduler.request();
     });
 
     for (const host of hosts.current) {
@@ -115,10 +103,9 @@ export function TerminalGrid(): JSX.Element {
     }
 
     return () => {
-      if (timer !== null) window.clearTimeout(timer);
       observer.disconnect();
     };
-  }, [layout, activePane]);
+  }, [layout, activePane, fitScheduler]);
 
   // アンマウント時は全件 detach する（インスタンスは保持したまま）。
   useEffect(
