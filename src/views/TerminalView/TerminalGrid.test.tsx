@@ -112,6 +112,38 @@ function attachedSurfaces(): string[] {
   return mocks.attachTerminal.mock.calls.map((c) => c[0] as string);
 }
 
+/** ペイン index のスロットが持つ attach コンテナ。 */
+function hostOf(pane: number): HTMLElement | null {
+  return slots()[pane]?.querySelector<HTMLElement>('.terminal-pane-slot__host') ?? null;
+}
+
+/**
+ * attachTerminal がそのサーフェスに渡した直近のコンテナ。
+ *
+ * **`toHaveBeenCalledWith(sid, host)` で書いてはならない。** vitest の引数比較は
+ * 構造の等価性なので、中身が空で同じクラスの div が 2 つ並ぶ左右ペインでは
+ * ホストを取り違えても（`hosts.current[pane]` を `hosts.current[activePane]` に
+ * すり替えても）緑のままになる。実測で生き延びた変異である。同一性（toBe）で見ること。
+ */
+function attachTargetOf(surface: string): unknown {
+  const calls = mocks.attachTerminal.mock.calls.filter((c) => c[0] === surface);
+  return calls[calls.length - 1]?.[1];
+}
+
+/**
+ * surface_id をキーに引ける xterm のダミー（TerminalView.test.tsx と同じ形）。
+ * getTerminal が undefined を返すままだと「非アクティブなペインにも打鍵の宛先が
+ * 移る」変異（isActive を true 固定にする）が観測できない。
+ */
+const terms = new Map<string, { focus: ReturnType<typeof vi.fn> }>();
+function termOf(surface: string): { focus: ReturnType<typeof vi.fn> } {
+  const existing = terms.get(surface);
+  if (existing !== undefined) return existing;
+  const created = { focus: vi.fn() };
+  terms.set(surface, created);
+  return created;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
@@ -120,7 +152,8 @@ beforeEach(() => {
   mocks.isStarted.mockReturnValue(false);
   mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
   mocks.fitTerminal.mockReturnValue(null);
-  mocks.getTerminal.mockReturnValue(undefined);
+  terms.clear();
+  mocks.getTerminal.mockImplementation((surface: string) => termOf(surface));
   mocks.resizePty.mockResolvedValue(undefined);
   mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
     mocks.resizePty(surfaceId, cols, rows);
@@ -146,10 +179,7 @@ describe('TerminalGrid（DOM 契約 §57.3）', () => {
     expect(slots()).toHaveLength(1);
     expect(slots()[0].dataset.pane).toBe('0');
     expect(container.querySelector('.terminal-grid')?.getAttribute('data-layout')).toBe('single');
-    expect(mocks.attachTerminal).toHaveBeenCalledWith(
-      's1:agent',
-      container.querySelector('.terminal-pane-slot__host'),
-    );
+    expect(attachTargetOf('s1:agent')).toBe(hostOf(0));
   });
 
   it('single かつ activePane=1 では裏スロットではなく 1 番のペインを描く', async () => {
@@ -162,10 +192,7 @@ describe('TerminalGrid（DOM 契約 §57.3）', () => {
     expect(slots()).toHaveLength(1);
     expect(slots()[0].dataset.pane).toBe('1');
     expect(attachedSurfaces()).toEqual(['s2:agent']);
-    expect(mocks.attachTerminal).toHaveBeenCalledWith(
-      's2:agent',
-      container.querySelector('.terminal-pane-slot__host'),
-    );
+    expect(attachTargetOf('s2:agent')).toBe(hostOf(0));
   });
 
   it('split2 では 2 面を左から描き、それぞれ自分のホストへ attach する', async () => {
@@ -173,10 +200,10 @@ describe('TerminalGrid（DOM 契約 §57.3）', () => {
     render();
     await flush();
 
-    const hosts = Array.from(container.querySelectorAll<HTMLElement>('.terminal-pane-slot__host'));
     expect(slots().map((el) => el.dataset.pane)).toEqual(['0', '1']);
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s1:agent', hosts[0]);
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s2:agent', hosts[1]);
+    // 左のスロットのホストへ左のセッション、右へ右（同一性で見る。上の attachTargetOf 参照）
+    expect(attachTargetOf('s1:agent')).toBe(hostOf(0));
+    expect(attachTargetOf('s2:agent')).toBe(hostOf(1));
   });
 
   it('split2-v でも 2 面を描き、data-layout だけが変わる（契約 §28.2 / §28.4）', async () => {
@@ -223,6 +250,33 @@ describe('TerminalGrid（アクティブペインの移動）', () => {
     expect(slots().map((el) => el.dataset.active)).toEqual(['false', 'true']);
   });
 
+  it('打鍵の宛先はアクティブペインだけ（非アクティブ側のターミナルに focus しない）', async () => {
+    // 分割時に「どちらへキー入力が行くか」の実体。isActive を渡し忘れる / true 固定に
+    // すると、後から effect が走ったペインが必ずフォーカスを奪う
+    setPanes('split2', ['s1', 's2'], 1);
+    render();
+    await flush();
+
+    expect(termOf('s2:agent').focus).toHaveBeenCalledTimes(1);
+    expect(termOf('s1:agent').focus).not.toHaveBeenCalled();
+  });
+
+  it('フォーカスは attach の後に当てる（順序が逆だと打鍵の宛先にならない）', async () => {
+    // xterm の textarea は attachTerminal でコンテナへ入るまで DOM に無い。
+    // attach（親の layout effect）より先に focus（子の passive effect）が走ると
+    // フォーカスがどこにも当たらない。この順序は TerminalGrid が attach を
+    // useLayoutEffect に置いていることで構造的に保証されている
+    setPanes('split2', ['s1', 's2'], 1);
+    render();
+    await flush();
+
+    const attachOrder = mocks.attachTerminal.mock.invocationCallOrder;
+    const focusOrder = termOf('s2:agent').focus.mock.invocationCallOrder;
+    expect(attachOrder.length).toBeGreaterThan(0);
+    expect(focusOrder.length).toBeGreaterThan(0);
+    expect(Math.max(...attachOrder)).toBeLessThan(focusOrder[0]);
+  });
+
   it('アクティブ側を押しても activePane は動かない', async () => {
     setPanes('split2', ['s1', 's2'], 1);
     render();
@@ -250,9 +304,9 @@ describe('TerminalGrid（不変条件 F: 集合差分で attach/detach を駆動
 
     expect(useAppStore.getState().paneAssignment).toEqual(['s2', 's1']);
     expect(mocks.detachTerminal).not.toHaveBeenCalled();
-    const hosts = Array.from(container.querySelectorAll<HTMLElement>('.terminal-pane-slot__host'));
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s2:agent', hosts[0]);
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s1:agent', hosts[1]);
+    // スワップ後は左右が入れ替わって attach し直される（detach は経ない）
+    expect(attachTargetOf('s2:agent')).toBe(hostOf(0));
+    expect(attachTargetOf('s1:agent')).toBe(hostOf(1));
   });
 
   it('表示集合から外れたセッションだけを detach する', async () => {
@@ -267,10 +321,7 @@ describe('TerminalGrid（不変条件 F: 集合差分で attach/detach を駆動
 
     expect(mocks.detachTerminal).toHaveBeenCalledWith('s1:agent');
     expect(mocks.detachTerminal).toHaveBeenCalledTimes(1);
-    expect(mocks.attachTerminal).toHaveBeenCalledWith(
-      's2:agent',
-      container.querySelector('.terminal-pane-slot__host'),
-    );
+    expect(attachTargetOf('s2:agent')).toBe(hostOf(0));
   });
 
   it('split2 → single で見えなくなったペインの surface を detach する', async () => {
@@ -351,8 +402,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     await flush();
     mocks.resizePty.mockClear();
 
-    const hosts = Array.from(container.querySelectorAll<HTMLElement>('.terminal-pane-slot__host'));
-    expect(FakeResizeObserver.observed).toEqual(hosts);
+    expect(FakeResizeObserver.observed).toEqual([hostOf(0), hostOf(1)]);
 
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
