@@ -11,6 +11,9 @@ import {
   nextSessionId,
   cycleSessionReducer,
   routeFocusReducer,
+  visibleAgentSurfaces,
+  surfacesToDetach,
+  paneBadgeFor,
   type PaneState,
 } from './paneLogic';
 
@@ -366,5 +369,142 @@ describe('isSplit / nextLayout / isLayout', () => {
     expect(isLayout('vsplit')).toBe(false);
     expect(isLayout(undefined)).toBe(false);
     expect(isLayout(null)).toBe(false);
+  });
+});
+
+describe('visibleAgentSurfaces', () => {
+  it('split2 では両ペインの agent サーフェスを左から返す', () => {
+    expect(visibleAgentSurfaces(S('split2', ['a', 'b'], 0))).toEqual(['a:agent', 'b:agent']);
+  });
+
+  it('single では表示中のペインだけを返す（裏スロットを含めない）', () => {
+    expect(visibleAgentSurfaces(S('single', ['a', 'b'], 0))).toEqual(['a:agent']);
+    expect(visibleAgentSurfaces(S('single', ['a', 'b'], 1))).toEqual(['b:agent']);
+  });
+
+  it('split2-v でも両ペインを上から返す（軸 A: 向きで集合が変わらない）', () => {
+    expect(visibleAgentSurfaces(S('split2-v', ['a', 'b'], 0))).toEqual(['a:agent', 'b:agent']);
+    expect(visibleAgentSurfaces(S('split2-v', ['a', 'b'], 1))).toEqual(['a:agent', 'b:agent']);
+  });
+
+  it('未割当のペインを飛ばす', () => {
+    expect(visibleAgentSurfaces(S('split2', ['a', null], 0))).toEqual(['a:agent']);
+    expect(visibleAgentSurfaces(S('single', [null, null], 0))).toEqual([]);
+  });
+
+  it('editor サーフェスは決して含めない', () => {
+    expect(visibleAgentSurfaces(S('split2', ['a', 'b'], 0)).join()).not.toContain('editor');
+  });
+});
+
+describe('surfacesToDetach', () => {
+  it('表示集合から外れたものだけを返す', () => {
+    expect(surfacesToDetach(['a:agent', 'b:agent'], ['a:agent'])).toEqual(['b:agent']);
+  });
+
+  it('左右スワップでは detach が発生しない（集合が同じ）', () => {
+    expect(surfacesToDetach(['a:agent', 'b:agent'], ['b:agent', 'a:agent'])).toEqual([]);
+  });
+
+  it('初回描画では detach が発生しない', () => {
+    expect(surfacesToDetach([], ['a:agent'])).toEqual([]);
+  });
+
+  it('アンマウント時は全件を返す', () => {
+    expect(surfacesToDetach(['a:agent', 'b:agent'], [])).toEqual(['a:agent', 'b:agent']);
+  });
+});
+
+describe('paneBadgeFor', () => {
+  it('split2 で左ペインのセッションに L', () => {
+    expect(paneBadgeFor(S('split2', ['a', 'b'], 0), 'a')).toBe('L');
+  });
+
+  it('split2 で右ペインのセッションに R', () => {
+    expect(paneBadgeFor(S('split2', ['a', 'b'], 0), 'b')).toBe('R');
+  });
+
+  it('どちらにも出ていなければ null', () => {
+    expect(paneBadgeFor(S('split2', ['a', 'b'], 0), 'c')).toBeNull();
+  });
+
+  it('single では常に null（ペインの概念を見せない）', () => {
+    expect(paneBadgeFor(S('single', ['a', 'b'], 0), 'a')).toBeNull();
+    expect(paneBadgeFor(S('single', ['a', 'b'], 0), 'b')).toBeNull();
+  });
+
+  // 契約 §28.3
+  it('split2-v で上ペインのセッションに U', () => {
+    expect(paneBadgeFor(S('split2-v', ['a', 'b'], 0), 'a')).toBe('U');
+  });
+
+  it('split2-v で下ペインのセッションに D', () => {
+    expect(paneBadgeFor(S('split2-v', ['a', 'b'], 0), 'b')).toBe('D');
+  });
+
+  it('split2-v でもどちらにも出ていなければ null', () => {
+    expect(paneBadgeFor(S('split2-v', ['a', 'b'], 0), 'c')).toBeNull();
+  });
+
+  // 契約 §28.3: バッジは「どのペインに出ているか」であって「どちらがアクティブか」ではない。
+  // activePane を読む実装（例: paneAssignment[s.activePane] を先に見る）に退化させると
+  // activePane: 1 側だけが赤くなる（軸 B）
+  it('activePane に依存しない（1 始まりでも同じバッジ）', () => {
+    expect(paneBadgeFor(S('split2', ['a', 'b'], 1), 'a')).toBe('L');
+    expect(paneBadgeFor(S('split2', ['a', 'b'], 1), 'b')).toBe('R');
+    expect(paneBadgeFor(S('split2-v', ['a', 'b'], 1), 'a')).toBe('U');
+    expect(paneBadgeFor(S('split2-v', ['a', 'b'], 1), 'b')).toBe('D');
+  });
+});
+
+// 契約 §28.2: 6 箇所の比較の書き漏らしを、向きを変えても挙動が同じであることで検出する。
+// 個別タスクの assert が「その関数が退化していないか」を見るのに対し、この describe は
+// 「6 箇所が同じ規則に従っているか」を一度に突き合わせる唯一の場所である。
+// 7 箇所目が増えた日にここへ 1 本足すこと。重複に見えても削らないこと
+describe('split2 と split2-v は向き以外の挙動が同一（契約 §28.2）', () => {
+  it('visiblePanes は両方で [0, 1]', () => {
+    expect(visiblePanes(S('split2', ['a', 'b'], 0))).toEqual([0, 1]);
+    expect(visiblePanes(S('split2-v', ['a', 'b'], 0))).toEqual([0, 1]);
+  });
+
+  it('assignPaneReducer は両方で指定ペインに書く', () => {
+    expect(assignPaneReducer(S('split2', ['a', null], 0), 1, 'b').paneAssignment).toEqual([
+      'a',
+      'b',
+    ]);
+    expect(assignPaneReducer(S('split2-v', ['a', null], 0), 1, 'b').paneAssignment).toEqual([
+      'a',
+      'b',
+    ]);
+  });
+
+  it('setActivePaneReducer は両方で activePane を移す', () => {
+    expect(setActivePaneReducer(S('split2', ['a', 'b'], 0), 1).activePane).toBe(1);
+    expect(setActivePaneReducer(S('split2-v', ['a', 'b'], 0), 1).activePane).toBe(1);
+  });
+
+  it('cycleSessionReducer は両方でもう一方のペインのセッションを飛ばす', () => {
+    const order = ['a', 'b', 'c'];
+    expect(cycleSessionReducer(S('split2', ['a', 'b'], 0), order, 1).paneAssignment[0]).toBe('c');
+    expect(cycleSessionReducer(S('split2-v', ['a', 'b'], 0), order, 1).paneAssignment[0]).toBe('c');
+  });
+
+  it('routeFocusReducer は両方で割当を動かさず activePane だけ移す', () => {
+    for (const layout of ['split2', 'split2-v'] as const) {
+      const next = routeFocusReducer(S(layout, ['a', 'b'], 0), 'b');
+      expect(next.paneAssignment).toEqual(['a', 'b']);
+      expect(next.activePane).toBe(1);
+    }
+  });
+
+  it('paneBadgeFor は両方で 2 ペインぶんのバッジを返す（向きだけが違う）', () => {
+    expect([
+      paneBadgeFor(S('split2', ['a', 'b'], 0), 'a'),
+      paneBadgeFor(S('split2', ['a', 'b'], 0), 'b'),
+    ]).toEqual(['L', 'R']);
+    expect([
+      paneBadgeFor(S('split2-v', ['a', 'b'], 0), 'a'),
+      paneBadgeFor(S('split2-v', ['a', 'b'], 0), 'b'),
+    ]).toEqual(['U', 'D']);
   });
 });

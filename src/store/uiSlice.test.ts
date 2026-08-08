@@ -102,20 +102,84 @@ describe('focusSession（要件5: カードクリックで該当ペインにフ�
     expect(s.focusedSessionId).toBe('sess-b');
   });
 
-  it('既に別ペインに割り当て済みのセッションを再フォーカスしても重複しない', () => {
+  it('既に別ペインに割り当て済みのセッションを再フォーカスしても重複しない（single の裏スロットは破棄せず入れ替える）', () => {
+    // M3-2 Task 7: focusSession が routeFocusReducer → assignPaneReducer を経由するようになったことで、
+    // 「single に落としても裏スロットの割当を捨てない」（paneLogic.ts の設計 §3.5）が
+    // ここにも適用される。旧実装は裏スロットの sess-a を破棄していたが、
+    // 新実装は sess-a を裏スロットへ退避し、両方の割当を保つ（重複はしない）。
     useAppStore.setState({ activePane: 0, paneAssignment: ['sess-a', 'sess-b'] });
 
     useAppStore.getState().focusSession('sess-b', 'terminal');
 
     const s = useAppStore.getState();
-    expect(s.paneAssignment).toEqual(['sess-b', null]);
+    expect(s.paneAssignment).toEqual(['sess-b', 'sess-a']);
     expect(s.focusedSessionId).toBe('sess-b');
+  });
+
+  // M3-2 Task 7 修正ラウンド 1（レビュー Important #1）: 上のテスト（:105）は
+  // activePane=0 側からのスワップしか観測しておらず、paneLogic.ts:65 の
+  // `const other = otherPane(target);` を `1` 固定に壊しても 529 本全緑だった。
+  // ここでは activePane=1 側（other=0 側）からスワップを観測し、その穴を塞ぐ。
+  it('アクティブペイン=1 側から既に別ペインにあるセッションへ再フォーカスしてもスワップする（activePane=1 側からの観測）', () => {
+    useAppStore.setState({ layout: 'single', activePane: 1, paneAssignment: ['sess-a', 'sess-b'] });
+
+    useAppStore.getState().focusSession('sess-a', 'terminal');
+
+    expect(useAppStore.getState().paneAssignment).toEqual(['sess-b', 'sess-a']);
+    expect(useAppStore.getState().activePane).toBe(1);
   });
 
   it('エディタ画面へのフォーカスもできる（M3-1 が使う）', () => {
     useAppStore.getState().focusSession('sess-1', 'editor');
     expect(useAppStore.getState().view).toBe('editor');
     expect(useAppStore.getState().focusedSessionId).toBe('sess-1');
+  });
+});
+
+// M3-2 Task 7（契約 §85.2）: focusSession の本体を routeFocusReducer 経由へ差し替える。
+describe('focusSession のペインルーティング（routeFocusReducer 経由、契約 §85.2）', () => {
+  beforeEach(() => {
+    useAppStore.setState({
+      view: 'kanban',
+      focusedSessionId: null,
+      layout: 'single',
+      activePane: 0,
+      paneAssignment: [null, null],
+    });
+  });
+
+  it('未割当ならアクティブペインに割り当てる', () => {
+    useAppStore.getState().focusSession('a', 'terminal');
+
+    expect(useAppStore.getState().paneAssignment).toEqual(['a', null]);
+    expect(useAppStore.getState().focusedSessionId).toBe('a');
+    expect(useAppStore.getState().view).toBe('terminal');
+  });
+
+  it('split2 でもう一方のペインに出ているなら activePane だけ移す', () => {
+    useAppStore.getState().setLayout('split2');
+    useAppStore.getState().assignPane(0, 'a');
+    useAppStore.getState().assignPane(1, 'b');
+    useAppStore.getState().setActivePane(0);
+
+    useAppStore.getState().focusSession('b', 'terminal');
+
+    expect(useAppStore.getState().paneAssignment).toEqual(['a', 'b']);
+    expect(useAppStore.getState().activePane).toBe(1);
+    expect(useAppStore.getState().focusedSessionId).toBe('b');
+  });
+
+  // brief の原案は「view を省略すると現在の view を維持する」だったが、lane-controller の
+  // 読み替え（既定は 'terminal' のまま維持。契約 §11 の表と src/ の呼び出し 3 箇所が
+  // すべて明示引数で、計画も明示引数を前提にしている）に従い、
+  // 「既定が 'terminal' であること」と「ペインルーティングは効くこと」を主張する形に書き換える。
+  it('view を省略すると既定の terminal になり、ペインルーティングは効く', () => {
+    useAppStore.getState().setView('kanban');
+
+    useAppStore.getState().focusSession('a');
+
+    expect(useAppStore.getState().view).toBe('terminal');
+    expect(useAppStore.getState().paneAssignment[0]).toBe('a');
   });
 });
 

@@ -2,6 +2,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import { RuntimeBadge } from '../../components/RuntimeBadge';
 import { useAppStore } from '../../store';
+import { paneBadgeFor } from '../../store/paneLogic';
 import { selectTerminalTabs } from '../../store/terminalSlice';
 
 // 契約 §29.7: M3-4 でここが 2 グループ（SESSIONS / SCRATCH）に分かれる。
@@ -20,33 +21,46 @@ export function SessionTabList(): JSX.Element {
   // 配列を返すセレクタなので useShallow で無駄な再レンダリングを防ぐ
   const tabs = useAppStore(useShallow(selectTerminalTabs));
   const sessions = useAppStore((state) => state.sessions);
+  const layout = useAppStore((state) => state.layout);
+  const paneAssignment = useAppStore((state) => state.paneAssignment);
   const activePane = useAppStore((state) => state.activePane);
   const current = useAppStore((state) => state.paneAssignment[state.activePane]);
   const assignPane = useAppStore((state) => state.assignPane);
 
+  const paneState = { layout, paneAssignment, activePane };
+
   return (
     <div className="kamux-tablist" role="tablist" aria-label="セッション">
-      {tabs.map((id) => (
-        <button
-          key={id}
-          type="button"
-          role="tab"
-          className="kamux-tab"
-          data-session-id={id}
-          aria-selected={id === current}
-          onClick={() => assignPane(activePane, id)}
-        >
-          <span className="kamux-tab__title">{sessions[id]?.title ?? id}</span>
-          <span className="kamux-tab__meta">
-            {/* runtimeStates を購読するのはこのバッジの中だけ（契約 §25.5 / §38.3）。
+      {tabs.map((id) => {
+        // 契約 §28.3: split2 なら L / R、split2-v なら U / D、single なら null。
+        // 「どちらがアクティブか」は aria-selected が表す（バッジは位置だけを表す）
+        const paneBadge = paneBadgeFor(paneState, id);
+        return (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            className="kamux-tab"
+            data-session-id={id}
+            data-pane-badge={paneBadge ?? ''}
+            aria-selected={id === current}
+            onClick={() => assignPane(activePane, id)}
+          >
+            <span className="kamux-tab__title">{sessions[id]?.title ?? id}</span>
+            <span className="kamux-tab__meta">
+              {/* runtimeStates を購読するのはこのバッジの中だけ（契約 §25.5 / §38.3）。
                 タブ列がバッジの変化で再レンダリングされないよう props で渡さない */}
-            <RuntimeBadge sessionId={id} />
-            <span className="kamux-tab__cli" aria-hidden>
-              {sessions[id]?.cli_kind}
+              <RuntimeBadge sessionId={id} />
+              <span className="kamux-tab__cli" aria-hidden>
+                {sessions[id]?.cli_kind}
+              </span>
+              {paneBadge !== null ? (
+                <span className="kamux-tab__pane-badge">{paneBadge}</span>
+              ) : null}
             </span>
-          </span>
-        </button>
-      ))}
+          </button>
+        );
+      })}
     </div>
   );
 }
