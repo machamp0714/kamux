@@ -202,20 +202,37 @@ pub fn claude_hook_args(hooks: Option<&HooksRuntime>) -> Vec<String> {
 
 /// PTY spawn 時に注入する環境変数。
 /// 契約 §12.3 のとおり hook プロセスへ完全継承される。
-pub fn hook_env_vars(
-    kamux_session_id: &str,
-    hooks: Option<&HooksRuntime>,
-) -> Vec<(String, String)> {
+///
+/// **`KAMUX_SESSION_ID` は返さない**（契約 §102.3）。所有者は `build_launch_command`
+/// であり、この関数を第 1 引数の `kamux_session_id` ごと落とすことで、対を返す実装を
+/// 構造的に書けなくしてある。引数を残して散文で禁じる形は採らない
+/// （§102.3 の却下記録）。
+pub fn hook_env_vars(hooks: Option<&HooksRuntime>) -> Vec<(String, String)> {
     match hooks {
-        Some(h) => vec![
-            (ENV_SESSION_ID.to_string(), kamux_session_id.to_string()),
-            (
-                ENV_HOOKS_SOCK.to_string(),
-                h.socket_path.to_string_lossy().into_owned(),
-            ),
-        ],
+        Some(h) => vec![(
+            ENV_HOOKS_SOCK.to_string(),
+            h.socket_path.to_string_lossy().into_owned(),
+        )],
         None => Vec::new(),
     }
+}
+
+/// `build_launch_command` が組み立てた結果に、claude 起動時のみ hooks 由来の
+/// args / env を重ねる（契約 §31.4）。
+///
+/// `build_launch_command` 自身のシグネチャは変えない（契約 §23 / §30.2.1）——
+/// 5 引数のままでは `HooksRuntime` に辿り着けないため、この関数を後段の
+/// 合流点として 1 箇所に閉じる。claude 以外の `cli_kind` には何も足さない。
+pub fn apply_hooks(
+    session: &Session,
+    mut cmd: LaunchCommand,
+    hooks: Option<&HooksRuntime>,
+) -> LaunchCommand {
+    if session.cli_kind == CliKind::Claude {
+        cmd.args.extend(claude_hook_args(hooks));
+        cmd.env.extend(hook_env_vars(hooks));
+    }
+    cmd
 }
 
 #[cfg(test)]
@@ -815,27 +832,135 @@ pub(crate) mod tests {
     #[test]
     fn adds_nothing_when_hooks_are_disabled() {
         assert!(claude_hook_args(None).is_empty());
-        assert!(hook_env_vars("3f2a0000-0000-4000-8000-000000009c1e", None).is_empty());
+        assert!(hook_env_vars(None).is_empty());
     }
 
     #[test]
-    fn injects_session_id_and_socket_path() {
-        let env = hook_env_vars(
-            "3f2a0000-0000-4000-8000-000000009c1e",
-            Some(&fake_runtime()),
-        );
+    fn injects_socket_path() {
+        // 契約 §102.3: hook_env_vars は KAMUX_SESSION_ID を返さない
+        // （所有者は build_launch_command。§102.2）。
+        let env = hook_env_vars(Some(&fake_runtime()));
         assert_eq!(
             env,
-            vec![
-                (
-                    "KAMUX_SESSION_ID".to_string(),
-                    "3f2a0000-0000-4000-8000-000000009c1e".to_string()
-                ),
-                (
-                    "KAMUX_HOOKS_SOCK".to_string(),
-                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
-                ),
-            ]
+            vec![(
+                "KAMUX_HOOKS_SOCK".to_string(),
+                "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+            )]
         );
+    }
+
+    // ---- Task 11: M1-4 の claude 起動経路への結線（契約 §31.4 / §102） ----
+
+    /// `apply_hooks` の第 3 引数用。`Some` のときだけ claude の args / env に
+    /// hooks 由来の値を重ねる。
+    fn claude_session(hooks_enabled: bool) -> (Session, Option<HooksRuntime>) {
+        let session = sample_session(CliKind::Claude, SessionMode::InPlace, None);
+        let hooks = if hooks_enabled {
+            Some(fake_runtime())
+        } else {
+            None
+        };
+        (session, hooks)
+    }
+
+    #[test]
+    fn claude_command_carries_settings_flag_and_hook_env() {
+        let (session, hooks) = claude_session(true);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, hooks.as_ref());
+
+        let pos = cmd
+            .args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings must be present");
+        assert_eq!(
+            cmd.args[pos + 1],
+            "/tmp/kamux's dir/kamux-hooks-4321.settings.json"
+        );
+        assert!(cmd
+            .env
+            .contains(&("KAMUX_SESSION_ID".to_string(), session.id.clone())));
+        assert!(cmd.env.contains(&(
+            "KAMUX_HOOKS_SOCK".to_string(),
+            "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+        )));
+    }
+
+    #[test]
+    fn shell_command_gets_no_settings_flag() {
+        let session = sample_session(CliKind::Shell, SessionMode::InPlace, None);
+        let base = build_launch_command(
+            &session,
+            "/bin/zsh",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, Some(&fake_runtime()));
+        assert!(!cmd.args.iter().any(|a| a == "--settings"));
+    }
+
+    #[test]
+    fn claude_command_works_without_hooks() {
+        let (session, _none) = claude_session(false);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, None);
+
+        assert!(!cmd.args.iter().any(|a| a == "--settings"));
+        // 契約 §102: 所有者は build_launch_command であり、hooks == None でも
+        // KAMUX_SESSION_ID はちょうど 1 個入る。入らないのは KAMUX_HOOKS_SOCK のほう
+        // （§30.2 の「全 cli_kind 共通」/ §12.1）。
+        assert_eq!(
+            cmd.env
+                .iter()
+                .filter(|(k, _)| k == "KAMUX_SESSION_ID")
+                .count(),
+            1
+        );
+        assert!(!cmd.env.iter().any(|(k, _)| k == "KAMUX_HOOKS_SOCK"));
+    }
+
+    /// 契約 §102.7: 合流後の env にキー重複が無いことを、claude + hooks 有効の
+    /// 組み合わせ（全書き手が同時発火する条件）で見る。キー名は固定しない
+    /// （M3-4 が KAMUX_SHIM_DIR / KAMUX_HOOKS_SETTINGS を足しても同じテストが守るため）。
+    #[test]
+    fn claude_hooks_do_not_duplicate_any_env_key() {
+        let (session, hooks) = claude_session(true);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, hooks.as_ref());
+
+        let mut seen: Vec<&str> = Vec::new();
+        for (key, _) in &cmd.env {
+            let key = key.as_str();
+            assert!(
+                !seen.contains(&key),
+                "key {key} appears more than once in {:?}",
+                cmd.env
+            );
+            seen.push(key);
+        }
     }
 }

@@ -12,7 +12,7 @@ use crate::pty::launch_env::{probe_login_env, resolve_program, LaunchEnv};
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
-use cli_args::{binary_name, build_launch_command, login_shell, ResumeMode};
+use cli_args::{apply_hooks, binary_name, build_launch_command, login_shell, ResumeMode};
 use workspace::{apply_start_kanban_transition, prepare_worktree};
 
 /// `start_session` の `AppHandle` を必要としない部分だけを切り出した純関数（注入版）。
@@ -169,11 +169,18 @@ fn plan_agent_spawn_with(
         // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
         let launch = build_launch_command(&session, &program, &cwd, launch_env, ResumeMode::None)?;
 
+        // claude 起動時のみ、`--settings` と hooks 由来の env を重ねる（契約 §31.4 /
+        // §102）。`build_launch_command` 自身のシグネチャには手を入れない
+        // （契約 §23 / §30.2.1）。`state.hooks` は hooks が無効なら None のままで、
+        // `apply_hooks` はそのとき何も足さない。
+        let launch = apply_hooks(&session, launch, state.hooks.as_ref());
+
         Ok(SpawnSpec {
             surface_id: sid,
             program: launch.program.to_string_lossy().into_owned(),
-            // KAMUX_SESSION_ID / PATH / LANG は build_launch_command が入れている。
-            // ここでは push しない（契約 §23「呼び出し側は一切 push しない」）。
+            // KAMUX_SESSION_ID / PATH / LANG は build_launch_command が、
+            // --settings / KAMUX_HOOKS_SOCK は apply_hooks が入れている。
+            // ここでは push しない（契約 §23「呼び出し側は一切 push しない」/ §31.4）。
             env: launch.env,
             args: launch.args,
             cwd: launch.cwd,
@@ -556,6 +563,41 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "LANG" && v == "ja_JP.UTF-8"),
             "injected launch_env.lang must flow into the SpawnSpec env: {:?}",
+            spec.env
+        );
+    }
+
+    /// `state.hooks` が `Some` のとき、`plan_agent_spawn_with` が組み立てる
+    /// `SpawnSpec` に `--settings` と `KAMUX_HOOKS_SOCK` が実際に流れることを固定する
+    /// （契約 §31.4 / §102）。`apply_hooks` 単体のテストは `cli_args.rs` にあるが、
+    /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）はここでしか踏めない。
+    #[test]
+    fn plan_agent_spawn_injects_hooks_settings_and_sock_for_claude() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, mut state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state.hooks = Some(crate::hooks_srv::HooksRuntime {
+            socket_path: PathBuf::from("/tmp/kamux-hooks-test.sock"),
+            settings_path: PathBuf::from("/tmp/kamux-hooks-test.settings.json"),
+            relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+        });
+
+        let (_, spec) = plan(&state, &session.id).expect("plan spawn");
+
+        let pos = spec
+            .args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings must be present");
+        assert_eq!(spec.args[pos + 1], "/tmp/kamux-hooks-test.settings.json");
+        assert!(
+            spec.env.contains(&(
+                "KAMUX_HOOKS_SOCK".to_string(),
+                "/tmp/kamux-hooks-test.sock".to_string()
+            )),
+            "actual env: {:?}",
             spec.env
         );
     }
