@@ -84,10 +84,25 @@ fn writes_raw_stdin_to_debug_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `$TMPDIR` 直下にある `*-Stop.json`（`write_debug_capture` の命名規則）の集合。
+/// ガードを外して既定ディレクトリへ無条件キャプチャする変異が入った場合、
+/// もっともありそうな既定値は `std::env::temp_dir()` 自身であり、この集合が
+/// 増える形で検出できる。
+fn stray_stop_json_files() -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(std::env::temp_dir())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with("-Stop.json"))
+        .collect()
+}
+
 #[test]
 fn no_debug_dir_means_no_files() {
     let dir = std::env::temp_dir().join(format!("kamux-relay-nodebug-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    let stray_before = stray_stop_json_files();
 
     let out = Command::new(relay_bin())
         .arg("Stop")
@@ -102,6 +117,12 @@ fn no_debug_dir_means_no_files() {
     assert!(
         !dir.exists(),
         "debug dir must not be created when the env var is unset"
+    );
+    assert_eq!(
+        stray_stop_json_files(),
+        stray_before,
+        "no *-Stop.json capture file may appear directly under $TMPDIR when \
+         KAMUX_RELAY_DEBUG_DIR is unset"
     );
 }
 

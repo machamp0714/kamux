@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
+pub mod payload;
+
+pub use payload::{parse_hook_event, HookEnvelope, HookEvent, HookKind, WireMessage};
+
 /// macOS の sockaddr_un.sun_path は 104 バイト。
 pub const SUN_PATH_MAX: usize = 104;
 
