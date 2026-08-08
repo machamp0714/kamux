@@ -1,7 +1,8 @@
 dist/
-src-tauri/target/
-# Cargo ワークスペース化（M2-2 Task 1）で target/ が repo root へ移った。
-# Tauri のビルド生成物 __global-api-script.js が走査対象に入る。
+# 無視パターンが特定の場所を焼き込んでいると、その場所が動いたときに黙って死ぬ
+# （Cargo ワークスペース化で target/ が src-tauri/target/ から repo root へ移った）。
+# .prettierignore は gitignore 構文なので、先頭に / の無い target/ は任意の階層に
+# 一致し、src-tauri/target/ も既にこの 1 行が覆う（後者は冗長だった）。
 target/
 playwright-report/
 test-results/
