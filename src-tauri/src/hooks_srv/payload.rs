@@ -173,7 +173,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    /// `tracing::warn!` が実際に鳴ったことを検証するためのキャプチャ用 `Layer`。
+    /// `tracing::warn!` が実際に鳴ったことを検証するために記録する 1 イベント。
     ///
     /// レビューで指摘された通り、`fmt` の文字列出力を `contains` で見る形は
     /// 恒真になりうる（例: 条件 1-1 の `raw_json` フィールドには wire 全体が
