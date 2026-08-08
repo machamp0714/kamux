@@ -77,6 +77,14 @@ describe('assignPaneReducer', () => {
     const next = assignPaneReducer(before, 0, 'a');
     expect(next.paneAssignment).toEqual(['a', 'b']);
     expect(next.activePane).toBe(0);
+
+    // target: 1 の反対方向。この早期リターン分岐（既にそのペインに居る）は
+    // target をそのまま返さず固定値へすり替える退化を、片方向だけでは検出できない
+    // （棚卸しで発見。M8 と同形）。
+    const beforeR = S('split2', ['a', 'b'], 0);
+    const nextR = assignPaneReducer(beforeR, 1, 'b');
+    expect(nextR.paneAssignment).toEqual(['a', 'b']);
+    expect(nextR.activePane).toBe(1);
   });
 
   it('layout は変更しない', () => {
@@ -106,6 +114,12 @@ describe('setLayoutReducer', () => {
     expect(next.paneAssignment).toEqual(['a', 'b']);
     expect(next.paneAssignment).toBe(before.paneAssignment);
     expect(next.activePane).toBe(1);
+
+    // activePane: 0 起点の反対方向。s.activePane をそのまま返さず固定値へ
+    // すり替える退化を、片方向だけでは検出できない（棚卸しで発見。M8 と同形）。
+    const beforeZ = S('split2', ['a', 'b'], 0);
+    const nextZ = setLayoutReducer(beforeZ, 'single');
+    expect(nextZ.activePane).toBe(0);
   });
 
   it('split2 に戻すと左右が元の位置のまま復帰する', () => {
@@ -136,6 +150,12 @@ describe('setActivePaneReducer', () => {
     expect(nextV.activePane).toBe(1);
     expect(nextV.paneAssignment).toEqual(['a', 'b']);
     expect(nextV.paneAssignment).toBe(beforeV.paneAssignment);
+
+    // activePane: 1 → pane: 0 の反対方向。pane をそのまま返さず固定値へ
+    // すり替える退化を、片方向だけでは検出できない（棚卸しで発見。M8 と同形）。
+    const beforeR = S('split2', ['a', 'b'], 1);
+    const nextR = setActivePaneReducer(beforeR, 0);
+    expect(nextR.activePane).toBe(0);
   });
 
   it('single では no-op（同一オブジェクトを返す）', () => {
