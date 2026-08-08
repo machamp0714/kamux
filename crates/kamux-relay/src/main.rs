@@ -48,6 +48,11 @@ fn relay() -> Option<()> {
     // take() は上限に当たっても Ok を返す。切り詰めを検知して下流に伝える。
     let truncated = raw.len() as u64 == MAX_STDIN_BYTES;
 
+    // 未確認の payload 構造（契約 §12.7-1）を通常利用中にキャプチャするための逃げ道。
+    if let Ok(dir) = std::env::var("KAMUX_RELAY_DEBUG_DIR") {
+        write_debug_capture(&dir, &hook_kind, &raw);
+    }
+
     let message = wire::build_wire_message(&kamux_session_id, &hook_kind, &raw, truncated);
 
     let mut stream = UnixStream::connect(&socket_path).ok()?;
@@ -62,4 +67,18 @@ fn relay() -> Option<()> {
 /// argv[1] は kamux 自身が settings JSON に書いた値だが、念のため形を検査する。
 fn is_valid_hook_kind(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// デバッグ記録。失敗しても relay の主経路には影響させない。
+fn write_debug_capture(dir: &str, hook_kind: &str, raw: &[u8]) {
+    let dir = std::path::Path::new(dir);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("{millis}-{hook_kind}.json"));
+    let _ = std::fs::write(path, raw);
 }
