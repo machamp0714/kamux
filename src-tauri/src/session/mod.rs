@@ -573,9 +573,8 @@ mod tests {
     /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）はここでしか踏めない。
     #[test]
     fn plan_agent_spawn_injects_hooks_settings_and_sock_for_claude() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // ENV_LOCK は不要: CliKind::Claude は fake_resolve_program 経由で解決され、
+        // login_shell()（$SHELL 読み取り）を踏まない（上の binary_name 分岐と同じ理由）。
         let (_dir, mut state, session, _worktree_path) =
             build_state_with_worktree_session(CliKind::Claude, None);
         state.hooks = Some(crate::hooks_srv::HooksRuntime {
