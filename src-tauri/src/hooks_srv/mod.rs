@@ -304,10 +304,15 @@ fn handle_connection(stream: UnixStream, sink: &dyn HookSink) {
 /// Tauri の externalBin はターゲットトリプルのサフィックスを剥がして配置する。
 pub const RELAY_BIN_NAME: &str = "kamux-relay";
 
-/// テスト可能な純粋版。候補を順に試す。
+/// テスト可能な純粋版。
 ///
-/// 1. `KAMUX_RELAY_BIN`（開発・テスト用の明示指定）
-/// 2. アプリ実行ファイルと同じディレクトリ
+/// `KAMUX_RELAY_BIN`（開発・テスト用の明示指定）が与えられた場合は、それだけを
+/// 見て fail-fast する。ファイルが無ければ即座にエラーを返し、2 のディレクトリ
+/// 探索へはフォールスルーしない（古い relay が居座っていても override が優先
+/// されることを保証するため）。
+///
+/// 1. `KAMUX_RELAY_BIN`（開発・テスト用の明示指定。指すファイルが無ければ即エラー）
+/// 2. 上記が無い場合、アプリ実行ファイルと同じディレクトリ
 ///    - dev: `target/debug/kamux` の隣の `target/debug/kamux-relay`
 ///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測）
 pub fn resolve_relay_bin_from(env_override: Option<&str>, exe_dir: &Path) -> AppResult<PathBuf> {
@@ -1080,9 +1085,16 @@ mod tests {
         let dir = std::env::temp_dir();
         let err =
             resolve_relay_bin_from(Some("/nonexistent/kamux-relay"), &dir).expect_err("must fail");
+        let AppError::CliNotFound(msg) = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        // variant の一致だけでは、beside 探索へのフォールスルーで別理由の
+        // CliNotFound になっても見分けがつかない。メッセージに
+        // KAMUX_RELAY_BIN が現れることまで見て、override 起因の失敗である
+        // ことを固定する。
         assert!(
-            matches!(err, AppError::CliNotFound(_)),
-            "unexpected error: {err:?}"
+            msg.contains("KAMUX_RELAY_BIN"),
+            "expected message to mention KAMUX_RELAY_BIN, got: {msg}"
         );
     }
 
