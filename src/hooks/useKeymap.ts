@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 
 import { useAppStore } from '../store';
 import { resolveKeymap } from './keymap';
+import { nextLayout } from '../store/paneLogic';
 
 /**
  * IME 変換確定前の Escape（変換キャンセル）かどうかを DOM イベントから判定する。
@@ -26,7 +27,7 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
   if (isImeCancelEscape(event)) return;
   const store = useAppStore.getState();
   const action = resolveKeymap(
-    { key: event.key, metaKey: event.metaKey },
+    { key: event.key, metaKey: event.metaKey, ctrlKey: event.ctrlKey, altKey: event.altKey },
     { modalOpen: store.modal !== null, view: store.view },
   );
   if (action === null) return;
@@ -43,6 +44,12 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
       break;
     case 'cycle_session':
       store.cycleSession(action.dir);
+      break;
+    case 'set_active_pane':
+      store.setActivePane(action.pane);
+      break;
+    case 'toggle_layout':
+      store.setLayout(nextLayout(store.layout));
       break;
   }
 }
