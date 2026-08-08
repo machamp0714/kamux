@@ -721,6 +721,36 @@ mod tests {
     }
 
     #[test]
+    fn badge_counts_waiting_input_among_all_six_runtime_states() {
+        // RuntimeState の 6 値すべてを置く。1 値でも欠けると、その値をフィルタに足す変異が
+        // 素通りする（レビュー指摘: WaitingInput | Error でも既存フィクスチャは全緑だった）。
+        let s = states(&[
+            ("a", RuntimeState::WaitingInput),
+            ("b", RuntimeState::WaitingInput),
+            ("c", RuntimeState::Running),
+            ("d", RuntimeState::Idle),
+            ("e", RuntimeState::Exited),
+            ("f", RuntimeState::Interrupted),
+            ("g", RuntimeState::Error),
+        ]);
+        assert_eq!(badge_count(&s), Some(2));
+    }
+
+    #[test]
+    fn badge_is_none_when_all_five_non_waiting_states_are_present() {
+        // WaitingInput 以外の 5 値すべてを置く。部分列にしない —— 居ない値があると、
+        // その値をフィルタに足す変異（誤って数えてしまう）が検出できなくなる。
+        let s = states(&[
+            ("a", RuntimeState::Running),
+            ("b", RuntimeState::Idle),
+            ("c", RuntimeState::Exited),
+            ("d", RuntimeState::Interrupted),
+            ("e", RuntimeState::Error),
+        ]);
+        assert_eq!(badge_count(&s), None);
+    }
+
+    #[test]
     fn waiting_input_title_follows_the_design_doc() {
         let label = SessionLabel {
             title: "fix-login".into(),
