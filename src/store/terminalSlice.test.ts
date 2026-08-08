@@ -110,6 +110,17 @@ describe('assignPane', () => {
     expect(store.getState().activePane).toBe(1);
     expect(store.getState().focusedSessionId).toBe('b1');
   });
+
+  it('single では pane 引数を無視して activePane に寄せる（reducer 単体の観測は paneLogic.test.ts:94。ここは terminalSlice 経由の配線の統合確認）', () => {
+    const order = emptyOrder();
+    order.backlog = ['a'];
+    const store = makeStore([session('a', 'backlog')], order);
+    store.getState().assignPane(1, 'a');
+    const s = store.getState();
+    expect(s.paneAssignment).toEqual(['a', null]);
+    expect(s.activePane).toBe(0);
+    expect(s.focusedSessionId).toBe('a');
+  });
 });
 
 describe('cycleSession', () => {
