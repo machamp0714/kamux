@@ -413,7 +413,7 @@ mod tests {
         let raw_json = events[0].fields.get("raw_json").map(String::as_str);
         assert!(
             raw_json.is_some_and(
-                |s| s.contains(r#""kamux_session_id""#) && s.contains(r#""source":"startup"#)
+                |s| s.contains(r#""kamux_session_id""#) && s.contains(r#""source":"startup""#)
             ),
             "raw_json missing wire+payload markers: {raw_json:?}"
         );
