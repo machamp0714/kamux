@@ -255,11 +255,11 @@ fn flags_truncated_when_stdin_exceeds_max_bytes() {
             .spawn()
             .expect("spawn relay");
         let oversized = vec![b'x'; OVER_MAX_STDIN_BYTES];
-        proc.stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(&oversized)
-            .expect("write stdin");
+        // relay は MAX_STDIN_BYTES ちょうどで stdin を読むのを止めて先に進むため、
+        // 末尾の超過分の書き込みが EPIPE になるのは正常系でも起こりうる。
+        // このテストが主張したいのはワイヤ上の `truncated` であって write の成否
+        // ではないので、書き込み自体の失敗ではテストを落とさない。
+        let _ = proc.stdin.as_mut().expect("stdin").write_all(&oversized);
         proc.wait_with_output().expect("wait")
     });
 
