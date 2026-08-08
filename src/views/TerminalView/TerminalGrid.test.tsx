@@ -440,6 +440,41 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s1:agent', 100, 30);
     expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 100, 30);
+
+    // (a) 反応配線: レイアウトが動くと effect が張り直され、新しいホストを observe する
+    // （M-E: deps を [] に潰すと検出できない）。single へ一旦畳んで split2 に戻すと、
+    // pane 1 のスロットは完全に unmount → remount され、ホスト要素は新しい DOM ノードに
+    // 差し替わる。effect が張り直されていなければ、この新しいホストは誰にも observe されない
+    act(() => {
+      useAppStore.getState().setLayout('single');
+    });
+    await flush();
+    act(() => {
+      useAppStore.getState().setLayout('split2');
+    });
+    await flush();
+
+    const rewiredHost1 = hostOf(1);
+    expect(rewiredHost1).not.toBeNull();
+    expect(FakeResizeObserver.observed).toContain(rewiredHost1);
+
+    // (b) 反応配線: assignPane 後に RO コールバックが発火すると、resizePty の第 1 引数は
+    // 【新しい】割当の surface になる（M-F: stateRef.current の更新が消えると、
+    // ResizeObserver コールバックは初回マウント時点の古い割当のまま固まる）
+    mocks.resizePty.mockClear();
+    act(() => {
+      useAppStore.getState().assignPane(0, 's3');
+    });
+    await flush();
+
+    FakeResizeObserver.callbacks.forEach((cb) => {
+      cb();
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await flush();
+
+    expect(mocks.resizePty).toHaveBeenCalledWith('s3:agent', 100, 30);
+    expect(mocks.resizePty).not.toHaveBeenCalledWith('s1:agent', 100, 30);
   });
 
   it('isStarted の門を通った resize_pty が reject しても unhandled rejection にならない', async () => {

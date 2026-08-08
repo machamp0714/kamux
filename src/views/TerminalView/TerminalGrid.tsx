@@ -78,6 +78,12 @@ export function TerminalGrid(): JSX.Element {
     attached.current = next;
   }, [layout, paneAssignment, activePane]);
 
+  // Task 10 で usePaneFit が入ると、この ResizeObserver と usePaneFit の window.resize
+  // 経路が二重になる。どちらを残すかは Task 10 で決めること。契約 §28 は「usePaneFit の
+  // useEffect deps から layout を外す最適化」を禁止している —— 外すと向き変更時に xterm が
+  // 横向きの cols/rows を保持したまま resize_pty に誤ったジオメトリが飛ぶ。表示は崩れないので
+  // 発覚が遅れる。
+  //
   // ResizeObserver はサイズが変化したときにしか発火しない（ポーリングではない）。
   // 表示中のペインが入れ替わる（= ホスト要素が増減する）のは layout / activePane の
   // 変化時なので、その 2 つで張り直す。割当だけの変化ではホスト要素は変わらない
