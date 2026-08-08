@@ -127,6 +127,50 @@ pub fn is_session_visible(session_id: &str, v: &VisibilityContext) -> bool {
         && v.visible_session_ids.iter().any(|id| id == session_id)
 }
 
+/// `decide` の入力。引数が多いので構造体でまとめる。
+#[derive(Debug, Clone)]
+pub struct DecisionInput<'a> {
+    pub session_id: &'a str,
+    /// 直前の `runtime_state`。初観測なら `None`。
+    pub prev: Option<RuntimeState>,
+    pub next: RuntimeState,
+    pub reason: StateReason,
+    pub permission: NotifyPermission,
+    pub visibility: &'a VisibilityContext,
+    /// 同一セッションに前回通知を出した時刻（Unix epoch ミリ秒）。
+    pub last_notified_at_ms: Option<i64>,
+    pub now_ms: i64,
+}
+
+/// 通知を出すか、出さないならなぜかを決める。
+///
+/// 判定順は「対象状態か → 権限 → エッジトリガ → 表示中 → レート制限」。
+/// 対象外の状態遷移を最初に弾くのは、権限が拒否されていても
+/// 「そもそも通知の対象ではない」ほうが原因として正確だから。
+pub fn decide(input: &DecisionInput<'_>) -> NotifyDecision {
+    let Some(kind) = notify_kind_for(input.next, input.reason) else {
+        return NotifyDecision::SuppressIrrelevantState;
+    };
+    if input.permission == NotifyPermission::Denied {
+        return NotifyDecision::SuppressPermissionDenied;
+    }
+    if input.prev == Some(input.next) {
+        return NotifyDecision::SuppressNotTransition;
+    }
+    if is_session_visible(input.session_id, input.visibility) {
+        return NotifyDecision::SuppressVisible;
+    }
+    if let Some(last) = input.last_notified_at_ms {
+        // 時計が巻き戻ると差は負になり、NOTIFY_MIN_INTERVAL_MS 未満なので抑制側に倒れる。
+        // saturating_sub は i64::MIN 方向のオーバーフロー panic を避けるためであり、
+        // 0 にクランプするわけではない（負の値のまま比較に使われる）。
+        if input.now_ms.saturating_sub(last) < NOTIFY_MIN_INTERVAL_MS {
+            return NotifyDecision::SuppressRateLimited;
+        }
+    }
+    NotifyDecision::Post(kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +182,226 @@ mod tests {
             view,
             visible_session_ids: ids.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    fn input<'a>(
+        prev: Option<RuntimeState>,
+        next: RuntimeState,
+        reason: StateReason,
+        permission: NotifyPermission,
+        visibility: &'a VisibilityContext,
+        last: Option<i64>,
+        now_ms: i64,
+    ) -> DecisionInput<'a> {
+        DecisionInput {
+            session_id: "s1",
+            prev,
+            next,
+            reason,
+            permission,
+            visibility,
+            last_notified_at_ms: last,
+            now_ms,
+        }
+    }
+
+    #[test]
+    fn posts_on_first_transition_into_waiting_input() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::Post(NotifyKind::WaitingInput));
+    }
+
+    #[test]
+    fn posts_when_permission_is_still_unknown() {
+        let v = ctx(false, None, &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::Idle,
+            StateReason::HookStop,
+            NotifyPermission::Unknown,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::Post(NotifyKind::Stopped));
+    }
+
+    #[test]
+    fn suppresses_when_permission_is_denied() {
+        let v = ctx(false, None, &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Denied,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressPermissionDenied);
+    }
+
+    #[test]
+    fn suppresses_irrelevant_state_before_anything_else() {
+        let v = ctx(true, Some(ViewKind::Terminal), &["s1"]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::Exited,
+            StateReason::PtyExited,
+            NotifyPermission::Denied,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressIrrelevantState);
+    }
+
+    #[test]
+    fn suppresses_re_entry_into_the_same_state() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            Some(RuntimeState::WaitingInput),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressNotTransition);
+    }
+
+    #[test]
+    fn posts_when_there_is_no_previous_state() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            None,
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::Post(NotifyKind::WaitingInput));
+    }
+
+    #[test]
+    fn suppresses_when_the_session_is_on_screen() {
+        let v = ctx(true, Some(ViewKind::Terminal), &["s1"]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            None,
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressVisible);
+    }
+
+    #[test]
+    fn suppresses_within_the_minimum_interval() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            Some(1_000),
+            1_000 + NOTIFY_MIN_INTERVAL_MS - 1,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressRateLimited);
+    }
+
+    #[test]
+    fn posts_exactly_at_the_minimum_interval() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            Some(1_000),
+            1_000 + NOTIFY_MIN_INTERVAL_MS,
+        );
+        assert_eq!(decide(&i), NotifyDecision::Post(NotifyKind::WaitingInput));
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_does_not_panic() {
+        let v = ctx(false, Some(ViewKind::Kanban), &[]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            Some(9_000),
+            1_000,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressRateLimited);
+    }
+
+    #[test]
+    fn permission_denied_wins_over_edge_trigger_visibility_and_rate_limit() {
+        // 判定順序の連鎖を閉じる: 権限拒否以外の全ゲート（エッジトリガでない・表示中・
+        // レート制限内）も同時に成立する入力で、権限が最優先で効くことを固定する。
+        let v = ctx(true, Some(ViewKind::Terminal), &["s1"]);
+        let i = input(
+            Some(RuntimeState::WaitingInput),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Denied,
+            &v,
+            Some(1_000),
+            1_000 + NOTIFY_MIN_INTERVAL_MS - 1,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressPermissionDenied);
+    }
+
+    #[test]
+    fn not_a_transition_wins_over_visibility_and_rate_limit() {
+        // エッジトリガでない（同一状態への再入）が、表示中・レート制限内より先に効く。
+        let v = ctx(true, Some(ViewKind::Terminal), &["s1"]);
+        let i = input(
+            Some(RuntimeState::WaitingInput),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            Some(1_000),
+            1_000 + NOTIFY_MIN_INTERVAL_MS - 1,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressNotTransition);
+    }
+
+    #[test]
+    fn visibility_wins_over_rate_limit() {
+        // 表示中が、レート制限内より先に効く。
+        let v = ctx(true, Some(ViewKind::Terminal), &["s1"]);
+        let i = input(
+            Some(RuntimeState::Running),
+            RuntimeState::WaitingInput,
+            StateReason::HookNotification,
+            NotifyPermission::Granted,
+            &v,
+            Some(1_000),
+            1_000 + NOTIFY_MIN_INTERVAL_MS - 1,
+        );
+        assert_eq!(decide(&i), NotifyDecision::SuppressVisible);
     }
 
     #[test]
