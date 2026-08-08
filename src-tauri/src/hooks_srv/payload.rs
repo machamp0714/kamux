@@ -564,7 +564,9 @@ mod tests {
         assert!(events.is_empty(), "expected no warn, got {events:?}");
     }
 
-    /// HookEnvelope は必須フィールドを持たないので、いかなる JSON オブジェクトでもパースできる。
+    /// HookEnvelope は必須フィールドを持たないので、フィールドの欠落では失敗しない。
+    /// ただし既知フィールドの型が違えば失敗する（契約 §91.1.1。
+    /// `object_payload_with_wrong_field_type_is_discarded_and_logs_warning` 参照）。
     #[test]
     fn envelope_has_no_required_fields() {
         let empty: HookEnvelope = serde_json::from_str("{}").expect("empty object must parse");

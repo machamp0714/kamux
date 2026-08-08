@@ -78,14 +78,32 @@ pub fn sweep_stale_runtime_files(dir: &Path) -> usize {
     removed
 }
 
+/// `kill(pid, 0)` の戻り値と errno から生存判定を行う純関数。
+/// `rc == 0` は生存。`rc != 0` のとき `EPERM`（他人の pid で権限が無く存在確認できない
+/// だけで、プロセス自体は存在する）は「生きている」とみなす。`ESRCH`（プロセス不在）は
+/// 「死んでいる」とみなす。
+///
+/// uid に依存する `kill(1, 0)` の実際の呼び出し結果ではなく、この関数自体を
+/// `0` / `EPERM` / `ESRCH` の 3 値で固定してテストする。root で実行すると
+/// `kill(1, 0)` は `rc == 0` を返して EPERM 分岐を通らないため、実呼び出し経由の
+/// テストは uid に依存してしまう。
+fn classify_kill_result(rc: libc::c_int, errno: Option<i32>) -> bool {
+    if rc == 0 {
+        return true;
+    }
+    errno == Some(libc::EPERM)
+}
+
 /// kill(pid, 0) で存在確認する。権限エラー(EPERM)は「生きている」とみなす。
 fn is_pid_alive(pid: u32) -> bool {
     // SAFETY: シグナル 0 の kill は副作用がなく、存在確認のみを行う。
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let errno = if rc == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+    classify_kill_result(rc, errno)
 }
 
 #[cfg(test)]
@@ -164,6 +182,21 @@ mod tests {
         let dir = dir_for_total_path_len(SUN_PATH_MAX);
         let err = socket_path_from(&dir);
         assert!(err.is_err(), "104 bytes must be rejected");
+    }
+
+    #[test]
+    fn classify_kill_result_treats_rc_zero_as_alive() {
+        assert!(classify_kill_result(0, None));
+    }
+
+    #[test]
+    fn classify_kill_result_treats_eperm_as_alive() {
+        assert!(classify_kill_result(-1, Some(libc::EPERM)));
+    }
+
+    #[test]
+    fn classify_kill_result_treats_esrch_as_dead() {
+        assert!(!classify_kill_result(-1, Some(libc::ESRCH)));
     }
 
     #[test]

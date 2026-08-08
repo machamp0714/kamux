@@ -136,11 +136,14 @@ mod tests {
             serde_json::from_str(&s).expect("wire message must be valid JSON");
         assert_eq!(v["truncated"], true);
         assert!(v["payload"].is_null());
-        // 4 KiB を base64 にすると 5464 文字。丸ごと運ばない。
+        // 契約 §84.3: 先頭 4 KiB(4096 バイト) まで。base64 にすると 5464 文字ちょうど。
+        // 片側境界（< 6000 など）だと縮める方向の変異（RAW_DEBUG_CAP を 1 KiB にする等）
+        // を捕まえられないため、両側を閉じた値で固定する。
         let encoded = v["raw_base64"].as_str().expect("raw_base64");
-        assert!(
-            encoded.len() < 6000,
-            "raw_base64 must be capped, got {}",
+        assert_eq!(
+            encoded.len(),
+            5464,
+            "raw_base64 must be capped to exactly 4 KiB (5464 base64 chars), got {}",
             encoded.len()
         );
     }
