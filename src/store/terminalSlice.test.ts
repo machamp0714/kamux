@@ -101,6 +101,10 @@ describe('assignPane', () => {
     const order = emptyOrder();
     order.backlog = ['b1'];
     const store = makeStore([session('b1', 'backlog')], order);
+    // single では pane 引数を無視して activePane に寄せる（paneLogic.ts の
+    // assignPaneReducer、設計 §3.5）。pane 1 を明示的に指定する意図を保つため
+    // split2 にしてから呼ぶ。
+    store.getState().setLayout('split2');
     store.getState().assignPane(1, 'b1');
     expect(store.getState().paneAssignment).toEqual([null, 'b1']);
     expect(store.getState().activePane).toBe(1);
@@ -155,6 +159,10 @@ describe('cycleSession', () => {
 
   it('アクティブなペインだけを動かす', () => {
     const store = makeStore(sessions(), order());
+    // single では pane 引数を無視して activePane に寄せる（paneLogic.ts の
+    // assignPaneReducer、設計 §3.5）。pane 1 をアクティブにする意図を保つため
+    // split2 にしてから呼ぶ。
+    store.getState().setLayout('split2');
     store.getState().assignPane(1, 'i1');
     store.getState().cycleSession(1);
     expect(store.getState().paneAssignment).toEqual([null, 'b1']);
@@ -167,5 +175,131 @@ describe('setLayout', () => {
     expect(store.getState().layout).toBe('single');
     store.getState().setLayout('split2');
     expect(store.getState().layout).toBe('split2');
+  });
+});
+
+// --- ここから M3-2 Task 6 の追加分。既存の describe は変更しない ---
+
+describe('setActivePane', () => {
+  it('split2 でアクティブペインを切り替え、focusedSessionId を同期する', () => {
+    const order = emptyOrder();
+    order.backlog = ['a', 'b'];
+    const store = makeStore([session('a', 'backlog'), session('b', 'backlog')], order);
+    store.getState().setLayout('split2');
+    store.getState().assignPane(0, 'a');
+    store.getState().assignPane(1, 'b');
+    store.getState().setActivePane(0);
+    expect(store.getState().activePane).toBe(0);
+    expect(store.getState().focusedSessionId).toBe('a');
+  });
+
+  it('single では setActivePane が no-op で focusedSessionId も動かない', () => {
+    const order = emptyOrder();
+    order.backlog = ['a'];
+    const store = makeStore([session('a', 'backlog')], order);
+    store.getState().assignPane(0, 'a');
+    store.getState().setActivePane(1);
+    const s = store.getState();
+    expect(s.activePane).toBe(0);
+    expect(s.paneAssignment).toEqual(['a', null]);
+    expect(s.focusedSessionId).toBe('a');
+  });
+
+  it('single に戻っても activePane=1 を維持し、setActivePane は依然 no-op（片方向フィクスチャの穴を塞ぐ）', () => {
+    const order = emptyOrder();
+    order.backlog = ['a', 'b'];
+    const store = makeStore([session('a', 'backlog'), session('b', 'backlog')], order);
+    store.getState().setLayout('split2');
+    store.getState().assignPane(0, 'a');
+    store.getState().assignPane(1, 'b');
+    store.getState().setActivePane(1);
+    store.getState().setLayout('single');
+    expect(store.getState().activePane).toBe(1);
+    expect(store.getState().focusedSessionId).toBe('b');
+
+    store.getState().setActivePane(0);
+    expect(store.getState().activePane).toBe(1);
+    expect(store.getState().focusedSessionId).toBe('b');
+  });
+});
+
+describe('resetTerminalLayout', () => {
+  it('初期状態へ戻し focusedSessionId も null にする', () => {
+    const order = emptyOrder();
+    order.backlog = ['a'];
+    const store = makeStore([session('a', 'backlog')], order);
+    store.getState().setLayout('split2');
+    store.getState().assignPane(0, 'a');
+    store.getState().resetTerminalLayout();
+    const s = store.getState();
+    expect(s.layout).toBe('single');
+    expect(s.paneAssignment).toEqual([null, null]);
+    expect(s.activePane).toBe(0);
+    expect(s.focusedSessionId).toBeNull();
+  });
+});
+
+describe('setLayout はペイン割当を保持する', () => {
+  it('single ↔ split2 を往復しても paneAssignment は消えない', () => {
+    const order = emptyOrder();
+    order.backlog = ['a', 'b'];
+    const store = makeStore([session('a', 'backlog'), session('b', 'backlog')], order);
+    store.getState().setLayout('split2');
+    store.getState().assignPane(0, 'a');
+    store.getState().assignPane(1, 'b');
+    store.getState().setLayout('single');
+    expect(store.getState().paneAssignment).toEqual(['a', 'b']);
+    store.getState().setLayout('split2');
+    expect(store.getState().paneAssignment).toEqual(['a', 'b']);
+  });
+});
+
+describe('split2-v でもペイン対応が機能する（契約 §28.1／§28.6）', () => {
+  it('assignPane と setActivePane が focusedSessionId を同期する', () => {
+    const order = emptyOrder();
+    order.backlog = ['a', 'b'];
+    const store = makeStore([session('a', 'backlog'), session('b', 'backlog')], order);
+    store.getState().setLayout('split2-v');
+    store.getState().assignPane(0, 'a');
+    store.getState().assignPane(1, 'b');
+    store.getState().setActivePane(1);
+    expect(store.getState().activePane).toBe(1);
+    expect(store.getState().focusedSessionId).toBe('b');
+  });
+});
+
+describe('withFocus は set() へ渡す形を 4 フィールドに保つ（PR 25 判定事項・変異 #6 の観測強化）', () => {
+  it('変化の無い setLayout 呼び出しでも set() の引数は 4 キーちょうど', () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const store = create<TestStore>()((set, get, api) => {
+      const spySet: typeof set = (partial, replace) => {
+        if (typeof partial !== 'function') {
+          calls.push(partial as Record<string, unknown>);
+        }
+        set(partial as Parameters<typeof set>[0], replace);
+      };
+      return {
+        sessions: {},
+        sessionOrder: emptyOrder(),
+        focusedSessionId: null,
+        ...(createTerminalSlice as unknown as StateCreator<TestStore, [], [], TerminalSlice>)(
+          spySet,
+          get,
+          api,
+        ),
+      };
+    });
+
+    // layout は初期値のまま 'single' なので、この呼び出しは reducer の早期 return
+    // （no-op）経路を通る。ここで reducer に渡した p は get() そのもの
+    // （sessions / sessionOrder など terminalSlice 外のフィールドも持つ AppStore 全体）
+    // なので、withFocus が `{ ...p, focusedSessionId }` の spread になっていれば
+    // set() へ渡る partial のキー数がここで膨らむ。
+    store.getState().setLayout('single');
+
+    expect(calls).toHaveLength(1);
+    expect(Object.keys(calls[0]).sort()).toEqual(
+      ['activePane', 'focusedSessionId', 'layout', 'paneAssignment'].sort(),
+    );
   });
 });
