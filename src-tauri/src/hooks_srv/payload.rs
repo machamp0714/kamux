@@ -109,7 +109,25 @@ pub fn parse_hook_event(bytes: &[u8]) -> Result<HookEvent, serde_json::Error> {
     }
 
     let envelope: HookEnvelope = match wire.payload {
-        Some(value) => serde_json::from_value(value).unwrap_or_default(),
+        Some(value) => {
+            let raw_json = value.to_string();
+            // 契約 §91.1.1 条件 1-4: payload は Some だが HookEnvelope への
+            // デシリアライズが失敗した（map ではない、または既知フィールドの型が
+            // 変わった）。§84.1 が「失敗しえない」のは外側（ワイヤ → WireMessage /
+            // Value の受け取り）だけであり、内側（Value → HookEnvelope）は今も
+            // 失敗しうる。§12.5 の原規則（デシリアライズ失敗は握りつぶさず
+            // warn! に生 JSON を残す）がこの層でまだ生きているので、
+            // unwrap_or_default() で握りつぶさず、記録してから既定値へ落とす。
+            serde_json::from_value(value).unwrap_or_else(|err| {
+                tracing::warn!(
+                    kamux_session_id = %wire.kamux_session_id,
+                    error = %err,
+                    raw_json = %raw_json,
+                    "hook payload could not be deserialized into HookEnvelope; falling back to an empty envelope"
+                );
+                HookEnvelope::default()
+            })
+        }
         None => HookEnvelope::default(),
     };
 
@@ -150,6 +168,78 @@ pub fn parse_hook_event(bytes: &[u8]) -> Result<HookEvent, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// `tracing::warn!` が実際に鳴ったことを検証するためのキャプチャ用 `Layer`。
+    ///
+    /// レビューで指摘された通り、`fmt` の文字列出力を `contains` で見る形は
+    /// 恒真になりうる（例: 条件 1-1 の `raw_json` フィールドには wire 全体が
+    /// 含まれるため、`kamux_session_id` を落とす変異でも `contains` が通る）。
+    /// ここではイベントをフィールド単位で構造化して記録し、フィールド値を
+    /// 個別に assert する。
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer(Arc<Mutex<Vec<CapturedEvent>>>);
+
+    struct Visitor<'a>(&'a mut CapturedEvent);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0.message = value.to_string();
+            } else {
+                self.0
+                    .fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.0.message = rendered;
+            } else {
+                self.0.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut captured = CapturedEvent {
+                level: *event.metadata().level(),
+                message: String::new(),
+                fields: BTreeMap::new(),
+            };
+            event.record(&mut Visitor(&mut captured));
+            self.0.lock().expect("capture lock").push(captured);
+        }
+    }
+
+    /// `f` を実行しつつ、その間に鳴った `tracing` イベントをすべて集めて返す。
+    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        let layer = CaptureLayer::default();
+        let sink = Arc::clone(&layer.0);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let events = sink.lock().expect("capture lock").clone();
+        (result, events)
+    }
 
     /// 契約 §12.4 の実測済み SessionStart payload（逐語）。
     const SESSION_START_PAYLOAD: &str = r#"{
@@ -280,6 +370,171 @@ mod tests {
     fn broken_wire_message_is_an_error_not_a_panic() {
         assert!(parse_hook_event(b"garbage").is_err());
         assert!(parse_hook_event(b"").is_err());
+        // 契約 §84.3: `v` を読まずに捨てる実装にはしない。`v` が欠落した wire は
+        // WireMessage のデシリアライズ自体が失敗すること（レビュー Important 4）。
+        assert!(
+            parse_hook_event(br#"{"kamux_session_id":"k","hook_kind":"Stop","payload":{}}"#)
+                .is_err()
+        );
+    }
+
+    /// 契約 §84.1.1 条件 1-1（最重要）: `SessionStart` なのに `payload.session_id` が
+    /// `None` のとき、`tracing::warn!` が実際に鳴ること。
+    ///
+    /// レビュー Important 1: 既存の `wire("SessionStart", …)` テストは 2 本とも
+    /// payload に `session_id` を持っており、この分岐に入る入力が 1 本も無かった。
+    #[test]
+    fn session_start_without_session_id_logs_warning() {
+        let bytes = wire(
+            "SessionStart",
+            r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+        );
+        let (ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
+
+        assert_eq!(ev.claude_session_id, None);
+        assert_eq!(events.len(), 1, "expected exactly one warn, got {events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(
+            events[0].fields.get("kamux_session_id").map(String::as_str),
+            Some("3f2a0000-0000-4000-8000-000000009c1e")
+        );
+        assert!(
+            events[0]
+                .message
+                .contains("SessionStart hook arrived without payload.session_id"),
+            "unexpected message: {}",
+            events[0].message
+        );
+    }
+
+    /// `SessionStart` かつ `payload.session_id` が取れているときは条件 1-1 は鳴らない
+    /// （条件反転の変異を塞ぐ）。
+    #[test]
+    fn session_start_with_session_id_does_not_log_condition_1_1() {
+        let bytes = wire("SessionStart", SESSION_START_PAYLOAD);
+        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
+        assert!(events.is_empty(), "expected no warn, got {events:?}");
+    }
+
+    /// 契約 §84.1.1 条件 1-2: `payload` が `null` のとき `tracing::warn!` が実際に鳴ること。
+    ///
+    /// レビュー Important 2: `null_payload_still_yields_an_event` は分岐を通過するだけで
+    /// `warn!` が鳴ったかを検査していなかった。
+    #[test]
+    fn null_payload_logs_warning() {
+        let bytes = br#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Notification","payload":null,"raw_base64":"bm90IGpzb24="}"#;
+        let (ev, events) = capture_events(|| parse_hook_event(bytes).expect("parse"));
+
+        assert_eq!(ev.kind, HookKind::Notification);
+        assert_eq!(events.len(), 1, "expected exactly one warn, got {events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(
+            events[0].fields.get("kamux_session_id").map(String::as_str),
+            Some("3f2a0000-0000-4000-8000-000000009c1e")
+        );
+        assert_eq!(
+            events[0].fields.get("truncated").map(String::as_str),
+            Some("false")
+        );
+        assert!(
+            events[0].message.contains("hook payload is null"),
+            "unexpected message: {}",
+            events[0].message
+        );
+    }
+
+    /// 契約 §84.1.1 条件 2: argv の `hook_kind` と `payload.hook_event_name` が食い違う
+    /// とき `tracing::warn!` が実際に鳴り、両方の値が個別に記録されること。
+    ///
+    /// レビュー Important 2: `argv_kind_wins_over_payload_hook_event_name` は分岐を通過
+    /// するだけで `warn!` が鳴ったかを検査していなかった。
+    #[test]
+    fn argv_payload_mismatch_logs_warning_with_both_values() {
+        let payload = r#"{"session_id":"abc","hook_event_name":"SomethingElse"}"#;
+        let bytes = wire("Stop", payload);
+        let (ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
+
+        assert_eq!(ev.kind, HookKind::Stop);
+        assert_eq!(events.len(), 1, "expected exactly one warn, got {events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(
+            events[0].fields.get("argv_hook_kind").map(String::as_str),
+            Some("Stop")
+        );
+        assert_eq!(
+            events[0]
+                .fields
+                .get("payload_hook_event_name")
+                .map(String::as_str),
+            Some("SomethingElse")
+        );
+    }
+
+    /// argv と `payload.hook_event_name` が一致するときは条件 2 は鳴らない
+    /// （条件反転の変異を塞ぐ）。
+    #[test]
+    fn argv_payload_match_does_not_log_condition_2() {
+        let bytes = wire("Stop", STOP_PAYLOAD);
+        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
+        assert!(events.is_empty(), "expected no warn, got {events:?}");
+    }
+
+    /// 契約 §84.1: `payload` の中身は何であっても成功する（object でなくても良い）。
+    /// 契約 §91.1.1 条件 1-4: このとき `HookEnvelope` へのデシリアライズは失敗するので
+    /// `tracing::warn!` が実際に鳴ること。
+    ///
+    /// レビュー Important 3: `unwrap_or_default()` を `?` に変える変異が無検出だった。
+    /// `payload.rs:92` の doc コメント「payload の中身は何であっても成功する」を固定する。
+    #[test]
+    fn non_object_payload_is_discarded_and_logs_warning() {
+        let bytes = br#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Notification","payload":[1,2,3]}"#;
+        let (ev, events) =
+            capture_events(|| parse_hook_event(bytes).expect("parse must still succeed"));
+
+        assert_eq!(ev.claude_session_id, None);
+        assert_eq!(events.len(), 1, "expected exactly one warn, got {events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert_eq!(
+            events[0].fields.get("kamux_session_id").map(String::as_str),
+            Some("3f2a0000-0000-4000-8000-000000009c1e")
+        );
+        assert!(
+            events[0]
+                .message
+                .contains("could not be deserialized into HookEnvelope"),
+            "unexpected message: {}",
+            events[0].message
+        );
+    }
+
+    /// 契約 §91.1.1: `payload` が object であっても、既知フィールドの型が違えば
+    /// デシリアライズは失敗する（`!is_object()` では取りこぼす具体例）。
+    /// `hook_event_name` は `Option<String>` なので数値は入らない。
+    #[test]
+    fn object_payload_with_wrong_field_type_is_discarded_and_logs_warning() {
+        let bytes = br#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Notification","payload":{"hook_event_name":42}}"#;
+        let (ev, events) =
+            capture_events(|| parse_hook_event(bytes).expect("parse must still succeed"));
+
+        assert_eq!(ev.claude_session_id, None);
+        assert_eq!(events.len(), 1, "expected exactly one warn, got {events:?}");
+        assert_eq!(events[0].level, tracing::Level::WARN);
+        assert!(
+            events[0]
+                .message
+                .contains("could not be deserialized into HookEnvelope"),
+            "unexpected message: {}",
+            events[0].message
+        );
+    }
+
+    /// `payload` が正しく `HookEnvelope` へデシリアライズできるときは条件 1-4 は鳴らない
+    /// （条件反転の変異を塞ぐ）。
+    #[test]
+    fn well_formed_payload_does_not_log_condition_1_4() {
+        let bytes = wire("Stop", STOP_PAYLOAD);
+        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
+        assert!(events.is_empty(), "expected no warn, got {events:?}");
     }
 
     /// HookEnvelope は必須フィールドを持たないので、いかなる JSON オブジェクトでもパースできる。
