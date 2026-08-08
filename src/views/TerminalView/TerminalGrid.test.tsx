@@ -426,6 +426,31 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     expect(mocks.fitTerminal).toHaveBeenCalledWith('s1:agent');
   });
 
+  it('レイアウトの向きだけが変わっても（split2 → split2-v）可視ペインへ resize_pty が送られる（契約 §28.2）', async () => {
+    // paneAssignment / activePane は不変のまま layout だけが split2 → split2-v へ
+    // 変わる向き変更。usePaneFit の useEffect deps から layout を外す「最適化」は
+    // 契約 §28.2 が名指しで禁止している —— 外すと xterm が横向きの cols/rows を
+    // 保持したまま resize_pty に誤ったジオメトリが飛ぶ（表示は崩れないので発覚が
+    // 遅れる）。ここではシステム全体としてこの向き変更が re-fit をトリガすることを
+    // 固定する
+    mocks.isStarted.mockReturnValue(true);
+    mocks.fitTerminal.mockReturnValue({ cols: 40, rows: 60 });
+    setPanes('split2', ['s1', 's2'], 0);
+
+    render();
+    await flush();
+    mocks.resizePty.mockClear();
+
+    act(() => {
+      useAppStore.getState().setLayout('split2-v');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await flush();
+
+    expect(mocks.resizePty).toHaveBeenCalledWith('s1:agent', 40, 60);
+    expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 40, 60);
+  });
+
   it('ResizeObserver 経路にも同じ門がある（isStarted が false の間は resize が来ても fitTerminal を呼ばない）', async () => {
     mocks.isStarted.mockReturnValue(false); // pty://exit 後、まだ再起動していない状態を模す
     mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
