@@ -97,6 +97,50 @@ async function flush(times = 4): Promise<void> {
   });
 }
 
+/**
+ * `requestAnimationFrame` / `cancelAnimationFrame` のフェイク（`fitScheduler.test.ts`
+ * と同じ形）。壁時計（`setTimeout(resolve, 50)` 等）に依存すると、余裕が失われたときに
+ * テストの検出力が静かに失われる（Important 2 の修正ラウンド、契約 §96.2）。
+ * `usePaneFit` は `createFitScheduler` を既定の `window.requestAnimationFrame` で
+ * 呼ぶため、フック自身にはフェイクを注入する経路が無い。`window` のグローバルを
+ * 差し替えることで、`TerminalGrid` 経由のテストでも `fitScheduler.test.ts` と
+ * 同じ手動キューを使う。
+ */
+function fakeRaf() {
+  const queue = new Map<number, () => void>();
+  let id = 0;
+  return {
+    raf: (cb: () => void): number => {
+      id += 1;
+      queue.set(id, cb);
+      return id;
+    },
+    caf: (h: number): void => {
+      queue.delete(h);
+    },
+    tick: (): void => {
+      const cbs = [...queue.values()];
+      queue.clear();
+      cbs.forEach((cb) => cb());
+    },
+  };
+}
+
+let raf: ReturnType<typeof fakeRaf>;
+
+/**
+ * フェイク rAF のキューを進めてから、そこで走った副作用（resize_pty 呼び出し等）が
+ * 落ち着くまでマイクロタスクを流す。`await new Promise((r) => setTimeout(r, N))` の
+ * 置き換え。待ち時間の値に依存しないので、マシンやタイマー解像度が変わっても
+ * 検出力が変わらない。
+ */
+async function rafTick(): Promise<void> {
+  await act(async () => {
+    raf.tick();
+  });
+  await flush();
+}
+
 let container: HTMLDivElement;
 let root: Root;
 
@@ -162,6 +206,9 @@ beforeEach(() => {
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
   FakeResizeObserver.callbacks = [];
   FakeResizeObserver.observed = [];
+  raf = fakeRaf();
+  vi.stubGlobal('requestAnimationFrame', raf.raf);
+  vi.stubGlobal('cancelAnimationFrame', raf.caf);
   mocks.isStarted.mockReturnValue(false);
   mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
   mocks.fitTerminal.mockReturnValue(null);
@@ -440,19 +487,17 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     render();
     await flush();
     // マウント時点で usePaneFit の状態変化 effect も 1 度発火し、rAF が 1 本
-    // ペンディングになる。flush() はマイクロタスクしか進めないので、ここで先に
-    // 実 rAF（jsdom は ~16ms の実タイマーで実装している）を解決してから
-    // mockClear() しないと、次の向き変更とは無関係なマウント起因の flush が
-    // 後続のアサーションに紛れ込む
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await flush();
+    // ペンディングになる。フェイク rAF（beforeEach で window.requestAnimationFrame /
+    // cancelAnimationFrame を差し替え済み）を明示的に進めてから mockClear() する。
+    // 壁時計（setTimeout）には依存しない —— 依存すると余裕が失われたときに
+    // 検出力が静かに失われる（Important 2 の修正ラウンド、契約 §96.2）
+    await rafTick();
     mocks.resizePty.mockClear();
 
     act(() => {
       useAppStore.getState().setLayout('split2-v');
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s1:agent', 40, 60);
     expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 40, 60);
@@ -469,8 +514,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
     expect(mocks.fitTerminal).not.toHaveBeenCalled();
   });
@@ -483,14 +527,12 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     render();
     await flush();
     // マウント時点で usePaneFit の状態変化 effect も 1 度発火し、rAF が 1 本
-    // ペンディングになる。flush() はマイクロタスクしか進めないので、ここで
-    // 先にドレインしてから mockClear() しないと、下の RO コールバック発火が
-    // 参照する scheduler は「マウント由来のペンディング rAF が既にある」状態を
-    // 素通りするだけの no-op になり、実際には RO コールバック本体を空にしても
-    // マウント由来の rAF が stateRef.current を読んで assert を満たしてしまう
-    // （TerminalGrid.tsx:97-99 の request() 呼び出しが無検証になる事故）
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await flush();
+    // ペンディングになる。フェイク rAF を先にドレインしてから mockClear() しないと、
+    // 下の RO コールバック発火が参照する scheduler は「マウント由来のペンディング
+    // rAF が既にある」状態を素通りするだけの no-op になり、実際には RO コールバック
+    // 本体を空にしてもマウント由来の rAF が stateRef.current を読んで assert を
+    // 満たしてしまう（TerminalGrid.tsx の request() 呼び出しが無検証になる事故）
+    await rafTick();
     mocks.resizePty.mockClear();
 
     expect(FakeResizeObserver.observed).toEqual([hostOf(0), hostOf(1)]);
@@ -498,8 +540,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s1:agent', 100, 30);
     expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 100, 30);
@@ -536,8 +577,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
     expect(mocks.resizePty).toHaveBeenCalledWith('s3:agent', 100, 30);
     expect(mocks.resizePty).not.toHaveBeenCalledWith('s1:agent', 100, 30);
@@ -573,16 +613,18 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     // マウント由来の usePaneFit の rAF をここでドレインしてから mockClear() する
     // （上の RO テストの冒頭コメントと同じ理由）。ドレインしないと、下の RO
     // コールバック発火が実際に resize_pty を送っているかが無検証になる
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await flush();
+    await rafTick();
     mocks.resizePty.mockClear();
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
-    // 6 回（3 本の死んだ observer × 2 ペイン）ではなく、可視ペイン数ぶんの 2 回
+    // 6 回（3 本の死んだ observer × 2 ペイン）ではなく、可視ペイン数ぶんの 2 回。
+    // このアサーション自体は observer リークに対して独立の検出力を持たない
+    // （見張りは上の toHaveLength(1)）。共有スケジューラの request() が冪等なので、
+    // 死んだ observer が何本あっても flush は 1 回で resize_pty は可視ペイン数ぶんしか
+    // 出ない（Task 10 レビュー Minor 3）
     expect(mocks.resizePty).toHaveBeenCalledTimes(2);
   });
 
@@ -601,8 +643,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     act(() => {
       window.dispatchEvent(new Event('resize'));
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await flush();
+    await rafTick();
 
     expect(mocks.resizePty).not.toHaveBeenCalled();
   });
@@ -621,7 +662,9 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     act(() => {
       root.unmount();
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // scheduler.cancel() が効いていれば、フェイク rAF のキューはこの時点で
+    // 空になっている。tick() しても何も呼ばれない（壁時計を待つ必要がない）
+    await rafTick();
 
     expect(mocks.resizePty).not.toHaveBeenCalled();
 
@@ -630,7 +673,7 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     act(() => {
       window.dispatchEvent(new Event('resize'));
     });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await rafTick();
 
     expect(mocks.resizePty).not.toHaveBeenCalled();
 
