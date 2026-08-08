@@ -230,4 +230,74 @@ mod tests {
         assert_eq!(v.view, None);
         assert!(v.visible_session_ids.is_empty());
     }
+
+    #[test]
+    fn notify_constants_match_the_contract() {
+        // 契約 §83.4（00-contracts.md）が正典。値を変えるときは契約を先に直すこと
+        assert_eq!(NOTIFY_MIN_INTERVAL_MS, 10_000);
+        assert_eq!(NOTIFY_TIMEOUT_MS, 300_000);
+        assert_eq!(MAX_INFLIGHT_WAITERS, 32);
+        assert_eq!(MAIN_WINDOW_LABEL, "main");
+    }
+
+    /// `Deserialize` を持つので `serde_json` での roundtrip を直接書く。
+    /// 契約 §83.3（00-contracts.md）が正典。TS 側は `src/types/model.ts` の
+    /// `export type NotifyPermission = 'unknown' | 'granted' | 'denied';`。
+    #[test]
+    fn notify_permission_matches_contract_strings() {
+        let cases: [(NotifyPermission, &str); 3] = [
+            (NotifyPermission::Unknown, "unknown"),
+            (NotifyPermission::Granted, "granted"),
+            (NotifyPermission::Denied, "denied"),
+        ];
+        for (value, expected) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "NotifyPermission の serde 表現が契約 §83.3 と違う: {value:?}"
+            );
+            let back: NotifyPermission = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, value);
+        }
+    }
+
+    /// 設計書 §9.1 の 2 行（「入力待ち」「応答完了」）に対応する wire 文字列を固定する。
+    #[test]
+    fn notify_kind_matches_contract_strings() {
+        let cases: [(NotifyKind, &str); 2] = [
+            (NotifyKind::WaitingInput, "waiting_input"),
+            (NotifyKind::Stopped, "stopped"),
+        ];
+        for (value, expected) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "NotifyKind の serde 表現が違う: {value:?}"
+            );
+            let back: NotifyKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, value);
+        }
+    }
+
+    /// 契約 §7.2（00-contracts.md）が正典。`pub enum ViewKind { Kanban, Terminal, Editor }`。
+    #[test]
+    fn view_kind_matches_contract_strings() {
+        let cases: [(ViewKind, &str); 3] = [
+            (ViewKind::Kanban, "kanban"),
+            (ViewKind::Terminal, "terminal"),
+            (ViewKind::Editor, "editor"),
+        ];
+        for (value, expected) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "ViewKind の serde 表現が契約 §7.2 と違う: {value:?}"
+            );
+            let back: ViewKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, value);
+        }
+    }
 }
