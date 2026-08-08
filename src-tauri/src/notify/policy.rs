@@ -3,6 +3,8 @@
 //! このモジュールは OS API に一切触れない。すべて純粋関数と純粋なデータで構成し、
 //! `cargo test` で全分岐を検証できるようにする（設計書 §13 / 契約 §14）。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::model::{RuntimeState, StateReason};
@@ -169,6 +171,49 @@ pub fn decide(input: &DecisionInput<'_>) -> NotifyDecision {
         }
     }
     NotifyDecision::Post(kind)
+}
+
+/// リポジトリ直上モードのときに通知本文へ出す文言。
+pub const LOCATION_IN_PLACE: &str = "リポジトリ直上";
+
+impl SessionLabel {
+    /// セッションが DB から引けなかったときの退避ラベル。
+    /// 通知が完全に沈黙するより、識別子だけでも出したほうがましなので用意する。
+    pub fn fallback(session_id: &str) -> Self {
+        let short: String = session_id.chars().take(8).collect();
+        Self {
+            title: format!("セッション {short}"),
+            project_name: "kamux".to_string(),
+            location: LOCATION_IN_PLACE.to_string(),
+        }
+    }
+}
+
+/// Dock バッジに出す「要対応セッション数」。
+///
+/// `waiting_input` のみを数える。`exited` はアーカイブされるまで DB に残り続けるため、
+/// 含めるとバッジが恒常的に非ゼロになり「今すぐ対応すべき件数」の意味を失う。
+/// 0 件のときは `None` を返し、呼び出し側が `set_badge_count(None)` でバッジを消す。
+pub fn badge_count(states: &BTreeMap<String, RuntimeState>) -> Option<i64> {
+    let n = states
+        .values()
+        .filter(|s| **s == RuntimeState::WaitingInput)
+        .count() as i64;
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
+}
+
+/// 通知のタイトルと本文を組み立てる。タイトルは設計書 §9.1 の表に逐語で従う。
+pub fn format_notification(kind: NotifyKind, label: &SessionLabel) -> (String, String) {
+    let title = match kind {
+        NotifyKind::WaitingInput => format!("入力待ち: {}", label.title),
+        NotifyKind::Stopped => format!("応答完了: {}", label.title),
+    };
+    let body = format!("{} · {}", label.project_name, label.location);
+    (title, body)
 }
 
 #[cfg(test)]
@@ -635,5 +680,75 @@ mod tests {
             let back: ViewKind = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, value);
         }
+    }
+
+    fn states(pairs: &[(&str, RuntimeState)]) -> BTreeMap<String, RuntimeState> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn badge_is_none_when_nothing_needs_attention() {
+        assert_eq!(badge_count(&states(&[])), None);
+        assert_eq!(
+            badge_count(&states(&[
+                ("a", RuntimeState::Running),
+                ("b", RuntimeState::Idle)
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn badge_counts_only_waiting_input() {
+        let s = states(&[
+            ("a", RuntimeState::WaitingInput),
+            ("b", RuntimeState::WaitingInput),
+            ("c", RuntimeState::Running),
+            ("d", RuntimeState::Idle),
+        ]);
+        assert_eq!(badge_count(&s), Some(2));
+    }
+
+    #[test]
+    fn exited_sessions_do_not_inflate_the_badge() {
+        // exited はアーカイブされるまで DB に残るため、数えるとバッジが恒常的に非ゼロになる
+        let s = states(&[
+            ("a", RuntimeState::Exited),
+            ("b", RuntimeState::Exited),
+            ("c", RuntimeState::Interrupted),
+        ]);
+        assert_eq!(badge_count(&s), None);
+    }
+
+    #[test]
+    fn waiting_input_title_follows_the_design_doc() {
+        let label = SessionLabel {
+            title: "fix-login".into(),
+            project_name: "kamux".into(),
+            location: "session/fix-login".into(),
+        };
+        let (title, body) = format_notification(NotifyKind::WaitingInput, &label);
+        assert_eq!(title, "入力待ち: fix-login");
+        assert_eq!(body, "kamux · session/fix-login");
+    }
+
+    #[test]
+    fn stopped_title_follows_the_design_doc() {
+        let label = SessionLabel {
+            title: "fix-login".into(),
+            project_name: "kamux".into(),
+            location: "リポジトリ直上".into(),
+        };
+        let (title, body) = format_notification(NotifyKind::Stopped, &label);
+        assert_eq!(title, "応答完了: fix-login");
+        assert_eq!(body, "kamux · リポジトリ直上");
+    }
+
+    #[test]
+    fn fallback_label_uses_a_short_session_id() {
+        let label = SessionLabel::fallback("3f2a9c1e-0000-4000-8000-000000000000");
+        assert_eq!(label.title, "セッション 3f2a9c1e");
+        assert_eq!(label.project_name, "kamux");
+        assert_eq!(label.location, "リポジトリ直上");
     }
 }
