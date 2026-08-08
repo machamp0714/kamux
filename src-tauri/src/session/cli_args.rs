@@ -705,7 +705,10 @@ pub(crate) mod tests {
         // PermissionDenied は登録しない（対応する runtime_state が無い。契約 §83.6.1 / §84.5）
         assert!(!hooks.contains_key("PermissionDenied"));
 
-        for event in HOOK_EVENTS {
+        // イベント名は HOOK_EVENTS から再導出せず、契約 §12.4 / §83.6.1 / §84.5 の
+        // 4 値をリテラルで固定する。production の HOOK_EVENTS 配列を変異させても、
+        // ここが道連れで変異すると検出力を失う（契約 §90.2 のフィクスチャ規律）。
+        for event in ["SessionStart", "Notification", "PermissionRequest", "Stop"] {
             let entries = hooks[event].as_array().expect("array of matcher groups");
             assert_eq!(entries.len(), 1);
             // matcher は書かない（設計 §4 / 未確認事実 #11）
