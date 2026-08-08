@@ -92,3 +92,23 @@ export function setActivePaneReducer(s: PaneState, pane: PaneIndex): PaneState {
   if (s.activePane === pane) return s;
   return { layout: s.layout, paneAssignment: s.paneAssignment, activePane: pane };
 }
+
+/**
+ * タブ順を dir 方向に 1 つ進めた session_id を返す。
+ * exclude に含まれる id は候補から外す。候補が無ければ null。
+ * order はレイアウトに一切依存しない（呼び出し側が selectTerminalTabs 等で渡す）。
+ */
+export function nextSessionId(
+  order: string[],
+  current: string | null,
+  dir: 1 | -1,
+  exclude: string[],
+): string | null {
+  const candidates = order.filter((id) => !exclude.includes(id));
+  if (candidates.length === 0) return null;
+
+  const i = current === null ? -1 : candidates.indexOf(current);
+  if (i === -1) return dir === 1 ? candidates[0] : candidates[candidates.length - 1];
+
+  return candidates[(i + dir + candidates.length) % candidates.length];
+}

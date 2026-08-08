@@ -5,6 +5,7 @@ import {
   assignPaneReducer,
   setLayoutReducer,
   setActivePaneReducer,
+  nextSessionId,
   type PaneState,
 } from './paneLogic';
 
@@ -122,5 +123,54 @@ describe('setActivePaneReducer', () => {
   it('同じペインなら同一オブジェクトを返す', () => {
     const before = S('split2', ['a', 'b'], 1);
     expect(setActivePaneReducer(before, 1)).toBe(before);
+  });
+});
+
+describe('nextSessionId', () => {
+  const order = ['a', 'b', 'c'];
+
+  it('dir=1 で次へ進む', () => {
+    expect(nextSessionId(order, 'a', 1, [])).toBe('b');
+  });
+
+  it('dir=-1 で前へ戻る', () => {
+    expect(nextSessionId(order, 'b', -1, [])).toBe('a');
+  });
+
+  it('末尾から dir=1 で先頭へ巡回する', () => {
+    expect(nextSessionId(order, 'c', 1, [])).toBe('a');
+  });
+
+  it('先頭から dir=-1 で末尾へ巡回する', () => {
+    expect(nextSessionId(order, 'a', -1, [])).toBe('c');
+  });
+
+  it('除外されたセッションを飛ばす', () => {
+    expect(nextSessionId(order, 'a', 1, ['b'])).toBe('c');
+    // current より前を除外すると order 上の index と candidates 上の index がずれる。
+    // ここで candidates 側の index を使わないと 'c'（自分自身）や 'a' を誤って返す。
+    expect(nextSessionId(order, 'c', 1, ['a'])).toBe('b');
+  });
+
+  it('current が null なら dir=1 で先頭を返す', () => {
+    expect(nextSessionId(order, null, 1, [])).toBe('a');
+  });
+
+  it('current が null なら dir=-1 で末尾を返す', () => {
+    expect(nextSessionId(order, null, -1, [])).toBe('c');
+  });
+
+  it('current が order に無ければ先頭/末尾にフォールバックする', () => {
+    expect(nextSessionId(order, 'zzz', 1, [])).toBe('a');
+    expect(nextSessionId(order, 'zzz', -1, [])).toBe('c');
+  });
+
+  it('候補が空なら null', () => {
+    expect(nextSessionId([], 'a', 1, [])).toBeNull();
+    expect(nextSessionId(['a'], 'a', 1, ['a'])).toBeNull();
+  });
+
+  it('候補が current 1 件だけなら自分自身を返す', () => {
+    expect(nextSessionId(order, 'a', 1, ['b', 'c'])).toBe('a');
   });
 });
