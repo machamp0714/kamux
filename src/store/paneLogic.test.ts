@@ -264,6 +264,18 @@ describe('routeFocusReducer', () => {
     const nextV = routeFocusReducer(beforeV, 'b');
     expect(nextV.paneAssignment).toEqual(['a', 'b']);
     expect(nextV.activePane).toBe(1);
+    // split 分岐の返り値は layout を保持する（isSplit を通さず 'split2' に固定しても
+    // split2-v の他のアサートは緑のままになるため layout 自体を見る）。
+    expect(nextV.layout).toBe('split2-v');
+  });
+
+  it('split2 で activePane が 1 のときにもう一方のペインへ移すと 0 に戻る', () => {
+    // 上の split2 テストは activePane: 0 → 1 の 1 方向しか通らないため、
+    // otherPane(1) === 0 の経路がここまで一度も観測されていなかった。
+    const before = S('split2', ['a', 'b'], 1);
+    const next = routeFocusReducer(before, 'a');
+    expect(next.paneAssignment).toBe(before.paneAssignment);
+    expect(next.activePane).toBe(0);
   });
 
   it('どこにも居ないならアクティブペインに割り当てる', () => {
