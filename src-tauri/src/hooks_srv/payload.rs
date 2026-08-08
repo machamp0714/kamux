@@ -406,6 +406,17 @@ mod tests {
             "unexpected message: {}",
             events[0].message
         );
+        // 契約 §84.1.1 条件 1: `raw_json` に生 JSON が実際に載っていること。
+        // wire にしか無い `kamux_session_id` と payload 由来の `source":"startup` の
+        // 両方を見ることで、フィールド削除（生 JSON が空になる）と payload だけを
+        // 積む取り違えの両方を落とす。
+        let raw_json = events[0].fields.get("raw_json").map(String::as_str);
+        assert!(
+            raw_json.is_some_and(
+                |s| s.contains(r#""kamux_session_id""#) && s.contains(r#""source":"startup"#)
+            ),
+            "raw_json missing wire+payload markers: {raw_json:?}"
+        );
     }
 
     /// `SessionStart` かつ `payload.session_id` が取れているときは条件 1-1 は鳴らない
@@ -441,6 +452,11 @@ mod tests {
             events[0].message.contains("hook payload is null"),
             "unexpected message: {}",
             events[0].message
+        );
+        // 契約 §84.1.1 条件 1-2: `raw_base64` に生データが実際に載っていること。
+        assert_eq!(
+            events[0].fields.get("raw_base64").map(String::as_str),
+            Some("bm90IGpzb24=")
         );
     }
 
