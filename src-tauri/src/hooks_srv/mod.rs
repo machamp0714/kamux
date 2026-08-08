@@ -212,17 +212,58 @@ impl Drop for HooksServer {
     }
 }
 
-/// ブロッキング accept。待機中は CPU を消費しない（契約 §0）。
+/// `accept()` が持続的に失敗するとき（例: プロセスの fd 上限 `EMFILE`）に待つ時間。
+/// 連続失敗回数に応じて線形に増え、上限に張り付く。
+///
+/// 契約 §0（アイドル CPU ほぼ 0%・ポーリングループ禁止）向けの手当て。
+/// `std::os::unix::net::Incoming::next()` はエラーでも `None` を返さず
+/// `Some(listener.accept().map(...))` を返し続けるため、この待機を入れないと
+/// `accept()` が持続的に失敗する状態で `accept_loop` は 1 ミリ秒も待たずに
+/// 回り続け、CPU を 1 コア占有しながら `warn!` を出し続ける。
+const ACCEPT_ERROR_BACKOFF_UNIT: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+fn accept_error_backoff(consecutive_errors: u32) -> Duration {
+    ACCEPT_ERROR_BACKOFF_UNIT
+        .saturating_mul(consecutive_errors)
+        .min(ACCEPT_ERROR_BACKOFF_MAX)
+}
+
+/// ブロッキング accept。正常系の待機中は CPU を消費しない（契約 §0）。
 /// 受信処理をインラインで行うことでイベント順序を保存する（設計 §6-4）。
 fn accept_loop(listener: UnixListener, sink: Arc<dyn HookSink>, stop: Arc<AtomicBool>) {
-    for stream in listener.incoming() {
+    accept_loop_with(listener.incoming(), sink, stop, std::thread::sleep);
+}
+
+/// `accept_loop` の本体。`socket_path_from` / `sweep_stale_runtime_files_with` と
+/// 同じ作法で、テストから固定したい境界（`incoming` の連続失敗と、それに対する
+/// 待機の実行）を引数へ出す。実 `UnixListener` を `accept()` が持続的に失敗する
+/// 状態にするのは困難なので、この継ぎ目が無いと「無待機スピンを防ぐ手当てが
+/// 実際に呼ばれていること」を検証できない。
+fn accept_loop_with<I>(
+    incoming: I,
+    sink: Arc<dyn HookSink>,
+    stop: Arc<AtomicBool>,
+    sleep: impl Fn(Duration),
+) where
+    I: Iterator<Item = std::io::Result<UnixStream>>,
+{
+    let mut consecutive_errors: u32 = 0;
+    for stream in incoming {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         match stream {
-            Ok(stream) => handle_connection(stream, sink.as_ref()),
+            Ok(stream) => {
+                consecutive_errors = 0;
+                handle_connection(stream, sink.as_ref());
+            }
             Err(e) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
                 tracing::warn!(error = %e, "hooks socket accept failed");
+                // ポーリングではない: 正常系はブロッキング accept のままで、
+                // ここはエラーが続く異常系でのみ通るスピン抑止。
+                sleep(accept_error_backoff(consecutive_errors));
             }
         }
     }
@@ -842,5 +883,47 @@ mod tests {
         assert!(unrelated.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 契約 §0: `accept()` が持続的に失敗する状況（`EMFILE` 等）で無待機スピンに
+    /// ならないこと。実 `UnixListener` を持続的に失敗させるのは困難なので、
+    /// `accept_loop_with` の `incoming` に合成のエラー列を注入する
+    /// （`sweep_stale_runtime_files_with` と同じ作法）。`sleep` も注入し、
+    /// 実時間を消費せずに「何回・どれだけ待とうとしたか」を記録する。
+    ///
+    /// この 1 本で 3 種の手当てを一度に守る:
+    /// - 待機の呼び出しそのものを消す変異 → `waits.len()` が 30 未満になり赤
+    /// - `accept_error_backoff` が常に `Duration::ZERO` を返す変異 → 非ゼロの主張が赤
+    /// - 失敗回数の上限（cap）を外す変異 → 30 回目には UNIT*30 (=1.5s) > MAX (=1s)
+    ///   になり、上限の主張が赤
+    #[test]
+    fn accept_loop_backs_off_and_caps_wait_when_accept_fails_persistently() {
+        const PERSISTENT_FAILURES: usize = 30;
+        let errors = (0..PERSISTENT_FAILURES).map(|_| -> std::io::Result<UnixStream> {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        });
+
+        let sink: Arc<dyn HookSink> = Arc::new(RecordingSink::default());
+        let waits: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits_for_sleep = Arc::clone(&waits);
+
+        accept_loop_with(errors, sink, Arc::new(AtomicBool::new(false)), move |d| {
+            waits_for_sleep.lock().expect("lock").push(d)
+        });
+
+        let waits = waits.lock().expect("lock").clone();
+        assert_eq!(
+            waits.len(),
+            PERSISTENT_FAILURES,
+            "each persistent accept failure must wait exactly once: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|d| *d > Duration::ZERO),
+            "no-wait spin must not happen: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|d| *d <= ACCEPT_ERROR_BACKOFF_MAX),
+            "backoff must stay capped even after many consecutive failures: {waits:?}"
+        );
     }
 }
