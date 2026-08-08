@@ -131,3 +131,25 @@ export function cycleSessionReducer(s: PaneState, order: string[], dir: 1 | -1):
   // 巡回してもスワップになり、同一セッションが両スロットに入らない。
   return assignPaneReducer(s, s.activePane, next);
 }
+
+/**
+ * 「このセッションを見せろ」という要求をペイン操作へ翻訳する
+ * （カードクリック / focus://session/{session_id} / エディタ画面のタブ切替）。
+ *
+ * split2 / split2-v でもう一方のペインに既に出ている場合は割当を動かさず
+ * activePane だけ移す。これが設計書 要件 5「該当セッションのペインに
+ * フォーカスが当たる」。レイアウト比較は例外なく isSplit() を通す（契約 §28.2）。
+ */
+export function routeFocusReducer(s: PaneState, sessionId: string): PaneState {
+  if (s.paneAssignment[s.activePane] === sessionId) return s;
+
+  if (isSplit(s.layout) && s.paneAssignment[otherPane(s.activePane)] === sessionId) {
+    return {
+      layout: s.layout,
+      paneAssignment: s.paneAssignment,
+      activePane: otherPane(s.activePane),
+    };
+  }
+
+  return assignPaneReducer(s, s.activePane, sessionId);
+}

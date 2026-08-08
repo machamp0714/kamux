@@ -7,6 +7,7 @@ import {
   setActivePaneReducer,
   nextSessionId,
   cycleSessionReducer,
+  routeFocusReducer,
   type PaneState,
 } from './paneLogic';
 
@@ -236,5 +237,43 @@ describe('cycleSessionReducer', () => {
     const next = cycleSessionReducer(S('split2', ['a', 'b'], 1), order, 1);
     expect(next.paneAssignment).toEqual(['a', 'c']);
     expect(next.activePane).toBe(1);
+  });
+});
+
+describe('routeFocusReducer', () => {
+  it('既にアクティブペインに居るなら何もしない', () => {
+    const before = S('split2', ['a', 'b'], 0);
+    expect(routeFocusReducer(before, 'a')).toBe(before);
+  });
+
+  it('split2 でもう一方のペインに居るなら activePane を移すだけ（割当は動かさない）', () => {
+    const next = routeFocusReducer(S('split2', ['a', 'b'], 0), 'b');
+    expect(next.paneAssignment).toEqual(['a', 'b']);
+    expect(next.activePane).toBe(1);
+
+    // isSplit() 経由であることの証跡: split2-v でも同じ結果になる（契約 §28.2 追跡表 #5）。
+    // isSplit(s.layout) を s.layout === 'split2' に退化させると、split2-v では
+    // もう一方のペインへのルーティングが効かず assignPaneReducer 側へ落ちてしまい、
+    // このアサートだけが独り赤くなる。
+    const nextV = routeFocusReducer(S('split2-v', ['a', 'b'], 0), 'b');
+    expect(nextV.paneAssignment).toEqual(['a', 'b']);
+    expect(nextV.activePane).toBe(1);
+  });
+
+  it('どこにも居ないならアクティブペインに割り当てる', () => {
+    const next = routeFocusReducer(S('split2', ['a', 'b'], 1), 'c');
+    expect(next.paneAssignment).toEqual(['a', 'c']);
+    expect(next.activePane).toBe(1);
+  });
+
+  it('single で裏スロットに居る場合はアクティブペインに引き込む（スワップ）', () => {
+    // single では裏スロットは見えないので activePane を移してはならない
+    const next = routeFocusReducer(S('single', ['a', 'b'], 0), 'b');
+    expect(next.activePane).toBe(0);
+    expect(next.paneAssignment).toEqual(['b', 'a']);
+  });
+
+  it('layout は変更しない', () => {
+    expect(routeFocusReducer(S('single', ['a', null], 0), 'c').layout).toBe('single');
   });
 });
