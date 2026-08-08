@@ -7,6 +7,9 @@ export default tseslint.config(
     ignores: [
       'dist/',
       'src-tauri/target/',
+      // Cargo ワークスペース化（M2-2 Task 1）で target/ が repo root へ移った。
+      // Tauri のビルド生成物 __global-api-script.js が走査対象に入る。
+      'target/',
       'playwright-report/',
       'test-results/',
       // ESLint 9 の flat config は .gitignore を読まず、既定でドットディレクトリも
