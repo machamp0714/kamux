@@ -84,12 +84,13 @@ fn writes_raw_stdin_to_debug_dir() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `$TMPDIR` 直下にある `*-Stop.json`（`write_debug_capture` の命名規則）の集合。
+/// 指定したディレクトリ直下にある `*-Stop.json`（`write_debug_capture` の
+/// 命名規則）の集合。
 /// ガードを外して既定ディレクトリへ無条件キャプチャする変異が入った場合、
 /// もっともありそうな既定値は `std::env::temp_dir()` 自身であり、この集合が
 /// 増える形で検出できる。
-fn stray_stop_json_files() -> std::collections::BTreeSet<String> {
-    std::fs::read_dir(std::env::temp_dir())
+fn stray_stop_json_files(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
@@ -102,13 +103,26 @@ fn stray_stop_json_files() -> std::collections::BTreeSet<String> {
 fn no_debug_dir_means_no_files() {
     let dir = std::env::temp_dir().join(format!("kamux-relay-nodebug-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let stray_before = stray_stop_json_files();
+
+    // `stray_stop_json_files` はこのテスト専用のサブディレクトリだけを見る。
+    // 子プロセスの `TMPDIR` をこのサブディレクトリへ向けることで、
+    // `std::env::temp_dir()` を既定の書き込み先にする変異が入っても、共有
+    // `$TMPDIR` ルートを一切汚さずに検出できる（並列稼働中の他レーンの
+    // 測定に影響しないため。実際にこの変異実験中に共有 `$TMPDIR` へ実ファイルを
+    // 漏らして手で `rm` した事例がある）。
+    let tmp_sandbox =
+        std::env::temp_dir().join(format!("kamux-relay-nodebug-tmpdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_sandbox);
+    std::fs::create_dir_all(&tmp_sandbox).expect("create tmp sandbox");
+
+    let stray_before = stray_stop_json_files(&tmp_sandbox);
 
     let out = Command::new(relay_bin())
         .arg("Stop")
         .stdin(Stdio::null())
         .env("KAMUX_SESSION_ID", "3f2a0000-0000-4000-8000-000000009c1e")
         .env("KAMUX_HOOKS_SOCK", "/nonexistent/kamux-hooks-none.sock")
+        .env("TMPDIR", &tmp_sandbox)
         .env_remove("KAMUX_RELAY_DEBUG_DIR")
         .output()
         .expect("spawn relay");
@@ -119,11 +133,13 @@ fn no_debug_dir_means_no_files() {
         "debug dir must not be created when the env var is unset"
     );
     assert_eq!(
-        stray_stop_json_files(),
+        stray_stop_json_files(&tmp_sandbox),
         stray_before,
-        "no *-Stop.json capture file may appear directly under $TMPDIR when \
-         KAMUX_RELAY_DEBUG_DIR is unset"
+        "no *-Stop.json capture file may appear directly under the sandboxed \
+         TMPDIR when KAMUX_RELAY_DEBUG_DIR is unset"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp_sandbox);
 }
 
 /// `KAMUX_RELAY_DEBUG_DIR` の親を辿れない場合（`/dev/null` 配下はディレクトリに
