@@ -247,15 +247,21 @@ describe('routeFocusReducer', () => {
   });
 
   it('split2 でもう一方のペインに居るなら activePane を移すだけ（割当は動かさない）', () => {
-    const next = routeFocusReducer(S('split2', ['a', 'b'], 0), 'b');
+    const before = S('split2', ['a', 'b'], 0);
+    const next = routeFocusReducer(before, 'b');
     expect(next.paneAssignment).toEqual(['a', 'b']);
+    // 「割当は動かさない」の実体: 新しい配列を作らず同一参照を返す
+    // （契約 §81.2。paneAssignment を [s.paneAssignment[0], s.paneAssignment[1]] のような
+    // 新しい配列にすり替えても toEqual は緑のままになるため toBe で参照を見る）。
+    expect(next.paneAssignment).toBe(before.paneAssignment);
     expect(next.activePane).toBe(1);
 
     // isSplit() 経由であることの証跡: split2-v でも同じ結果になる（契約 §28.2 追跡表 #5）。
     // isSplit(s.layout) を s.layout === 'split2' に退化させると、split2-v では
     // もう一方のペインへのルーティングが効かず assignPaneReducer 側へ落ちてしまい、
     // このアサートだけが独り赤くなる。
-    const nextV = routeFocusReducer(S('split2-v', ['a', 'b'], 0), 'b');
+    const beforeV = S('split2-v', ['a', 'b'], 0);
+    const nextV = routeFocusReducer(beforeV, 'b');
     expect(nextV.paneAssignment).toEqual(['a', 'b']);
     expect(nextV.activePane).toBe(1);
   });
