@@ -86,9 +86,13 @@ export function usePaneFit(): FitScheduler {
   // isStarted=false（PTY 起動要求がまだ解決していない）のことがある。その場合
   // attach effect は syncPaneSize をスキップし、子の passive effect で
   // isStarted が true になるのは次のフレームである。このフレーム差を埋めるのは
-  // この layout dep だけであり、外すと新ペインが旧ジオメトリのまま固定される
+  // この layout dep（および同じ役割を持つ paneAssignment dep）だけであり、
+  // どちらを外しても新ペインが旧ジオメトリのまま固定される。新しく可視になる
+  // サーフェスは layout 変更（single → split2）でも paneAssignment 変更
+  // （assignPane）でも生じるため、両 dep とも単独では削れない
   // （Task 10 レビュー Important 1、§89.1.1 で実測確認済み。
-  // TerminalGrid.test.tsx の「single → split2 の直後に...」が固定する）
+  // TerminalGrid.test.tsx の「single → split2 の直後に...」（layout）と
+  // 「assignPane で新しく可視になった...」（paneAssignment）がそれぞれ固定する）
   useEffect(() => {
     if (view !== 'terminal') return;
     scheduler.request();

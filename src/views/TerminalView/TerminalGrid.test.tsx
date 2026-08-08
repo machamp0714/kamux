@@ -537,6 +537,29 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     expect(mocks.resizePty).toHaveBeenCalledWith('s2:agent', 40, 60);
   });
 
+  it('assignPane で新しく可視になったペインへ、次のフレームで resize_pty が飛ぶ（契約 §28.2 / usePaneFit の paneAssignment dep 単独の防衛）', async () => {
+    // activePane === 対象ペインなので assignPaneReducer は activePane / layout を動かさない。
+    // 変わるのは paneAssignment だけであり、attach effect は isStarted=false で
+    // syncPaneSize をスキップする。このフレーム差を埋めるのは usePaneFit の paneAssignment dep だけ
+    mocks.isStarted.mockReturnValue(false);
+    mocks.fitTerminal.mockReturnValue({ cols: 40, rows: 60 });
+    setPanes('split2', ['s1', 's2'], 1);
+
+    render();
+    await flush();
+    await rafTick();
+    mocks.resizePty.mockClear();
+
+    act(() => {
+      useAppStore.getState().assignPane(1, 's3');
+    });
+    mocks.isStarted.mockReturnValue(true);
+
+    await rafTick();
+
+    expect(mocks.resizePty).toHaveBeenCalledWith('s3:agent', 40, 60);
+  });
+
   it('ResizeObserver 経路にも同じ門がある（isStarted が false の間は resize が来ても fitTerminal を呼ばない）', async () => {
     mocks.isStarted.mockReturnValue(false); // pty://exit 後、まだ再起動していない状態を模す
     mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
