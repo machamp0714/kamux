@@ -1,6 +1,7 @@
 // モジュールはすべて pub mod で宣言する。private mod にすると dead_code が消えない（§45.1 の実測）
 pub mod error;
 pub mod model;
+pub mod notify;
 pub mod pty;
 pub mod session;
 pub mod state;
