@@ -507,7 +507,7 @@ mod notifier_tests {
     fn badge_counts_two_waiting_sessions() {
         let (_sink, n) = fixture();
         n.set_permission(NotifyPermission::Granted);
-        n.on_state(
+        let first = n.on_state(
             &payload(
                 "s1",
                 RuntimeState::WaitingInput,
@@ -515,6 +515,8 @@ mod notifier_tests {
             ),
             1_000,
         );
+        // StateReason::Spawned 以外では許可要求を出さない（設計 §5.6）。
+        assert!(!first.request_permission);
         let out = n.on_state(
             &payload(
                 "s2",
@@ -537,7 +539,7 @@ mod notifier_tests {
 
     #[test]
     fn forget_session_removes_it_from_the_badge() {
-        let (_sink, n) = fixture();
+        let (sink, n) = fixture();
         n.set_permission(NotifyPermission::Granted);
         n.on_state(
             &payload(
@@ -548,6 +550,19 @@ mod notifier_tests {
             1_000,
         );
         assert_eq!(n.forget_session("s1"), None);
+        assert_eq!(sink.dismissed(), vec!["s1".to_string()]);
+
+        // 同じ session_id が再登録されたとき、prev_state / last_notified_at が
+        // 消えていなければ SuppressNotTransition / SuppressRateLimited に誤判定される。
+        let out = n.on_state(
+            &payload(
+                "s1",
+                RuntimeState::WaitingInput,
+                StateReason::HookNotification,
+            ),
+            1_100,
+        );
+        assert_eq!(out.decision, NotifyDecision::Post(NotifyKind::WaitingInput));
     }
 
     #[test]
@@ -633,6 +648,8 @@ mod notifier_tests {
 
         let posted = sink.posted();
         assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].session_id, "s1");
+        assert_eq!(posted[0].kind, NotifyKind::WaitingInput);
         assert_eq!(posted[0].title, "入力待ち: fix-login");
         assert_eq!(posted[0].body, "kamux · session/fix-login");
     }
