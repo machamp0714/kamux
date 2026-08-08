@@ -57,6 +57,8 @@ describe('resolveKeymap', () => {
   it('ターミナル画面でないときは Cmd+J/K を無視する（null を返す）', () => {
     expect(resolveKeymap(ev({ key: 'j', metaKey: true }), closed)).toBeNull();
     expect(resolveKeymap(ev({ key: 'k', metaKey: true }), closed)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'j', metaKey: true }), editorView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'k', metaKey: true }), editorView)).toBeNull();
   });
 
   it('Cmd+N で新規セッションモーダルを開く', () => {
@@ -180,13 +182,21 @@ describe('resolveKeymap', () => {
     ).toBeNull();
   });
 
-  it('モーダル表示中でも terminal 画面なら Cmd+D / Cmd+[ は発火する（契約 §11.4.1 規則 M）', () => {
+  it('モーダル表示中でも terminal 画面なら Cmd+D / Cmd+[ / Cmd+J / Cmd+K は発火する（契約 §11.4.1 規則 M）', () => {
     expect(resolveKeymap(ev({ key: 'd', metaKey: true }), terminalModal)).toEqual({
       type: 'toggle_layout',
     });
     expect(resolveKeymap(ev({ key: '[', metaKey: true }), terminalModal)).toEqual({
       type: 'set_active_pane',
       pane: 0,
+    });
+    expect(resolveKeymap(ev({ key: 'j', metaKey: true }), terminalModal)).toEqual({
+      type: 'cycle_session',
+      dir: 1,
+    });
+    expect(resolveKeymap(ev({ key: 'k', metaKey: true }), terminalModal)).toEqual({
+      type: 'cycle_session',
+      dir: -1,
     });
   });
 
