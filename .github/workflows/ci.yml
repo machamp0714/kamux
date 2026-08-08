@@ -39,7 +39,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          # ワークスペースルートはリポジトリルート（`Cargo.toml` / `Cargo.lock` /
+          # `target/` が repo root にある）。`run:` の working-directory は
+          # 引き続き src-tauri だが、cargo 自体は親をたどって repo root の
+          # ワークスペースを解決するため、キャッシュ対象だけをここで repo root に
+          # 合わせる。
+          workspaces: .
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
