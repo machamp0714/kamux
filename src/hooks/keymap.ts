@@ -21,7 +21,7 @@ export type KeymapAction =
 export interface KeymapEvent {
   key: string;
   metaKey: boolean;
-  /** Cmd+D / Cmd+[ / Cmd+] の判定に使う（Ctrl 併用はターミナルへ通す。契約 §11 Task 11 Note） */
+  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] の判定に使う（Ctrl 併用はターミナルへ通す。契約 §11 Task 11 Note） */
   ctrlKey: boolean;
   /** Cmd+Alt+←/→（Cmd+[/] のフォールバック）の判定に使う */
   altKey: boolean;
@@ -67,10 +67,10 @@ export function resolveKeymap(e: KeymapEvent, ctx: KeymapContext): KeymapAction 
     if (e.key === '3') return { type: 'set_view', view: 'editor' };
     if (e.key === 'n' || e.key === 'N') return { type: 'open_create_session' };
     if (e.key === 'j' || e.key === 'J') {
-      return ctx.view === 'terminal' ? { type: 'cycle_session', dir: 1 } : null;
+      return ctx.view === 'terminal' && !e.ctrlKey ? { type: 'cycle_session', dir: 1 } : null;
     }
     if (e.key === 'k' || e.key === 'K') {
-      return ctx.view === 'terminal' ? { type: 'cycle_session', dir: -1 } : null;
+      return ctx.view === 'terminal' && !e.ctrlKey ? { type: 'cycle_session', dir: -1 } : null;
     }
     return ctx.view === 'terminal' ? resolveTerminalOnlyAction(e) : null;
   }

@@ -4,6 +4,8 @@ import { resolveKeymap, type KeymapEvent } from './keymap';
 const closed = { modalOpen: false, view: 'kanban' as const };
 const open = { modalOpen: true, view: 'kanban' as const };
 const terminalView = { modalOpen: false, view: 'terminal' as const };
+const editorView = { modalOpen: false, view: 'editor' as const };
+const terminalModal = { modalOpen: true, view: 'terminal' as const };
 
 /** ctrlKey / altKey を明示しない呼び出しを短く書くためのヘルパー。既定値は両方 false。 */
 const ev = (over: Partial<KeymapEvent> & Pick<KeymapEvent, 'key' | 'metaKey'>): KeymapEvent => ({
@@ -127,6 +129,11 @@ describe('resolveKeymap', () => {
 
   it('ターミナル画面でないときは Cmd+D を無視する（契約 §11.4.2: view 条件は terminal のみ）', () => {
     expect(resolveKeymap(ev({ key: 'd', metaKey: true }), closed)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'd', metaKey: true }), editorView)).toBeNull();
+  });
+
+  it('Cmd なしの d は無視する（terminal でも vim の削除キーを奪わない）', () => {
+    expect(resolveKeymap(ev({ key: 'd', metaKey: false }), terminalView)).toBeNull();
   });
 
   it('ターミナル画面では Cmd+[ で前のペイン（pane 0）、Cmd+] で次のペイン（pane 1）', () => {
@@ -143,6 +150,12 @@ describe('resolveKeymap', () => {
   it('ターミナル画面でないときは Cmd+[ / Cmd+] を無視する（契約 §11.4.2: view 条件は terminal のみ）', () => {
     expect(resolveKeymap(ev({ key: '[', metaKey: true }), closed)).toBeNull();
     expect(resolveKeymap(ev({ key: ']', metaKey: true }), closed)).toBeNull();
+    expect(resolveKeymap(ev({ key: '[', metaKey: true }), editorView)).toBeNull();
+    expect(resolveKeymap(ev({ key: ']', metaKey: true }), editorView)).toBeNull();
+  });
+
+  it('Cmd なしの [ は無視する（terminal でも通常入力を奪わない）', () => {
+    expect(resolveKeymap(ev({ key: '[', metaKey: false }), terminalView)).toBeNull();
   });
 
   it('WKWebView に Cmd+[/] が奪われた場合のフォールバック Cmd+Alt+←/→ も同じアクション', () => {
@@ -162,12 +175,30 @@ describe('resolveKeymap', () => {
 
   it('ターミナル画面でないときは Cmd+Alt+←/→ フォールバックも無視する', () => {
     expect(resolveKeymap(ev({ key: 'ArrowLeft', metaKey: true, altKey: true }), closed)).toBeNull();
+    expect(
+      resolveKeymap(ev({ key: 'ArrowLeft', metaKey: true, altKey: true }), editorView),
+    ).toBeNull();
+  });
+
+  it('モーダル表示中でも terminal 画面なら Cmd+D / Cmd+[ は発火する（契約 §11.4.1 規則 M）', () => {
+    expect(resolveKeymap(ev({ key: 'd', metaKey: true }), terminalModal)).toEqual({
+      type: 'toggle_layout',
+    });
+    expect(resolveKeymap(ev({ key: '[', metaKey: true }), terminalModal)).toEqual({
+      type: 'set_active_pane',
+      pane: 0,
+    });
   });
 
   it('Ctrl 併用の Cmd+D / Cmd+[ / Cmd+] は無視する（ターミナルへ通す）', () => {
     expect(resolveKeymap(ev({ key: 'd', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
     expect(resolveKeymap(ev({ key: '[', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
     expect(resolveKeymap(ev({ key: ']', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
+  });
+
+  it('Ctrl 併用の Cmd+J / Cmd+K は無視する（ターミナルへ通す。brief Step 1 指定）', () => {
+    expect(resolveKeymap(ev({ key: 'j', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'k', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
   });
 
   it('Alt 併用の [ は無視する（矢印以外の Alt 組合せを拾わない）', () => {

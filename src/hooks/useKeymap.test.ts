@@ -187,6 +187,14 @@ describe('handleKeymapKeyDown', () => {
     expect(event.defaultPrevented).toBe(false);
   });
 
+  it('エディタ画面では Cmd+D を無視する（契約 §11.4.2: view 条件は terminal のみ）', () => {
+    const setLayout = vi.fn();
+    useAppStore.setState({ view: 'editor', layout: 'single', setLayout });
+    const event = dispatch({ key: 'd', metaKey: true });
+    expect(setLayout).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
   it('ターミナル画面での Ctrl+Cmd+D / Ctrl+Cmd+[ は無視する（preventDefault せずターミナルへ通す）', () => {
     const setLayout = vi.fn();
     const setActivePane = vi.fn();
