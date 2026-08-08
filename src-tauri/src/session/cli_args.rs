@@ -896,17 +896,31 @@ pub(crate) mod tests {
 
     #[test]
     fn shell_command_gets_no_settings_flag() {
-        let session = sample_session(CliKind::Shell, SessionMode::InPlace, None);
-        let base = build_launch_command(
-            &session,
-            "/bin/zsh",
-            Path::new("/repo"),
-            &test_env(),
-            ResumeMode::None,
-        )
-        .expect("build");
-        let cmd = apply_hooks(&session, base, Some(&fake_runtime()));
-        assert!(!cmd.args.iter().any(|a| a == "--settings"));
+        // apply_hooks は CliKind::Claude だけに hooks を配線する（契約 §102）。
+        // Claude 以外の 3 種（Shell / Codex / Custom）は args にも env にも
+        // hooks の痕跡が一切残らないことを、ここで一括して検証する
+        // （契約 §81.3。ガードの射程を CliKind::Claude 1 種類に固定する）。
+        for cli_kind in [CliKind::Shell, CliKind::Codex, CliKind::Custom] {
+            let cli_command = (cli_kind == CliKind::Custom).then_some("echo hi");
+            let session = sample_session(cli_kind, SessionMode::InPlace, cli_command);
+            let base = build_launch_command(
+                &session,
+                "/bin/zsh",
+                Path::new("/repo"),
+                &test_env(),
+                ResumeMode::None,
+            )
+            .expect("build");
+            let cmd = apply_hooks(&session, base, Some(&fake_runtime()));
+            assert!(
+                !cmd.args.iter().any(|a| a == "--settings"),
+                "cli_kind={cli_kind:?} に --settings が混入した"
+            );
+            assert!(
+                !cmd.env.iter().any(|(k, _)| k == "KAMUX_HOOKS_SOCK"),
+                "cli_kind={cli_kind:?} の env に KAMUX_HOOKS_SOCK が混入した"
+            );
+        }
     }
 
     #[test]
