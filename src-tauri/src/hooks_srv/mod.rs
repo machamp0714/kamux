@@ -11,7 +11,13 @@ const SETTINGS_SUFFIX: &str = ".settings.json";
 
 /// 契約 §12.1: $TMPDIR/kamux-hooks-{pid}.sock
 pub fn hooks_socket_path() -> AppResult<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
+    socket_path_from(&std::env::temp_dir())
+}
+
+/// `hooks_socket_path` の本体。`dir` を注入できる形にして、
+/// `SUN_PATH_MAX` 境界のオフバイワンをテストで固定できるようにする。
+fn socket_path_from(dir: &Path) -> AppResult<PathBuf> {
+    let path = dir.join(format!(
         "{RUNTIME_PREFIX}{}{SOCKET_SUFFIX}",
         std::process::id()
     ));
@@ -116,6 +122,44 @@ mod tests {
         assert_eq!(runtime_file_pid("kamux-hooks-abc.sock"), None);
         assert_eq!(runtime_file_pid("unrelated.sock"), None);
         assert_eq!(runtime_file_pid("kamux-relay-test-1.sock"), None);
+    }
+
+    /// `socket_path_from` が組み立てる相対部分（ファイル名）の長さ。
+    /// 境界テストで dir の長さを逆算するために使う。
+    fn file_name_len() -> usize {
+        format!("kamux-hooks-{}.sock", std::process::id()).len()
+    }
+
+    /// `total_len` バイトちょうどのソケットパスになる `dir` を組み立てる。
+    /// `dir.join(file_name)` は dir がセパレータで終わらない限り "/" を 1 つ挟むため、
+    /// `dir` の長さは `total_len - 1(sep) - file_name_len` にする。
+    fn dir_for_total_path_len(total_len: usize) -> PathBuf {
+        let dir_len = total_len - 1 - file_name_len();
+        // 先頭の "/" を含めて dir_len バイトにする。
+        let dir = PathBuf::from(format!("/{}", "a".repeat(dir_len - 1)));
+        // 逆算が正しいことをここで固定する。ずれたら境界テストの Ok/Err の判定を
+        // 待たずに、この assert 自体が落ちる（103/104 いずれの呼び出しでも赤になる）。
+        assert_eq!(
+            dir.join(format!("kamux-hooks-{}.sock", std::process::id()))
+                .as_os_str()
+                .len(),
+            total_len
+        );
+        dir
+    }
+
+    #[test]
+    fn socket_path_from_accepts_a_path_of_exactly_103_bytes() {
+        let dir = dir_for_total_path_len(SUN_PATH_MAX - 1);
+        let path = socket_path_from(&dir).expect("103 bytes must be accepted");
+        assert_eq!(path.as_os_str().len(), SUN_PATH_MAX - 1);
+    }
+
+    #[test]
+    fn socket_path_from_rejects_a_path_of_exactly_104_bytes() {
+        let dir = dir_for_total_path_len(SUN_PATH_MAX);
+        let err = socket_path_from(&dir);
+        assert!(err.is_err(), "104 bytes must be rejected");
     }
 
     #[test]
