@@ -751,4 +751,13 @@ mod tests {
         assert_eq!(label.project_name, "kamux");
         assert_eq!(label.location, "リポジトリ直上");
     }
+
+    #[test]
+    fn fallback_label_takes_eight_chars_not_eight_bytes() {
+        // §81.2 変異検証: chars().take(8) をバイト単位のスライスに変異させると、
+        // 全 ASCII の session_id では検出できない（"3f2a9c1e" は 8 バイト = 8 文字で一致してしまう）。
+        // マルチバイト文字を含む session_id で「文字数」であることを固定する。
+        let label = SessionLabel::fallback("日本語テストID-0000-4000-8000-000000000000");
+        assert_eq!(label.title, "セッション 日本語テストID");
+    }
 }
