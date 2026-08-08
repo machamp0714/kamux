@@ -112,3 +112,22 @@ export function nextSessionId(
 
   return candidates[(i + dir + candidates.length) % candidates.length];
 }
+
+/**
+ * フォーカス中ペインのセッションをタブ順で 1 つ動かす（Cmd+J / Cmd+K）。
+ *
+ * 除外条件は「もう一方のスロットが非 null か」ではなく isSplit(layout) か（契約 §28.2）。
+ * single では裏スロットの割当が画面に出ていないため、これを除外すると
+ * そのセッションが Cmd+J/K で到達不能になる（設計 §3.6）。
+ */
+export function cycleSessionReducer(s: PaneState, order: string[], dir: 1 | -1): PaneState {
+  const hidden = isSplit(s.layout) ? s.paneAssignment[otherPane(s.activePane)] : null;
+  const exclude = hidden === null ? [] : [hidden];
+
+  const next = nextSessionId(order, s.paneAssignment[s.activePane], dir, exclude);
+  if (next === null || next === s.paneAssignment[s.activePane]) return s;
+
+  // assignPaneReducer を経由することで、single のときに裏スロットのセッションへ
+  // 巡回してもスワップになり、同一セッションが両スロットに入らない。
+  return assignPaneReducer(s, s.activePane, next);
+}
