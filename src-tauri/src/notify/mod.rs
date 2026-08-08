@@ -184,6 +184,9 @@ impl Notifier {
         });
 
         let request_permission = payload.reason == StateReason::Spawned
+            // この項は set_permission が permission_requested を立てるのと冗長であり、
+            // 公開 API 経由では単独では到達不能なのでテストで守れない（PR 18 単位レビュー I-1）。
+            // 設計 §5.6 の「権限が未知のときに 1 回だけ訊く」を式の上に残すために意図的に置いている。
             && inner.permission == NotifyPermission::Unknown
             && !inner.permission_requested;
         if request_permission {
@@ -587,6 +590,17 @@ mod notifier_tests {
         let out = n.on_state(
             &payload("s1", RuntimeState::Running, StateReason::Spawned),
             0,
+        );
+        assert!(!out.request_permission);
+
+        // permission が Unknown に戻っても、一度要求済み（permission_requested）なら
+        // 再要求しない。set_permission(Denied) が permission_requested を立てるのが
+        // この検査の要であり、その後 Unknown に戻すことで第 3 項（!permission_requested）
+        // だけが唯一の抑止になる状況を作る（PR 18 単位レビュー I-1）。
+        n.set_permission(NotifyPermission::Unknown);
+        let out = n.on_state(
+            &payload("s1", RuntimeState::Running, StateReason::Spawned),
+            10,
         );
         assert!(!out.request_permission);
     }

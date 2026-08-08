@@ -583,10 +583,24 @@ mod tests {
 
     #[test]
     fn startup_normalize_never_notifies() {
-        assert_eq!(
-            notify_kind_for(RuntimeState::Interrupted, StateReason::StartupNormalize),
-            None
-        );
+        // RuntimeState の 6 値すべてを置く。1 値でも欠けると、その値へ通知を割り当てる変異が
+        // 素通りする（PR 18 単位レビュー I-2: (WaitingInput, StartupNormalize) を
+        // Some(WaitingInput) に割り当てる変異が Interrupted 1 値だけのフィクスチャでは
+        // 素通りしていた）。
+        for state in [
+            RuntimeState::Running,
+            RuntimeState::WaitingInput,
+            RuntimeState::Idle,
+            RuntimeState::Exited,
+            RuntimeState::Interrupted,
+            RuntimeState::Error,
+        ] {
+            assert_eq!(
+                notify_kind_for(state, StateReason::StartupNormalize),
+                None,
+                "state={state:?}"
+            );
+        }
     }
 
     #[test]
