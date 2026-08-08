@@ -300,6 +300,51 @@ fn handle_connection(stream: UnixStream, sink: &dyn HookSink) {
     }
 }
 
+/// 同梱される relay バイナリのファイル名。
+/// Tauri の externalBin はターゲットトリプルのサフィックスを剥がして配置する。
+pub const RELAY_BIN_NAME: &str = "kamux-relay";
+
+/// テスト可能な純粋版。候補を順に試す。
+///
+/// 1. `KAMUX_RELAY_BIN`（開発・テスト用の明示指定）
+/// 2. アプリ実行ファイルと同じディレクトリ
+///    - dev: `target/debug/kamux` の隣の `target/debug/kamux-relay`
+///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測）
+pub fn resolve_relay_bin_from(env_override: Option<&str>, exe_dir: &Path) -> AppResult<PathBuf> {
+    if let Some(raw) = env_override {
+        let path = PathBuf::from(raw);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(AppError::CliNotFound(format!(
+            "KAMUX_RELAY_BIN does not point to a file: {}",
+            path.display()
+        )));
+    }
+
+    let beside = exe_dir.join(RELAY_BIN_NAME);
+    if beside.is_file() {
+        return Ok(beside);
+    }
+
+    Err(AppError::CliNotFound(format!(
+        "{RELAY_BIN_NAME} not found in {}",
+        exe_dir.display()
+    )))
+}
+
+/// 実環境版。
+pub fn resolve_relay_bin() -> AppResult<PathBuf> {
+    let env_override = std::env::var("KAMUX_RELAY_BIN").ok();
+    let exe =
+        std::env::current_exe().map_err(|e| AppError::Io(format!("current_exe failed: {e}")))?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| AppError::Io(format!("current_exe has no parent: {}", exe.display())))?
+        .to_path_buf();
+    resolve_relay_bin_from(env_override.as_deref(), &exe_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +946,18 @@ mod tests {
     #[test]
     fn accept_loop_backs_off_and_caps_wait_when_accept_fails_persistently() {
         const PERSISTENT_FAILURES: usize = 30;
+        // このテストの「cap（上限への張り付き）」カバレッジは、doc コメント
+        // （直上）がハードコードしている `UNIT*30 (=1.5s) > MAX (=1s)` の関係が
+        // 実際に成立していることに依存する。定数のどちらかを動かしてこの関係が
+        // 崩れると、下の expected は cap 分岐を一度も通らずに線形加算のみへ
+        // 縮退し、cap のカバレッジが黙って消える。doc に書くだけでなく、ここで
+        // assert して壊れたら赤にする（契約 §90.2）。
+        assert!(
+            ACCEPT_ERROR_BACKOFF_UNIT.saturating_mul(PERSISTENT_FAILURES as u32)
+                > ACCEPT_ERROR_BACKOFF_MAX,
+            "fixture invariant broken: UNIT * PERSISTENT_FAILURES must exceed MAX so the \
+             cap branch is actually exercised below"
+        );
         let errors = (0..PERSISTENT_FAILURES).map(|_| -> std::io::Result<UnixStream> {
             Err(std::io::Error::from_raw_os_error(libc::EMFILE))
         });
@@ -972,6 +1029,60 @@ mod tests {
                 ACCEPT_ERROR_BACKOFF_UNIT,
             ],
             "a successful connection must reset consecutive_errors, not merely pause it: {waits:?}"
+        );
+    }
+
+    #[test]
+    fn resolves_relay_next_to_the_app_executable() {
+        let dir = std::env::temp_dir().join(format!("kamux-relayres-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"#!/bin/sh\n").expect("write");
+
+        let got = resolve_relay_bin_from(None, &dir).expect("resolve");
+        assert_eq!(got, relay);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_override_wins_over_exe_dir() {
+        let dir = std::env::temp_dir().join(format!("kamux-relayenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let beside = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&beside, b"").expect("write");
+        let custom = dir.join("custom-relay");
+        std::fs::write(&custom, b"").expect("write");
+
+        let got =
+            resolve_relay_bin_from(Some(custom.to_str().expect("utf8")), &dir).expect("resolve");
+        assert_eq!(got, custom);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_relay_is_cli_not_found() {
+        let dir = std::env::temp_dir().join(format!("kamux-relaymiss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let err = resolve_relay_bin_from(None, &dir).expect_err("must fail");
+        assert!(
+            matches!(err, AppError::CliNotFound(_)),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_override_pointing_at_nothing_is_an_error() {
+        let dir = std::env::temp_dir();
+        let err =
+            resolve_relay_bin_from(Some("/nonexistent/kamux-relay"), &dir).expect_err("must fail");
+        assert!(
+            matches!(err, AppError::CliNotFound(_)),
+            "unexpected error: {err:?}"
         );
     }
 }
