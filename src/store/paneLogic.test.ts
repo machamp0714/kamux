@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  isSplit,
+  nextLayout,
+  isLayout,
   otherPane,
   visiblePanes,
   assignPaneReducer,
@@ -32,6 +35,10 @@ describe('visiblePanes', () => {
 
   it('split2 では両方を左から', () => {
     expect(visiblePanes(S('split2', ['a', 'b'], 1))).toEqual([0, 1]);
+
+    // isSplit() 経由であることの証跡（契約 §28.2）。isSplit(s.layout) を
+    // s.layout === 'split2' に退化させると、split2-v がここだけ独り赤くなる。
+    expect(visiblePanes(S('split2-v', ['a', 'b'], 1))).toEqual([0, 1]);
   });
 });
 
@@ -40,6 +47,12 @@ describe('assignPaneReducer', () => {
     const next = assignPaneReducer(S('split2', ['a', null], 0), 1, 'b');
     expect(next.paneAssignment).toEqual(['a', 'b']);
     expect(next.activePane).toBe(1);
+
+    // isSplit() 経由であることの証跡（契約 §28.2）。isSplit(s.layout) を
+    // s.layout === 'split2' に退化させると、split2-v がここだけ独り赤くなる。
+    const nextV = assignPaneReducer(S('split2-v', ['a', null], 0), 1, 'b');
+    expect(nextV.paneAssignment).toEqual(['a', 'b']);
+    expect(nextV.activePane).toBe(1);
   });
 
   it('既に割り当て済みのペインは置き換える', () => {
@@ -74,6 +87,14 @@ describe('assignPaneReducer', () => {
     const next = assignPaneReducer(S('single', ['a', null], 0), 1, 'b');
     expect(next.paneAssignment).toEqual(['b', null]);
     expect(next.activePane).toBe(0);
+
+    // 不変条件 4（single の間 activePane は変化しない）の反対方向。
+    // activePane: 1 起点が無いと、target を `s.activePane` ではなく
+    // 固定値 `0` に退化させても（PR 25 レビュー M8）、上のケースは
+    // たまたま activePane が既に 0 なので気づけない。
+    const nextV = assignPaneReducer(S('single', [null, 'a'], 1), 0, 'b');
+    expect(nextV.paneAssignment).toEqual([null, 'b']);
+    expect(nextV.activePane).toBe(1);
   });
 });
 
@@ -293,5 +314,37 @@ describe('routeFocusReducer', () => {
 
   it('layout は変更しない', () => {
     expect(routeFocusReducer(S('single', ['a', null], 0), 'c').layout).toBe('single');
+  });
+});
+
+// 契約 §28.2 / §28.5 / §28.6。レイアウト比較の書き漏らしを機械的に検出する唯一の防具
+// （計画 M3-2-split-layout.md Task 8 Step 1 から前倒し。PR 25 レビュー Important #4）
+describe('isSplit / nextLayout / isLayout', () => {
+  it('single だけが非分割', () => {
+    expect(isSplit('single')).toBe(false);
+    expect(isSplit('split2')).toBe(true);
+    expect(isSplit('split2-v')).toBe(true);
+  });
+
+  it('nextLayout は single → split2 → split2-v → single を一周する', () => {
+    expect(nextLayout('single')).toBe('split2');
+    expect(nextLayout('split2')).toBe('split2-v');
+    expect(nextLayout('split2-v')).toBe('single');
+  });
+
+  it('nextLayout を 3 回適用すると元に戻る', () => {
+    for (const l of ['single', 'split2', 'split2-v'] as const) {
+      expect(nextLayout(nextLayout(nextLayout(l)))).toBe(l);
+    }
+  });
+
+  it('isLayout は既知の 3 値だけを通す', () => {
+    expect(isLayout('single')).toBe(true);
+    expect(isLayout('split2')).toBe(true);
+    expect(isLayout('split2-v')).toBe(true);
+    expect(isLayout('split2v')).toBe(false);
+    expect(isLayout('vsplit')).toBe(false);
+    expect(isLayout(undefined)).toBe(false);
+    expect(isLayout(null)).toBe(false);
   });
 });
