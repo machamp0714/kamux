@@ -482,6 +482,15 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
 
     render();
     await flush();
+    // マウント時点で usePaneFit の状態変化 effect も 1 度発火し、rAF が 1 本
+    // ペンディングになる。flush() はマイクロタスクしか進めないので、ここで
+    // 先にドレインしてから mockClear() しないと、下の RO コールバック発火が
+    // 参照する scheduler は「マウント由来のペンディング rAF が既にある」状態を
+    // 素通りするだけの no-op になり、実際には RO コールバック本体を空にしても
+    // マウント由来の rAF が stateRef.current を読んで assert を満たしてしまう
+    // （TerminalGrid.tsx:97-99 の request() 呼び出しが無検証になる事故）
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flush();
     mocks.resizePty.mockClear();
 
     expect(FakeResizeObserver.observed).toEqual([hostOf(0), hostOf(1)]);
@@ -561,6 +570,11 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
     // 生きている observer は最後の 1 本だけのはず
     expect(FakeResizeObserver.callbacks).toHaveLength(1);
 
+    // マウント由来の usePaneFit の rAF をここでドレインしてから mockClear() する
+    // （上の RO テストの冒頭コメントと同じ理由）。ドレインしないと、下の RO
+    // コールバック発火が実際に resize_pty を送っているかが無検証になる
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flush();
     mocks.resizePty.mockClear();
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
