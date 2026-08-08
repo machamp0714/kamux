@@ -2,6 +2,7 @@
 pub mod error;
 pub mod hooks_srv;
 pub mod model;
+pub mod notify;
 pub mod pty;
 pub mod session;
 pub mod state;
