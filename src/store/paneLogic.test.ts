@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { otherPane, visiblePanes, assignPaneReducer, type PaneState } from './paneLogic';
+import {
+  otherPane,
+  visiblePanes,
+  assignPaneReducer,
+  setLayoutReducer,
+  setActivePaneReducer,
+  type PaneState,
+} from './paneLogic';
 
 const S = (
   layout: PaneState['layout'],
@@ -64,5 +71,47 @@ describe('assignPaneReducer', () => {
     const next = assignPaneReducer(S('single', ['a', null], 0), 1, 'b');
     expect(next.paneAssignment).toEqual(['b', null]);
     expect(next.activePane).toBe(0);
+  });
+});
+
+describe('setLayoutReducer', () => {
+  it('paneAssignment と activePane を一切変更しない', () => {
+    const before = S('split2', ['a', 'b'], 1);
+    const next = setLayoutReducer(before, 'single');
+    expect(next.layout).toBe('single');
+    expect(next.paneAssignment).toEqual(['a', 'b']);
+    expect(next.paneAssignment).toBe(before.paneAssignment);
+    expect(next.activePane).toBe(1);
+  });
+
+  it('split2 に戻すと左右が元の位置のまま復帰する', () => {
+    const start = S('split2', ['a', 'b'], 1);
+    const round = setLayoutReducer(setLayoutReducer(start, 'single'), 'split2');
+    expect(round.layout).toBe('split2');
+    expect(round.paneAssignment).toEqual(['a', 'b']);
+    expect(round.activePane).toBe(1);
+  });
+
+  it('同じ layout なら同一オブジェクトを返す', () => {
+    const before = S('single', ['a', null], 0);
+    expect(setLayoutReducer(before, 'single')).toBe(before);
+  });
+});
+
+describe('setActivePaneReducer', () => {
+  it('split2 ではアクティブペインを移す', () => {
+    const next = setActivePaneReducer(S('split2', ['a', 'b'], 0), 1);
+    expect(next.activePane).toBe(1);
+    expect(next.paneAssignment).toEqual(['a', 'b']);
+  });
+
+  it('single では no-op（同一オブジェクトを返す）', () => {
+    const before = S('single', ['a', 'b'], 0);
+    expect(setActivePaneReducer(before, 1)).toBe(before);
+  });
+
+  it('同じペインなら同一オブジェクトを返す', () => {
+    const before = S('split2', ['a', 'b'], 1);
+    expect(setActivePaneReducer(before, 1)).toBe(before);
   });
 });

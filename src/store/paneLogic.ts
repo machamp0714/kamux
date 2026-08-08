@@ -72,3 +72,23 @@ export function assignPaneReducer(s: PaneState, pane: PaneIndex, sessionId: stri
 
   return { layout: s.layout, paneAssignment, activePane: target };
 }
+
+/**
+ * レイアウトのみを切り替える。paneAssignment / activePane は保持する。
+ * single に落としても裏スロットの割当を捨てないので、split2 に戻すと
+ * 左右の位置ごと元通りになる（設計 §3.5）。
+ */
+export function setLayoutReducer(s: PaneState, layout: Layout): PaneState {
+  if (s.layout === layout) return s;
+  return { layout, paneAssignment: s.paneAssignment, activePane: s.activePane };
+}
+
+/**
+ * アクティブペインを移す。single では「ペイン」がユーザーの画面に存在しないため
+ * no-op（設計 §3.5 付随決定）。
+ */
+export function setActivePaneReducer(s: PaneState, pane: PaneIndex): PaneState {
+  if (!isSplit(s.layout)) return s;
+  if (s.activePane === pane) return s;
+  return { layout: s.layout, paneAssignment: s.paneAssignment, activePane: pane };
+}
