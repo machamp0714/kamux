@@ -891,11 +891,13 @@ mod tests {
     /// （`sweep_stale_runtime_files_with` と同じ作法）。`sleep` も注入し、
     /// 実時間を消費せずに「何回・どれだけ待とうとしたか」を記録する。
     ///
-    /// この 1 本で 3 種の手当てを一度に守る:
-    /// - 待機の呼び出しそのものを消す変異 → `waits.len()` が 30 未満になり赤
-    /// - `accept_error_backoff` が常に `Duration::ZERO` を返す変異 → 非ゼロの主張が赤
-    /// - 失敗回数の上限（cap）を外す変異 → 30 回目には UNIT*30 (=1.5s) > MAX (=1s)
-    ///   になり、上限の主張が赤
+    /// 記録した待機列を、1 回目から 30 回目までの期待値（線形増加し `MAX` で
+    /// 頭打ちになる列）と `assert_eq!` で突き合わせる。`> Duration::ZERO` のような
+    /// 恒真に近い述語では「線形に増える」ことも「上限に張り付く」ことも守れない
+    /// ため、この 1 本で以下をまとめて守る:
+    /// - 待機の呼び出しそのものを消す/定数に潰す変異 → 列が一致せず赤
+    /// - 失敗回数の上限（cap）を外す変異 → 30 回目には UNIT*30 (=1.5s) が
+    ///   期待値 `MAX` (=1s) と一致せず赤
     #[test]
     fn accept_loop_backs_off_and_caps_wait_when_accept_fails_persistently() {
         const PERSISTENT_FAILURES: usize = 30;
