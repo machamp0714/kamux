@@ -362,24 +362,33 @@ impl PtySurface {
     }
 }
 
-/// errno が「シグナルを届けられるプロセス(グループメンバ)が 1 つも無かった」
-/// ことを意味するか。契約 §15: `PtySurface::kill()` は完全に冪等でなければ
-/// ならない。
+/// 対象(プロセス/プロセスグループ)へ「シグナルを届けられる相手が 1 つも
+/// 残っていない」という**状態**を判定する。契約 §15: `PtySurface::kill()`
+/// は完全に冪等でなければならない。正典はこの**状態の集合**であり
+/// (契約 §98.2 の規則 K。状態 4「終了処理中・未 reap」と状態 5「reap 済み
+/// だが `pid` がまだ `None` になっていない」が該当する)、errno はその状態の
+/// **帰結**にすぎない。
 ///
-/// - `ESRCH`: 既に reap 済みで、プロセス(グループ)自体がもう存在しない。
+/// 以下は macOS でその状態が観測されたときに実際に返ってくる errno の
+/// **列挙であって上限ではない**。同じ状態に対応する別の errno が判明すれば
+/// (契約 §98.7 のとおり本挙動は macOS 固有で POSIX の保証ではない)、この
+/// match 式に追加する。
+///
+/// - `ESRCH`: 既に reap 済みで、プロセス(グループ)自体がもう存在しない
+///   状態(状態 5)に対応する。
 /// - `EPERM`: macOS の `kill(-pgid, sig)` はプロセスグループ宛のシグナル
 ///   送信で「シグナルできたメンバが 0」のとき、`ESRCH` ではなく `EPERM` を
 ///   返す。子が SIGKILL を受けて終了処理に入った時点(reap のおよそ
 ///   25〜200µs 前。実 PTY で未読出力が残っていると waiter 側の `ttywait`
 ///   により最大 ~601ms 前まで広がる)から、waiter が `waitpid` で reap する
-///   までの区間がこれに当たる(実測:
+///   までの区間(状態 4)がこれに当たる(実測:
 ///   `.superpowers/sdd/M2-2-hooks-relay/flake-investigation.md` 段2 / 2.4)。
 ///   同じプロセスグループに生存中の別メンバが居る場合は、1 つでも殺せれば
 ///   `rc=0` になる(同調査 `mixed.c` での実測)ため、`EPERM` は「一部だけ
 ///   殺せた中途半端な状態」を隠さない —— 文字通り 1 つもシグナルが
-///   届かなかった場合にのみ返る。kamux は子プロセスを自分自身で spawn して
-///   おり同一 uid のため、この経路で「本物の権限エラー(殺せる相手がいる
-///   のに殺せない)」が起きることは実質的に無い。
+///   届かなかった場合にのみ返る(契約 §98.3)。kamux は子プロセスを自分自身
+///   で spawn しており同一 uid のため、この経路で「本物の権限エラー(殺せる
+///   相手がいるのに殺せない)」が起きることは実質的に無い。
 fn is_nothing_left_to_signal(errno: i32) -> bool {
     matches!(errno, libc::ESRCH | libc::EPERM)
 }
@@ -1661,9 +1670,10 @@ mod tests {
 
     // --- 契約 §15 (kill は完全に冪等) の EPERM 対応の観測 -----------------
     // 詳細な機構は `.superpowers/sdd/M2-2-hooks-relay/flake-investigation.md`
-    // を参照。ここでは「なぜ EPERM も冪等扱いか」(段2: 純関数の単体テスト)と
-    // 「macOS の kill(-pgid, sig) が実際にその挙動をすること」(段1: OS の
-    // 挙動そのものを固定する回帰テスト)の両方を独立に固定する。
+    // を参照。ここでは「なぜ EPERM も冪等扱いか」を純関数の単体テストとして
+    // 固定する。`fork` + `setsid` を使って OS の挙動そのものを固定する回帰
+    // テストは契約 §98.11 が却下した(守る対象が挙動ではなく理由になる。かつ
+    // マルチスレッドのテストプロセスで `fork` するハザードを買う)。
 
     #[test]
     fn is_nothing_left_to_signal_is_true_for_esrch() {
@@ -1678,111 +1688,5 @@ mod tests {
     #[test]
     fn is_nothing_left_to_signal_is_false_for_einval() {
         assert!(!is_nothing_left_to_signal(libc::EINVAL));
-    }
-
-    #[test]
-    fn process_group_kill_reports_eperm_until_reaped_then_esrch() {
-        // OS の挙動そのものを固定する決定論的な回帰テスト。kamux の型には
-        // 一切依存せず、`fork` + `setsid` した子プロセスグループへ
-        // `kill(-pgid, ..)` を送ったときの errno 遷移だけを見る。
-        //
-        // タイミング窓(実測: SIGKILL 送出後 ~25〜35µs で EPERM が始まる)に
-        // 賭けるのではなく、「reap するまで EPERM が持続する」という性質を
-        // 使う: reap(`waitpid`)を呼ばない限りゾンビは消えないため、
-        // 下のプローブループは有界時間内に必ず EPERM を観測でき、以後
-        // reap するまでその状態が変わらない。したがって壁時計に依存しない。
-        //
-        // fork した子では async-signal-safe な操作(setsid/execl/_exit)のみを
-        // 行う。Rust の allocator/ロック/panic 機構には一切触れない。
-        let pid = unsafe { libc::fork() };
-        match pid {
-            0 => {
-                // SAFETY: fork() 直後の子プロセス側。ここから execve が
-                // 成功して置き換わるか、失敗して _exit するまでの間、
-                // async-signal-safe な libc 呼び出し(setsid, execl, _exit)
-                // だけを行い、Rust の allocator・ロック・unwind には触れない。
-                unsafe {
-                    libc::setsid();
-                    libc::execl(
-                        c"/bin/sleep".as_ptr(),
-                        c"/bin/sleep".as_ptr(),
-                        c"30".as_ptr(),
-                        std::ptr::null::<std::os::raw::c_char>(),
-                    );
-                    // execl が返ってきた = 失敗。フォーマット/allocation を
-                    // 経由しない即時終了のみを行う。
-                    libc::_exit(127);
-                }
-            }
-            child if child > 0 => {
-                // 親プロセス側。子は setsid() 済みなので最終的に pgid ==
-                // child になるが、fork() 直後は子がまだ setsid() を実行して
-                // いない可能性がある(TOCTOU)。子が実際に自分の
-                // プロセスグループリーダーになるまで待ってから
-                // プロセスグループ宛の kill を送る。
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                loop {
-                    // SAFETY: `child` は fork() が返した有効な子プロセスの
-                    // pid。存在確認のための読み取り専用呼び出し。
-                    let pgid = unsafe { libc::getpgid(child) };
-                    if pgid == child {
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "子プロセスが setsid() 完了前にタイムアウトした"
-                    );
-                }
-
-                // 子は setsid() 済みなので pgid == child。
-                // SAFETY: `child` は fork() が返した有効な子プロセスの pid。
-                // 負の pid で呼ぶことでプロセスグループ宛の kill(2)
-                // (killpg 相当)になる。production の `PtySurface::kill()`
-                // と同じ呼び方。
-                let rc = unsafe { libc::kill(-child, libc::SIGKILL) };
-                assert_eq!(
-                    rc, 0,
-                    "生存直後の子プロセスグループへの初回 SIGKILL は成功するはず"
-                );
-
-                // reap 前: EPERM が観測できるまで signal 0 でプローブする。
-                // 有界(5秒)。5秒以内に観測できなければ、このプローブ自体の
-                // 判別力が無いということなので、タイムアウト側で fail する。
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                loop {
-                    // SAFETY: 上記と同じ `child` に対する signal 0(存在確認
-                    // のみで実際にはシグナルを送らない)呼び出し。
-                    let probe = unsafe { libc::kill(-child, 0) };
-                    if probe == -1
-                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                    {
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "reap 前に EPERM を一度も観測できなかった: \
-                         このプローブの判別力が失われている(前提が崩れている)"
-                    );
-                }
-
-                // reap する。ゾンビを残さない。
-                let mut status: libc::c_int = 0;
-                // SAFETY: `child` は自分が fork した子。`&mut status` は
-                // スタック上の有効な `c_int` を指す。
-                let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-                assert_eq!(waited, child, "reap に失敗した(waitpid)");
-
-                // reap 後: ESRCH に切り替わる。
-                // SAFETY: reap 済みの pid に対する signal 0 プローブ。
-                let post_reap = unsafe { libc::kill(-child, 0) };
-                assert_eq!(post_reap, -1, "reap 後は kill(-pgid, 0) が失敗するはず");
-                assert_eq!(
-                    std::io::Error::last_os_error().raw_os_error(),
-                    Some(libc::ESRCH),
-                    "reap 後は ESRCH になるはず"
-                );
-            }
-            _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
-        }
     }
 }
