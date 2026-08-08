@@ -153,6 +153,32 @@ describe('useActivePaneFocus（§85.5 条件 2: focus:// / カードクリック
     expect(focus2).toHaveBeenCalledTimes(1);
   });
 
+  it('single で「今表示していないセッション」へ focusSession すると新しい端末に focus が当たる', async () => {
+    // single + paneAssignment: ['s1', null] + activePane: 0 から focusSession('s2') を呼ぶと、
+    // routeFocusReducer → assignPaneReducer は paneAssignment だけを新配列にし、
+    // layout / activePane / view / modal は動かさない（契約 §85.5.1 が名指しした経路）。
+    useAppStore.setState({ layout: 'single', paneAssignment: ['s1', null], activePane: 0 });
+    const focus1 = vi.fn();
+    const focus2 = vi.fn();
+    mocks.getTerminal.mockImplementation((surface: string) =>
+      surface === 's1:agent' ? fakeTerm(focus1) : fakeTerm(focus2),
+    );
+
+    render();
+    await flush();
+    expect(focus2).not.toHaveBeenCalled();
+
+    act(() => {
+      useAppStore.getState().focusSession('s2', 'terminal');
+    });
+    await flush();
+
+    expect(mocks.getTerminal).toHaveBeenCalledWith('s2:agent');
+    expect(focus2).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().activePane).toBe(0);
+    expect(useAppStore.getState().paneAssignment).toEqual(['s2', null]);
+  });
+
   it('モーダル表示中に focusSession しても focus しない', async () => {
     useAppStore.setState({
       layout: 'split2',
@@ -180,7 +206,7 @@ describe('useActivePaneFocus（§85.5 条件 2: focus:// / カードクリック
   });
 });
 
-describe('useActivePaneFocus（自作変異 1: view のガード）', () => {
+describe('useActivePaneFocus（view のガード）', () => {
   it('view が terminal でなければ focus しない', async () => {
     useAppStore.setState({ view: 'kanban' });
     const focus = vi.fn();
@@ -193,7 +219,7 @@ describe('useActivePaneFocus（自作変異 1: view のガード）', () => {
   });
 });
 
-describe('useActivePaneFocus（自作変異 2: 冪等ガード）', () => {
+describe('useActivePaneFocus（冪等ガード）', () => {
   it('既に合焦している textarea には再度 focus() しない', async () => {
     const textarea = document.createElement('textarea');
     document.body.appendChild(textarea);

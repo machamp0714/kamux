@@ -151,5 +151,4 @@ describe('TerminalView（不変条件 E・F）', () => {
 // `useActivePaneFocus` へ統合されて消えたため（契約 §85.5.1 / §85.6）、
 // src/views/TerminalView/useActivePaneFocus.test.tsx の
 // 「§85.5 条件 2: focus:// / カードクリックの着地点を失わない」に移設した。
-// `fakeTerminals` / `flushFrame` は移設先で使わなくなったため、この移設に伴って
-// 未使用になった場合は本ファイルから削除すること
+// `fakeTerminals` / `flushFrame` は同じコミットで既に削除済み。
