@@ -169,9 +169,9 @@ pub fn parse_hook_event(bytes: &[u8]) -> Result<HookEvent, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::SubscriberExt;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// `tracing::warn!` が実際に鳴ったことを検証するためのキャプチャ用 `Layer`。
     ///
@@ -187,8 +187,12 @@ mod tests {
         fields: BTreeMap<String, String>,
     }
 
-    #[derive(Clone, Default)]
-    struct CaptureLayer(Arc<Mutex<Vec<CapturedEvent>>>);
+    type Sink = Arc<Mutex<Vec<CapturedEvent>>>;
+
+    thread_local! {
+        /// 現在のスレッドが収集中のイベント置き場。`None` なら捨てる。
+        static CAPTURE_SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    }
 
     struct Visitor<'a>(&'a mut CapturedEvent);
 
@@ -213,32 +217,106 @@ mod tests {
         }
     }
 
-    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
+    /// プロセスに 1 つだけ立てる `Subscriber`。イベントは呼び出し元スレッドの
+    /// [`CAPTURE_SINK`] へ流し、sink が無いスレッドでは捨てる。
+    ///
+    /// **なぜ `with_default`（スレッドローカルの scoped dispatcher）ではないか。**
+    /// `tracing` の callsite ごとの `Interest` は**プロセス大域**にキャッシュされる。
+    /// キャッシュは callsite の初回登録時に計算され、そのとき
+    /// `tracing_core::callsite::Rebuilder::JustOne` 経路では
+    /// `dispatcher::get_default` —— つまり**登録した瞬間のスレッドの** subscriber
+    /// —— が使われる。`parse_hook_event` は capture を張らないテスト
+    /// （`argv_kind_wins_over_payload_hook_event_name` など）からも呼ばれるため、
+    /// そのスレッドが callsite の初回登録を取ると `NoSubscriber::register_callsite`
+    /// が返す `Interest::never()` が焼き付き、以後 capture 側へイベントが 1 件も
+    /// 届かなくなる（並列実行下で間欠に発生。実測 2/60）。
+    ///
+    /// 大域 subscriber を 1 つ立てておくと `get_default` は常にこれを返すので
+    /// `never` が計算されることが無い。さらにテスト側が `Dispatch` を作らなく
+    /// なるため、dispatcher の登録・破棄に伴う競合そのものが消える。
+    struct GlobalCaptureSubscriber;
+
+    impl tracing::Subscriber for GlobalCaptureSubscriber {
+        fn register_callsite(
             &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut captured = CapturedEvent {
-                level: *event.metadata().level(),
-                message: String::new(),
-                fields: BTreeMap::new(),
-            };
-            event.record(&mut Visitor(&mut captured));
-            self.0.lock().expect("capture lock").push(captured);
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURE_SINK.with(|cell| {
+                let borrowed = cell.borrow();
+                let Some(sink) = borrowed.as_ref() else {
+                    return;
+                };
+                let mut captured = CapturedEvent {
+                    level: *event.metadata().level(),
+                    message: String::new(),
+                    fields: BTreeMap::new(),
+                };
+                event.record(&mut Visitor(&mut captured));
+                sink.lock().expect("capture sink").push(captured);
+            });
+        }
+
+        // span は使わないので受け取るだけ。Id は 0 が禁止されている。
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// 大域 subscriber をプロセスで 1 回だけ立てる。
+    /// 失敗を握りつぶすとキャプチャが黙って空を返す（= 否定テストが恒真になる）ので、
+    /// ここで必ず落とす。
+    fn install_capture_subscriber() {
+        static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
+        let installed = INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(GlobalCaptureSubscriber)
+                .map_err(|err| err.to_string())
+        });
+        assert!(
+            installed.is_ok(),
+            "global capture subscriber must be installed: {installed:?}"
+        );
+    }
+
+    /// このスレッドの sink を差し込み、抜けるときに必ず外す。
+    struct SinkGuard;
+
+    impl SinkGuard {
+        fn install(sink: Sink) -> Self {
+            CAPTURE_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+            SinkGuard
+        }
+    }
+
+    impl Drop for SinkGuard {
+        fn drop(&mut self) {
+            CAPTURE_SINK.with(|cell| *cell.borrow_mut() = None);
         }
     }
 
     /// `f` を実行しつつ、その間に鳴った `tracing` イベントをすべて集めて返す。
     fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
-        let layer = CaptureLayer::default();
-        let sink = Arc::clone(&layer.0);
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let events = sink.lock().expect("capture lock").clone();
+        install_capture_subscriber();
+        let sink: Sink = Arc::new(Mutex::new(Vec::new()));
+        let guard = SinkGuard::install(Arc::clone(&sink));
+        let result = f();
+        drop(guard);
+        let events = sink.lock().expect("capture sink").clone();
         (result, events)
     }
 
@@ -267,10 +345,52 @@ mod tests {
 }"#;
 
     fn wire(hook_kind: &str, payload: &str) -> Vec<u8> {
+        wire_with_id(KAMUX_ID, hook_kind, payload)
+    }
+
+    const KAMUX_ID: &str = "3f2a0000-0000-4000-8000-000000009c1e";
+    /// 「鳴ってはいけない側」の入力に付ける ID。否定テストで、鳴った 1 件が
+    /// どちらの入力に由来するかを区別するために使う。
+    const QUIET_ID: &str = "00000000-0000-4000-8000-000000000000";
+    /// 「鳴るべき対照側」の入力に付ける ID。
+    const LOUD_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn wire_with_id(kamux_session_id: &str, hook_kind: &str, payload: &str) -> Vec<u8> {
         format!(
-            r#"{{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"{hook_kind}","payload":{payload}}}"#
+            r#"{{"v":1,"kamux_session_id":"{kamux_session_id}","hook_kind":"{hook_kind}","payload":{payload}}}"#
         )
         .into_bytes()
+    }
+
+    /// 否定の主張（「この入力では鳴らない」）専用のヘルパ。
+    ///
+    /// `quiet` だけを流して `events.is_empty()` を見る形は、キャプチャ機構が
+    /// 何らかの理由でイベントを 1 件も返さなくなった瞬間に**恒真**になる
+    /// （契約 §69.2: 負の主張が壊れる向きは偽陰性で、CI を赤くしない）。
+    /// そこで同じ capture の中で、**同じ `warn!` callsite を鳴らす対照入力** `loud`
+    /// も流し、鳴った 1 件が `loud` 由来であることまで固定する。
+    ///
+    /// これで次の 4 つがすべて赤になる:
+    /// - キャプチャが空を返す / `warn!` ブロックの削除 → 0 件
+    /// - 条件の反転 → `quiet` 側が鳴り、`kamux_session_id` が `QUIET_ID` になる
+    /// - 対照の callsite が死んでいる → 0 件
+    fn assert_only_the_loud_input_warns(quiet: &[u8], loud: &[u8]) {
+        let (_, events) = capture_events(|| {
+            parse_hook_event(quiet).expect("quiet input must parse");
+            parse_hook_event(loud).expect("loud input must parse");
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one warn (from the loud control input), got {events:?}"
+        );
+        assert_eq!(
+            events[0].fields.get("kamux_session_id").map(String::as_str),
+            Some(LOUD_ID),
+            "the warn must come from the loud control input, not the quiet one: {:?}",
+            events[0]
+        );
     }
 
     #[test]
@@ -423,9 +543,14 @@ mod tests {
     /// （条件反転の変異を塞ぐ）。
     #[test]
     fn session_start_with_session_id_does_not_log_condition_1_1() {
-        let bytes = wire("SessionStart", SESSION_START_PAYLOAD);
-        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
-        assert!(events.is_empty(), "expected no warn, got {events:?}");
+        let quiet = wire_with_id(QUIET_ID, "SessionStart", SESSION_START_PAYLOAD);
+        // 対照: 同じ条件 1-1 の callsite を鳴らす入力（session_id が無い SessionStart）。
+        let loud = wire_with_id(
+            LOUD_ID,
+            "SessionStart",
+            r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+        );
+        assert_only_the_loud_input_warns(&quiet, &loud);
     }
 
     /// 契約 §84.1.1 条件 1-2: `payload` が `null` のとき `tracing::warn!` が実際に鳴ること。
@@ -491,9 +616,14 @@ mod tests {
     /// （条件反転の変異を塞ぐ）。
     #[test]
     fn argv_payload_match_does_not_log_condition_2() {
-        let bytes = wire("Stop", STOP_PAYLOAD);
-        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
-        assert!(events.is_empty(), "expected no warn, got {events:?}");
+        let quiet = wire_with_id(QUIET_ID, "Stop", STOP_PAYLOAD);
+        // 対照: 同じ条件 2 の callsite を鳴らす入力（argv と hook_event_name が不一致）。
+        let loud = wire_with_id(
+            LOUD_ID,
+            "Stop",
+            r#"{"session_id":"abc","hook_event_name":"SomethingElse"}"#,
+        );
+        assert_only_the_loud_input_warns(&quiet, &loud);
     }
 
     /// 契約 §84.1: `payload` の中身は何であっても成功する（object でなくても良い）。
@@ -559,9 +689,10 @@ mod tests {
     /// （条件反転の変異を塞ぐ）。
     #[test]
     fn well_formed_payload_does_not_log_condition_1_4() {
-        let bytes = wire("Stop", STOP_PAYLOAD);
-        let (_ev, events) = capture_events(|| parse_hook_event(&bytes).expect("parse"));
-        assert!(events.is_empty(), "expected no warn, got {events:?}");
+        let quiet = wire_with_id(QUIET_ID, "Stop", STOP_PAYLOAD);
+        // 対照: 同じ条件 1-4 の callsite を鳴らす入力（object でない payload）。
+        let loud = wire_with_id(LOUD_ID, "Notification", "[1,2,3]");
+        assert_only_the_loud_input_warns(&quiet, &loud);
     }
 
     /// HookEnvelope は必須フィールドを持たないので、フィールドの欠落では失敗しない。

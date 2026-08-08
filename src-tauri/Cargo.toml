@@ -28,7 +28,3 @@ tempfile = "3"
 # 素の Window<R> を引き直すため）に必要。dev-dependencies なので production
 # の `cargo build` / `cargo build --release` には影響しない。
 tauri = { version = "2", features = ["test", "unstable"] }
-# hooks_srv::payload のテストで tracing::warn! が実際に鳴ったことを検証するために
-# 使う（`Registry` + 自前 `Layer` でイベントをキャプチャする）。dev-dependencies
-# なので production の `cargo build` / `cargo build --release` には影響しない。
-tracing-subscriber = "0.3"
