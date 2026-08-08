@@ -300,6 +300,15 @@ fn handle_connection(stream: UnixStream, sink: &dyn HookSink) {
     }
 }
 
+/// hooks が有効なとき AppState に載る。relay 解決に失敗したら None になり、
+/// セッションは hooks 無しで動く(設計書 §12「hooks 不達 → 汎用ヒューリスティック」)。
+#[derive(Debug, Clone)]
+pub struct HooksRuntime {
+    pub socket_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub relay_bin: PathBuf,
+}
+
 /// 同梱される relay バイナリのファイル名。
 /// Tauri の externalBin はターゲットトリプルのサフィックスを剥がして配置する。
 pub const RELAY_BIN_NAME: &str = "kamux-relay";

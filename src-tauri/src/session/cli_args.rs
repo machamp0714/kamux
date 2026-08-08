@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
+use crate::hooks_srv::HooksRuntime;
 use crate::model::{CliKind, Session};
 use crate::pty::launch_env::LaunchEnv;
 
@@ -176,6 +177,45 @@ pub fn write_hook_settings_file(path: &Path, relay_bin: &Path) -> AppResult<()> 
             path.display()
         ))
     })
+}
+
+/// 契約 §12.1: リレーは KAMUX_SESSION_ID で自セッションを識別する。
+pub const ENV_SESSION_ID: &str = "KAMUX_SESSION_ID";
+/// 契約への追加提案 B: relay はアプリの pid を知らないのでソケットパスを env で受け取る。
+pub const ENV_HOOKS_SOCK: &str = "KAMUX_HOOKS_SOCK";
+
+/// claude の argv に足す hooks 引数。
+///
+/// `--settings` はここでは `Command::arg` 経由(cmd.arg)で子プロセスへ渡り、
+/// シェルを経由しないので、パスに空白や `'` が含まれてもクォートは不要かつ
+/// 有害である(§60.6.1 の `PtySurface::spawn` が `CommandBuilder::arg` で
+/// argv 要素を 1 つずつ積む。`spec.args` の各要素は execve の argv[i] になる)。
+pub fn claude_hook_args(hooks: Option<&HooksRuntime>) -> Vec<String> {
+    match hooks {
+        Some(h) => vec![
+            "--settings".to_string(),
+            h.settings_path.to_string_lossy().into_owned(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// PTY spawn 時に注入する環境変数。
+/// 契約 §12.3 のとおり hook プロセスへ完全継承される。
+pub fn hook_env_vars(
+    kamux_session_id: &str,
+    hooks: Option<&HooksRuntime>,
+) -> Vec<(String, String)> {
+    match hooks {
+        Some(h) => vec![
+            (ENV_SESSION_ID.to_string(), kamux_session_id.to_string()),
+            (
+                ENV_HOOKS_SOCK.to_string(),
+                h.socket_path.to_string_lossy().into_owned(),
+            ),
+        ],
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -744,5 +784,54 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Task 10: claude の argv と環境変数への hooks 注入（契約 §12.1 / §61.2） ----
+
+    fn fake_runtime() -> HooksRuntime {
+        HooksRuntime {
+            socket_path: PathBuf::from("/tmp/kamux-hooks-4321.sock"),
+            settings_path: PathBuf::from("/tmp/kamux-hooks-4321.settings.json"),
+            relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+        }
+    }
+
+    #[test]
+    fn adds_settings_flag_when_hooks_are_enabled() {
+        let args = claude_hook_args(Some(&fake_runtime()));
+        assert_eq!(
+            args,
+            vec![
+                "--settings".to_string(),
+                "/tmp/kamux-hooks-4321.settings.json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn adds_nothing_when_hooks_are_disabled() {
+        assert!(claude_hook_args(None).is_empty());
+        assert!(hook_env_vars("3f2a0000-0000-4000-8000-000000009c1e", None).is_empty());
+    }
+
+    #[test]
+    fn injects_session_id_and_socket_path() {
+        let env = hook_env_vars(
+            "3f2a0000-0000-4000-8000-000000009c1e",
+            Some(&fake_runtime()),
+        );
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "KAMUX_SESSION_ID".to_string(),
+                    "3f2a0000-0000-4000-8000-000000009c1e".to_string()
+                ),
+                (
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux-hooks-4321.sock".to_string()
+                ),
+            ]
+        );
     }
 }
