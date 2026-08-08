@@ -788,10 +788,14 @@ pub(crate) mod tests {
 
     // ---- Task 10: claude の argv と環境変数への hooks 注入（契約 §12.1 / §61.2） ----
 
+    /// フィクスチャのパスは意図的に空白と `'` を含む
+    /// （`claude_hook_args` / `hook_env_vars` の doc コメントが「シェルを経由しないため
+    /// 空白や `'` を含んでもクォート不要かつ有害」と主張しており、その主張を検査するため。
+    /// フィックス対象レビュー指摘: `cli_args.rs` Task 10 fix round 1）。
     fn fake_runtime() -> HooksRuntime {
         HooksRuntime {
-            socket_path: PathBuf::from("/tmp/kamux-hooks-4321.sock"),
-            settings_path: PathBuf::from("/tmp/kamux-hooks-4321.settings.json"),
+            socket_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.sock"),
+            settings_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.settings.json"),
             relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
         }
     }
@@ -803,7 +807,7 @@ pub(crate) mod tests {
             args,
             vec![
                 "--settings".to_string(),
-                "/tmp/kamux-hooks-4321.settings.json".to_string()
+                "/tmp/kamux's dir/kamux-hooks-4321.settings.json".to_string()
             ]
         );
     }
@@ -829,7 +833,7 @@ pub(crate) mod tests {
                 ),
                 (
                     "KAMUX_HOOKS_SOCK".to_string(),
-                    "/tmp/kamux-hooks-4321.sock".to_string()
+                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
                 ),
             ]
         );
