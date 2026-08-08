@@ -1,4 +1,11 @@
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::error::{AppError, AppResult};
 
@@ -133,14 +140,6 @@ fn is_pid_alive_with(pid: u32, kill: impl Fn(libc::pid_t, libc::c_int) -> libc::
     };
     classify_kill_result(rc, errno)
 }
-
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 /// 1 メッセージの受け入れ上限。Stop の last_assistant_message は長くなりうる。
 const MAX_MESSAGE_BYTES: u64 = 1024 * 1024;
@@ -308,6 +307,27 @@ mod tests {
         panic!("condition not met within 2s");
     }
 
+    /// `wait_for` と同じ形だが、上限を明示的に指定できる。
+    ///
+    /// `wait_for` の固定上限（200 * 10ms = 2 秒）は `READ_TIMEOUT`（2 秒）と
+    /// ちょうど同じ長さである。黙り込む接続の read タイムアウトを跨いで待つ
+    /// テストで `wait_for` をそのまま使うと、「read タイムアウト待ち」と
+    /// 「テスト自身のタイムアウト」が競走してしまい、CI 環境の遅さ次第で
+    /// 揺れる。そのテスト専用に、`READ_TIMEOUT` より十分長い独立の上限を渡す。
+    fn wait_for_within<F: Fn() -> bool>(bound: Duration, cond: F) {
+        let start = std::time::Instant::now();
+        loop {
+            if cond() {
+                return;
+            }
+            assert!(
+                start.elapsed() < bound,
+                "condition not met within {bound:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn creates_socket_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -375,6 +395,35 @@ mod tests {
         wait_for(|| sink.snapshot().len() == 1);
         assert_eq!(sink.snapshot()[0].kind, HookKind::Stop);
 
+        drop(server);
+    }
+
+    /// 契約 §0 の並行処理要件（brief §3）: 「1 つの接続の相手が黙り込んでも、
+    /// サーバ全体が止まらないこと」。accept ループは受信処理をインラインで
+    /// 行う（設計 §6-4）ため、黙り込む接続を先に受け取ると、後続の接続は
+    /// その接続の read が `READ_TIMEOUT`（2 秒）で打ち切られるまで accept
+    /// されない。「止まらない」とは「無期限には止まらない」ことであり、
+    /// このテストは READ_TIMEOUT を跨いで後続メッセージが届くことを固定する。
+    #[test]
+    fn a_silent_peer_does_not_block_delivery_of_a_later_message() {
+        let path = test_socket_path("silent-peer");
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink.clone()).expect("start");
+
+        // 黙り込む接続: 何も書かず、閉じずに繋ぎっぱなしにする。
+        let silent = UnixStream::connect(&path).expect("connect silent peer");
+
+        send(
+            &path,
+            r#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Stop","payload":null}"#,
+        );
+
+        // READ_TIMEOUT（2 秒）を跨ぐ必要があるので、wait_for の固定 2 秒とは
+        // 競走しない、十分に長い独立の上限を使う。
+        wait_for_within(Duration::from_secs(6), || sink.snapshot().len() == 1);
+        assert_eq!(sink.snapshot()[0].kind, HookKind::Stop);
+
+        drop(silent);
         drop(server);
     }
 
