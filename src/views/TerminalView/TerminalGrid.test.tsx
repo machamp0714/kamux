@@ -460,12 +460,15 @@ describe('TerminalGrid（Important 1: 未起動 PTY への resize_pty を防ぐ�
 
     // (b) 反応配線: assignPane 後に RO コールバックが発火すると、resizePty の第 1 引数は
     // 【新しい】割当の surface になる（M-F: stateRef.current の更新が消えると、
-    // ResizeObserver コールバックは初回マウント時点の古い割当のまま固まる）
-    mocks.resizePty.mockClear();
+    // ResizeObserver コールバックは初回マウント時点の古い割当のまま固まる）。
+    // mockClear は assignPane の attach effect（useLayoutEffect）の呼び出しを飲み込んだ
+    // 【後】、RO コールバックを発火する直前に置く —— 先に置くと attach 経路の
+    // resizePty 呼び出しで下の assert が満たされてしまい、RO 経路を見ていることにならない
     act(() => {
       useAppStore.getState().assignPane(0, 's3');
     });
     await flush();
+    mocks.resizePty.mockClear();
 
     FakeResizeObserver.callbacks.forEach((cb) => {
       cb();
