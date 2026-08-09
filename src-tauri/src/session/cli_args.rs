@@ -895,7 +895,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn shell_command_gets_no_settings_flag() {
+    fn non_claude_cli_kinds_get_no_hooks_wiring() {
         // apply_hooks は CliKind::Claude だけに hooks を配線する（契約 §102）。
         // Claude 以外の 3 種（Shell / Codex / Custom）は args にも env にも
         // hooks の痕跡が一切残らないことを、ここで一括して検証する
