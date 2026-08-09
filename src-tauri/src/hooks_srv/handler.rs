@@ -262,17 +262,41 @@ mod tests {
         }
     }
 
+    /// `RecordingObserver` が拾った通知のうち、hook 由来の遷移理由(HookPermission /
+    /// HookNotification)だけを残す。
+    ///
+    /// fixture の `Spawned` 送信(→ StateReason::Spawned)は memory 更新 -> DB 書き込み
+    /// -> observer 通知の順で非同期に進む(runtime_state.rs のテストコメント参照)。
+    /// `wait_state` が保証するのは memory 更新までで、observer 通知はさらに後段のため、
+    /// `register_observer` のタイミング次第で Spawned の通知まで拾ってしまうことがある
+    /// (実測: 稀に `seen[0]` が `(id, Spawned)` になり位置指定の assert が壊れた)。
+    /// 位置ではなく hook 由来の reason だけに絞ることで、この残留レースを観測から
+    /// 切り離す。
+    fn hook_reasons(observer: &RecordingObserver) -> Vec<(String, StateReason)> {
+        observer
+            .seen()
+            .into_iter()
+            .filter(|(_, reason)| {
+                matches!(
+                    reason,
+                    StateReason::HookPermission | StateReason::HookNotification
+                )
+            })
+            .collect()
+    }
+
     /// consumer スレッド経由の通知が届くまで、有界時間だけ待つ。
-    fn wait_observed(observer: &RecordingObserver, want: usize) {
+    /// hook 由来の reason(`hook_reasons`)の件数で待つ。
+    fn wait_hook_reasons(observer: &RecordingObserver, want: usize) {
         for _ in 0..200 {
-            if observer.seen().len() >= want {
+            if hook_reasons(observer).len() >= want {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!(
-            "observer did not see {want} events within 2s (now {:?})",
-            observer.seen()
+            "observer did not see {want} hook-originated events within 2s (now {:?})",
+            hook_reasons(observer)
         );
     }
 
@@ -306,7 +330,7 @@ mod tests {
             claude_session_id: None,
             source: None,
         });
-        wait_observed(&observer, 1);
+        wait_hook_reasons(&observer, 1);
         runtime_a.begin_shutdown();
 
         let (handler_b, _store_b, tx_b, runtime_b, id_b, _dir_b) = handler_with_session();
@@ -318,19 +342,17 @@ mod tests {
             claude_session_id: None,
             source: None,
         });
-        wait_observed(&observer, 2);
+        wait_hook_reasons(&observer, 2);
         runtime_b.begin_shutdown();
 
-        let seen = observer.seen();
         assert_eq!(
-            seen[0],
-            (id_a, StateReason::HookPermission),
-            "PermissionRequest must be observed as StateReason::HookPermission"
-        );
-        assert_eq!(
-            seen[1],
-            (id_b, StateReason::HookNotification),
-            "Notification must be observed as StateReason::HookNotification, not HookPermission"
+            hook_reasons(&observer),
+            vec![
+                (id_a, StateReason::HookPermission),
+                (id_b, StateReason::HookNotification),
+            ],
+            "PermissionRequest must be observed as HookPermission and Notification as \
+             HookNotification, in that order"
         );
     }
 
