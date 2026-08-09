@@ -1,6 +1,8 @@
 // モジュールはすべて pub mod で宣言する。private mod にすると dead_code が消えない（§45.1 の実測）
 pub mod error;
+pub mod hooks_srv;
 pub mod model;
+pub mod notify;
 pub mod pty;
 pub mod session;
 pub mod state;
@@ -1015,7 +1017,7 @@ mod tests {
         /// `runtime_state::tests::tauri_emit_observer_emits_the_payload_on_the_contract_topic`
         /// は observer を**直接構築**するので、この 1 行を消しても緑のまま通る
         /// （レビュアーの変異 I で実測済み）。ここでは observer を 1 つも作らず、
-        /// **`sender()` に入力を積んで `session://state/{id}` が届くか**だけを見る。
+        /// **`sender()` に入力を積んで `session://state/{session_id}` が届くか**だけを見る。
         ///
         /// 消えたときの症状は重い —— イベントが 1 度も発火せず、フロント（Task 8-10）と
         /// M2-2 以降が丸ごと無反応になる。
@@ -1050,7 +1052,7 @@ mod tests {
                 .send(&session.id, StateInput::Spawned);
 
             let raw = rx.recv_timeout(Duration::from_secs(5)).expect(
-                "session://state/{id} が届かない: install_app_state_with が \
+                "session://state/{session_id} が届かない: install_app_state_with が \
                  TauriEmitObserver を register_observer していない",
             );
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
