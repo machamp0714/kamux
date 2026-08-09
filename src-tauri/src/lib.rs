@@ -382,53 +382,22 @@ pub fn run() {
                 Err(e) => println!("[NG] get_notification_settings: {e}"),
             }
 
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let granted = notify_rust::request_auth_blocking().unwrap_or(false);
-                println!("[--] request_auth -> {granted}");
+            // Task 7 修正ラウンド 1（M2-3 PR 19）: 以下 2 行は測定であって
+            // 守りではない。Task 10 の本番配線ではこの if ブロックごと消す。
+            //
+            // 測定 1: setup はまだイベントループ開始前なので false のはず
+            // （違えば「ループ未開始でも true になる」という重要な発見なので
+            // そのまま報告する）。
+            let waiting_at_setup =
+                objc2_core_foundation::CFRunLoop::main().is_some_and(|rl| rl.is_waiting());
+            println!("[MEASURE-1] setup: main_run_loop_is_waiting = {waiting_at_setup}");
 
-                let want_id = "kamux-session-spike".to_string();
-                let mut n = notify_rust::Notification::new();
-                n.summary("入力待ち: spike")
-                    .body("kamux · session/spike")
-                    .id(notify_rust::NotificationId::Mac(want_id.clone()))
-                    .timeout(notify_rust::Timeout::Milliseconds(30_000));
+            // 測定 3-a: setup はメインスレッドで走るので true のはず。
+            let marker_at_setup = objc2::MainThreadMarker::new().is_some();
+            println!(
+                "[MEASURE-3a] setup (main thread): main_thread_marker_is_some = {marker_at_setup}"
+            );
 
-                let h = match n.show() {
-                    Ok(h) => h,
-                    Err(e) => {
-                        println!("[NG] show failed: {e}");
-                        return;
-                    }
-                };
-
-                // 要検証 3-a: 指定した id がそのまま採用されるか
-                //（採用されないと「同一 id で置き換え」も close_delivered も効かない）
-                match h.id() {
-                    notify_rust::NotificationId::Mac(ref got) if *got == want_id => {
-                        println!("[OK] notification id round-trips: {got}")
-                    }
-                    other => println!("[NG] notification id was rewritten: {other:?}"),
-                }
-
-                let r = h.wait_for_response(|resp: &notify_rust::NotificationResponse| {
-                    println!(
-                        "[--] response = {resp:?} (is_default_action = {})",
-                        resp.is_default_action()
-                    );
-                });
-                println!("[--] wait_for_response returned: {r:?}");
-
-                // 要検証 4-b: Dock バッジ
-                use tauri::Manager;
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.set_badge_count(Some(3));
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    let _ = w.set_badge_count(None);
-                    println!("[--] badge: 3 を 3 秒表示したあと None で消した");
-                }
-                println!("[OK] spike finished without hanging");
-            });
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
@@ -452,7 +421,144 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build kamux");
 
-    app.run(kill_on_run_event_exit);
+    app.run(move |handle, event| {
+        // Task 7 修正ラウンド 1（M2-3 PR 19）: `RunEvent::Ready` を合図に
+        // 測定 2・3-b と試行 A・B を行う。`kill_on_run_event_exit` は
+        // これまでどおり全イベントで呼び続ける（2 本のテストがこれに依存する）。
+        if matches!(event, tauri::RunEvent::Ready) && std::env::var("KAMUX_NOTIFY_SPIKE").is_ok() {
+            let spike_handle = handle.clone();
+            std::thread::spawn(move || run_notify_spike_after_ready(spike_handle));
+        }
+        kill_on_run_event_exit(handle, event);
+    });
+}
+
+/// Task 7 修正ラウンド 1（M2-3 PR 19）: `RunEvent::Ready` 直後にバックグラウンド
+/// スレッドから呼ばれる。測定 2・3-b と試行 A・B（`mac-usernotifications` の
+/// `block_on_current` がどちらの枝を通るかの実地確認）を行う。
+///
+/// **測定 2 はこの関数の呼び出し元（バックグラウンドスレッド）から行うこと。**
+/// `Mainthread not running` を出している当の述語
+/// (`mac-usernotifications-0.3.1::block_on_current` -> `main_run_loop_is_running`)
+/// がバックグラウンドスレッドから `CFRunLoop::main().is_waiting()` を評価して
+/// いるため、メインスレッドから測ると測定コード自身の実行によって
+/// `is_waiting` がほぼ常に false になり、別の量を測ることになる。
+///
+/// 測定コード（`[MEASURE-*]` を出す部分）は測定であって守りではない。
+/// Task 10 の本番配線ではこの関数ごと消す。
+fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
+    // 測定 3-b: バックグラウンドスレッドなので false のはず。
+    let marker_on_thread = objc2::MainThreadMarker::new().is_some();
+    println!("[MEASURE-3b] spawned thread:      main_thread_marker_is_some = {marker_on_thread}");
+
+    // 測定 2: Ready 直後から 100 回、2ms 間隔で is_waiting をサンプリングする。
+    // 間隔の sleep は測定のためであり許される（下の試行 A/B には壁時計 sleep
+    // を入れない）。生の列も出す —— 比率だけだと分布（振動しているか、
+    // 一貫して false か）が消える。
+    const SAMPLES: usize = 100;
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let waiting = objc2_core_foundation::CFRunLoop::main().is_some_and(|rl| rl.is_waiting());
+        samples.push(waiting);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let true_count = samples.iter().filter(|&&b| b).count();
+    let false_count = SAMPLES - true_count;
+    let ratio = true_count as f64 / SAMPLES as f64;
+    println!(
+        "[MEASURE-2] samples={SAMPLES} interval=2ms true={true_count} false={false_count} ratio={ratio:.2}"
+    );
+    let first20 = samples
+        .iter()
+        .take(20)
+        .map(|b| if *b { "t" } else { "f" })
+        .collect::<Vec<&str>>()
+        .join(",");
+    println!("[MEASURE-2] first20={first20}");
+
+    let granted = notify_rust::request_auth_blocking().unwrap_or(false);
+    println!("[--] request_auth -> {granted}");
+
+    // 試行 A: そのまま show()。
+    let want_id_a = "kamux-session-spike-a".to_string();
+    let mut n_a = notify_rust::Notification::new();
+    n_a.summary("A: 入力待ち")
+        .body("kamux · session/spike (A: そのまま show)")
+        .id(notify_rust::NotificationId::Mac(want_id_a.clone()))
+        .timeout(notify_rust::Timeout::Milliseconds(30_000));
+    let a_handle = match n_a.show() {
+        Ok(h) => {
+            println!("[TRY-A] show -> ok id={want_id_a}");
+            match h.id() {
+                notify_rust::NotificationId::Mac(ref got) if *got == want_id_a => {
+                    println!("[OK] notification id round-trips: {got}")
+                }
+                other => println!("[NG] notification id was rewritten: {other:?}"),
+            }
+            Some(h)
+        }
+        Err(e) => {
+            println!("[TRY-A] show -> failed: {e}");
+            None
+        }
+    };
+
+    // 試行 B: run_on_main_thread 経由で show()。
+    // A の成否に関わらず必ず試す —— ゲートは 1 回しか回らない。
+    // B の中では wait_for_response を呼ばない（メインスレッドを 30 秒
+    // ブロックして UI が固まる。見たいのは show() が通るかだけなので、
+    // 返ったハンドルはそのまま drop する）。
+    //
+    // A の `wait_for_response`（最大 30 秒ブロック）より先に済ませることで、
+    // B の通知が A の陰で 30 秒以上遅れて出るのを避ける。
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let run_result = handle.run_on_main_thread(move || {
+        let marker_inside = objc2::MainThreadMarker::new().is_some();
+        let want_id_b = "kamux-session-spike-b".to_string();
+        let mut n_b = notify_rust::Notification::new();
+        n_b.summary("B: 入力待ち")
+            .body("kamux · session/spike (B: run_on_main_thread)")
+            .id(notify_rust::NotificationId::Mac(want_id_b.clone()))
+            .timeout(notify_rust::Timeout::Milliseconds(30_000));
+        // ハンドルは drop する（上のコメントのとおり）。
+        let show_result = match n_b.show() {
+            Ok(_h) => format!("[TRY-B] show -> ok id={want_id_b}"),
+            Err(e) => format!("[TRY-B] show -> failed: {e}"),
+        };
+        let _ = tx.send(format!(
+            "[TRY-B] main_thread_marker_is_some_inside = {marker_inside}\n{show_result}"
+        ));
+    });
+    match run_result {
+        Ok(()) => match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => println!("[NG] TRY-B result channel: {e}"),
+        },
+        Err(e) => println!("[NG] run_on_main_thread failed: {e}"),
+    }
+
+    // 試行 A が成功していれば、これまでどおり id 往復に続けて
+    // wait_for_response / Dock バッジの観測を続ける。B の後に置くことで
+    // B の通知が A の 30 秒ブロックに巻き込まれない。
+    if let Some(h) = a_handle {
+        let r = h.wait_for_response(|resp: &notify_rust::NotificationResponse| {
+            println!(
+                "[--] response = {resp:?} (is_default_action = {})",
+                resp.is_default_action()
+            );
+        });
+        println!("[--] wait_for_response returned: {r:?}");
+
+        // 要検証 4-b: Dock バッジ
+        use tauri::Manager;
+        if let Some(w) = handle.get_webview_window("main") {
+            let _ = w.set_badge_count(Some(3));
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = w.set_badge_count(None);
+            println!("[--] badge: 3 を 3 秒表示したあと None で消した");
+        }
+    }
+    println!("[OK] spike finished without hanging");
 }
 
 #[cfg(test)]
