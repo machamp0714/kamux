@@ -902,16 +902,26 @@ pub(crate) mod tests {
         )));
     }
 
-    /// `CliKind` の全 variant について `apply_hooks` を通した結果を、`cli_kind` と対で返す。
-    /// **`cli_command` の決定を `match` の明示列挙にしてあるため、`CliKind` に 5 つ目の
-    /// variant が増えるとこの関数がコンパイルエラーになる** —— 呼び出し側のテスト名が
-    /// 主張する「every cli_kind」の射程を、配列リテラルではなく型で担保するためである
-    /// （`_ => None` に潰すと 5 つ目でも黙って通り、名前が実体より広く主張する）。
+    /// `CliKind` の 4 variant（`Claude` / `Codex` / `Shell` / `Custom`）について
+    /// `apply_hooks` を通した結果を、`cli_kind` と対で返す。
+    ///
+    /// **この関数が担保するのは「`CliKind` に 5 つ目の variant が増えたときに
+    /// `cli_command` を決める `match` がコンパイルエラーになる」という接触点だけである。**
+    /// 下の配列リテラルへの追加は依然として手作業であり、型はそれを担保しない
+    /// （配列から要素を 1 つ落としても、この関数はコンパイルも実行も通る）。
+    /// だからこの関数名も呼び出し側のテスト名も「every」「all」を名乗らず、
+    /// 4 種を明示的に列挙している。
+    ///
+    /// 網羅を機構で担保する設計（index/count によるチェック等）はあえて採らない。
+    /// `CliKind` は契約 §2 が `Claude` / `Codex` / `Shell` / `Custom` の 4 値で固定して
+    /// おり、5 つ目を足すこと自体が契約改訂であって、その改訂は §30.2 の「全 `cli_kind`
+    /// 共通」の env 表を必ず通る —— 機構が守ろうとしている経路を、契約改訂そのものが
+    /// 通過するので過剰設計になる。
     ///
     /// `program` は `--settings` / env のどちらの assert にも効かないので `/bin/zsh` 固定。
-    fn apply_hooks_for_every_cli_kind(hooks: &HooksRuntime) -> Vec<(CliKind, LaunchCommand)> {
-        // CliKind に variant を足したら、下の match と同時にこの配列にも足すこと
-        // （コンパイルエラーが出るのは match の側だけで、直し忘れるのはこちらである）。
+    fn apply_hooks_for_the_four_cli_kinds(hooks: &HooksRuntime) -> Vec<(CliKind, LaunchCommand)> {
+        // CliKind に variant を足したら、下の match（コンパイルエラーで気づける）と
+        // この配列（気づけない。手作業で追記すること）の両方に足すこと。
         let every = [
             CliKind::Claude,
             CliKind::Codex,
@@ -943,8 +953,8 @@ pub(crate) mod tests {
     /// （shell のスクラッチ端末から手で起動した claude の hook も届く必要があるため）。
     /// 値まで比較するのは、キーの存在だけだと空文字や別パスを入れる潰しを捕まえられないため。
     #[test]
-    fn hooks_sock_env_is_injected_for_every_cli_kind() {
-        for (cli_kind, cmd) in apply_hooks_for_every_cli_kind(&fake_runtime()) {
+    fn hooks_sock_env_is_injected_for_claude_codex_shell_and_custom() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
             assert!(
                 cmd.env.contains(&(
                     "KAMUX_HOOKS_SOCK".to_string(),
@@ -959,10 +969,10 @@ pub(crate) mod tests {
     /// 契約 §30.2 の分界のうち **argv 側**: `--settings` は claude 専用フラグであり、
     /// §30.2 の env 表は argv を射程にしていない。`cli_kind == Claude` のときだけ付き、
     /// 他の 3 種には付かないことを固定する（env 側の主張はここではしない —— それは
-    /// `hooks_sock_env_is_injected_for_every_cli_kind` が別の規定として持つ）。
+    /// `hooks_sock_env_is_injected_for_claude_codex_shell_and_custom` が別の規定として持つ）。
     #[test]
-    fn settings_flag_is_injected_for_claude_only_across_every_cli_kind() {
-        for (cli_kind, cmd) in apply_hooks_for_every_cli_kind(&fake_runtime()) {
+    fn settings_flag_is_injected_for_claude_only_among_the_four_cli_kinds() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
             assert_eq!(
                 cmd.args.iter().any(|a| a == "--settings"),
                 cli_kind == CliKind::Claude,
