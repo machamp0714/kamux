@@ -151,6 +151,15 @@ mod tests {
             source: Some("startup".to_string()),
         });
 
+        // SessionStart は状態機械へ何も送らない。send() は mpsc 経由の非同期処理なので、
+        // 直後に tx.current() を読むと consumer スレッドがまだ何も消化していない
+        // "たまたま無傷" を拾ってしまい非決定的になる(実測: SessionStart 腕に誤って
+        // send(HookNotification) を混ぜても、猶予なしでは cargo test --workspace
+        // --no-fail-fast 4 回中 2 回しか赤くならなかった)。
+        // unknown_session_id_is_dropped_before_reaching_the_state_machine と同じ
+        // 200ms の猶予を置いてから確認する。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         let got = store.get_session(&id).expect("get");
         assert_eq!(
             got.claude_session_id.as_deref(),
@@ -377,6 +386,12 @@ mod tests {
     #[test]
     fn stop_moves_to_idle() {
         let (handler, _store, tx, runtime, id, _dir) = handler_with_session();
+        // fixture の Spawned が Running へ処理されるのを待ってから確認する。
+        // 待たないと wait_state(Idle) はマップ未登録セッションの既定値である
+        // Idle にも一致するため、Stop を送らなくても即座に緑になる恒真テストに
+        // なってしまう(実測: HookStop -> HookNotification に潰しても、Stop 腕
+        // 本体を削除しても、どちらも全緑のまま)。
+        wait_state(&tx, &id, RuntimeState::Running);
 
         handler.on_hook(HookEvent {
             kamux_session_id: id.clone(),
@@ -421,6 +436,51 @@ mod tests {
         assert_eq!(tx.current(&id), RuntimeState::Running);
         // DB も無傷
         assert_eq!(store.get_session(&id).expect("get").claude_session_id, None);
+
+        runtime.begin_shutdown();
+    }
+
+    /// 設計 §6-7: なりすまし防止フィルタ(`is_known_session`)そのものを守る観測。
+    ///
+    /// `unknown_session_id_is_dropped_before_reaching_the_state_machine` は
+    /// 既知セッションの無傷しか見ていないため、`is_known_session` を
+    /// `|| true` で無効化しても両 assert が成立し続ける(実測: 507 passed のまま)。
+    /// ここでは observer を直接見て、未知 ID の通知が 1 件も届かないことを
+    /// 確かめる。陽性の対照として既知セッションへの通知が 1 件観測されることも
+    /// 同時に見る(片側だけだと観測経路自体が死んでいるのか、フィルタが効いて
+    /// いるのかを区別できない)。
+    #[test]
+    fn unknown_session_id_never_reaches_the_observer() {
+        let observer = Arc::new(RecordingObserver::default());
+        let (handler, _store, tx, runtime, id, _dir) = handler_with_session();
+        wait_state(&tx, &id, RuntimeState::Running);
+        runtime.register_observer(observer.clone());
+
+        let unknown = "00000000-0000-4000-8000-000000000001";
+        handler.on_hook(HookEvent {
+            kamux_session_id: unknown.to_string(),
+            kind: HookKind::Notification,
+            claude_session_id: None,
+            source: None,
+        });
+        handler.on_hook(HookEvent {
+            kamux_session_id: id.clone(),
+            kind: HookKind::Notification,
+            claude_session_id: None,
+            source: None,
+        });
+
+        // 陽性の対照(既知セッションの通知)が届くのを待つ。フィルタが外れていれば
+        // 未知 ID の通知も同じ consumer スレッドを経由して同じ猶予内に届く。
+        wait_hook_reasons(&observer, 1);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert_eq!(
+            hook_reasons(&observer),
+            vec![(id.clone(), StateReason::HookNotification)],
+            "only the known session's hook must reach the observer; an unknown \
+             session_id must never reach it"
+        );
 
         runtime.begin_shutdown();
     }
