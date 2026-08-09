@@ -221,9 +221,16 @@ gh pr merge <n> --squash --delete-branch
 git fetch origin --prune
 MC=$(gh pr view <n> --json mergeCommit -q .mergeCommit.oid)   # 🔴 P2: 基準は origin/main ではなく mergeCommit
 git diff "$MC" "$TIP" --stat          # 検証 D（最重要）: 出力が空であること。非空なら取りこぼしている
-[ "$(git rev-list --count --merges "$MC" -1)" = "0" ]  # 検証 E: squash されている（マージコミットでない）
+[ "$(git cat-file -p "$MC" | grep -c '^parent ')" = "1" ]  # 検証 E: squash されている（親が 1 つ）
 git rev-parse --verify "origin/$BR"   # 検証 F: 失敗すること（ブランチが消えている）
 ```
+
+- **🔴 検証 E は 2026-08-09 まで常に空振りしていた。前版の `git rev-list --count --merges "$MC" -1` は決して `0` を返さない**（PR #63 のマージで実測して発覚）。
+  **`git rev-list --merges <commit>` は `<commit>` 自身がマージかを見るのではなく、そこから履歴全体を遡ってマージコミットを探す。**
+  **本リポジトリは PR #1 が真のマージコミット（`0bed3b7`、親 2 つ）で入っており、それが全ブランチの祖先にある。** したがって `--max-count=1` が付いていても必ず 1 が返る。
+  **検算: 既知の正常な squash マージ 2 件（`993dafe` = PR #59 / `3cc3225` = PR #63）に当てて両方 `1`。** つまり**合格と不合格が同じ出力になる形**であり、契約 §99.2 / §101.7 の族である。
+  **現行の `git cat-file -p "$MC" | grep -c '^parent '` は同じ 3 件で squash = 1 / 真のマージ = 2 と弁別することを実測済み。**
+  > **⚠️ この行は 2026-08-09 に P1 / P3 を足したのと同じ編集で目の前にあったが、team-lead は検証 E を一度も実行しなかった。** **検査を足すときに、隣の既存の検査を実測しないと、壊れた検査が「在るから通っている」と読まれ続ける。**
 
 - **🔴 検証 D の基準は `origin/main` ではなく `$MC`（当該 PR の `mergeCommit`）である**（契約 §101.2 の P2）。**`origin/main` のままだと、自分のマージ後に他 PR が載った瞬間に、その内容が全部並ぶ** —— 実測で 7 files / 1675 deletions（§101.1 の 5）。**3 レーンが並列で走るステージでは日常的に起きる**
 - **P1 と P2 は別の穴である。片方を塞いでももう片方は残る。** **`mergeCommit` を基準にしても P1 は閉じない**（`mergeCommit` の tree は「マージ時点の main + PR 差分」であり、ブランチが main を含まなければ差分は同じだけ出る）
