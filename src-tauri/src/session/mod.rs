@@ -169,17 +169,19 @@ fn plan_agent_spawn_with(
         // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
         let launch = build_launch_command(&session, &program, &cwd, launch_env, ResumeMode::None)?;
 
-        // claude 起動時のみ、`--settings` と hooks 由来の env を重ねる（契約 §31.4 /
-        // §102）。`build_launch_command` 自身のシグネチャには手を入れない
-        // （契約 §23 / §30.2.1）。`state.hooks` は hooks が無効なら None のままで、
-        // `apply_hooks` はそのとき何も足さない。
+        // hooks 由来の値を重ねる。argv（`--settings`）は claude 限定、env
+        // （`KAMUX_HOOKS_SOCK`）は全 cli_kind 共通である（契約 §30.2。分界の理由は
+        // `apply_hooks` の doc）。`build_launch_command` 自身のシグネチャには手を
+        // 入れない（契約 §23 / §30.2.1）。`state.hooks` は hooks が無効なら None の
+        // ままで、`apply_hooks` はそのとき何も足さない。
         let launch = apply_hooks(&session, launch, state.hooks.as_ref());
 
         Ok(SpawnSpec {
             surface_id: sid,
             program: launch.program.to_string_lossy().into_owned(),
             // KAMUX_SESSION_ID / PATH / LANG は build_launch_command が、
-            // --settings / KAMUX_HOOKS_SOCK は apply_hooks が入れている。
+            // KAMUX_HOOKS_SOCK（全 cli_kind 共通。契約 §30.2）と --settings
+            // （claude 限定）は apply_hooks が入れている。
             // ここでは push しない（契約 §23「呼び出し側は一切 push しない」/ §31.4）。
             env: launch.env,
             args: launch.args,

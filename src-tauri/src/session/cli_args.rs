@@ -217,12 +217,20 @@ pub fn hook_env_vars(hooks: Option<&HooksRuntime>) -> Vec<(String, String)> {
     }
 }
 
-/// `build_launch_command` が組み立てた結果に、claude 起動時のみ hooks 由来の
-/// args / env を重ねる（契約 §31.4）。
+/// `build_launch_command` が組み立てた結果に hooks 由来の値を重ねる。**argv と env で
+/// 射程が違う**（契約 §30.2）。
+///
+/// - **argv（`--settings`）は `cli_kind == Claude` 限定。** claude 専用フラグであり、
+///   §30.2 の env 表は argv を射程にしていない
+/// - **env（`KAMUX_HOOKS_SOCK`）は全 `cli_kind` 共通**（§30.2 / §31.2 の既往ドリフト訂正）。
+///   shell のスクラッチ端末から手で起動した claude の hook も relay に届く必要があるため、
+///   `cli_kind` で絞ってはならない
 ///
 /// `build_launch_command` 自身のシグネチャは変えない（契約 §23 / §30.2.1）——
-/// 5 引数のままでは `HooksRuntime` に辿り着けないため、この関数を後段の
-/// 合流点として 1 箇所に閉じる。claude 以外の `cli_kind` には何も足さない。
+/// 5 引数のままでは `HooksRuntime` に辿り着けないため、この関数を後段の合流点として
+/// 1 箇所に閉じる（§31.4 の「呼び出し側は値を組み立てず、`hook_env_vars` の結果を
+/// 合流させるだけ」）。`KAMUX_SESSION_ID` はここでは足さない —— 所有は
+/// `build_launch_command` である（§102.3）。
 pub fn apply_hooks(
     session: &Session,
     mut cmd: LaunchCommand,
@@ -230,8 +238,8 @@ pub fn apply_hooks(
 ) -> LaunchCommand {
     if session.cli_kind == CliKind::Claude {
         cmd.args.extend(claude_hook_args(hooks));
-        cmd.env.extend(hook_env_vars(hooks));
     }
+    cmd.env.extend(hook_env_vars(hooks));
     cmd
 }
 
@@ -894,31 +902,72 @@ pub(crate) mod tests {
         )));
     }
 
+    /// `CliKind` の全 variant について `apply_hooks` を通した結果を、`cli_kind` と対で返す。
+    /// **`cli_command` の決定を `match` の明示列挙にしてあるため、`CliKind` に 5 つ目の
+    /// variant が増えるとこの関数がコンパイルエラーになる** —— 呼び出し側のテスト名が
+    /// 主張する「every cli_kind」の射程を、配列リテラルではなく型で担保するためである
+    /// （`_ => None` に潰すと 5 つ目でも黙って通り、名前が実体より広く主張する）。
+    ///
+    /// `program` は `--settings` / env のどちらの assert にも効かないので `/bin/zsh` 固定。
+    fn apply_hooks_for_every_cli_kind(hooks: &HooksRuntime) -> Vec<(CliKind, LaunchCommand)> {
+        // CliKind に variant を足したら、下の match と同時にこの配列にも足すこと
+        // （コンパイルエラーが出るのは match の側だけで、直し忘れるのはこちらである）。
+        let every = [
+            CliKind::Claude,
+            CliKind::Codex,
+            CliKind::Shell,
+            CliKind::Custom,
+        ];
+        every
+            .into_iter()
+            .map(|cli_kind| {
+                let cli_command = match cli_kind {
+                    CliKind::Custom => Some("echo hi"),
+                    CliKind::Claude | CliKind::Codex | CliKind::Shell => None,
+                };
+                let session = sample_session(cli_kind, SessionMode::InPlace, cli_command);
+                let base = build_launch_command(
+                    &session,
+                    "/bin/zsh",
+                    Path::new("/repo"),
+                    &test_env(),
+                    ResumeMode::None,
+                )
+                .expect("build");
+                (cli_kind, apply_hooks(&session, base, Some(hooks)))
+            })
+            .collect()
+    }
+
+    /// 契約 §30.2 の env 表: `KAMUX_HOOKS_SOCK` は**全 `cli_kind` 共通**で入る
+    /// （shell のスクラッチ端末から手で起動した claude の hook も届く必要があるため）。
+    /// 値まで比較するのは、キーの存在だけだと空文字や別パスを入れる潰しを捕まえられないため。
     #[test]
-    fn non_claude_cli_kinds_get_no_hooks_wiring() {
-        // apply_hooks は CliKind::Claude だけに hooks を配線する（契約 §102）。
-        // Claude 以外の 3 種（Shell / Codex / Custom）は args にも env にも
-        // hooks の痕跡が一切残らないことを、ここで一括して検証する
-        // （契約 §81.3。ガードの射程を CliKind::Claude 1 種類に固定する）。
-        for cli_kind in [CliKind::Shell, CliKind::Codex, CliKind::Custom] {
-            let cli_command = (cli_kind == CliKind::Custom).then_some("echo hi");
-            let session = sample_session(cli_kind, SessionMode::InPlace, cli_command);
-            let base = build_launch_command(
-                &session,
-                "/bin/zsh",
-                Path::new("/repo"),
-                &test_env(),
-                ResumeMode::None,
-            )
-            .expect("build");
-            let cmd = apply_hooks(&session, base, Some(&fake_runtime()));
+    fn hooks_sock_env_is_injected_for_every_cli_kind() {
+        for (cli_kind, cmd) in apply_hooks_for_every_cli_kind(&fake_runtime()) {
             assert!(
-                !cmd.args.iter().any(|a| a == "--settings"),
-                "cli_kind={cli_kind:?} に --settings が混入した"
+                cmd.env.contains(&(
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+                )),
+                "cli_kind={cli_kind:?} の env に KAMUX_HOOKS_SOCK が入っていない: {:?}",
+                cmd.env
             );
-            assert!(
-                !cmd.env.iter().any(|(k, _)| k == "KAMUX_HOOKS_SOCK"),
-                "cli_kind={cli_kind:?} の env に KAMUX_HOOKS_SOCK が混入した"
+        }
+    }
+
+    /// 契約 §30.2 の分界のうち **argv 側**: `--settings` は claude 専用フラグであり、
+    /// §30.2 の env 表は argv を射程にしていない。`cli_kind == Claude` のときだけ付き、
+    /// 他の 3 種には付かないことを固定する（env 側の主張はここではしない —— それは
+    /// `hooks_sock_env_is_injected_for_every_cli_kind` が別の規定として持つ）。
+    #[test]
+    fn settings_flag_is_injected_for_claude_only_across_every_cli_kind() {
+        for (cli_kind, cmd) in apply_hooks_for_every_cli_kind(&fake_runtime()) {
+            assert_eq!(
+                cmd.args.iter().any(|a| a == "--settings"),
+                cli_kind == CliKind::Claude,
+                "cli_kind={cli_kind:?} の args: {:?}",
+                cmd.args
             );
         }
     }
