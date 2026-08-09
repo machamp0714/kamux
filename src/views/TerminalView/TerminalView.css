@@ -79,36 +79,28 @@
   background: var(--accent);
 }
 
-/* 契約 §57.3。M3-2 が分割で使うのと同じブロック名を M1-3 の単一ペインでも使う。
-   旧称（正典表 §25.3 の禁止列を参照）に戻すと M3-2 が同じ要素を改名することになる */
-.terminal-pane-slot {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
-  /* 上下分割で xterm がスロットからはみ出すのを防ぐ（契約 §28.4）。M1-3 でも書いておく */
-  min-height: 0;
-  overflow: hidden;
+/* ペイン 1 面（.terminal-pane-slot / __host / __empty）の所有者は TerminalGrid.css
+   （契約 §57.3 の 3 クラス）。同じセレクタを 2 ファイルで宣言すると読み込み順に
+   依存するので、M3-2 で TerminalGrid.css へ移設した。ここには再宣言しないこと */
+
+/* components.md「セッションタブ」節: 2 段目の右端に置くペインバッジ（契約 §28.3）。
+   内容は L / R（左右分割）と U / D（上下分割）で、CSS クラスは向きで変えない */
+.kamux-tab__pane-badge {
+  margin-left: auto;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  /* components.md が px で直接指定している部品固有の寸法（尺度ではない）。
+     同ファイル内の選択中バー 3px / 30px と同じ扱い */
+  border-radius: 3px;
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
 }
 
-/* attachTerminal のコンテナ。契約 §57.3 でこの要素に固定されている。
-   絶対配置の包含ブロックは祖先の padding「エッジ」で区切られる箱なので、
-   inset: 0 の子は padding 領域まで覆う（= 親に padding を置いても効かない。
-   headless Chromium で実測済み）。余白が要る場合は親の padding ではなく、
-   この要素の inset の値で与えること（M3-2 が focus border を入れるときの申し送り） */
-.terminal-pane-slot__host {
-  position: absolute;
-  inset: 0;
-}
-
-.terminal-pane-slot__empty {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  /* この要素はターミナル面（--bg-terminal、テーマ非依存）に直接乗るので、
-     テーマ追従の --text-muted ではなくターミナル面専用のトークン系統を使う
-     （fix round 1、light: --text-muted だと 3.17:1 だった） */
-  color: var(--text-term-dim);
-  pointer-events: none;
+/* 割当先ペインがフォーカス中（= そのタブが aria-selected）なら枠と文字を accent に。
+   aria-selected は paneAssignment[activePane] と一致するタブに付くので、
+   「フォーカス中のペインに出ている」ことと同義である */
+.kamux-tab[aria-selected='true'] .kamux-tab__pane-badge {
+  border-color: var(--accent);
+  color: var(--accent);
 }

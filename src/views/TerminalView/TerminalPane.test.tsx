@@ -24,10 +24,7 @@ const mocks = vi.hoisted(() => {
     isStarted: vi.fn(),
     markStarted: vi.fn(),
     unmarkStarted: vi.fn(),
-    attachTerminal: vi.fn(),
-    detachTerminal: vi.fn(),
     fitTerminal: vi.fn(),
-    getTerminal: vi.fn(),
     invalidateFitCache: vi.fn(),
     writeNotice: vi.fn(),
   };
@@ -44,11 +41,12 @@ vi.mock('../../terminal/ptyBridge', () => ({
   markStarted: mocks.markStarted,
   unmarkStarted: mocks.unmarkStarted,
 }));
+// attachTerminal / detachTerminal / getTerminal は意図的に生やさない。この層は
+// DOM を持たず attach/detach を行わず、フォーカスも当てない（契約 §85.5 / §85.6。
+// 駆動は TerminalGrid の集合差分、フォーカスは useActivePaneFocus に一本化）ため、
+// 実装がどれかを呼べば「関数ではない」で例外になりテストが失敗する
 vi.mock('../../terminal/registry', () => ({
-  attachTerminal: mocks.attachTerminal,
-  detachTerminal: mocks.detachTerminal,
   fitTerminal: mocks.fitTerminal,
-  getTerminal: mocks.getTerminal,
   invalidateFitCache: mocks.invalidateFitCache,
   writeNotice: mocks.writeNotice,
 }));
@@ -91,19 +89,6 @@ declare const process: {
   off(event: 'unhandledRejection', listener: (reason: unknown) => void): void;
 };
 
-// ResizeObserver 経路の isStarted 門を手動発火で検証するため、コールバックを
-// 保持できるようにする（既定の no-op スタブでは発火手段が無い）
-class FakeResizeObserver {
-  static callbacks: Array<() => void> = [];
-
-  constructor(cb: () => void) {
-    FakeResizeObserver.callbacks.push(cb);
-  }
-
-  observe(): void {}
-  disconnect(): void {}
-}
-
 /** マイクロタスクを複数回消化する。ensurePtySubscription → startSession → 後処理と
  *  Promise チェーンが 3 段あるため、1 回の flush では最後の段まで届かないことがある。
  *  act() で包むことで、消化中に起きる React の状態更新も同期に扱われたことにする */
@@ -118,7 +103,7 @@ async function flush(times = 4): Promise<void> {
 let container: HTMLDivElement;
 let root: Root;
 
-function renderPane(sessionId: string | null): void {
+function renderPane(sessionId: string): void {
   act(() => {
     root = createRoot(container);
     root.render(<TerminalPane sessionId={sessionId} />);
@@ -127,11 +112,8 @@ function renderPane(sessionId: string | null): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-  FakeResizeObserver.callbacks = [];
   mocks.isStarted.mockReturnValue(false);
   mocks.fitTerminal.mockReturnValue(null);
-  mocks.getTerminal.mockReturnValue(undefined);
   mocks.resizePty.mockResolvedValue(undefined);
   // 回帰テストが差し替えても、次のテストでは既定の vi.fn() 経由へ必ず戻す
   mocks.resizePtyImpl = (surfaceId: string, cols: number, rows: number) =>
@@ -146,7 +128,6 @@ afterEach(() => {
     root.unmount();
   });
   container.remove();
-  vi.unstubAllGlobals();
 });
 
 describe('TerminalPane（不変条件 A）', () => {
@@ -261,41 +242,14 @@ describe('TerminalPane（不変条件 C）', () => {
 });
 
 describe('TerminalPane（Important 1: 未起動 PTY への resize_pty を防ぐ門）', () => {
-  it('isStarted が false の初回マウントでは、start_session が解決するまで fitTerminal を呼ばない', async () => {
+  it('start_session が解決するまで fitTerminal を呼ばない', async () => {
+    // この層は attach を持たないので「マウント直後の fit」も持たない
+    // （再 attach 経路の門は TerminalGrid 側にある。TerminalGrid.test.tsx 参照）。
+    // ここに mount 時 fit を足し戻すと、attach 前に fit する経路が復活する
     mocks.isStarted.mockReturnValue(false);
-    // ensurePtySubscription を pending のまま止めて「マウント直後」の状態を固定する
     mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
 
     renderPane('s1');
-    await flush();
-
-    expect(mocks.fitTerminal).not.toHaveBeenCalled();
-  });
-
-  it('isStarted が true の再 attach（画面外にいる間の window resize 相当）ではマウント直後に fitTerminal を呼ぶ', async () => {
-    mocks.isStarted.mockReturnValue(true);
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-
-    renderPane('s1');
-    await flush();
-
-    expect(mocks.fitTerminal).toHaveBeenCalledTimes(1);
-  });
-
-  it('ResizeObserver 経路にも同じ門がある（isStarted が false の間は resize が来ても fitTerminal を呼ばない）', async () => {
-    mocks.isStarted.mockReturnValue(false); // pty://exit 後、まだ再起動していない状態を模す
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
-
-    renderPane('s1');
-    await flush();
-    expect(mocks.fitTerminal).not.toHaveBeenCalled(); // マウント時点（既存の門）
-
-    // ResizeObserver のコールバックを手動発火し、デバウンス（60ms）を実時間で待つ
-    FakeResizeObserver.callbacks.forEach((cb) => {
-      cb();
-    });
-    await new Promise((resolve) => setTimeout(resolve, 150));
     await flush();
 
     expect(mocks.fitTerminal).not.toHaveBeenCalled();
@@ -303,16 +257,14 @@ describe('TerminalPane（Important 1: 未起動 PTY への resize_pty を防ぐ�
 });
 
 describe('TerminalPane（Important 1: resize_pty の reject が unhandled rejection にならない・PR 10 fix round 2）', () => {
-  it('isStarted の門を通った resize_pty が reject しても unhandled rejection にならない', async () => {
+  it('start_session 解決後の resize_pty が reject しても unhandled rejection にならない', async () => {
     // resizePtyImpl を素の reject する関数へ挿げ替える（vi.fn() 越しでは検出できない。
     // mocks 定義側のコメント参照）
     mocks.resizePtyImpl = (): Promise<void> =>
       Promise.reject(new Error('NotFound: pty already exited'));
 
-    // markStarted 直後（start_session 未解決の in-flight）を模す。isStarted は
-    // 「起動済み」ではなく「start_session を投げ済み」の意味なので true になりうる
-    mocks.isStarted.mockReturnValue(true);
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
+    mocks.ensurePtySubscription.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(makeSession({ id: 's1' }));
     mocks.fitTerminal.mockReturnValue({ cols: 80, rows: 24 });
 
     const rejections: unknown[] = [];
@@ -322,7 +274,6 @@ describe('TerminalPane（Important 1: resize_pty の reject が unhandled reject
     process.on('unhandledRejection', onUnhandledRejection);
 
     try {
-      // isStarted=true なのでマウント直後の syncSize が走り resize_pty が飛ぶ
       renderPane('s1');
       await flush();
       // unhandledRejection はイベントループを最低 1 周させないと発火しない
@@ -332,74 +283,34 @@ describe('TerminalPane（Important 1: resize_pty の reject が unhandled reject
       process.off('unhandledRejection', onUnhandledRejection);
     }
 
+    expect(mocks.fitTerminal).toHaveBeenCalledWith('s1:agent');
     expect(rejections).toHaveLength(0);
   });
 });
 
-describe('TerminalPane（Critical: モーダル表示中は実シェルへ focus を渡さない）', () => {
-  it('modal が null なら getTerminal(surface).focus() を呼ぶ', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: null });
+// 契約 §85.6: フォーカスは `useActivePaneFocus` に統合され、この層はもう当てない
+// （src/views/TerminalView/useActivePaneFocus.test.tsx に移設した）。
+// registry モックに getTerminal を生やしていないので、実装がまだ focus() を
+// 呼んでいれば「関数ではない」で例外になり、退行の検出器として働く
 
-    renderPane('s1');
-    await flush();
-
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-
-  it('modal が開いていれば focus しない（実シェルへ打鍵が流れるのを防ぐ）', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: { kind: 'create_session' } });
-
-    renderPane('s1');
-    await flush();
-
-    expect(focus).not.toHaveBeenCalled();
-  });
-
-  it('モーダルを閉じると（再マウントなしで）フォーカスが戻る', async () => {
-    const focus = vi.fn();
-    mocks.getTerminal.mockReturnValue({ focus });
-    mocks.ensurePtySubscription.mockReturnValue(new Promise<void>(() => {}));
-    useAppStore.setState({ modal: { kind: 'create_session' } });
-
-    renderPane('s1');
-    await flush();
-    expect(focus).not.toHaveBeenCalled();
-
-    // TerminalPane を作り直すのではなく、購読しているストアの modal だけを更新する
-    // ——「マウント時に 1 度評価する」ではなく modal の遷移に追従することの検証
-    act(() => {
-      useAppStore.setState({ modal: null });
-    });
-    await flush();
-
-    expect(focus).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('TerminalPane（不変条件 F）', () => {
-  it('ペイン再割当で detachTerminal(旧 surface) が呼ばれ、disposeTerminal は呼ばれない', async () => {
+describe('TerminalPane（ペインの載せ替え）', () => {
+  it('sessionId が変わると新しいセッションを起動する（旧セッションは止めない）', async () => {
     mocks.ensurePtySubscription.mockResolvedValue(undefined);
     mocks.startSession.mockResolvedValue(makeSession({ id: 's1' }));
 
     renderPane('s1');
     await flush();
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s1:agent', expect.any(HTMLElement));
+    expect(mocks.startSession).toHaveBeenCalledWith('s1');
 
     act(() => {
       root.render(<TerminalPane sessionId="s2" />);
     });
     await flush();
 
-    expect(mocks.detachTerminal).toHaveBeenCalledWith('s1:agent');
-    expect(mocks.attachTerminal).toHaveBeenCalledWith('s2:agent', expect.any(HTMLElement));
-    // registry モックには disposeTerminal を生やしていない。実装が呼べば
-    // 「関数ではない」で例外になりテストが失敗する（このテスト自体が不変条件の検出器）
+    expect(mocks.ensurePtySubscription).toHaveBeenCalledWith('s2:agent');
+    expect(mocks.startSession).toHaveBeenCalledWith('s2');
+    // detach / dispose はこの層の責務ではない。registry モックに attachTerminal /
+    // detachTerminal / disposeTerminal を生やしていないので、呼べば例外になる
   });
 });
 
@@ -426,7 +337,7 @@ describe('TerminalPane（必達 7: StrictMode での冪等性）', () => {
     // 前提の確認: StrictMode で実際に effect が二重実行されていること。
     // ここが 1 回しかなければ、以下の start_session の assertion は弁別力ゼロなので
     // その場合はテストを失敗させて気づけるようにする
-    expect(mocks.attachTerminal.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mocks.ensurePtySubscription.mock.calls.length).toBeGreaterThanOrEqual(2);
 
     expect(mocks.startSession).toHaveBeenCalledTimes(1);
   });

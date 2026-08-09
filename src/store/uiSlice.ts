@@ -2,6 +2,7 @@ import type { StateCreator } from 'zustand';
 
 import type { AppError } from '../types/model';
 import type { AppStore } from './index';
+import { routeFocusReducer } from './paneLogic';
 
 /** 開いているモーダルの種類。M3-4 の Cmd+P で variant を追加する。 */
 export type ModalState = { kind: 'create_session' } | { kind: 'edit_session'; sessionId: string };
@@ -77,16 +78,19 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set) => (
 
   setView: (view) => set({ view }),
 
+  // routeFocusReducer（paneLogic.ts）へ委譲する。もう一方のペインに既に出ている
+  // 場合は割当を動かさず activePane だけ移し、それ以外は assignPaneReducer 経由で
+  // アクティブペインへ割り当てる（契約 §85.1 / §85.2）。
   focusSession: (sessionId, view = 'terminal') =>
     set((s) => {
-      // 別ペインに同じセッションが載っていたら外す（同一セッションの二重表示を防ぐ）
-      const other = s.activePane === 0 ? 1 : 0;
-      const paneAssignment: [string | null, string | null] = [...s.paneAssignment];
-      if (paneAssignment[other] === sessionId) {
-        paneAssignment[other] = null;
-      }
-      paneAssignment[s.activePane] = sessionId;
-      return { focusedSessionId: sessionId, paneAssignment, view };
+      const routed = routeFocusReducer(s, sessionId);
+      return {
+        layout: routed.layout,
+        paneAssignment: routed.paneAssignment,
+        activePane: routed.activePane,
+        focusedSessionId: sessionId,
+        view,
+      };
     }),
 
   modal: null,

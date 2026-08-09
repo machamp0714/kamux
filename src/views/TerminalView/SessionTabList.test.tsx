@@ -143,3 +143,67 @@ describe('SessionTabList のバッジ（契約 §25.5 / §38.3）', () => {
     expect(titleReads).toBe(1);
   });
 });
+
+describe('SessionTabList のペインバッジ（契約 §28.3）', () => {
+  function setTabs(): void {
+    useAppStore.setState({
+      sessions: { s1: session('s1'), s2: session('s2'), s3: session('s3') },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2', 's3'], review: [], done: [] },
+    });
+  }
+
+  function badgeOf(id: string): string | null {
+    const tab = container.querySelector(`[data-session-id="${id}"]`);
+    return tab?.querySelector('.kamux-tab__pane-badge')?.textContent ?? null;
+  }
+
+  function renderTabs(): void {
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionTabList />);
+    });
+  }
+
+  it('split2 では左ペインに L、右ペインに R を出す', () => {
+    setTabs();
+    useAppStore.setState({ layout: 'split2', paneAssignment: ['s1', 's2'], activePane: 0 });
+    renderTabs();
+
+    expect(badgeOf('s1')).toBe('L');
+    expect(badgeOf('s2')).toBe('R');
+    // どちらのペインにも出ていないセッションにはバッジを出さない
+    expect(badgeOf('s3')).toBeNull();
+  });
+
+  it('split2-v では上ペインに U、下ペインに D を出す（クラス名は変えない）', () => {
+    setTabs();
+    useAppStore.setState({ layout: 'split2-v', paneAssignment: ['s1', 's2'], activePane: 1 });
+    renderTabs();
+
+    expect(badgeOf('s1')).toBe('U');
+    expect(badgeOf('s2')).toBe('D');
+    expect(container.querySelectorAll('.kamux-tab__pane-badge')).toHaveLength(2);
+  });
+
+  it('single ではバッジを出さない（ペインの概念を見せない）', () => {
+    setTabs();
+    useAppStore.setState({ layout: 'single', paneAssignment: ['s1', 's2'], activePane: 0 });
+    renderTabs();
+
+    expect(container.querySelector('.kamux-tab__pane-badge')).toBeNull();
+  });
+
+  it('レイアウトを切り替えるとバッジの向きが追従する', () => {
+    setTabs();
+    useAppStore.setState({ layout: 'split2', paneAssignment: ['s1', 's2'], activePane: 0 });
+    renderTabs();
+    expect(badgeOf('s1')).toBe('L');
+
+    act(() => {
+      useAppStore.getState().setLayout('split2-v');
+    });
+
+    expect(badgeOf('s1')).toBe('U');
+    expect(badgeOf('s2')).toBe('D');
+  });
+});
