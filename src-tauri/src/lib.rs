@@ -431,7 +431,9 @@ pub fn run() {
 
     app.run(move |handle, event| {
         // Task 7 スパイク（M2-3 PR 19）: `RunEvent::Ready` を合図に
-        // 測定 2・3-b・4 と試行 C を行う。`kill_on_run_event_exit` は
+        // 測定 2・3-b・4、バッジ観測、試行 C の順で行う（修正ラウンド 3 で
+        // バッジ観測を測定 4 の直後・試行 C の前へ移した）。
+        // `kill_on_run_event_exit` は
         // これまでどおり全イベントで呼び続ける（2 本のテストがこれに依存する）。
         if matches!(event, tauri::RunEvent::Ready) && std::env::var("KAMUX_NOTIFY_SPIKE").is_ok() {
             let spike_handle = handle.clone();
@@ -472,8 +474,10 @@ fn sample_main_run_loop_is_waiting() -> (usize, usize, f64, String) {
 }
 
 /// Task 7 スパイク（M2-3 PR 19）: `RunEvent::Ready` 直後にバックグラウンド
-/// スレッドから呼ばれる。測定 2・3-b・4 と試行 C（`mac-usernotifications` の
-/// async API を 1 つの `block_on` の中で駆動する経路）を行う。
+/// スレッドから呼ばれる。測定 2・3-b・4、Dock バッジ観測、試行 C
+/// （`mac-usernotifications` の async API を 1 つの `block_on` の中で
+/// 駆動する経路）を、この順で行う（修正ラウンド 3 でバッジ観測を測定 4 の
+/// 直後・試行 C の前へ移した）。
 ///
 /// **測定 2・4 はこの関数の呼び出し元（バックグラウンドスレッド）から行うこと。**
 /// `Mainthread not running` を出していた当の述語
@@ -536,6 +540,9 @@ fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
     // まったく同じ方法で採る。**測定 2 と測定 4 の間に通知も許可ダイアログも
     // 出さない** —— どちらもメインランループを動かすので、定常状態が壊れる。
     // したがって request_auth も試行 C もこの測定より後に置く。
+    // **Dock バッジ（`set_badge_count`）も同じ理由でこの測定より後に置く**
+    // —— Dock を触る操作はメインランループを動かすので、測定 2・測定 4 の
+    // 前後に置くと定常状態が壊れる（修正ラウンド 3）。
     let until_steady = std::time::Duration::from_secs(10).saturating_sub(entered_at.elapsed());
     std::thread::sleep(until_steady);
     let (true_count, false_count, ratio, first20) = sample_main_run_loop_is_waiting();
@@ -543,6 +550,49 @@ fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
         "[MEASURE-4] steady(+10s) samples={SPIKE_SAMPLES} interval=2ms true={true_count} false={false_count} ratio={ratio:.2}"
     );
     println!("[MEASURE-4] steady(+10s) first20={first20}");
+
+    // 要検証 4-b（修正ラウンド 3）: Dock バッジ。**測定 4 の直後・試行 C の
+    // 前に置く** —— `set_badge_count` は Tauri の API であり
+    // `mac-usernotifications` を一切通らないので、通知経路の成否に一切
+    // 依存させない位置にできる。試行 C より前に出したので、この観測は
+    // そもそも通知経路（`request_auth_blocking` や `block_on`）を通る前に
+    // 終わっている。したがって「試行 C の成否と無関係に必ず実行する」という
+    // 目的は、後ろにあったとき（通知が落ちても到達する）よりも強い形で
+    // 満たされる。
+    use tauri::Manager;
+    if let Some(w) = handle.get_webview_window("main") {
+        match w.set_badge_count(Some(3)) {
+            Ok(()) => println!(
+                "[--] badge: window OPEN  (Some(3))  at ready+{} ms —— ここから 15 秒、Dock を見ること",
+                entered_at.elapsed().as_millis()
+            ),
+            Err(e) => println!(
+                "[NG] badge: set_badge_count(Some(3)) failed at ready+{} ms: {e}",
+                entered_at.elapsed().as_millis()
+            ),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        match w.set_badge_count(None) {
+            Ok(()) => println!(
+                "[--] badge: CLEARED (None)          at ready+{} ms —— ここから 5 秒、バッジ欄が空か（`0` が残っていないか）を見ること",
+                entered_at.elapsed().as_millis()
+            ),
+            Err(e) => println!(
+                "[NG] badge: set_badge_count(None) failed at ready+{} ms: {e}",
+                entered_at.elapsed().as_millis()
+            ),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!(
+            "[--] badge: window CLOSE            at ready+{} ms",
+            entered_at.elapsed().as_millis()
+        );
+    } else {
+        println!(
+            "[NG] badge: get_webview_window(\"main\") returned None —— \
+             MAIN_WINDOW_LABEL とウィンドウラベルの不一致を疑う分岐（手順書参照）"
+        );
+    }
 
     let granted = notify_rust::request_auth_blocking().unwrap_or(false);
     println!("[--] request_auth -> {granted}");
@@ -621,16 +671,6 @@ fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
         println!("[TRY-C] show -> failed: {e}");
     }
 
-    // 要検証 4-b: Dock バッジ。**試行 C の成否と無関係に必ず実行する** ——
-    // `set_badge_count` は Tauri の API であり `mac-usernotifications` を
-    // 一切通らないので、通知経路が落ちても独立に測れる。
-    use tauri::Manager;
-    if let Some(w) = handle.get_webview_window("main") {
-        let _ = w.set_badge_count(Some(3));
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let _ = w.set_badge_count(None);
-        println!("[--] badge: 3 を 3 秒表示したあと None で消した");
-    }
     println!("[OK] spike finished without hanging");
 }
 
