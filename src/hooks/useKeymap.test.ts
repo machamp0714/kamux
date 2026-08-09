@@ -128,6 +128,84 @@ describe('handleKeymapKeyDown', () => {
     expect(jEvent.defaultPrevented).toBe(false);
     expect(kEvent.defaultPrevented).toBe(false);
   });
+
+  it('ターミナル画面での Cmd+[ は preventDefault し、setActivePane(0) を呼ぶ', () => {
+    const setActivePane = vi.fn();
+    useAppStore.setState({ view: 'terminal', setActivePane });
+    const event = dispatch({ key: '[', metaKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(setActivePane).toHaveBeenCalledWith(0);
+  });
+
+  it('ターミナル画面での Cmd+] は preventDefault し、setActivePane(1) を呼ぶ', () => {
+    const setActivePane = vi.fn();
+    useAppStore.setState({ view: 'terminal', setActivePane });
+    const event = dispatch({ key: ']', metaKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(setActivePane).toHaveBeenCalledWith(1);
+  });
+
+  it('WKWebView に奪われた場合のフォールバック Cmd+Alt+← / Cmd+Alt+→ も同じアクションを呼ぶ', () => {
+    const setActivePane = vi.fn();
+    useAppStore.setState({ view: 'terminal', setActivePane });
+    dispatch({ key: 'ArrowLeft', metaKey: true, altKey: true });
+    expect(setActivePane).toHaveBeenCalledWith(0);
+    dispatch({ key: 'ArrowRight', metaKey: true, altKey: true });
+    expect(setActivePane).toHaveBeenCalledWith(1);
+  });
+
+  it('カンバン画面では Cmd+[ / Cmd+] を無視する（setActivePane を呼ばず、preventDefault もしない）', () => {
+    const setActivePane = vi.fn();
+    useAppStore.setState({ view: 'kanban', setActivePane });
+    const leftEvent = dispatch({ key: '[', metaKey: true });
+    const rightEvent = dispatch({ key: ']', metaKey: true });
+    expect(setActivePane).not.toHaveBeenCalled();
+    expect(leftEvent.defaultPrevented).toBe(false);
+    expect(rightEvent.defaultPrevented).toBe(false);
+  });
+
+  it('ターミナル画面での Cmd+D は preventDefault し、setLayout に nextLayout(layout) の結果を渡す（single → split2）', () => {
+    const setLayout = vi.fn();
+    useAppStore.setState({ view: 'terminal', layout: 'single', setLayout });
+    const event = dispatch({ key: 'd', metaKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(setLayout).toHaveBeenCalledWith('split2');
+  });
+
+  it('ターミナル画面での Cmd+D は 3 値サイクルの次の値を渡す（split2 → split2-v）', () => {
+    const setLayout = vi.fn();
+    useAppStore.setState({ view: 'terminal', layout: 'split2', setLayout });
+    dispatch({ key: 'd', metaKey: true });
+    expect(setLayout).toHaveBeenCalledWith('split2-v');
+  });
+
+  it('カンバン画面では Cmd+D を無視する（setLayout を呼ばず、preventDefault もしない）', () => {
+    const setLayout = vi.fn();
+    useAppStore.setState({ view: 'kanban', layout: 'single', setLayout });
+    const event = dispatch({ key: 'd', metaKey: true });
+    expect(setLayout).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('エディタ画面では Cmd+D を無視する（契約 §11.4.2: view 条件は terminal のみ）', () => {
+    const setLayout = vi.fn();
+    useAppStore.setState({ view: 'editor', layout: 'single', setLayout });
+    const event = dispatch({ key: 'd', metaKey: true });
+    expect(setLayout).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it('ターミナル画面での Ctrl+Cmd+D / Ctrl+Cmd+[ は無視する（preventDefault せず、アプリが消費しない。契約 §97.2）', () => {
+    const setLayout = vi.fn();
+    const setActivePane = vi.fn();
+    useAppStore.setState({ view: 'terminal', layout: 'single', setLayout, setActivePane });
+    const dEvent = dispatch({ key: 'd', metaKey: true, ctrlKey: true });
+    const bracketEvent = dispatch({ key: '[', metaKey: true, ctrlKey: true });
+    expect(setLayout).not.toHaveBeenCalled();
+    expect(setActivePane).not.toHaveBeenCalled();
+    expect(dEvent.defaultPrevented).toBe(false);
+    expect(bracketEvent.defaultPrevented).toBe(false);
+  });
 });
 
 describe('useKeymap（実フックとして window リスナを 1 本だけ張る。契約 §11.3-1）', () => {

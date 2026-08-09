@@ -1,7 +1,7 @@
 // 契約 §28.1: Layout の正典は src/types/model.ts。ここでは import して再エクスポートする
 // （types/model.ts が TerminalWorkspace で Layout を使うため、ここに定義すると
 //  types → store の逆向き依存になる）
-import type { Layout } from '../types/model';
+import { surfaceId, type Layout } from '../types/model';
 export type { Layout };
 
 /**
@@ -152,4 +152,44 @@ export function routeFocusReducer(s: PaneState, sessionId: string): PaneState {
   }
 
   return assignPaneReducer(s, s.activePane, sessionId);
+}
+
+/**
+ * 画面に出ている agent サーフェスの一覧（左ペイン → 右ペインの順）。
+ * attach 対象・fit 対象・resize_pty 対象はすべてこの集合と一致する。
+ * editor サーフェスは M3-1 の管轄なのでここでは決して返さない。
+ */
+export function visibleAgentSurfaces(s: PaneState): string[] {
+  return visiblePanes(s)
+    .map((pane) => s.paneAssignment[pane])
+    .filter((id): id is string => id !== null)
+    .map((id) => surfaceId(id, 'agent'));
+}
+
+/**
+ * 表示集合から外れたサーフェス = detachTerminal すべきもの。
+ * 左右スワップでは prev と next が同じ集合になるので空配列になり、
+ * attachTerminal の付け替え保証（契約 §16）だけで完結する（設計 §3.9）。
+ *
+ * prev / next は「集合」として扱う。順序には意味が無いので、
+ * index ごとの比較に「最適化」してはならない（スワップが誤検知される）。
+ */
+export function surfacesToDetach(prev: string[], next: string[]): string[] {
+  return prev.filter((sid) => !next.includes(sid));
+}
+
+/**
+ * タブ列に出す「このセッションはどのペインに出ているか」のバッジ（契約 §28.3）。
+ * 左右分割なら L / R、上下分割なら U（Upper）/ D（Down）。
+ * 日本語 1 文字（上 / 下）は使わない —— タブは横幅が狭く L / R と字幅が揃わない。
+ *
+ * activePane は読まない。バッジは「どのペインに出ているか」であって
+ * 「どちらがアクティブか」ではない（後者はタブの aria-selected が表す）。
+ */
+export function paneBadgeFor(s: PaneState, sessionId: string): 'L' | 'R' | 'U' | 'D' | null {
+  if (!isSplit(s.layout)) return null;
+  const [a, b] = s.layout === 'split2' ? (['L', 'R'] as const) : (['U', 'D'] as const);
+  if (s.paneAssignment[0] === sessionId) return a;
+  if (s.paneAssignment[1] === sessionId) return b;
+  return null;
 }
