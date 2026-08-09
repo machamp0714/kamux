@@ -430,8 +430,8 @@ pub fn run() {
         .expect("failed to build kamux");
 
     app.run(move |handle, event| {
-        // Task 7 修正ラウンド 1（M2-3 PR 19）: `RunEvent::Ready` を合図に
-        // 測定 2・3-b と試行 A・B を行う。`kill_on_run_event_exit` は
+        // Task 7 スパイク（M2-3 PR 19）: `RunEvent::Ready` を合図に
+        // 測定 2・3-b・4 と試行 C を行う。`kill_on_run_event_exit` は
         // これまでどおり全イベントで呼び続ける（2 本のテストがこれに依存する）。
         if matches!(event, tauri::RunEvent::Ready) && std::env::var("KAMUX_NOTIFY_SPIKE").is_ok() {
             let spike_handle = handle.clone();
@@ -441,137 +441,195 @@ pub fn run() {
     });
 }
 
-/// Task 7 修正ラウンド 1（M2-3 PR 19）: `RunEvent::Ready` 直後にバックグラウンド
-/// スレッドから呼ばれる。測定 2・3-b と試行 A・B（`mac-usernotifications` の
-/// `block_on_current` がどちらの枝を通るかの実地確認）を行う。
-///
-/// **測定 2 はこの関数の呼び出し元（バックグラウンドスレッド）から行うこと。**
-/// `Mainthread not running` を出している当の述語
-/// (`mac-usernotifications-0.3.1::block_on_current` -> `main_run_loop_is_running`)
-/// がバックグラウンドスレッドから `CFRunLoop::main().is_waiting()` を評価して
-/// いるため、メインスレッドから測ると測定コード自身の実行によって
-/// `is_waiting` がほぼ常に false になり、別の量を測ることになる。
-///
-/// **測定 2・3-b が使う `CFRunLoop::main().is_some_and(|rl| rl.is_waiting())` は、
-/// `mac-usernotifications` **0.3.1** の `main_run_loop_is_running()`
-/// （`pub(crate)` でクレート外から呼べないため再構成した。
-/// `src/lib.rs:232-234`）の再構成であって、述語そのものではない。**
-/// **0.3.1 の式であり、他の版は測っていない。** 上流が式を変えたら、
-/// この測定は古い述語を測ったことになる。
-///
-/// 測定コード（`[MEASURE-*]` を出す部分）は測定であって守りではない。
-/// Task 10 の本番配線ではこの関数ごと消す。
-fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
-    // 測定 3-b: バックグラウンドスレッドなので false のはず。
-    let marker_on_thread = objc2::MainThreadMarker::new().is_some();
-    println!("[MEASURE-3b] spawned thread:      main_thread_marker_is_some = {marker_on_thread}");
+/// `[MEASURE-2]` / `[MEASURE-4]` が使うサンプル数。
+const SPIKE_SAMPLES: usize = 100;
 
-    // 測定 2: Ready 直後から 100 回、2ms 間隔で is_waiting をサンプリングする。
-    // 間隔の sleep は測定のためであり許される（下の試行 A/B には壁時計 sleep
-    // を入れない）。生の列も出す —— 比率だけだと分布（振動しているか、
-    // 一貫して false か）が消える。
-    const SAMPLES: usize = 100;
-    let mut samples = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
+/// `CFRunLoop::main().is_waiting()` を [`SPIKE_SAMPLES`] 回、2 ms 間隔で採る。
+///
+/// 測定 2 と測定 4 は「同じ方法で採った 2 時点の比較」でなければ意味が無い
+/// （片方だけ間隔やサンプル数が違うと、差が状態の差なのか手法の差なのか
+/// 分からなくなる）。同一性を目視ではなくコードで保証するために括ってある。
+///
+/// 戻り値は `(true の数, false の数, 比, 先頭 20 サンプルの t/f 列)`。
+/// 印字は呼び側が行う（ラベルが測定ごとに違うため）。
+fn sample_main_run_loop_is_waiting() -> (usize, usize, f64, String) {
+    let mut samples = Vec::with_capacity(SPIKE_SAMPLES);
+    for _ in 0..SPIKE_SAMPLES {
         let waiting = objc2_core_foundation::CFRunLoop::main().is_some_and(|rl| rl.is_waiting());
         samples.push(waiting);
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     let true_count = samples.iter().filter(|&&b| b).count();
-    let false_count = SAMPLES - true_count;
-    let ratio = true_count as f64 / SAMPLES as f64;
-    println!(
-        "[MEASURE-2] samples={SAMPLES} interval=2ms true={true_count} false={false_count} ratio={ratio:.2}"
-    );
+    let false_count = SPIKE_SAMPLES - true_count;
+    let ratio = true_count as f64 / SPIKE_SAMPLES as f64;
     let first20 = samples
         .iter()
         .take(20)
         .map(|b| if *b { "t" } else { "f" })
         .collect::<Vec<&str>>()
         .join(",");
+    (true_count, false_count, ratio, first20)
+}
+
+/// Task 7 スパイク（M2-3 PR 19）: `RunEvent::Ready` 直後にバックグラウンド
+/// スレッドから呼ばれる。測定 2・3-b・4 と試行 C（`mac-usernotifications` の
+/// async API を 1 つの `block_on` の中で駆動する経路）を行う。
+///
+/// **測定 2・4 はこの関数の呼び出し元（バックグラウンドスレッド）から行うこと。**
+/// `Mainthread not running` を出していた当の述語
+/// (`mac-usernotifications-0.3.1::block_on_current` -> `main_run_loop_is_running`)
+/// がバックグラウンドスレッドから `CFRunLoop::main().is_waiting()` を評価して
+/// いるため、メインスレッドから測ると測定コード自身の実行によって
+/// `is_waiting` がほぼ常に false になり、別の量を測ることになる。
+///
+/// **測定 2・3-b・4 が使う `CFRunLoop::main().is_some_and(|rl| rl.is_waiting())` は、
+/// `mac-usernotifications` **0.3.1** の `main_run_loop_is_running()`
+/// （`pub(crate)` でクレート外から呼べないため再構成した。
+/// `src/lib.rs:232-234`）の再構成であって、述語そのものではない。**
+/// **0.3.1 の式であり、他の版は測っていない。** 上流が式を変えたら、
+/// この測定は古い述語を測ったことになる。
+///
+/// # 試行 C が `is_waiting` を評価しないこと
+///
+/// 試行 C は `mac_usernotifications::block_on`（= `futures_lite::future::block_on`
+/// の再エクスポート。`src/lib.rs:157`）で `Notification::send()` と
+/// `NotificationHandle::response()` を直接駆動する。**`block_on_current`
+/// （`src/lib.rs:214-224`）を通らないので、`is_waiting` も `MainThreadMarker`
+/// も評価されない。競合を避けているのではなく、競合が表現できなくなっている。**
+/// 根拠は crate 自身の doc（`mac-usernotifications-0.3.1/src/lib.rs:56-59`）:
+/// 「GUI apps (`AppKit` / `SwiftUI` / `Tauri`) … The framework drives the main
+/// run loop automatically. `send`, `send_blocking`, and `response().await` all
+/// work from any thread without extra setup.」
+///
+/// `block_on` はこの関数を走らせているバックグラウンドスレッドを park する
+/// だけであり、メインスレッドは一切ブロックしない。
+///
+/// # ポーリングに入らないこと（契約 §0）
+///
+/// この通知にはアクションボタンを付けていないので `has_actions = false` だが、
+/// **`timeout` を設定しているため `response()` は timeout 分岐に入り、
+/// `poll_until_dismissed` の 500 ms ポーリングには入らない**
+/// （`mac-usernotifications-0.3.1/src/send.rs:91-108`）。
+///
+/// # 測定は測定であって守りではない
+///
+/// 測定 4 の 10 秒待ちは「何かが整うのを待つ守り」ではなく、
+/// **「定常状態」を定義する測定パラメータ**である。サンプリング間隔の 2 ms も
+/// 同様に測定であって守りではない。
+/// **`[MEASURE-*]` を出す部分も含め、Task 10 の本番配線ではこの関数ごと消す。**
+fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
+    let entered_at = std::time::Instant::now();
+
+    // 測定 3-b: バックグラウンドスレッドなので false のはず。
+    let marker_on_thread = objc2::MainThreadMarker::new().is_some();
+    println!("[MEASURE-3b] spawned thread:      main_thread_marker_is_some = {marker_on_thread}");
+
+    // 測定 2: Ready 直後の is_waiting の分布。生の列も出す —— 比率だけだと
+    // 分布（振動しているか、一貫して false か）が消える。
+    let (true_count, false_count, ratio, first20) = sample_main_run_loop_is_waiting();
+    println!(
+        "[MEASURE-2] samples={SPIKE_SAMPLES} interval=2ms true={true_count} false={false_count} ratio={ratio:.2}"
+    );
     println!("[MEASURE-2] first20={first20}");
+
+    // 測定 4: 定常状態（Ready から 10 秒後）の is_waiting の分布を、測定 2 と
+    // まったく同じ方法で採る。**測定 2 と測定 4 の間に通知も許可ダイアログも
+    // 出さない** —— どちらもメインランループを動かすので、定常状態が壊れる。
+    // したがって request_auth も試行 C もこの測定より後に置く。
+    let until_steady = std::time::Duration::from_secs(10).saturating_sub(entered_at.elapsed());
+    std::thread::sleep(until_steady);
+    let (true_count, false_count, ratio, first20) = sample_main_run_loop_is_waiting();
+    println!(
+        "[MEASURE-4] steady(+10s) samples={SPIKE_SAMPLES} interval=2ms true={true_count} false={false_count} ratio={ratio:.2}"
+    );
+    println!("[MEASURE-4] steady(+10s) first20={first20}");
 
     let granted = notify_rust::request_auth_blocking().unwrap_or(false);
     println!("[--] request_auth -> {granted}");
 
-    // 試行 A: そのまま show()。
-    let want_id_a = "kamux-session-spike-a".to_string();
-    let mut n_a = notify_rust::Notification::new();
-    n_a.summary("A: 入力待ち")
-        .body("kamux · session/spike (A: そのまま show)")
-        .id(notify_rust::NotificationId::Mac(want_id_a.clone()))
-        .timeout(notify_rust::Timeout::Milliseconds(30_000));
-    let a_handle = match n_a.show() {
-        Ok(h) => {
-            println!("[TRY-A] show -> ok id={want_id_a}");
-            match h.id() {
-                notify_rust::NotificationId::Mac(ref got) if *got == want_id_a => {
-                    println!("[OK] notification id round-trips: {got}")
-                }
-                other => println!("[NG] notification id was rewritten: {other:?}"),
-            }
-            Some(h)
-        }
-        Err(e) => {
-            println!("[TRY-A] show -> failed: {e}");
-            None
-        }
-    };
-
-    // 試行 B: run_on_main_thread 経由で show()。
-    // A の成否に関わらず必ず試す —— ゲートは 1 回しか回らない。
-    // B の中では wait_for_response を呼ばない（メインスレッドを 30 秒
-    // ブロックして UI が固まる。見たいのは show() が通るかだけなので、
-    // 返ったハンドルはそのまま drop する）。
+    // 試行 C: 唯一のバナー。1 つの block_on の中で send -> delivered 問い合わせ
+    // -> response -> delivered 再問い合わせ まで閉じる。
     //
-    // A の `wait_for_response`（最大 30 秒ブロック）より先に済ませることで、
-    // B の通知が A の陰で 30 秒以上遅れて出るのを避ける。
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let run_result = handle.run_on_main_thread(move || {
-        let marker_inside = objc2::MainThreadMarker::new().is_some();
-        let want_id_b = "kamux-session-spike-b".to_string();
-        let mut n_b = notify_rust::Notification::new();
-        n_b.summary("B: 入力待ち")
-            .body("kamux · session/spike (B: run_on_main_thread)")
-            .id(notify_rust::NotificationId::Mac(want_id_b.clone()))
-            .timeout(notify_rust::Timeout::Milliseconds(30_000));
-        // ハンドルは drop する（上のコメントのとおり）。
-        let show_result = match n_b.show() {
-            Ok(_h) => format!("[TRY-B] show -> ok id={want_id_b}"),
-            Err(e) => format!("[TRY-B] show -> failed: {e}"),
-        };
-        let _ = tx.send(format!(
-            "[TRY-B] main_thread_marker_is_some_inside = {marker_inside}\n{show_result}"
-        ));
-    });
-    match run_result {
-        Ok(()) => match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(msg) => println!("{msg}"),
-            Err(e) => println!("[NG] TRY-B result channel: {e}"),
+    // `?` が脱出するのは `send().await` だけである（delivered 問い合わせは
+    // infallible、response の失敗は内側の match で `[NG] response failed` に
+    // 留める）。したがって外側の `Err` は send の失敗と 1 対 1 に対応する。
+    let elapsed_base = std::time::Instant::now();
+    let c_result: Result<(), mac_usernotifications::Error> = mac_usernotifications::block_on(
+        async {
+            let handle = mac_usernotifications::Notification::new()
+                .title("入力待ち")
+                .message("kamux · session/spike")
+                .id("kamux-session-spike")
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await?;
+            // response() は handle を消費するので、id は先に束ねておく。
+            let id = handle.notification_id().to_string();
+            println!("[TRY-C] show -> ok id={id}");
+
+            // 項目 3（送出直後）: macOS の deliveredNotifications に自分の id が
+            // 現れるか。`handle.notification_id()` は自前で作った文字列を返す
+            // だけなので、それ自体は往復の証拠にならない
+            // （`send.rs:344-366` の `request_id`）。deliveredNotifications は
+            // UNUserNotificationCenter への問い合わせなので、これが実測になる。
+            // **response() は handle を消費するので、この問い合わせは必ず
+            // response() の前に行う。**
+            let delivered = mac_usernotifications::get_delivered_notification_ids().await;
+            let contains = delivered.contains(&id);
+            println!("[--] delivered_after_send contains={contains} ids={delivered:?}");
+            if contains {
+                println!("[OK] notification id observed in deliveredNotifications: {id}");
+            } else {
+                println!("[NG] notification id NOT in deliveredNotifications: {id}");
+            }
+
+            // 項目 4/5: 応答（クリック）または 30 秒タイムアウト。
+            match handle.response().await {
+                Ok(resp) => {
+                    println!("[--] response = {resp:?}");
+                    println!(
+                        "[--] flags: is_default_action={} is_dismiss_action={} is_timed_out={} action_identifier={:?}",
+                        resp.is_default_action(),
+                        resp.is_dismiss_action(),
+                        resp.is_timed_out(),
+                        resp.action_identifier
+                    );
+                    println!(
+                        "[--] elapsed_since_show = {} ms",
+                        elapsed_base.elapsed().as_millis()
+                    );
+                }
+                Err(e) => println!("[NG] response failed: {e}"),
+            }
+
+            // 項目 3（解決後）: timeout 分岐は close_delivered(id) を呼んでから
+            // timed_out を返す（`send.rs:96-101`）。したがって解決後に id が
+            // 消えていることが、§5.3 の dismiss（close_delivered）が id で効く
+            // ことの実測になる。
+            let delivered = mac_usernotifications::get_delivered_notification_ids().await;
+            let contains = delivered.contains(&id);
+            println!("[--] delivered_after_response contains={contains} ids={delivered:?}");
+            if contains {
+                println!("[NG] id still delivered after resolution: {id}");
+            } else {
+                println!("[OK] close_delivered removed the id: {id}");
+            }
+            Ok(())
         },
-        Err(e) => println!("[NG] run_on_main_thread failed: {e}"),
+    );
+    if let Err(e) = c_result {
+        println!("[TRY-C] show -> failed: {e}");
     }
 
-    // 試行 A が成功していれば、これまでどおり id 往復に続けて
-    // wait_for_response / Dock バッジの観測を続ける。B の後に置くことで
-    // B の通知が A の 30 秒ブロックに巻き込まれない。
-    if let Some(h) = a_handle {
-        let r = h.wait_for_response(|resp: &notify_rust::NotificationResponse| {
-            println!(
-                "[--] response = {resp:?} (is_default_action = {})",
-                resp.is_default_action()
-            );
-        });
-        println!("[--] wait_for_response returned: {r:?}");
-
-        // 要検証 4-b: Dock バッジ
-        use tauri::Manager;
-        if let Some(w) = handle.get_webview_window("main") {
-            let _ = w.set_badge_count(Some(3));
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            let _ = w.set_badge_count(None);
-            println!("[--] badge: 3 を 3 秒表示したあと None で消した");
-        }
+    // 要検証 4-b: Dock バッジ。**試行 C の成否と無関係に必ず実行する** ——
+    // `set_badge_count` は Tauri の API であり `mac-usernotifications` を
+    // 一切通らないので、通知経路が落ちても独立に測れる。
+    use tauri::Manager;
+    if let Some(w) = handle.get_webview_window("main") {
+        let _ = w.set_badge_count(Some(3));
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = w.set_badge_count(None);
+        println!("[--] badge: 3 を 3 秒表示したあと None で消した");
     }
     println!("[OK] spike finished without hanging");
 }
