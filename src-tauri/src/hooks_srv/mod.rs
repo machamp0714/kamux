@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use crate::error::{AppError, AppResult};
 
+pub mod handler;
 pub mod payload;
 
+pub use handler::HookHandler;
 pub use payload::{parse_hook_event, HookEnvelope, HookEvent, HookKind, WireMessage};
 
 /// macOS の sockaddr_un.sun_path は 104 バイト。
