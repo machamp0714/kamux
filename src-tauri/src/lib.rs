@@ -348,6 +348,9 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         store,
         pty: pty::PtyManager::new(),
         runtime,
+        // Task 13 が hooks ブートストラップを足すまでは常に None（契約 §84.6.2 の
+        // 3 箇所目のうち、値を渡す配線自体は Task 13 の担当。ここはフィールドの追加のみ）。
+        hooks: None,
     });
 }
 

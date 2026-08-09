@@ -383,6 +383,7 @@ pub(crate) fn fetch_session(conn: &rusqlite::Connection, id: &str) -> AppResult<
 
 #[cfg(test)]
 mod tests {
+    use crate::error::AppError;
     use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode, SessionPatch};
     use crate::store::session_dao::{row_to_session, SESSION_COLUMNS};
     use crate::store::test_support::{insert_test_session, open_temp};
@@ -1265,6 +1266,18 @@ mod tests {
                 .claude_session_id
                 .as_deref(),
             Some("cc-2")
+        );
+    }
+
+    #[test]
+    fn setting_claude_session_id_for_unknown_session_is_not_found() {
+        let (_dir, store) = open_temp();
+        let err = store
+            .set_claude_session_id("no-such-session", "x")
+            .expect_err("must fail");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "unexpected error: {err:?}"
         );
     }
 

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
+use crate::hooks_srv::HooksRuntime;
 use crate::model::{CliKind, Session};
 use crate::pty::launch_env::LaunchEnv;
 
@@ -122,6 +123,124 @@ pub fn resolve_cwd(session: &Session, repo_path: &str) -> PathBuf {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(repo_path),
     }
+}
+
+/// kamux が購読する hook イベント（契約 §12.4）。
+///
+/// `PermissionRequest` は「ユーザーの承認待ち」の最も直接的な信号なので
+/// `Notification` と併せて必ず登録する。
+/// `PermissionDenied` は対応する runtime_state が契約 §2 に無いため登録しない
+/// （§83.6.1 / §84.5）。
+pub const HOOK_EVENTS: [&str; 4] = ["SessionStart", "Notification", "PermissionRequest", "Stop"];
+
+/// hook 1 個あたりの制限時間（秒）。既定の 600 秒でぶら下がるのを避ける。
+pub const HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// hook の command は sh -c 経由で実行される。パスに空白が含まれても壊れないよう包む。
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `--settings` に渡す JSON を組み立てる（設計 §4）。
+///
+/// 契約 §12.2: この設定はユーザーの settings.json を**置換しない**。マージされる。
+/// ユーザー自身の Stop / Notification hook も同時に発火する前提で、
+/// kamux 側の hook は副作用のない転送だけを行う。
+pub fn build_hook_settings(relay_bin: &Path) -> serde_json::Value {
+    let quoted = shell_single_quote(&relay_bin.to_string_lossy());
+
+    let mut hooks = serde_json::Map::new();
+    for event in HOOK_EVENTS {
+        hooks.insert(
+            event.to_string(),
+            serde_json::json!([{
+                "hooks": [{
+                    "type": "command",
+                    // hook 種別を argv 第 1 引数で渡す（契約 §84.1）。
+                    "command": format!("{quoted} {event}"),
+                    "timeout": HOOK_TIMEOUT_SECS,
+                }]
+            }]),
+        );
+    }
+
+    serde_json::json!({ "hooks": serde_json::Value::Object(hooks) })
+}
+
+/// settings JSON をファイルへ書く。アプリ起動につき 1 回。
+pub fn write_hook_settings_file(path: &Path, relay_bin: &Path) -> AppResult<()> {
+    let text = serde_json::to_string_pretty(&build_hook_settings(relay_bin))
+        .map_err(|e| AppError::Io(format!("failed to serialize hook settings: {e}")))?;
+    std::fs::write(path, text).map_err(|e| {
+        AppError::Io(format!(
+            "failed to write hook settings {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// 契約 §12.1: リレーは KAMUX_SESSION_ID で自セッションを識別する。
+pub const ENV_SESSION_ID: &str = "KAMUX_SESSION_ID";
+/// 契約への追加提案 B: relay はアプリの pid を知らないのでソケットパスを env で受け取る。
+pub const ENV_HOOKS_SOCK: &str = "KAMUX_HOOKS_SOCK";
+
+/// claude の argv に足す hooks 引数。
+///
+/// `--settings` はここでは `Command::arg` 経由(cmd.arg)で子プロセスへ渡り、
+/// シェルを経由しないので、パスに空白や `'` が含まれてもクォートは不要かつ
+/// 有害である(§60.6.1 の `PtySurface::spawn` が `CommandBuilder::arg` で
+/// argv 要素を 1 つずつ積む。`spec.args` の各要素は execve の argv[i] になる)。
+pub fn claude_hook_args(hooks: Option<&HooksRuntime>) -> Vec<String> {
+    match hooks {
+        Some(h) => vec![
+            "--settings".to_string(),
+            h.settings_path.to_string_lossy().into_owned(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// PTY spawn 時に注入する環境変数。
+/// 契約 §12.3 のとおり hook プロセスへ完全継承される。
+///
+/// **`KAMUX_SESSION_ID` は返さない**（契約 §102.3）。所有者は `build_launch_command`
+/// であり、この関数を第 1 引数の `kamux_session_id` ごと落とすことで、対を返す実装を
+/// 構造的に書けなくしてある。引数を残して散文で禁じる形は採らない
+/// （§102.3 の却下記録）。
+pub fn hook_env_vars(hooks: Option<&HooksRuntime>) -> Vec<(String, String)> {
+    match hooks {
+        Some(h) => vec![(
+            ENV_HOOKS_SOCK.to_string(),
+            h.socket_path.to_string_lossy().into_owned(),
+        )],
+        None => Vec::new(),
+    }
+}
+
+/// `build_launch_command` が組み立てた結果に hooks 由来の値を重ねる。**argv と env で
+/// 射程が違う**（契約 §30.2）。
+///
+/// - **argv（`--settings`）は `cli_kind == Claude` 限定。** claude 専用フラグであり、
+///   §30.2 の env 表は argv を射程にしていない
+/// - **env（`KAMUX_HOOKS_SOCK`）は全 `cli_kind` 共通**（§30.2 / §31.2 の既往ドリフト訂正）。
+///   shell のスクラッチ端末から手で起動した claude の hook も relay に届く必要があるため、
+///   `cli_kind` で絞ってはならない
+///
+/// `build_launch_command` 自身のシグネチャは変えない（契約 §23 / §30.2.1）——
+/// 5 引数のままでは `HooksRuntime` に辿り着けないため、この関数を後段の合流点として
+/// 1 箇所に閉じる（§31.4 の「呼び出し側は値を組み立てず、`hook_env_vars` の結果を
+/// 合流させるだけ」）。`KAMUX_SESSION_ID` はここでは足さない —— 所有は
+/// `build_launch_command` である（§102.3）。
+pub fn apply_hooks(
+    session: &Session,
+    mut cmd: LaunchCommand,
+    hooks: Option<&HooksRuntime>,
+) -> LaunchCommand {
+    if session.cli_kind == CliKind::Claude {
+        cmd.args.extend(claude_hook_args(hooks));
+    }
+    cmd.env.extend(hook_env_vars(hooks));
+    cmd
 }
 
 #[cfg(test)]
@@ -607,5 +726,314 @@ pub(crate) mod tests {
             Some("ja_JP.UTF-8".to_string()),
             "空 LANG は日本語ファイル名を化けさせる"
         );
+    }
+
+    // ---- Task 9: --settings に渡す hooks 設定 JSON の生成（契約 §12.2 / §12.4） ----
+
+    #[test]
+    fn quotes_plain_paths() {
+        assert_eq!(
+            shell_single_quote("/usr/local/bin/kamux-relay"),
+            "'/usr/local/bin/kamux-relay'"
+        );
+    }
+
+    #[test]
+    fn quotes_paths_with_spaces() {
+        assert_eq!(
+            shell_single_quote("/Applications/My App.app/Contents/MacOS/kamux-relay"),
+            "'/Applications/My App.app/Contents/MacOS/kamux-relay'"
+        );
+    }
+
+    #[test]
+    fn escapes_embedded_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/tmp/it's/relay"),
+            r#"'/tmp/it'\''s/relay'"#
+        );
+    }
+
+    #[test]
+    fn builds_settings_for_the_four_hook_events() {
+        let v = build_hook_settings(Path::new("/opt/kamux/kamux-relay"));
+
+        let hooks = v["hooks"].as_object().expect("hooks object");
+        assert_eq!(
+            hooks.len(),
+            4,
+            "SessionStart / Notification / PermissionRequest / Stop"
+        );
+        // 契約 §12.4: PermissionRequest は waiting_input の最も直接的な信号なので必須。
+        // このキー名が実際に有効かは未確認（表 #13b）。Task 17 Step 4 が発火で検証する。
+        assert!(hooks.contains_key("PermissionRequest"));
+        // PermissionDenied は登録しない（対応する runtime_state が無い。契約 §83.6.1 / §84.5）
+        assert!(!hooks.contains_key("PermissionDenied"));
+
+        // イベント名は HOOK_EVENTS から再導出せず、契約 §12.4 / §83.6.1 / §84.5 の
+        // 4 値をリテラルで固定する。production の HOOK_EVENTS 配列を変異させても、
+        // ここが道連れで変異すると検出力を失う（契約 §90.2 のフィクスチャ規律）。
+        for event in ["SessionStart", "Notification", "PermissionRequest", "Stop"] {
+            let entries = hooks[event].as_array().expect("array of matcher groups");
+            assert_eq!(entries.len(), 1);
+            // matcher は書かない（設計 §4 / 未確認事実 #11）
+            assert!(
+                entries[0].get("matcher").is_none(),
+                "{event} must not carry a matcher"
+            );
+
+            let inner = entries[0]["hooks"].as_array().expect("array of hooks");
+            assert_eq!(inner.len(), 1);
+            assert_eq!(inner[0]["type"], "command");
+            assert_eq!(
+                inner[0]["command"],
+                format!("'/opt/kamux/kamux-relay' {event}")
+            );
+            assert_eq!(inner[0]["timeout"], 5);
+        }
+    }
+
+    #[test]
+    fn settings_json_is_written_to_disk_and_reparses() {
+        let path =
+            std::env::temp_dir().join(format!("kamux-settings-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        write_hook_settings_file(&path, Path::new("/opt/kamux/kamux-relay")).expect("write");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "'/opt/kamux/kamux-relay' Stop"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Task 10: claude の argv と環境変数への hooks 注入（契約 §12.1 / §61.2） ----
+
+    /// フィクスチャのパスは意図的に空白と `'` を含む
+    /// （`claude_hook_args` / `hook_env_vars` の doc コメントが「シェルを経由しないため
+    /// 空白や `'` を含んでもクォート不要かつ有害」と主張しており、その主張を検査するため。
+    /// フィックス対象レビュー指摘: `cli_args.rs` Task 10 fix round 1）。
+    fn fake_runtime() -> HooksRuntime {
+        HooksRuntime {
+            socket_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.sock"),
+            settings_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.settings.json"),
+            relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+        }
+    }
+
+    #[test]
+    fn adds_settings_flag_when_hooks_are_enabled() {
+        let args = claude_hook_args(Some(&fake_runtime()));
+        assert_eq!(
+            args,
+            vec![
+                "--settings".to_string(),
+                "/tmp/kamux's dir/kamux-hooks-4321.settings.json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn adds_nothing_when_hooks_are_disabled() {
+        assert!(claude_hook_args(None).is_empty());
+        assert!(hook_env_vars(None).is_empty());
+    }
+
+    #[test]
+    fn injects_socket_path() {
+        // 契約 §102.3: hook_env_vars は KAMUX_SESSION_ID を返さない
+        // （所有者は build_launch_command。§102.2）。
+        let env = hook_env_vars(Some(&fake_runtime()));
+        assert_eq!(
+            env,
+            vec![(
+                "KAMUX_HOOKS_SOCK".to_string(),
+                "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+            )]
+        );
+    }
+
+    // ---- Task 11: M1-4 の claude 起動経路への結線（契約 §31.4 / §102） ----
+
+    /// `apply_hooks` の第 3 引数用。`Some` のときだけ claude の args / env に
+    /// hooks 由来の値を重ねる。
+    fn claude_session(hooks_enabled: bool) -> (Session, Option<HooksRuntime>) {
+        let session = sample_session(CliKind::Claude, SessionMode::InPlace, None);
+        let hooks = if hooks_enabled {
+            Some(fake_runtime())
+        } else {
+            None
+        };
+        (session, hooks)
+    }
+
+    #[test]
+    fn claude_command_carries_settings_flag_and_hook_env() {
+        let (session, hooks) = claude_session(true);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, hooks.as_ref());
+
+        let pos = cmd
+            .args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings must be present");
+        assert_eq!(
+            cmd.args[pos + 1],
+            "/tmp/kamux's dir/kamux-hooks-4321.settings.json"
+        );
+        assert!(cmd
+            .env
+            .contains(&("KAMUX_SESSION_ID".to_string(), session.id.clone())));
+        assert!(cmd.env.contains(&(
+            "KAMUX_HOOKS_SOCK".to_string(),
+            "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+        )));
+    }
+
+    /// `CliKind` の 4 variant（`Claude` / `Codex` / `Shell` / `Custom`）について
+    /// `apply_hooks` を通した結果を、`cli_kind` と対で返す。
+    ///
+    /// **この関数が担保するのは「`CliKind` に 5 つ目の variant が増えたときに
+    /// `cli_command` を決める `match` がコンパイルエラーになる」という接触点だけである。**
+    /// 下の配列リテラルへの追加は依然として手作業であり、型はそれを担保しない
+    /// （配列から要素を 1 つ落としても、この関数はコンパイルも実行も通る）。
+    /// だからこの関数名も呼び出し側のテスト名も「every」「all」を名乗らず、
+    /// 4 種を明示的に列挙している。
+    ///
+    /// 網羅を機構で担保する設計（index/count によるチェック等）はあえて採らない。
+    /// `CliKind` は契約 §2 が `Claude` / `Codex` / `Shell` / `Custom` の 4 値で固定して
+    /// おり、5 つ目を足すこと自体が契約改訂であって、その改訂は §30.2 の「全 `cli_kind`
+    /// 共通」の env 表を必ず通る —— 機構が守ろうとしている経路を、契約改訂そのものが
+    /// 通過するので過剰設計になる。
+    ///
+    /// `program` は `--settings` / env のどちらの assert にも効かないので `/bin/zsh` 固定。
+    fn apply_hooks_for_the_four_cli_kinds(hooks: &HooksRuntime) -> Vec<(CliKind, LaunchCommand)> {
+        // CliKind に variant を足したら、下の match（コンパイルエラーで気づける）と
+        // この配列（気づけない。手作業で追記すること）の両方に足すこと。
+        let every = [
+            CliKind::Claude,
+            CliKind::Codex,
+            CliKind::Shell,
+            CliKind::Custom,
+        ];
+        every
+            .into_iter()
+            .map(|cli_kind| {
+                let cli_command = match cli_kind {
+                    CliKind::Custom => Some("echo hi"),
+                    CliKind::Claude | CliKind::Codex | CliKind::Shell => None,
+                };
+                let session = sample_session(cli_kind, SessionMode::InPlace, cli_command);
+                let base = build_launch_command(
+                    &session,
+                    "/bin/zsh",
+                    Path::new("/repo"),
+                    &test_env(),
+                    ResumeMode::None,
+                )
+                .expect("build");
+                (cli_kind, apply_hooks(&session, base, Some(hooks)))
+            })
+            .collect()
+    }
+
+    /// 契約 §30.2 の env 表: `KAMUX_HOOKS_SOCK` は**全 `cli_kind` 共通**で入る
+    /// （shell のスクラッチ端末から手で起動した claude の hook も届く必要があるため）。
+    /// 値まで比較するのは、キーの存在だけだと空文字や別パスを入れる潰しを捕まえられないため。
+    #[test]
+    fn hooks_sock_env_is_injected_for_claude_codex_shell_and_custom() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
+            assert!(
+                cmd.env.contains(&(
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+                )),
+                "cli_kind={cli_kind:?} の env に KAMUX_HOOKS_SOCK が入っていない: {:?}",
+                cmd.env
+            );
+        }
+    }
+
+    /// 契約 §30.2 の分界のうち **argv 側**: `--settings` は claude 専用フラグであり、
+    /// §30.2 の env 表は argv を射程にしていない。`cli_kind == Claude` のときだけ付き、
+    /// 他の 3 種には付かないことを固定する（env 側の主張はここではしない —— それは
+    /// `hooks_sock_env_is_injected_for_claude_codex_shell_and_custom` が別の規定として持つ）。
+    #[test]
+    fn settings_flag_is_injected_for_claude_only_among_the_four_cli_kinds() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
+            assert_eq!(
+                cmd.args.iter().any(|a| a == "--settings"),
+                cli_kind == CliKind::Claude,
+                "cli_kind={cli_kind:?} の args: {:?}",
+                cmd.args
+            );
+        }
+    }
+
+    #[test]
+    fn claude_command_works_without_hooks() {
+        let (session, _none) = claude_session(false);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, None);
+
+        assert!(!cmd.args.iter().any(|a| a == "--settings"));
+        // 契約 §102: 所有者は build_launch_command であり、hooks == None でも
+        // KAMUX_SESSION_ID はちょうど 1 個入る。入らないのは KAMUX_HOOKS_SOCK のほう
+        // （§30.2 の「全 cli_kind 共通」/ §12.1）。
+        assert_eq!(
+            cmd.env
+                .iter()
+                .filter(|(k, _)| k == "KAMUX_SESSION_ID")
+                .count(),
+            1
+        );
+        assert!(!cmd.env.iter().any(|(k, _)| k == "KAMUX_HOOKS_SOCK"));
+    }
+
+    /// 契約 §102.7: 合流後の env にキー重複が無いことを、claude + hooks 有効の
+    /// 組み合わせ（全書き手が同時発火する条件）で見る。キー名は固定しない
+    /// （M3-4 が KAMUX_SHIM_DIR / KAMUX_HOOKS_SETTINGS を足しても同じテストが守るため）。
+    #[test]
+    fn claude_hooks_do_not_duplicate_any_env_key() {
+        let (session, hooks) = claude_session(true);
+        let base = build_launch_command(
+            &session,
+            "/opt/homebrew/bin/claude",
+            Path::new("/repo"),
+            &test_env(),
+            ResumeMode::None,
+        )
+        .expect("build");
+        let cmd = apply_hooks(&session, base, hooks.as_ref());
+
+        let mut seen: Vec<&str> = Vec::new();
+        for (key, _) in &cmd.env {
+            let key = key.as_str();
+            assert!(
+                !seen.contains(&key),
+                "key {key} appears more than once in {:?}",
+                cmd.env
+            );
+            seen.push(key);
+        }
     }
 }
