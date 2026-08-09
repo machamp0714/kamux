@@ -388,6 +388,14 @@ pub fn run() {
             // 測定 1: setup はまだイベントループ開始前なので false のはず
             // （違えば「ループ未開始でも true になる」という重要な発見なので
             // そのまま報告する）。
+            //
+            // `CFRunLoop::main().is_some_and(|rl| rl.is_waiting())` は
+            // `mac-usernotifications` **0.3.1** の `main_run_loop_is_running()`
+            // （`pub(crate)` でクレート外から呼べないため再構成した式。
+            // `src/lib.rs:232-234`）の再構成である。**0.3.1 の式であり、
+            // 他の版は測っていない。** 上流が式を変えたらこの測定は古い述語を
+            // 測ったことになる（詳細は `run_notify_spike_after_ready` の
+            // doc コメント参照）。
             let waiting_at_setup =
                 objc2_core_foundation::CFRunLoop::main().is_some_and(|rl| rl.is_waiting());
             println!("[MEASURE-1] setup: main_run_loop_is_waiting = {waiting_at_setup}");
@@ -443,6 +451,13 @@ pub fn run() {
 /// がバックグラウンドスレッドから `CFRunLoop::main().is_waiting()` を評価して
 /// いるため、メインスレッドから測ると測定コード自身の実行によって
 /// `is_waiting` がほぼ常に false になり、別の量を測ることになる。
+///
+/// **測定 2・3-b が使う `CFRunLoop::main().is_some_and(|rl| rl.is_waiting())` は、
+/// `mac-usernotifications` **0.3.1** の `main_run_loop_is_running()`
+/// （`pub(crate)` でクレート外から呼べないため再構成した。
+/// `src/lib.rs:232-234`）の再構成であって、述語そのものではない。**
+/// **0.3.1 の式であり、他の版は測っていない。** 上流が式を変えたら、
+/// この測定は古い述語を測ったことになる。
 ///
 /// 測定コード（`[MEASURE-*]` を出す部分）は測定であって守りではない。
 /// Task 10 の本番配線ではこの関数ごと消す。
