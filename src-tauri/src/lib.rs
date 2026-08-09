@@ -541,8 +541,8 @@ fn run_notify_spike_after_ready(handle: tauri::AppHandle<tauri::Wry>) {
     // 出さない** —— どちらもメインランループを動かすので、定常状態が壊れる。
     // したがって request_auth も試行 C もこの測定より後に置く。
     // **Dock バッジ（`set_badge_count`）も同じ理由でこの測定より後に置く**
-    // —— Dock を触る操作はメインランループを動かすので、測定 2・測定 4 の
-    // 前後に置くと定常状態が壊れる（修正ラウンド 3）。
+    // —— Dock を触る操作はメインランループを動かすので、測定 2 と測定 4 の
+    // 間に置くと定常状態が壊れる（修正ラウンド 3）。
     let until_steady = std::time::Duration::from_secs(10).saturating_sub(entered_at.elapsed());
     std::thread::sleep(until_steady);
     let (true_count, false_count, ratio, first20) = sample_main_run_loop_is_waiting();
