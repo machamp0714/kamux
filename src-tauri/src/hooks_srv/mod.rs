@@ -46,7 +46,12 @@ fn socket_path_from(dir: &Path) -> AppResult<PathBuf> {
 
 /// --settings に渡す JSON の置き場所。ソケットと同じライフサイクル。
 pub fn hooks_settings_path() -> AppResult<PathBuf> {
-    Ok(std::env::temp_dir().join(format!(
+    hooks_settings_path_from(&std::env::temp_dir())
+}
+
+/// `hooks_settings_path` の本体。`socket_path_from` と同じく `dir` を注入できる形にする。
+fn hooks_settings_path_from(dir: &Path) -> AppResult<PathBuf> {
+    Ok(dir.join(format!(
         "{RUNTIME_PREFIX}{}{SETTINGS_SUFFIX}",
         std::process::id()
     )))
@@ -399,22 +404,30 @@ pub fn bootstrap_hooks_in(
     (Some(runtime), Some(server))
 }
 
-/// 実環境版。アプリ起動時に 1 回だけ呼ぶ。
-pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>) {
+/// テスト可能な内部版。ランタイムファイルのディレクトリと relay 解決結果を注入する。
+///
+/// 契約 §100.3: 到達不能領域（`bootstrap_hooks` 実環境版）には判断を残さない。
+/// 「socket_path をどちらの引数に渡すか」という判断はここへ集約し、`dir` を
+/// 注入できるテストから到達可能にする。
+fn bootstrap_hooks_from(
+    dir: &Path,
+    sink: Arc<dyn HookSink>,
+    relay_bin: AppResult<PathBuf>,
+) -> (Option<HooksRuntime>, Option<HooksServer>) {
     // 前回の異常終了で残ったソケット/設定を掃除する（設計 §6-6）。
-    let removed = sweep_stale_runtime_files(&std::env::temp_dir());
+    let removed = sweep_stale_runtime_files(dir);
     if removed > 0 {
         tracing::info!(removed, "swept stale hooks runtime files");
     }
 
-    let socket_path = match hooks_socket_path() {
+    let socket_path = match socket_path_from(dir) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "hooks disabled");
             return (None, None);
         }
     };
-    let settings_path = match hooks_settings_path() {
+    let settings_path = match hooks_settings_path_from(dir) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "hooks disabled");
@@ -422,7 +435,12 @@ pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option
         }
     };
 
-    bootstrap_hooks_in(sink, resolve_relay_bin(), socket_path, settings_path)
+    bootstrap_hooks_in(sink, relay_bin, socket_path, settings_path)
+}
+
+/// 実環境版。アプリ起動時に 1 回だけ呼ぶ。
+pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    bootstrap_hooks_from(&std::env::temp_dir(), sink, resolve_relay_bin())
 }
 
 #[cfg(test)]
@@ -1292,6 +1310,47 @@ mod tests {
         assert!(server.is_none());
         assert!(!settings.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `bootstrap_hooks_from(:425 相当) で socket_path と settings_path を
+    /// 取り違える変異（M4）を検出する。既存 2 本（`:1243` / `:1283` 相当）が
+    /// 使っている `assert!(...exists())` は unix socket に対しても `true` を
+    /// 返すため弁別しない。ここでは (1) 期待パスをリテラルに組み立てた
+    /// `assert_eq!`、(2) `settings_path` を `read_to_string` して通常ファイル
+    /// として読めることの 2 つで弁別する。
+    #[test]
+    fn bootstrap_hooks_from_assigns_socket_and_settings_to_correct_paths() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-from-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_from(&dir, sink, Ok(relay.clone()));
+
+        let runtime = runtime.expect("hooks must be enabled");
+
+        let expected_sock = dir.join(format!("kamux-hooks-{}.sock", std::process::id()));
+        let expected_settings =
+            dir.join(format!("kamux-hooks-{}.settings.json", std::process::id()));
+        assert_eq!(
+            runtime.socket_path, expected_sock,
+            "socket_path must be the .sock file, not the .settings.json file"
+        );
+        assert_eq!(
+            runtime.settings_path, expected_settings,
+            "settings_path must be the .settings.json file, not the .sock file"
+        );
+
+        let body = std::fs::read_to_string(&runtime.settings_path)
+            .expect("settings_path must be a readable regular file, not a unix socket");
+        assert!(
+            body.contains("\"hooks\""),
+            "settings file must contain the hooks JSON body, got: {body}"
+        );
+
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
