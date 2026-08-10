@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "dev.kamux.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run tauri:before-dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run tauri:before-build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": ["app"],
-    "icon": ["icons/icon.icns"]
+    "icon": ["icons/icon.icns"],
+    "externalBin": ["bin/kamux-relay"]
   }
 }

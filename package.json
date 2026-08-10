@@ -13,7 +13,11 @@
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
     "fmt": "prettier --write .",
-    "fmt:check": "prettier --check ."
+    "fmt:check": "prettier --check .",
+    "relay:debug": "./scripts/build-relay.sh",
+    "relay:release": "./scripts/build-relay.sh --release",
+    "tauri:before-dev": "npm run relay:debug && vite",
+    "tauri:before-build": "npm run relay:release && tsc && vite build"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.1.0",
