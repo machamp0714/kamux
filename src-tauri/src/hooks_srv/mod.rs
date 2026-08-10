@@ -330,7 +330,9 @@ pub const RELAY_BIN_NAME: &str = "kamux-relay";
 /// 1. `KAMUX_RELAY_BIN`（開発・テスト用の明示指定。指すファイルが無ければ即エラー）
 /// 2. 上記が無い場合、アプリ実行ファイルと同じディレクトリ
 ///    - dev: `target/debug/kamux` の隣の `target/debug/kamux-relay`
-///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測）
+///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測済み:
+///      2026-08-10, commit 39ffb79。evidence:
+///      docs/superpowers/plans/2026-08-01-kamux/evidence/M2-2/bundle-layout.txt）
 pub fn resolve_relay_bin_from(env_override: Option<&str>, exe_dir: &Path) -> AppResult<PathBuf> {
     if let Some(raw) = env_override {
         let path = PathBuf::from(raw);
