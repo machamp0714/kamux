@@ -1318,9 +1318,14 @@ mod tests {
     /// `bootstrap_hooks_from(:425 相当) で socket_path と settings_path を
     /// 取り違える変異（M4）を検出する。既存 2 本（`:1243` / `:1283` 相当）が
     /// 使っている `assert!(...exists())` は unix socket に対しても `true` を
-    /// 返すため弁別しない。ここでは (1) 期待パスをリテラルに組み立てた
-    /// `assert_eq!`、(2) `settings_path` を `read_to_string` して通常ファイル
-    /// として読めることの 2 つで弁別する。
+    /// 返すため弁別しない。
+    ///
+    /// M4 の入れ替えは自己整合する（`HooksServer` は `…settings.json` という
+    /// 名前で bind し、JSON は `…sock` という名前の通常ファイルへ書かれ、
+    /// `HooksRuntime.settings_path` にはその `…sock` が入る）ため、`runtime`
+    /// 経由で読む観測は弁別しない。ここでは (1) 期待パスをリテラルに組み立てた
+    /// `assert_eq!`、(2) その**リテラル**の `expected_settings` を
+    /// `read_to_string` して通常ファイルとして読めることの 2 つで弁別する。
     #[test]
     fn bootstrap_hooks_from_assigns_socket_and_settings_to_correct_paths() {
         let dir = std::env::temp_dir().join(format!("kamux-boot-from-{}", std::process::id()));
@@ -1345,8 +1350,9 @@ mod tests {
             "settings_path must be the .settings.json file, not the .sock file"
         );
 
-        let body = std::fs::read_to_string(&runtime.settings_path)
-            .expect("settings_path must be a readable regular file, not a unix socket");
+        let body = std::fs::read_to_string(&expected_settings).expect(
+            "the .settings.json path itself must be a readable regular file, not a unix socket",
+        );
         assert!(
             body.contains("\"hooks\""),
             "settings file must contain the hooks JSON body, got: {body}"
