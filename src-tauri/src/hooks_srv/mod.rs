@@ -1247,6 +1247,7 @@ mod tests {
         let runtime = runtime.expect("hooks must be enabled");
         assert_eq!(runtime.relay_bin, relay);
         assert_eq!(runtime.socket_path, sock);
+        assert_eq!(runtime.settings_path, settings);
         assert!(settings.exists(), "settings file must be written");
         assert!(sock.exists(), "socket must be listening");
 

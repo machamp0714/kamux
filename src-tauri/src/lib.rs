@@ -398,8 +398,19 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
 
 /// `tracing` の大域 subscriber を初期化する。`setup` から 1 回だけ呼ぶ。
 ///
-/// **`init()` ではなく `try_init()` を使う**: 同一プロセスに subscriber を 2 つ
-/// 立てようとすると `tracing` は 2 人目を黙って無視する設計だが、`init()` は
+/// **環境変数に依存しない固定レベルフィルタを使う**（task-13 修正ラウンド 1、
+/// I-4）。`tracing_subscriber::fmt::try_init()` は既定 feature（`env-filter` 無効）の
+/// 下ではログ用環境変数を `Targets::from_str(..).unwrap_or_default()` で解釈する
+/// 経路を通るため、無関係な値や不正値だけで 4 経路の `warn!` が丸ごと消える
+/// （実測。task-13-review.md I-4）。契約 §61.2 に行の無い環境変数を実装へ入れては
+/// ならない（RULINGS §4）ため、そのログ用環境変数を一切読まない
+/// `fmt().with_max_level(..)` の明示フィルタで組み立てる。
+///
+/// **レベルは `INFO`**: `bootstrap_hooks` の `tracing::info!(socket = ..,
+/// "hooks enabled")` と 4 経路の `tracing::warn!` の両方を出すには INFO 以上が要る。
+///
+/// **`init()` ではなく `set_global_default()` を使う**: 同一プロセスに subscriber を
+/// 2 つ立てようとすると `tracing` は 2 人目を黙って無視する設計だが、`init()` は
 /// その失敗を `expect` 相当で `panic!` に変える。契約 §0 は panic 経路を禁じている
 /// うえ、`payload.rs` のテスト専用 `install_capture_subscriber`（大域 subscriber を
 /// `OnceLock` で立てる）と衝突すると、どちらが先に走るかは並列実行の順序に依存する
@@ -415,7 +426,10 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
 /// （brief 冒頭。契約 §96.4: 処理本体を `run()` の外の関数へ出す代わりに、
 /// その関数自体はテストから呼ばない）。
 fn init_tracing_subscriber() {
-    if let Err(err) = tracing_subscriber::fmt::try_init() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    if let Err(err) = tracing::subscriber::set_global_default(subscriber) {
         eprintln!(
             "[kamux] tracing subscriber already installed by another initializer \
              ({err}); hook/session warnings may not be visible"
@@ -683,6 +697,7 @@ mod tests {
         use tauri::test::{mock_builder, mock_context, noop_assets};
         use tauri::{Manager, WebviewWindowBuilder};
 
+        use crate::hooks_srv::{HookEvent, HookSink, HooksRuntime, HooksServer};
         use crate::pty::surface::PtySink;
         use crate::pty::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
         use crate::store::test_support::open_temp;
@@ -695,9 +710,37 @@ mod tests {
             }
         }
 
+        // task-13 レビュー I-2: `shutdown_hooks`（`kill_on_run_event_exit` から呼ばれる）
+        // の 2 つの副作用が両方 no-op でも既存アサートは全緑のままだった
+        // （変異 M2、533 全緑）。`state.hooks` / `state.hooks_server` に実ファイル・
+        // 実ソケットを持つ `HooksRuntime` / `HooksServer` を仕込み、
+        // `RunEvent::Exit` 後にどちらも消えていることを直接観測する。
+        struct NoopHookSink;
+        impl HookSink for NoopHookSink {
+            fn on_hook(&self, _event: HookEvent) {}
+        }
+
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir();
+        let settings_path = tmp.join(format!("kamux-runeventexit-settings-{pid}.json"));
+        std::fs::write(&settings_path, b"{}").expect("write settings fixture");
+        // `kamux-hooks-<pid>.sock`（実 `bootstrap_hooks` が使う pid ソケット）とは
+        // 別名にすることで pid 共有問題を起こさない。
+        let probe_sock = tmp.join(format!("kamux-runeventexit-probe-{pid}.sock"));
+        let probe_server = HooksServer::start(probe_sock.clone(), Arc::new(NoopHookSink))
+            .expect("start probe hooks server");
+
         let (_dir, store) = open_temp();
+        let mut state = crate::state::test_support::app_state(store);
+        state.hooks = Some(HooksRuntime {
+            socket_path: tmp.join(format!("kamux-runeventexit-sock-{pid}.sock")),
+            settings_path: settings_path.clone(),
+            relay_bin: tmp.join(format!("kamux-runeventexit-relay-{pid}")),
+        });
+        state.hooks_server = std::sync::Mutex::new(Some(probe_server));
+
         let app = mock_builder()
-            .manage(crate::state::test_support::app_state(store))
+            .manage(state)
             .build(mock_context(noop_assets()))
             .expect("build mock app");
 
@@ -764,6 +807,22 @@ mod tests {
             !app_handle.state::<AppState>().pty.is_alive("run-event-exit:agent"),
             "kill_on_run_event_exit must kill every surface that was live when RunEvent::Exit fired"
         );
+
+        // `app_handle` のクローンが外側スコープ（このテスト関数）で生きているため、
+        // `app` を `run_thread` へ move して `.run()` に消費されても managed state
+        // (`AppState` を含む) は `join()` 後もまだ drop されていない。したがって
+        // 下記の 2 アサートは `HooksServer::Drop` の巻き添えではなく、`shutdown_hooks`
+        // が明示的に消したことだけを観測する（task-13 レビュー I-2 で実測済み）。
+        assert!(
+            !settings_path.exists(),
+            "shutdown_hooks must remove the settings file on RunEvent::Exit"
+        );
+        assert!(
+            !probe_sock.exists(),
+            "shutdown_hooks must shut down the hooks server (unlink the socket) on RunEvent::Exit"
+        );
+
+        let _ = std::fs::remove_file(&settings_path);
     }
 
     // 「Destroyed が来たときに kill する」経路のうち、MockRuntime がイベント配送
@@ -874,6 +933,35 @@ mod tests {
             _sink: Arc<dyn HookSink>,
         ) -> (Option<HooksRuntime>, Option<HooksServer>) {
             (None, None)
+        }
+
+        /// hooks を**有効化した**結果を返すテスト用ブートストラップ（task-13 レビュー
+        /// I-3 の手当て）。
+        ///
+        /// `test_bootstrap_hooks` は常に `(None, None)` を返すため、
+        /// `install_app_state_with` の `bootstrap(hook_handler)` の戻り値が
+        /// `AppState` へ実際に載る配線（`hooks` / `hooks_server` フィールド）を
+        /// 検証するテストが 1 本も無かった。`$TMPDIR/kamux-wiringboot-<pid>.sock`
+        /// に bind する ——実 `bootstrap_hooks` の pid ソケット
+        /// `kamux-hooks-<pid>.sock` とは別名なので、pid 共有問題（上の
+        /// `test_bootstrap_hooks` の doc コメント参照）を起こさない。
+        fn test_bootstrap_hooks_enabled(
+            sink: Arc<dyn HookSink>,
+        ) -> (Option<HooksRuntime>, Option<HooksServer>) {
+            let dir = std::env::temp_dir();
+            let pid = std::process::id();
+            let socket_path = dir.join(format!("kamux-wiringboot-{pid}.sock"));
+            let settings_path = dir.join(format!("kamux-wiringboot-{pid}-settings.json"));
+            let relay_bin = dir.join(format!("kamux-wiringboot-{pid}-relay"));
+            let server = HooksServer::start(socket_path.clone(), sink).expect("start hooks server");
+            (
+                Some(HooksRuntime {
+                    socket_path,
+                    settings_path,
+                    relay_bin,
+                }),
+                Some(server),
+            )
         }
 
         /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
@@ -1159,6 +1247,38 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
             assert_eq!(payload["session_id"], serde_json::json!(session.id));
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// 群 S（task-13 レビュー I-3）: `bootstrap(hook_handler)` の戻り値が
+        /// `AppState` へ実際に載ることを検証する。
+        ///
+        /// 既存テストは全て `test_bootstrap_hooks`（常に `(None, None)`）を渡すため、
+        /// `let _ = bootstrap(h); let (hooks, hooks_server) = (None, None);` という
+        /// 配線切断の変異（M3）を検出できなかった。hooks を有効化するブートストラップを
+        /// 渡し、`state.hooks` / `state.hooks_server` に実際にその値が載ることを固定する。
+        #[test]
+        fn install_app_state_wires_bootstrap_result_into_app_state() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+
+            super::super::install_app_state(&app, Arc::new(store), test_bootstrap_hooks_enabled);
+
+            let state = app.state::<AppState>();
+            let settings_path = state
+                .hooks
+                .as_ref()
+                .expect("bootstrap enabled hooks; state.hooks must be Some")
+                .settings_path
+                .clone();
+            let pid = std::process::id();
+            assert_eq!(
+                settings_path,
+                std::env::temp_dir().join(format!("kamux-wiringboot-{pid}-settings.json"))
+            );
+            assert!(
+                state.hooks_server.lock().expect("lock").take().is_some(),
+                "bootstrap enabled hooks; state.hooks_server must be Some"
+            );
         }
 
         /// 「この経路は状態機械の shutdown を始めたか」を、実際の遷移で確かめる。
