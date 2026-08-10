@@ -361,6 +361,70 @@ pub fn resolve_relay_bin() -> AppResult<PathBuf> {
     resolve_relay_bin_from(env_override.as_deref(), &exe_dir)
 }
 
+/// テスト可能な内部版。パスと relay 解決結果を注入する。
+pub fn bootstrap_hooks_in(
+    sink: Arc<dyn HookSink>,
+    relay_bin: AppResult<PathBuf>,
+    socket_path: PathBuf,
+    settings_path: PathBuf,
+) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    // 設計書 §12: hooks が使えなくてもアプリは起動し、汎用ヒューリスティックへ落ちる。
+    let relay_bin = match relay_bin {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled: kamux-relay not found");
+            return (None, None);
+        }
+    };
+
+    let server = match HooksServer::start(socket_path.clone(), sink) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled: failed to start hooks socket");
+            return (None, None);
+        }
+    };
+
+    if let Err(e) = crate::session::cli_args::write_hook_settings_file(&settings_path, &relay_bin) {
+        tracing::warn!(error = %e, "hooks disabled: failed to write settings file");
+        return (None, None);
+    }
+
+    let runtime = HooksRuntime {
+        socket_path,
+        settings_path,
+        relay_bin,
+    };
+    tracing::info!(socket = %runtime.socket_path.display(), "hooks enabled");
+    (Some(runtime), Some(server))
+}
+
+/// 実環境版。アプリ起動時に 1 回だけ呼ぶ。
+pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    // 前回の異常終了で残ったソケット/設定を掃除する（設計 §6-6）。
+    let removed = sweep_stale_runtime_files(&std::env::temp_dir());
+    if removed > 0 {
+        tracing::info!(removed, "swept stale hooks runtime files");
+    }
+
+    let socket_path = match hooks_socket_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled");
+            return (None, None);
+        }
+    };
+    let settings_path = match hooks_settings_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled");
+            return (None, None);
+        }
+    };
+
+    bootstrap_hooks_in(sink, resolve_relay_bin(), socket_path, settings_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1202,61 @@ mod tests {
 
         let _ = std::fs::remove_file(&fixture);
         assert_eq!(got.expect("resolve"), fixture);
+    }
+
+    #[test]
+    fn bootstrap_disables_hooks_when_relay_is_missing() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(
+            sink,
+            Err(AppError::CliNotFound("relay missing".into())),
+            hooks_socket_path().expect("sock"),
+            dir.join("settings.json"),
+        );
+
+        assert!(
+            runtime.is_none(),
+            "hooks must be disabled when relay cannot be resolved"
+        );
+        assert!(server.is_none());
+        assert!(!dir.join("settings.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_enables_hooks_and_writes_settings() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+        let sock = dir.join("boot.sock");
+        let settings = dir.join("settings.json");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(
+            sink.clone(),
+            Ok(relay.clone()),
+            sock.clone(),
+            settings.clone(),
+        );
+
+        let runtime = runtime.expect("hooks must be enabled");
+        assert_eq!(runtime.relay_bin, relay);
+        assert_eq!(runtime.socket_path, sock);
+        assert!(settings.exists(), "settings file must be written");
+        assert!(sock.exists(), "socket must be listening");
+
+        send(
+            &sock,
+            r#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Stop","payload":null}"#,
+        );
+        wait_for(|| sink.snapshot().len() == 1);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

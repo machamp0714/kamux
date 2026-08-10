@@ -9,15 +9,21 @@ pub mod state;
 pub mod store;
 pub mod worktree;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, State, WindowEvent};
 
 use crate::error::AppResult;
+use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
 use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
+
+/// hooks ブートストラップの注入 seam。production は `hooks_srv::bootstrap_hooks`、
+/// テストは常に `(None, None)` を返す関数を渡す（契約 §96.4 の到達不能領域を
+/// テストから切り離すため。brief 冒頭の解決 1）。
+type HooksBootstrap = fn(Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>);
 
 // 各コマンドは Store への薄いラッパに徹する。ロジックは DAO 側に置く。
 // 契約 §7 が async fn を要求する一方、Store の MutexGuard は !Send なので、
@@ -265,7 +271,26 @@ fn kill_on_run_event_exit<R: tauri::Runtime>(
     if matches!(event, tauri::RunEvent::Exit) {
         if let Some(state) = app_handle.try_state::<AppState>() {
             shutdown_runtime_then_kill_pty(&state);
+            shutdown_hooks(&state);
         }
+    }
+}
+
+/// hooks サーバを止め、`--settings` の一時ファイルを消す。
+///
+/// macOS の quit で managed state の `Drop` が走る保証がないため明示的に行う
+/// （設計 §6-6）。`kill_on_run_event_exit`（`MockRuntime` から実際に到達できる。
+/// `tests::run_event_exit_kills_every_live_pty_surface` 参照）の中に置くこと —
+/// `run()` / `.setup()` は 429 本のどのテストも通らない到達不能領域なので、
+/// 副作用の順序に依存する処理はそちらに置かない（契約 §96.4）。
+fn shutdown_hooks(state: &AppState) {
+    if let Ok(mut guard) = state.hooks_server.lock() {
+        if let Some(server) = guard.as_mut() {
+            server.shutdown();
+        }
+    }
+    if let Some(h) = state.hooks.as_ref() {
+        let _ = std::fs::remove_file(&h.settings_path);
     }
 }
 
@@ -279,9 +304,13 @@ fn kill_on_run_event_exit<R: tauri::Runtime>(
 /// `TauriEmitObserver` に `AppHandle` を渡す必要があり、`AppHandle` は `setup` の
 /// 中でしか取れない。コマンドは `setup` 完了後にしか実行されないので、この置き場所で
 /// `State<'_, AppState>` が未登録になる瞬間は生じない。
-fn install_app_state<R: tauri::Runtime, M: Manager<R>>(manager: &M, store: Arc<Store>) {
+fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
+    manager: &M,
+    store: Arc<Store>,
+    bootstrap: HooksBootstrap,
+) {
     let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-    install_app_state_with(manager, store, persist);
+    install_app_state_with(manager, store, persist, bootstrap);
 }
 
 /// `install_app_state` の注入版（`session::plan_agent_spawn_with` と同じ seam）。
@@ -293,6 +322,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     store: Arc<Store>,
     persist: Arc<dyn StatePersist>,
+    bootstrap: HooksBootstrap,
 ) {
     let runtime = RuntimeStateManager::new(persist);
     runtime.register_observer(Arc::new(TauriEmitObserver::new(
@@ -344,14 +374,53 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         Err(err) => eprintln!("[kamux] startup normalize failed: {err}"),
     }
 
+    // hooks ブートストラップ。`runtime.sender()` は Clone + Send + Sync なので
+    // accept スレッドから同期的に呼べる（HookHandler の doc コメント参照）。
+    //
+    // **`manage` より前に完了させること**（順序の制約。契約§84.6.2 と同じ規律）:
+    // `start_session` は `State<'_, AppState>` を経由してしか `state.hooks` を読めず、
+    // Tauri はマネージド状態が載るまでコマンドを解決できないため、ここで確定させれば
+    // 「hooks が載る前に始まったセッション」は構造的に発生しない。
+    let hook_handler: Arc<dyn HookSink> = Arc::new(crate::hooks_srv::HookHandler::new(
+        Arc::clone(&store),
+        runtime.sender(),
+    ));
+    let (hooks, hooks_server) = bootstrap(hook_handler);
+
     manager.manage(AppState {
         store,
         pty: pty::PtyManager::new(),
         runtime,
-        // Task 13 が hooks ブートストラップを足すまでは常に None（契約 §84.6.2 の
-        // 3 箇所目のうち、値を渡す配線自体は Task 13 の担当。ここはフィールドの追加のみ）。
-        hooks: None,
+        hooks,
+        hooks_server: Mutex::new(hooks_server),
     });
+}
+
+/// `tracing` の大域 subscriber を初期化する。`setup` から 1 回だけ呼ぶ。
+///
+/// **`init()` ではなく `try_init()` を使う**: 同一プロセスに subscriber を 2 つ
+/// 立てようとすると `tracing` は 2 人目を黙って無視する設計だが、`init()` は
+/// その失敗を `expect` 相当で `panic!` に変える。契約 §0 は panic 経路を禁じている
+/// うえ、`payload.rs` のテスト専用 `install_capture_subscriber`（大域 subscriber を
+/// `OnceLock` で立てる）と衝突すると、どちらが先に走るかは並列実行の順序に依存する
+/// ため panic が間欠になる（brief 冒頭 §「subscriber の installer は同一プロセスに
+/// 1 人しか居られない」）。
+///
+/// 失敗時のメッセージで「既に別の subscriber が入っている」ことを名指しする —
+/// 案 (a)（brief 承認済み）。間欠であることは変わらないが、「間欠かつ原因不明」が
+/// 「間欠だが原因は自明」になる。
+///
+/// **🔴 lib テストバイナリから到達可能な形で呼んではならない。** 呼ぶと
+/// `payload.rs` の capture subscriber と衝突し、否定テストが間欠に恒真化する
+/// （brief 冒頭。契約 §96.4: 処理本体を `run()` の外の関数へ出す代わりに、
+/// その関数自体はテストから呼ばない）。
+fn init_tracing_subscriber() {
+    if let Err(err) = tracing_subscriber::fmt::try_init() {
+        eprintln!(
+            "[kamux] tracing subscriber already installed by another initializer \
+             ({err}); hook/session warnings may not be visible"
+        );
+    }
 }
 
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
@@ -359,9 +428,10 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
+            init_tracing_subscriber();
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
-            install_app_state(app, store);
+            install_app_state(app, store, crate::hooks_srv::bootstrap_hooks);
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
@@ -788,10 +858,23 @@ mod tests {
         use tauri::{AppHandle, Manager, WebviewWindowBuilder};
 
         use crate::error::{AppError, AppResult};
+        use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
         use crate::model::{CliKind, RuntimeState};
         use crate::session::runtime_state::{StateInput, StatePersist};
         use crate::state::AppState;
         use crate::store::test_support::{insert_test_session, open_temp};
+
+        /// hooks を常に無効化するテスト用ブートストラップ。
+        ///
+        /// 実 `bootstrap_hooks` は `$TMPDIR/kamux-hooks-<pid>.sock` に bind する
+        /// （`hooks_srv::hooks_socket_path`）。lib テストバイナリの全テストが同じ
+        /// pid を共有するため、複数テストが実 `bootstrap_hooks` を呼ぶと同じパスへ
+        /// bind し合い、順序依存の間欠故障になる（brief 冒頭の解決 1）。
+        fn test_bootstrap_hooks(
+            _sink: Arc<dyn HookSink>,
+        ) -> (Option<HooksRuntime>, Option<HooksServer>) {
+            (None, None)
+        }
 
         /// consumer スレッドは非同期なので、条件が満たされるまで短時間待つ。
         fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
@@ -903,7 +986,12 @@ mod tests {
             let app = mock_app();
             let probe = NormalizeProbe::new(app.handle().clone(), false);
 
-            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+            super::super::install_app_state_with(
+                &app,
+                Arc::new(store),
+                probe.clone(),
+                test_bootstrap_hooks,
+            );
 
             assert!(
                 !probe
@@ -930,7 +1018,12 @@ mod tests {
             let app = mock_app();
             let probe = NormalizeProbe::new(app.handle().clone(), false);
 
-            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+            super::super::install_app_state_with(
+                &app,
+                Arc::new(store),
+                probe.clone(),
+                test_bootstrap_hooks,
+            );
 
             let queried = probe.queried();
             assert!(!queried.is_empty(), "正規化が一度も走っていない");
@@ -968,7 +1061,7 @@ mod tests {
                 .expect("set_last_runtime_state");
 
             let app = mock_app();
-            super::super::install_app_state(&app, Arc::new(store));
+            super::super::install_app_state(&app, Arc::new(store), test_bootstrap_hooks);
 
             let state = app.state::<AppState>();
             assert_eq!(
@@ -1004,7 +1097,12 @@ mod tests {
             let app = mock_app();
             let probe = NormalizeProbe::new(app.handle().clone(), true);
 
-            super::super::install_app_state_with(&app, Arc::new(store), probe.clone());
+            super::super::install_app_state_with(
+                &app,
+                Arc::new(store),
+                probe.clone(),
+                test_bootstrap_hooks,
+            );
 
             assert!(!probe.queried().is_empty(), "正規化は試みられている");
             assert!(
@@ -1047,7 +1145,7 @@ mod tests {
 
             let store = Arc::new(store);
             let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-            super::super::install_app_state_with(&app, store, persist);
+            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
 
             app.state::<AppState>()
                 .runtime
