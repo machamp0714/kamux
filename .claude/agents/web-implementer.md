@@ -130,10 +130,17 @@ npm run lint && npm run fmt:check && npx tsc --noEmit
 **レポート本文は渡されたレポートファイルに書く。** 呼び出し元には次の短い形だけを返す。
 
 ```
-STATUS: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED
+STATUS: DONE / DONE_WITH_CONCERNS / NEEDS_CONTEXT / BLOCKED (round: <渡されたトークン>)
 COMMITS: <short sha>..<short sha>
 TESTS: npx vitest run —— NN passed / 0 failed（+ npx tsc --noEmit の結果）
 CONCERNS: （あれば 1〜3 行。無ければ「なし」）
 ```
+
+**🔴 同じ `STATUS: … (round: <トークン>)` の 1 行を、レポートファイルにも書く。lane-controller の起床条件がそれである。**
+
+- **トークンは lane-controller が dispatch で渡す**（`m3-2-t8-r1` の形）。**渡されていなければ、書く前に聞く。自分で作らない**
+- **🔴 この行を書いたら作業を終える。書いてから続けない** —— **lane-controller はこの行を見た瞬間に次工程へ進む。** stage4 で 4 回、マーカの後に作業を続けて実害が出た。**dispatch に禁止を逐語で書いたうえで起きているので、規律ではなく順序の問題である**
+- **`REPORT_WRITTEN_AT: <YYYY-MM-DD HH:MM>` をその直前の行に置く**（群 Q）。**報告ファイルは git 管理外で版が残らないので、記述が偽になった時点を事後に切り分けられない**（台帳 #56 / #67）
+- **🔴 実行していない検証の出力を書かない**（台帳 #56）。**貼るのは実際に走らせた出力だけである。走らせていないなら「未実施」と書く**
 
 差分やコード全文を報告に貼らない。
