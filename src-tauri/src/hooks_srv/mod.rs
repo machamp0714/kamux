@@ -1259,4 +1259,35 @@ mod tests {
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 契約 §96.2 の変異検証で見つかった実測の穴: `write_hook_settings_file` が
+    /// 失敗したとき、`bootstrap_hooks_in` はソケットを既に起動してしまっている
+    /// (`HooksServer::start` が先に走る) にもかかわらず、hooks を無効化して
+    /// 呼び出し元へ `(None, None)` を返さなければならない。既存の 2 本の
+    /// テストはどちらも settings の書き込みが成功する経路しか通っておらず、
+    /// この分岐の early return を消す変異（`if let Err(e) = ... { warn!(..); }`
+    /// から `return (None, None);` を落とす）を検出できなかった。
+    #[test]
+    fn bootstrap_disables_hooks_when_settings_write_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("kamux-boot-settingsfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+        let sock = dir.join("boot.sock");
+        // 親ディレクトリが存在しないパス。std::fs::write は NotFound で失敗する。
+        let settings = dir.join("no-such-subdir").join("settings.json");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(sink, Ok(relay), sock.clone(), settings.clone());
+
+        assert!(
+            runtime.is_none(),
+            "settings の書き込みに失敗したら hooks は無効化されなければならない"
+        );
+        assert!(server.is_none());
+        assert!(!settings.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
