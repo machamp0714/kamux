@@ -426,6 +426,9 @@ pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option
 }
 
 #[cfg(test)]
+mod e2e_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -433,12 +436,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    struct RecordingSink {
+    pub(super) struct RecordingSink {
         events: Mutex<Vec<HookEvent>>,
     }
 
     impl RecordingSink {
-        fn snapshot(&self) -> Vec<HookEvent> {
+        pub(super) fn snapshot(&self) -> Vec<HookEvent> {
             self.events.lock().expect("lock").clone()
         }
     }
