@@ -46,6 +46,12 @@ jobs:
           # ワークスペースを解決するため、キャッシュ対象だけをここで repo root に
           # 合わせる。
           workspaces: .
+      # tauri.conf.json の externalBin が bin/kamux-relay-{target-triple} の実在を
+      # 要求するため、src-tauri 配下のあらゆる cargo 呼び出し（fmt/clippy/test の
+      # build script 実行）より先に relay バイナリを配置しておく必要がある。
+      # cargo test --workspace は debug ビルドを前提にするため、ここも debug
+      # （引数なし）で揃える。
+      - run: ../scripts/build-relay.sh
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
