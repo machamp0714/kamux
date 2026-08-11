@@ -103,6 +103,14 @@ mod tests {
     }
 
     #[test]
+    fn zero_timeout_waits_zero_instead_of_firing() {
+        // timeout_ms == 0 は本番では MIN_SILENCE_TIMEOUT_SECS により到達しないが、
+        // 純粋関数として渡された場合は elapsed <= 0 の早期 return を必ず経由し、
+        // Fire にはならない（Wait{ms:0} の doc コメントに書いた前提条件そのもの）。
+        assert_eq!(silence_step(0, 0, 0), SilenceStep::Wait { ms: 0 });
+    }
+
+    #[test]
     fn never_returns_a_zero_wait() {
         // Wait{0} を返すとウォッチャが busy loop になる。全ての Wait は 1ms 以上
         for now in 0..40_000i64 {
