@@ -125,6 +125,8 @@ grep -n -A22 '### 73.5' docs/superpowers/plans/2026-08-01-kamux/00-contracts.md
 ```
 subagent_type: "lane-controller"
 name:          "lane-<フェーズ ID 小文字>"     ← SendMessage の宛先になる
+               PR 単位で分けるなら末尾に "-pr<n>"、引き継ぎで起こし直すなら
+               さらに連番（b, c, …）を足す。例: lane-m2-2-pr17 → lane-m2-2-pr17b
 model:         "opus"
 description:   "<フェーズ ID> lane"
 run_in_background: true
@@ -186,6 +188,7 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 | 契約変更要求が返った | `contract-owner` を起動して裁定させる。**同時に走らせるのは 1 体だけ**（下記）。裁定結果は**並列中の他レーンにも周知する** |
 | PR が出た | **lane-controller がマージまで行う**（契約 §32 の 7 条件）。あなたは介入しない |
 | `needs-human-verification` の PR で BLOCKED が返った | 検証手順をユーザーに提示 → 結果を受けてラベルを外す → `SendMessage` でレーンへ通知 |
+| **引き継ぎ報告が返った** | **同じ形で次のレーンを起こす**（`name` は §5.1 の規則に従う）。レーンは 2 タスク進むと引き継いで終了する（`lane-controller.md`「2 タスク進んだら引き継いで終了する」）。**報告に書かれた「マージ許可」を次の dispatch にそのまま載せる。** フェーズが未完了なら**ゲートは実行しない** |
 | レーンが完了した | 下のゲートを実行 → 次のステージへ |
 
 ### 🔴 言明の**一部だけ**を測って、残りを前提として扱わない（群 F。stage4 で 4 回）
