@@ -7,6 +7,7 @@
 
 pub mod bel;
 pub mod clock;
+pub mod hook_liveness;
 pub mod silence;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
