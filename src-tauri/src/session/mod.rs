@@ -1,4 +1,5 @@
 pub mod cli_args;
+pub mod heuristics;
 pub mod runtime_state;
 pub mod workspace;
 
