@@ -113,6 +113,12 @@ mod tests {
             liveness_after_grace(CliKind::Claude, 0, Some(1_500), 2_000),
             HookLiveness::Healthy
         );
+        // `last_hook_at_ms` の値そのものは判定に使わない。0 でも「届いた事実」で
+        // Healthy になる(契約 §30.4: 判定キーは「届いたか」であって値の大小ではない)。
+        assert_eq!(
+            liveness_after_grace(CliKind::Claude, 1_000, Some(0), 30_000),
+            HookLiveness::Healthy
+        );
     }
 
     #[test]
