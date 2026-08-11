@@ -7,6 +7,7 @@
 
 pub mod bel;
 pub mod clock;
+pub mod gate;
 pub mod hook_liveness;
 pub mod silence;
 
