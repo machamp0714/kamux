@@ -5,6 +5,7 @@
 //! ここで導出される状態は必ず `gate::heuristic_transition` を通り、
 //! hook 由来の権威ある遷移を上書きしない。
 
+pub mod bel;
 pub mod clock;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
