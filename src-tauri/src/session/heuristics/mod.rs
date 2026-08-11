@@ -13,7 +13,10 @@ pub mod silence;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
-/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になるため構造的に禁じる
+/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になるため、
+/// クランプ・範囲検証（Task 7 / Task 11）でこの下限を強制する予定である。
+/// **現時点でこの定数を読む実装は無い**（下記 const assert が固定するのは
+/// `DEFAULT_SILENCE_TIMEOUT_SECS` との大小順序だけで、0 を禁じる強制ではない）。
 pub const MIN_SILENCE_TIMEOUT_SECS: u32 = 5;
 /// ユーザーが設定できる上限（1 時間）
 pub const MAX_SILENCE_TIMEOUT_SECS: u32 = 3600;
@@ -25,8 +28,16 @@ pub const HOOK_GRACE_MS: i64 = 20_000;
 
 // `HOOK_GRACE_MS` は `DEFAULT_SILENCE_TIMEOUT_SECS` より短くなければならない
 // （設計 §4.7）。この順序が崩れると「猶予切れ → 沈黙推定の発火」という
-// hooks 不達判定の前提が壊れるため、値の変更時にビルドで検知する。
+// hooks 不達判定の前提が壊れるため、既定値どうしのこの 1 本の関係はビルドで検知する。
 const _: () = assert!(HOOK_GRACE_MS < DEFAULT_SILENCE_TIMEOUT_SECS as i64 * 1000);
+
+// `DEFAULT_SILENCE_TIMEOUT_SECS` は常に `MIN_SILENCE_TIMEOUT_SECS..=MAX_SILENCE_TIMEOUT_SECS`
+// の範囲に収まらなければならない。Task 11 の範囲検証はこの区間をユーザー入力の
+// 許容範囲として使うため、既定値がこの区間の外に出ると既定値そのものが検証で
+// 弾かれる。3 定数の大小順序をビルドで固定する（下限に 0 を禁じる等の値そのものの
+// 妥当性はクランプ〔Task 7〕の責務であり、この不等式が保証する範囲ではない）。
+const _: () = assert!(MIN_SILENCE_TIMEOUT_SECS <= DEFAULT_SILENCE_TIMEOUT_SECS);
+const _: () = assert!(DEFAULT_SILENCE_TIMEOUT_SECS <= MAX_SILENCE_TIMEOUT_SECS);
 
 use std::collections::HashMap;
 use std::sync::Mutex;
