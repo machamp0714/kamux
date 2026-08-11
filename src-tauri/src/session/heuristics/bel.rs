@@ -182,6 +182,8 @@ mod tests {
     #[test]
     fn consecutive_escapes_do_not_break_the_scanner() {
         assert_eq!(count(b"\x1b\x1b\x1b]0;t\x07"), 0);
+        assert_eq!(count(b"\x1b\x1b]0;t\x07"), 0); // ESC 偶数 → (Esc, 0x1B) の自己ループを検出
+        assert_eq!(count(b"\x1b]0;t\x1b\x1b\\\x07"), 1); // StringModeEsc 中の ESC 連続 → (StringModeEsc, 0x1B) を検出
     }
 
     #[test]
