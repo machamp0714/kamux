@@ -138,8 +138,12 @@ mod sink_tests {
 
     #[test]
     fn fake_sink_reports_initial_state() {
-        let sink = FakeSink::new(&[("s1", RuntimeState::Running)]);
+        let sink = FakeSink::new(&[
+            ("s1", RuntimeState::Running),
+            ("s2", RuntimeState::WaitingInput),
+        ]);
         assert_eq!(sink.current("s1"), Some(RuntimeState::Running));
+        assert_eq!(sink.current("s2"), Some(RuntimeState::WaitingInput));
         assert_eq!(sink.current("unknown"), None);
     }
 
@@ -171,6 +175,24 @@ mod sink_tests {
             std::sync::Arc::new(FakeSink::new(&[("s1", RuntimeState::Running)]));
         sink.send("s1", StateInput::SilenceTimeout);
         assert_eq!(sink.current("s1"), Some(RuntimeState::Idle));
+    }
+
+    /// `send` は `session_id` をキーとして正しく振り分ける。
+    /// 片方のセッションへの `send` がもう片方の状態・履歴を動かしてはならない。
+    #[test]
+    fn fake_sink_send_keeps_sessions_independent() {
+        let sink = FakeSink::new(&[("s1", RuntimeState::Running), ("s2", RuntimeState::Running)]);
+        sink.send("s1", StateInput::SilenceTimeout);
+        sink.send("s2", StateInput::BelDetected);
+        assert_eq!(sink.current("s1"), Some(RuntimeState::Idle));
+        assert_eq!(sink.current("s2"), Some(RuntimeState::WaitingInput));
+        assert_eq!(
+            sink.sent(),
+            vec![
+                ("s1".to_string(), StateInput::SilenceTimeout),
+                ("s2".to_string(), StateInput::BelDetected),
+            ]
+        );
     }
 
     #[test]
