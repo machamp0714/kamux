@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::hooks_srv::HooksRuntime;
+use crate::hooks_srv::{HooksRuntime, HooksServer};
 use crate::pty::PtyManager;
 use crate::session::runtime_state::RuntimeStateManager;
 use crate::store::Store;
@@ -25,17 +25,20 @@ pub struct AppState {
     /// `set_hooks` / `hooks()` のような専用メソッドは作らない。`state.hooks.as_ref()` が
     /// 唯一の到達経路（契約 §75 の適用）。
     pub hooks: Option<HooksRuntime>,
+    /// Drop でソケットを unlink するため保持する。`shutdown()` が `&mut self` を要る
+    /// ため `hooks` とは違い `Mutex` が必要（RunEvent::Exit のハンドラから止める）。
+    pub hooks_server: Mutex<Option<HooksServer>>,
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{AppState, Arc, PtyManager, RuntimeStateManager, Store};
+    use super::{AppState, Arc, Mutex, PtyManager, RuntimeStateManager, Store};
 
     /// 実 `Store` を `StatePersist` に差した `AppState`。
     /// production の `install_app_state` と同じ結線（persist = その `Store` 自身）を
     /// テスト側で 1 行にする。`normalize_on_startup` は呼ばない —— 起動時正規化を
-    /// 検証するテストは `install_app_state` 側を通ること。`hooks` は既定で `None`
-    /// （hooks を使うテストは `state.hooks = Some(..)` を直接代入する）。
+    /// 検証するテストは `install_app_state` 側を通ること。`hooks` / `hooks_server` は
+    /// 既定で無効（hooks を使うテストは `state.hooks = Some(..)` を直接代入する）。
     pub(crate) fn app_state(store: Store) -> AppState {
         let store = Arc::new(store);
         AppState {
@@ -43,6 +46,7 @@ pub(crate) mod test_support {
             pty: PtyManager::new(),
             runtime: RuntimeStateManager::new(store),
             hooks: None,
+            hooks_server: Mutex::new(None),
         }
     }
 }

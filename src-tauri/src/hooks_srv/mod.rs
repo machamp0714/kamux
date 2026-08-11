@@ -46,7 +46,12 @@ fn socket_path_from(dir: &Path) -> AppResult<PathBuf> {
 
 /// --settings に渡す JSON の置き場所。ソケットと同じライフサイクル。
 pub fn hooks_settings_path() -> AppResult<PathBuf> {
-    Ok(std::env::temp_dir().join(format!(
+    hooks_settings_path_from(&std::env::temp_dir())
+}
+
+/// `hooks_settings_path` の本体。`socket_path_from` と同じく `dir` を注入できる形にする。
+fn hooks_settings_path_from(dir: &Path) -> AppResult<PathBuf> {
+    Ok(dir.join(format!(
         "{RUNTIME_PREFIX}{}{SETTINGS_SUFFIX}",
         std::process::id()
     )))
@@ -325,7 +330,9 @@ pub const RELAY_BIN_NAME: &str = "kamux-relay";
 /// 1. `KAMUX_RELAY_BIN`（開発・テスト用の明示指定。指すファイルが無ければ即エラー）
 /// 2. 上記が無い場合、アプリ実行ファイルと同じディレクトリ
 ///    - dev: `target/debug/kamux` の隣の `target/debug/kamux-relay`
-///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測）
+///    - 本番: `kamux.app/Contents/MacOS/` （設計 §6-1 / 未確認事実 #13。Task 16 で実測済み:
+///      2026-08-10, commit 39ffb79。evidence:
+///      docs/superpowers/plans/2026-08-01-kamux/evidence/M2-2/bundle-layout.txt）
 pub fn resolve_relay_bin_from(env_override: Option<&str>, exe_dir: &Path) -> AppResult<PathBuf> {
     if let Some(raw) = env_override {
         let path = PathBuf::from(raw);
@@ -361,6 +368,86 @@ pub fn resolve_relay_bin() -> AppResult<PathBuf> {
     resolve_relay_bin_from(env_override.as_deref(), &exe_dir)
 }
 
+/// テスト可能な内部版。パスと relay 解決結果を注入する。
+pub fn bootstrap_hooks_in(
+    sink: Arc<dyn HookSink>,
+    relay_bin: AppResult<PathBuf>,
+    socket_path: PathBuf,
+    settings_path: PathBuf,
+) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    // 設計書 §12: hooks が使えなくてもアプリは起動し、汎用ヒューリスティックへ落ちる。
+    let relay_bin = match relay_bin {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled: kamux-relay not found");
+            return (None, None);
+        }
+    };
+
+    let server = match HooksServer::start(socket_path.clone(), sink) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled: failed to start hooks socket");
+            return (None, None);
+        }
+    };
+
+    if let Err(e) = crate::session::cli_args::write_hook_settings_file(&settings_path, &relay_bin) {
+        tracing::warn!(error = %e, "hooks disabled: failed to write settings file");
+        return (None, None);
+    }
+
+    let runtime = HooksRuntime {
+        socket_path,
+        settings_path,
+        relay_bin,
+    };
+    tracing::info!(socket = %runtime.socket_path.display(), "hooks enabled");
+    (Some(runtime), Some(server))
+}
+
+/// テスト可能な内部版。ランタイムファイルのディレクトリと relay 解決結果を注入する。
+///
+/// 契約 §100.3: 到達不能領域（`bootstrap_hooks` 実環境版）には判断を残さない。
+/// 「socket_path をどちらの引数に渡すか」という判断はここへ集約し、`dir` を
+/// 注入できるテストから到達可能にする。
+fn bootstrap_hooks_from(
+    dir: &Path,
+    sink: Arc<dyn HookSink>,
+    relay_bin: AppResult<PathBuf>,
+) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    // 前回の異常終了で残ったソケット/設定を掃除する（設計 §6-6）。
+    let removed = sweep_stale_runtime_files(dir);
+    if removed > 0 {
+        tracing::info!(removed, "swept stale hooks runtime files");
+    }
+
+    let socket_path = match socket_path_from(dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled");
+            return (None, None);
+        }
+    };
+    let settings_path = match hooks_settings_path_from(dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "hooks disabled");
+            return (None, None);
+        }
+    };
+
+    bootstrap_hooks_in(sink, relay_bin, socket_path, settings_path)
+}
+
+/// 実環境版。アプリ起動時に 1 回だけ呼ぶ。
+pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>) {
+    bootstrap_hooks_from(&std::env::temp_dir(), sink, resolve_relay_bin())
+}
+
+#[cfg(test)]
+mod e2e_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,12 +456,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    struct RecordingSink {
+    pub(super) struct RecordingSink {
         events: Mutex<Vec<HookEvent>>,
     }
 
     impl RecordingSink {
-        fn snapshot(&self) -> Vec<HookEvent> {
+        pub(super) fn snapshot(&self) -> Vec<HookEvent> {
             self.events.lock().expect("lock").clone()
         }
     }
@@ -1138,5 +1225,140 @@ mod tests {
 
         let _ = std::fs::remove_file(&fixture);
         assert_eq!(got.expect("resolve"), fixture);
+    }
+
+    #[test]
+    fn bootstrap_disables_hooks_when_relay_is_missing() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(
+            sink,
+            Err(AppError::CliNotFound("relay missing".into())),
+            hooks_socket_path().expect("sock"),
+            dir.join("settings.json"),
+        );
+
+        assert!(
+            runtime.is_none(),
+            "hooks must be disabled when relay cannot be resolved"
+        );
+        assert!(server.is_none());
+        assert!(!dir.join("settings.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bootstrap_enables_hooks_and_writes_settings() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+        let sock = dir.join("boot.sock");
+        let settings = dir.join("settings.json");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(
+            sink.clone(),
+            Ok(relay.clone()),
+            sock.clone(),
+            settings.clone(),
+        );
+
+        let runtime = runtime.expect("hooks must be enabled");
+        assert_eq!(runtime.relay_bin, relay);
+        assert_eq!(runtime.socket_path, sock);
+        assert_eq!(runtime.settings_path, settings);
+        assert!(settings.exists(), "settings file must be written");
+        assert!(sock.exists(), "socket must be listening");
+
+        send(
+            &sock,
+            r#"{"v":1,"kamux_session_id":"3f2a0000-0000-4000-8000-000000009c1e","hook_kind":"Stop","payload":null}"#,
+        );
+        wait_for(|| sink.snapshot().len() == 1);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 契約 §96.2 の変異検証で見つかった実測の穴: `write_hook_settings_file` が
+    /// 失敗したとき、`bootstrap_hooks_in` はソケットを既に起動してしまっている
+    /// (`HooksServer::start` が先に走る) にもかかわらず、hooks を無効化して
+    /// 呼び出し元へ `(None, None)` を返さなければならない。既存の 2 本の
+    /// テストはどちらも settings の書き込みが成功する経路しか通っておらず、
+    /// この分岐の early return を消す変異（`if let Err(e) = ... { warn!(..); }`
+    /// から `return (None, None);` を落とす）を検出できなかった。
+    #[test]
+    fn bootstrap_disables_hooks_when_settings_write_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("kamux-boot-settingsfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+        let sock = dir.join("boot.sock");
+        // 親ディレクトリが存在しないパス。std::fs::write は NotFound で失敗する。
+        let settings = dir.join("no-such-subdir").join("settings.json");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_in(sink, Ok(relay), sock.clone(), settings.clone());
+
+        assert!(
+            runtime.is_none(),
+            "settings の書き込みに失敗したら hooks は無効化されなければならない"
+        );
+        assert!(server.is_none());
+        assert!(!settings.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `bootstrap_hooks_from(:425 相当) で socket_path と settings_path を
+    /// 取り違える変異（M4）を検出する。既存 2 本（`:1243` / `:1283` 相当）が
+    /// 使っている `assert!(...exists())` は unix socket に対しても `true` を
+    /// 返すため弁別しない。
+    ///
+    /// M4 の入れ替えは自己整合する（`HooksServer` は `…settings.json` という
+    /// 名前で bind し、JSON は `…sock` という名前の通常ファイルへ書かれ、
+    /// `HooksRuntime.settings_path` にはその `…sock` が入る）ため、`runtime`
+    /// 経由で読む観測は弁別しない。ここでは (1) 期待パスをリテラルに組み立てた
+    /// `assert_eq!`、(2) その**リテラル**の `expected_settings` を
+    /// `read_to_string` して通常ファイルとして読めることの 2 つで弁別する。
+    #[test]
+    fn bootstrap_hooks_from_assigns_socket_and_settings_to_correct_paths() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-from-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_from(&dir, sink, Ok(relay.clone()));
+
+        let runtime = runtime.expect("hooks must be enabled");
+
+        let expected_sock = dir.join(format!("kamux-hooks-{}.sock", std::process::id()));
+        let expected_settings =
+            dir.join(format!("kamux-hooks-{}.settings.json", std::process::id()));
+        assert_eq!(
+            runtime.socket_path, expected_sock,
+            "socket_path must be the .sock file, not the .settings.json file"
+        );
+        assert_eq!(
+            runtime.settings_path, expected_settings,
+            "settings_path must be the .settings.json file, not the .sock file"
+        );
+
+        let body = std::fs::read_to_string(&expected_settings).expect(
+            "the .settings.json path itself must be a readable regular file, not a unix socket",
+        );
+        assert!(
+            body.contains("\"hooks\""),
+            "settings file must contain the hooks JSON body, got: {body}"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
