@@ -5,8 +5,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SilenceStep {
     /// あと `ms` ミリ秒待ってから再評価する。`timeout_ms >= 1` の呼び出しでは `ms` は必ず 1 以上
-    /// （`timeout_ms == 0` を渡した場合のみ `ms == 0` になり得る。本番では
-    /// `MIN_SILENCE_TIMEOUT_SECS` により `timeout_ms == 0` は到達しない）
+    /// （`timeout_ms == 0` を渡した場合のみ `ms == 0` になり得る）。この関数自体は
+    /// `timeout_ms` をクランプしないため、`timeout_ms == 0` を渡さないことは呼び出し側の
+    /// 責務である（`MIN_SILENCE_TIMEOUT_SECS` はその制約の候補として存在するが、
+    /// 現時点でこの関数の呼び出し元は無く、クランプが実装されているかは未検証）
     Wait { ms: u64 },
     /// 沈黙が成立した。イベントを送ってウォッチャを終了する
     Fire,
@@ -104,9 +106,9 @@ mod tests {
 
     #[test]
     fn zero_timeout_waits_zero_instead_of_firing() {
-        // timeout_ms == 0 は本番では MIN_SILENCE_TIMEOUT_SECS により到達しないが、
-        // 純粋関数として渡された場合は elapsed <= 0 の早期 return を必ず経由し、
-        // Fire にはならない（Wait{ms:0} の doc コメントに書いた前提条件そのもの）。
+        // timeout_ms == 0 をクランプせず渡さないのは呼び出し側の責務（Wait{ms:0} の
+        // doc コメントに書いた前提条件そのもの）。この関数自体は elapsed <= 0 の
+        // 早期 return を必ず経由し、Fire にはならない。
         assert_eq!(silence_step(0, 0, 0), SilenceStep::Wait { ms: 0 });
     }
 
