@@ -7,6 +7,7 @@
 
 pub mod bel;
 pub mod clock;
+pub mod silence;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
