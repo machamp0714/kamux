@@ -18,3 +18,8 @@ pub const BEL_DEBOUNCE_MS: i64 = 1_000;
 /// claude セッションで hook を待つ猶予（ms）。これを過ぎたら hooks 不達と判定する。
 /// `DEFAULT_SILENCE_TIMEOUT_SECS` より短いことが重要（設計 §4.7）
 pub const HOOK_GRACE_MS: i64 = 20_000;
+
+// `HOOK_GRACE_MS` は `DEFAULT_SILENCE_TIMEOUT_SECS` より短くなければならない
+// （設計 §4.7）。この順序が崩れると「猶予切れ → 沈黙推定の発火」という
+// hooks 不達判定の前提が壊れるため、値の変更時にビルドで検知する。
+const _: () = assert!(HOOK_GRACE_MS < DEFAULT_SILENCE_TIMEOUT_SECS as i64 * 1000);
