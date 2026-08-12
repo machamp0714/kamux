@@ -166,12 +166,19 @@ impl RuntimeStateSink for FakeSink {
         guard.sent.push((session_id.to_string(), input));
         // 遷移表を写さず M2-1 の next_state を引く（契約 §41.4）。
         // 遷移が起きない入力は状態を動かさない —— 本番の consumer と同じ振る舞い。
+        //
+        // ⚠️ ここは**理由を持たない**スナップショットを渡す（このフェイクは
+        // `RuntimeState` しか保持していない）。したがって契約 §113.5 の P1
+        // （`HookStop` 由来の `idle` × `OutputActivity`）は **FakeSink 越しには
+        // 一度も発動しない**。P1 を検証したい者は `RuntimeStateManager` 越しに
+        // 見ること（`runtime_state.rs` の
+        // `hook_stop_idle_resists_output_activity_while_silence_idle_returns_to_running`）。
         let current = guard
             .states
             .get(session_id)
             .copied()
             .unwrap_or(RuntimeState::Idle);
-        if let Some((next, _reason)) = next_state(current, input) {
+        if let Some((next, _reason)) = next_state(current.into(), input) {
             guard.states.insert(session_id.to_string(), next);
         }
     }

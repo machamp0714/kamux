@@ -254,7 +254,7 @@ mod tests {
             for state in ALL_STATES {
                 if let Some(emitted) = heuristic_transition(ctx(state), input) {
                     assert!(
-                        next_state(state, emitted).is_some(),
+                        next_state(state.into(), emitted).is_some(),
                         "{state:?} × {emitted:?} は遷移表で禁止されている"
                     );
                 }
