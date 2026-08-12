@@ -39,6 +39,8 @@ function makeSession(overrides: Partial<Session> & { id: string }): Session {
     last_runtime_state: 'idle',
     last_runtime_error: null,
     first_started_at: 1,
+    heuristics_enabled: true,
+    silence_timeout_secs: 30,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
