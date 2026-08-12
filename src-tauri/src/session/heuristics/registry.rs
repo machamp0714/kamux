@@ -142,7 +142,9 @@ impl HeuristicRegistry {
     /// **出力が再開しない限り次のウォッチャが立たない。**
     ///
     /// BEL の抑止では呼ばない。BEL は出力があった証拠であり、同じ `record_output` が
-    /// 既に次のウォッチャを立てている。
+    /// 既に次のウォッチャを立てている。**この条件を外しても振る舞いは変わらない**
+    /// （そのとき `rearm_after` は生きているウォッチャを見て no-op になる。
+    /// 実測: 外す変異は全緑 —— round m3-3-t9-r1）。意図を残すために書いてある。
     ///
     /// 抑止の理由が規則 3 であることは `heuristics_enabled && hook_liveness == Pending`
     /// で判定できる —— `gate::heuristic_transition` は規則 1（セッション単位のオフ）→
@@ -215,8 +217,14 @@ impl HeuristicRegistry {
         };
         let was_enabled = entry.enabled;
         entry.enabled = enabled;
-        // 先に有効化を反映する。逆順にすると、下で立てた新しいウォッチャが
-        // 先頭の `enabled` 判定で `false` を見て即座に降りてしまう
+        // 🔴 先に有効化を反映する。逆順（下の `rearm_after` を先に呼ぶ）にすると、
+        // 立てた新しいウォッチャが先頭の `enabled` 判定で `false` を見て降りうる ——
+        // disabled 腕の再チェックが救うのは `enabled.store` がその再チェックより前に
+        // 着弾した場合だけで、後になればウォッチャは消え、誰も立て直さない。
+        // **単一スレッド・仮想時間の harness ではこの順序を観測できない**
+        // （spawn したタスクが最初に polled されるのは `reconfigure` が返った後なので、
+        // 逆順にしても全テストが緑のままになる。実測: round m3-3-t9-r1）。
+        // したがってこのコメントが唯一の防護である。入れ替えないこと。
         entry.activity.reconfigure(enabled, timeout_ms);
         let re_enabled = (!was_enabled && enabled).then(|| Arc::clone(&entry.activity));
         // ロックを持ったまま spawn 経路へ入らない
