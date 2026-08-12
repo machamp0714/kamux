@@ -513,6 +513,10 @@ mod tests {
             "claude は既定オン"
         );
         assert!(
+            built_with(CliKind::Codex).heuristics_enabled,
+            "codex は既定オン"
+        );
+        assert!(
             built_with(CliKind::Custom).heuristics_enabled,
             "custom は既定オン"
         );

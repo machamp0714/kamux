@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project_status
     ON sessions (project_id, kanban_status, sort_order);
 "#;
 
-/// 契約 §20 の DDL をそのまま写したもの（M3-3: 汎用 CLI ヒューリスティックの
+/// 契約 §20 / §117.2 の DDL をそのまま写したもの（M3-3: 汎用 CLI ヒューリスティックの
 /// セッション単位設定）。
 ///
 /// **`DDL_V1` 側にこの 2 列を足してはならない。** `migrate` は新規 DB でも
@@ -50,12 +50,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project_status
 /// 直後の `ALTER TABLE ADD COLUMN` が `duplicate column name` で必ず失敗し、
 /// 新規 DB が 1 つも開けなくなる。
 ///
-/// 既存行は一律 `DEFAULT 1` / `DEFAULT 30` で埋まる。`cli_kind` ごとの
-/// 既定値（`default_heuristics_enabled`）は新規セッションの構築点
-/// （`Session::new_backlog`）が持つ責務であり、ここでは分岐しない。
+/// 既存行の `silence_timeout_secs` は一律 `DEFAULT 30` で埋まる
+/// （`DEFAULT_SILENCE_TIMEOUT_SECS` と同値なので `UPDATE` は要らない）。
+/// `heuristics_enabled` は移行前から在る行を、構築点
+/// （`Session::new_backlog` → `default_heuristics_enabled`）が同じ `cli_kind` に
+/// 与える値へ正規化する（契約 §117.2）。
 const MIGRATION_V2: &str = r#"
 ALTER TABLE sessions ADD COLUMN heuristics_enabled   INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE sessions ADD COLUMN silence_timeout_secs INTEGER NOT NULL DEFAULT 30;
+-- 移行前から在る行を、構築点（Session::new_backlog → default_heuristics_enabled）が
+-- 同じ cli_kind に与える値へ正規化する（契約 §117）。
+-- 🔴 'shell' は v2 時点の default_heuristics_enabled の写しであり、ここで凍結する。
+--    将来 default_heuristics_enabled が変わっても、この行を追随させてはならない
+--    —— マイグレーションは履歴であって現在の方針ではない（§117.3）
+UPDATE sessions SET heuristics_enabled = 0 WHERE cli_kind = 'shell';
 "#;
 
 /// PRAGMA は接続ごとの設定。foreign_keys は特に永続化されないので
@@ -160,40 +168,44 @@ mod migration_v2_tests {
     }
 
     #[test]
-    fn migrate_backfills_existing_v1_rows_with_the_contract_defaults() {
-        // 契約 §20 の DDL は既存行を一律 `DEFAULT 1` / `DEFAULT 30` で埋める。
-        // `insert_session` は値を明示バインドするので、DDL の DEFAULT が観測される
-        // 経路はこのバックフィルだけである。
-        //
-        // 副作用（意図どおり）: 移行前から存在する cli_kind = 'shell' の行も
-        // heuristics_enabled = 1 になる。`default_heuristics_enabled(Shell) == false`
-        // と食い違うが、契約 §20 の SQL が正典なので UPDATE で直さない。
+    fn migrate_normalizes_pre_v2_shell_rows_and_leaves_the_other_cli_kinds_on_the_ddl_defaults() {
+        // 移行前から在る行は、構築点（`Session::new_backlog` → `default_heuristics_enabled`）が
+        // 同じ cli_kind に与える値へ正規化される（契約 §117.2 / §117.5）。4 値のうち
+        // `shell` だけが 0 になる。`insert_session` は値を明示バインドするので、
+        // DDL の DEFAULT とこの UPDATE が観測される経路はこのバックフィルだけである。
         let mut conn = v1_conn();
-        insert_v1_session(&conn, "s1", "claude");
-        insert_v1_session(&conn, "s2", "shell");
+        insert_v1_session(&conn, "s_claude", "claude");
+        insert_v1_session(&conn, "s_codex", "codex");
+        insert_v1_session(&conn, "s_shell", "shell");
+        insert_v1_session(&conn, "s_custom", "custom");
 
         migrate(&mut conn).expect("migrate");
 
-        let (enabled, secs): (i64, i64) = conn
-            .query_row(
-                "SELECT heuristics_enabled, silence_timeout_secs FROM sessions WHERE id = 's1'",
-                [],
+        let row = |id: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT heuristics_enabled, silence_timeout_secs FROM sessions WHERE id = ?1",
+                [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .expect("read back s1");
-        assert_eq!(enabled, 1, "heuristics_enabled の既定は 1");
-        assert_eq!(secs, 30, "silence_timeout_secs の既定は 30");
+            .expect("read back the migrated row")
+        };
 
-        let shell_enabled: i64 = conn
-            .query_row(
-                "SELECT heuristics_enabled FROM sessions WHERE id = 's2'",
-                [],
-                |r| r.get(0),
-            )
-            .expect("read back s2");
+        // `UPDATE` を全行へ広げる変異の観測点（契約 §117.5 の項目 3）
         assert_eq!(
-            shell_enabled, 1,
-            "既存の shell 行も一律 1 になる（契約 §20 の DDL どおり）"
+            row("s_claude"),
+            (1, 30),
+            "claude 行は DDL の DEFAULT のまま"
+        );
+        assert_eq!(row("s_codex"), (1, 30), "codex 行は DDL の DEFAULT のまま");
+        assert_eq!(
+            row("s_custom"),
+            (1, 30),
+            "custom 行は DDL の DEFAULT のまま"
+        );
+        assert_eq!(
+            row("s_shell"),
+            (0, 30),
+            "移行前の shell 行は 0 へ正規化する（契約 §117.2）。silence_timeout_secs は触らない"
         );
     }
 
@@ -259,6 +271,42 @@ mod migration_v2_tests {
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .expect("count");
         assert_eq!(rows, 1, "version = 0 の迷子行が残っている");
+    }
+
+    /// 各版のコミットが記帳するのは「いま適用した版」であって、目標版
+    /// （`SCHEMA_VERSION`）ではない。
+    ///
+    /// 新規 DB では両者の最終値が一致するので、公開面（`MAX(version)`）では区別が
+    /// 付かない。区別が出るのは v1 のコミット後・v2 の失敗後の中間状態だけである
+    /// —— そこで目標版が記帳されていると、次回の `open` はループが空範囲になり
+    /// `ALTER TABLE` が永久に飛ぶ（2 列が無いまま `SELECT` するので起動不能になる）。
+    ///
+    /// v2 を確実に失敗させるため、`heuristics_enabled` を既に持つ `sessions` を
+    /// 置いた DB を作る（`ALTER TABLE ADD COLUMN` に `IF NOT EXISTS` 形は無いので
+    /// duplicate column name で落ちる）。
+    #[test]
+    fn a_failed_v2_records_version_1_not_the_target_version() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(DDL_V1).expect("v1 ddl");
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN heuristics_enabled INTEGER NOT NULL DEFAULT 1;",
+        )
+        .expect("make the v2 ALTER collide");
+
+        migrate(&mut conn).expect_err("v2 は duplicate column name で失敗するはず");
+
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version");
+        assert_eq!(version, 1, "v1 のコミットが記帳するのは版 1 である");
+        assert!(
+            !columns(&conn).contains(&"silence_timeout_secs".to_owned()),
+            "v2 は適用されていない —— 版 2 を記帳すると、この列が無いまま完了扱いになる"
+        );
     }
 
     #[test]
