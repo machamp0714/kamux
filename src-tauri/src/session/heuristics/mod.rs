@@ -12,6 +12,7 @@ pub mod gate;
 pub mod hook_liveness;
 pub mod registry;
 pub mod silence;
+pub mod validate;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
@@ -19,7 +20,7 @@ pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
 /// **この下限を実際に強制しているのは `registry::clamp_timeout_secs` である** ——
 /// `HeuristicRegistry::register` / `::reconfigure` が `SessionActivity` へ渡す
 /// `silence_timeout_ms` は必ずそこを通る。**範囲検証（設定値を丸めずに弾く側）は
-/// Task 11 に残っている**: クランプは黙って丸めるだけで、範囲外の入力を拒否しない。
+/// `validate::validate_silence_timeout_secs` が持つ**: クランプは黙って丸めるだけで、範囲外の入力を拒否しない。
 /// （下記 const assert が固定するのは `DEFAULT_SILENCE_TIMEOUT_SECS` との
 /// 大小順序だけで、0 を禁じる強制ではない。0 を禁じるのはクランプの側である。）
 pub const MIN_SILENCE_TIMEOUT_SECS: u32 = 5;
