@@ -5,6 +5,7 @@
 //! ここで導出される状態は必ず `gate::heuristic_transition` を通り、
 //! hook 由来の権威ある遷移を上書きしない。
 
+pub mod activity;
 pub mod bel;
 pub mod clock;
 pub mod gate;
@@ -14,7 +15,7 @@ pub mod silence;
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
 /// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になるため、
-/// クランプ・範囲検証（Task 7 / Task 11）でこの下限を強制する予定である。
+/// クランプ・範囲検証（Task 9 / Task 11）でこの下限を強制する予定である。
 /// **現時点でこの定数を読む実装は無い**（下記 const assert が固定するのは
 /// `DEFAULT_SILENCE_TIMEOUT_SECS` との大小順序だけで、0 を禁じる強制ではない）。
 pub const MIN_SILENCE_TIMEOUT_SECS: u32 = 5;
