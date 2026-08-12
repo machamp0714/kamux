@@ -230,6 +230,59 @@ mod tests {
         assert_eq!(d.socket_path, declared.to_string_lossy());
     }
 
+    /// レビュー Important 1（task-14-review.md）: `hooks_server.lock()` が
+    /// poisoned（保持中のスレッドが panic した）とき、`Err(_)` 分岐が実際に
+    /// 踏まれ `listener_alive == false` / `socket_path` は宣言上の path へ
+    /// フォールバックすることを固定する。値を差し替える変異
+    /// （`(declared_socket_path(), false)` → 別の値）はこれまで検出されなかった
+    /// （9/9 全緑）。
+    ///
+    /// 陽性の対照を同じフィクスチャに同居させる: 毒される前は実サーバが生きて
+    /// おり `listener_alive == true` になることも固定する。これが無いと
+    /// 「常に false を返す実装」でもこのテストが緑になり判別力が無い。
+    #[test]
+    fn a_poisoned_hooks_server_lock_reports_a_dead_listener_via_the_declared_path() {
+        let (_dir, store) = crate::store::test_support::open_temp();
+        let mut state = crate::state::test_support::app_state(store);
+
+        let declared = test_diag_socket_path("poisoned-declared");
+        state.hooks = Some(unused_hooks_runtime("poisoned", declared.clone()));
+
+        let real_sock = test_diag_socket_path("poisoned-real");
+        let server =
+            HooksServer::start(real_sock.clone(), Arc::new(NoopHookSink)).expect("start server");
+        state.hooks_server = std::sync::Mutex::new(Some(server));
+
+        // 陽性の対照: 毒される前は listener_alive == true（サーバの実 path が真実）。
+        let before = diagnostics_from_state(&state);
+        assert!(before.listener_alive);
+        assert_eq!(before.socket_path, real_sock.to_string_lossy());
+
+        // `hooks_server.lock()` を保持したまま panic させ、poisoned にする。
+        // 子スレッドの panic はテスト自体を落とさない。
+        let state = Arc::new(state);
+        let state_for_thread = Arc::clone(&state);
+        let poisoning = std::thread::spawn(move || {
+            let _guard = state_for_thread.hooks_server.lock().expect("lock");
+            panic!("poison the hooks_server mutex on purpose");
+        });
+        assert!(
+            poisoning.join().is_err(),
+            "spawned thread must have panicked while holding the lock"
+        );
+
+        let after = diagnostics_from_state(&state);
+        assert!(
+            !after.listener_alive,
+            "a poisoned lock must report a dead listener"
+        );
+        assert_eq!(
+            after.socket_path,
+            declared.to_string_lossy(),
+            "a poisoned lock must fall back to the declared path in state.hooks"
+        );
+    }
+
     #[test]
     fn sessions_in_diagnostics_come_from_the_heuristics_registry() {
         let (_dir, store) = crate::store::test_support::open_temp();

@@ -636,6 +636,49 @@ mod tests {
         server.shutdown();
     }
 
+    /// レビュー Important 2（task-14-review.md）: `is_alive()` の doc コメント
+    /// （:203-204）は「accept ループのスレッドが panic した場合も
+    /// `is_finished()` が true になる」ことを理由に `handle.is_some()` では
+    /// なく `is_finished()` を見ている。この性質 —— `handle` が `Some` のまま
+    /// スレッドだけが終了したケース —— を検証するテストが無いと、
+    /// `is_alive()` を `handle.is_some()` へ弱める変異が検出できない。
+    ///
+    /// `shutdown()` を呼ばずに、`stop` を立てて accept をひとつ繋いで起こし、
+    /// スレッドが自然に終了するのを待つ（`shutdown()` の中身と同じ手口を、
+    /// `handle` には触れずに行う）。待ち合わせは固定 `sleep` ではなく
+    /// `wait_for` の条件ポーリングで行う。
+    #[test]
+    fn is_alive_returns_false_once_the_accept_thread_has_finished_without_shutdown() {
+        let path = test_socket_path("finished-thread");
+        let sink = Arc::new(RecordingSink::default());
+        let server = HooksServer::start(path.clone(), sink).expect("start");
+
+        server.stop.store(true, Ordering::SeqCst);
+        // ブロッキング accept を起こすためだけの接続（shutdown() と同じ手口）。
+        let _ = UnixStream::connect(&path);
+
+        wait_for(|| server.handle.as_ref().is_some_and(|h| h.is_finished()));
+
+        assert!(
+            server.handle.is_some(),
+            "shutdown() を呼んでいないので handle は Some のまま"
+        );
+        assert!(
+            !server.is_alive(),
+            "handle が Some でもスレッドが終了していれば is_alive() は false でなければならない"
+        );
+
+        // 後片付け: handle は既に終了しているので shutdown() は join がすぐ返る。
+        server_cleanup(server, &path);
+    }
+
+    /// `shutdown()` を呼んでソケットファイルを片付ける。テスト末尾の後始末を
+    /// 1 箇所へ集約する。
+    fn server_cleanup(mut server: HooksServer, path: &Path) {
+        server.shutdown();
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn start_replaces_a_stale_socket_file() {
         let path = test_socket_path("stale");
