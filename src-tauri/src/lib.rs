@@ -1607,6 +1607,99 @@ mod tests {
             );
             assert_eq!(state.runtime.current(&session.id), RuntimeState::Running);
         }
+
+        // --- 契約 §118.2: `StateInput::OutputActivity` の production 送信点 ---
+
+        /// 遷移の**理由**まで見るための観測。バッジの色（`RuntimeState`）だけでは
+        /// `OutputActivity` と `UserInput` を区別できない（契約 §118.4）。
+        #[derive(Default)]
+        struct ReasonRecorder {
+            seen: Mutex<Vec<crate::model::StateReason>>,
+        }
+
+        impl crate::session::runtime_state::StateObserver for ReasonRecorder {
+            fn on_state(&self, payload: &crate::model::SessionStatePayload) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(payload.reason);
+            }
+        }
+
+        impl ReasonRecorder {
+            fn reasons(&self) -> Vec<crate::model::StateReason> {
+                self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            }
+        }
+
+        /// 未知のセッションの snapshot は `Idle` / 理由なしなので（`RuntimeSender::snapshot`）、
+        /// 出力チャンク 1 つで `Idle` → `Running` が起きる。
+        fn app_with_a_recorder() -> (
+            tempfile::TempDir,
+            tauri::App<MockRuntime>,
+            crate::model::Session,
+            Arc<ReasonRecorder>,
+        ) {
+            let (dir, app, session) = app_with_one_session();
+            let recorder = Arc::new(ReasonRecorder::default());
+            app.state::<AppState>()
+                .runtime
+                .register_observer(recorder.clone());
+            (dir, app, session, recorder)
+        }
+
+        #[test]
+        fn output_on_an_agent_surface_through_the_sink_sends_output_activity() {
+            use crate::pty::surface::PtySink;
+
+            let (_dir, app, session, recorder) = app_with_a_recorder();
+            let state = app.state::<AppState>();
+            let sink = crate::pty::sink::TauriSink::new(app.handle().clone());
+
+            sink.on_data(&format!("{}:agent", session.id), "aGk=".to_owned(), 1);
+
+            // observer は `StateMap` の更新の**後**に呼ばれる（`consume_loop`）ので、
+            // `current()` を待つと理由が届く前に先へ進みうる。遅い側を待つ
+            assert!(
+                wait_until(|| !recorder.reasons().is_empty()),
+                "agent サーフェスの出力が状態機械へ届いていない（契約 §118.2）"
+            );
+            assert_eq!(
+                recorder.reasons(),
+                vec![crate::model::StateReason::OutputActivity],
+                "理由が output_activity でないと、⚪ のまま座ったバッチの復帰経路が塞がる（契約 §118.3）"
+            );
+            assert_eq!(state.runtime.current(&session.id), RuntimeState::Running);
+        }
+
+        #[test]
+        fn output_on_an_editor_surface_through_the_sink_leaves_the_session_alone() {
+            use crate::pty::surface::PtySink;
+
+            let (_dir, app, session, recorder) = app_with_a_recorder();
+            let state = app.state::<AppState>();
+            let sink = crate::pty::sink::TauriSink::new(app.handle().clone());
+
+            sink.on_data(&format!("{}:editor", session.id), "aGk=".to_owned(), 1);
+
+            // 負の主張なので待つ条件が作れない（契約 §69.2）
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                state.runtime.current(&session.id),
+                RuntimeState::Idle,
+                "nvim が出力しているだけでセッションが永遠に 🟢 になる（契約 §2 の事故 2）"
+            );
+            assert!(recorder.reasons().is_empty(), "遷移が 1 件も起きないこと");
+
+            // 陽性の対照: 同じ sink・同じセッションで agent サーフェスなら動く。
+            // これが無いと、上の緑は「フィクスチャが壊れていて何も起きない」と
+            // 区別が付かない
+            sink.on_data(&format!("{}:agent", session.id), "aGk=".to_owned(), 2);
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "陽性の対照: agent サーフェスの出力は 🟢 にするはず"
+            );
+        }
     }
 
     #[test]
