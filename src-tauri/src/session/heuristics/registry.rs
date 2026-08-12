@@ -664,6 +664,24 @@ mod tests {
         assert!(!diag[1].heuristics_active, "オフなら動いていない");
     }
 
+    /// 猶予中（`Pending`）はまだ hook を待っている段階なので、推定は働いていない。
+    ///
+    /// **他の diagnostics のテストは `Healthy` / `NotApplicable` / `Unreachable` しか
+    /// 通らないため、`heuristics_active` の判定から `Pending` を落とす変異を
+    /// 1 本も捕まえられない**（実測: 落とす変異は 630 passed / 0 failed で全緑だった）。
+    #[tokio::test(start_paused = true)]
+    async fn diagnostics_does_not_mark_a_claude_session_inside_the_grace_window_as_active() {
+        let (_c, _sink, reg) = setup(&[]);
+        reg.register("s1", CliKind::Claude, true, 30);
+
+        let diag = reg.diagnostics();
+        assert_eq!(diag[0].liveness, HookLiveness::Pending);
+        assert!(
+            !diag[0].heuristics_active,
+            "猶予中はまだ hook を待っている（推定は抑止されている）"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn diagnostics_marks_a_fallen_back_claude_session_as_active() {
         let (clock, _sink, reg) = setup(&[]);
