@@ -187,7 +187,10 @@ impl PtyManager {
             valid: Arc::clone(&valid),
             registry: Arc::downgrade(&self.surfaces),
         });
-        let surface = PtySurface::spawn(spec, wrapped)?;
+        // M3-3: observer は本 PR ではまだ誰も構築しない（Task 13 が `HeuristicRegistry`
+        // 越しに渡す高さを決める）。契約 §44.1 により、呼び出し側が無いことを
+        // 欠陥として扱わない。
+        let surface = PtySurface::spawn(spec, wrapped, None)?;
 
         if let Some(old) = guard.get(&id) {
             // 旧世代がまだ on_exit を送出していなければ、ここで無効化する。

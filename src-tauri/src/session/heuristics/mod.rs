@@ -46,8 +46,10 @@ const _: () = assert!(MIN_SILENCE_TIMEOUT_SECS <= DEFAULT_SILENCE_TIMEOUT_SECS);
 const _: () = assert!(DEFAULT_SILENCE_TIMEOUT_SECS <= MAX_SILENCE_TIMEOUT_SECS);
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use self::activity::SessionActivity;
+use self::bel::BelScanner;
 use crate::model::RuntimeState;
 use crate::session::runtime_state::{next_state, StateInput};
 
@@ -86,6 +88,34 @@ impl HeuristicEvent {
             HeuristicEvent::Bel { .. } => gate::HeuristicInput::Bel,
             HeuristicEvent::Silence { .. } => gate::HeuristicInput::Silence,
         }
+    }
+}
+
+/// agent サーフェスの読み取りスレッドが所有するオブザーバ。
+/// `BelScanner` を所有するのでロックが要らない。
+///
+/// editor サーフェス（nvim）には**装着しない**。nvim は常時 BEL を鳴らし、
+/// ユーザーが編集していない間は当然沈黙するため、混ぜると値が壊れる（設計 §4.8）。
+/// 装着するかどうかを決めるのは `PtySurface::spawn` の呼び出し側であり、
+/// `spawn` の中で `surface_id` を見て捨てる形にはしない（判断が 2 箇所に散る）。
+pub struct AgentOutputObserver {
+    activity: Arc<SessionActivity>,
+    scanner: BelScanner,
+}
+
+impl AgentOutputObserver {
+    pub fn new(activity: Arc<SessionActivity>) -> Self {
+        Self {
+            activity,
+            scanner: BelScanner::new(),
+        }
+    }
+}
+
+impl OutputObserver for AgentOutputObserver {
+    fn on_chunk(&mut self, chunk: &[u8]) {
+        let bel_count = self.scanner.scan(chunk);
+        self.activity.record_output(bel_count);
     }
 }
 
@@ -144,6 +174,90 @@ impl RuntimeStateSink for FakeSink {
         if let Some((next, _reason)) = next_state(current, input) {
             guard.states.insert(session_id.to_string(), next);
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::activity::SessionActivity;
+    use super::clock::TestClock;
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn setup() -> (
+        TestClock,
+        Box<dyn OutputObserver>,
+        mpsc::UnboundedReceiver<HeuristicEvent>,
+    ) {
+        let clock = TestClock::new(0);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let activity = SessionActivity::new(
+            "s1".to_string(),
+            Arc::new(clock.clone()),
+            tx,
+            tokio::runtime::Handle::current(),
+            true,
+            30_000,
+        );
+        (clock, Box::new(AgentOutputObserver::new(activity)), rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_real_bel_in_a_chunk_produces_an_event() {
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"waiting for input\x07");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Bel {
+                session_id: "s1".into()
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_osc_title_sequence_produces_no_event() {
+        // シェルのプロンプトが毎回吐くシーケンス。ここで誤検知すると実用にならない
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"\x1b]0;user@host: ~/repo\x07$ ");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_state_survives_across_chunks() {
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"\x1b]0;split-");
+        obs.on_chunk(b"title\x07");
+        assert!(
+            rx.try_recv().is_err(),
+            "チャンク跨ぎの OSC 終端子を誤検知した"
+        );
+
+        obs.on_chunk(b"\x07");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Bel {
+                session_id: "s1".into()
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plain_output_starts_the_silence_watcher() {
+        let (clock, mut obs, mut rx) = setup();
+        obs.on_chunk(b"building...\n");
+        tokio::task::yield_now().await;
+
+        clock.advance_ms(31_000);
+        tokio::time::advance(std::time::Duration::from_millis(31_000)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            }
+        );
     }
 }
 
