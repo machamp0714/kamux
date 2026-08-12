@@ -200,6 +200,12 @@ impl HooksServer {
         &self.socket_path
     }
 
+    /// accept ループのスレッドが生きているか。`shutdown()` は `handle` を take するので
+    /// 停止後は必ず false。スレッドが panic した場合も `is_finished()` が true になる。
+    pub fn is_alive(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// 冪等。二重に呼んでも安全。
     pub fn shutdown(&mut self) {
         let Some(handle) = self.handle.take() else {

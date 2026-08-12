@@ -137,6 +137,16 @@ async fn move_session(
     state.store.move_session(&id, to_status, to_index)
 }
 
+// hooks 疎通ステータス（契約 §7.1、M3-3、設計書 §12 が明示的に要求）。
+// `State<'_, AppState>` はテストから構築できないため、本体は薄いラッパに徹し、
+// ロジックは `diagnostics_from_state`（テストから直接呼べる自由関数）へ出す。
+#[tauri::command]
+async fn get_hooks_diagnostics(
+    state: State<'_, AppState>,
+) -> AppResult<crate::session::heuristics::diagnostics::HooksDiagnostics> {
+    Ok(crate::session::heuristics::diagnostics::diagnostics_from_state(&state))
+}
+
 /// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
 ///
 /// 効いているのはモジュールの private ではなく **`ShutdownBegun` のフィールドの
@@ -497,6 +507,7 @@ pub fn run() {
             list_sessions,
             delete_project,
             move_session,
+            get_hooks_diagnostics,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,

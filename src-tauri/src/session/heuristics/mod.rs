@@ -8,6 +8,7 @@
 pub mod activity;
 pub mod bel;
 pub mod clock;
+pub mod diagnostics;
 pub mod gate;
 pub mod hook_liveness;
 pub mod registry;
