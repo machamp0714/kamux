@@ -805,6 +805,27 @@ mod tests {
                 "{i} 番目が {expected} で始まらない: {entries:?}"
             );
         }
+        // observer と sink は同じチャンクを見る。observer へ渡すスライス境界
+        // (`&buf[..n]`)を落とすと、使い回している `buf` の前回分の残骸まで
+        // observer が読むのでここが落ちる。
+        assert!(
+            entries.len() >= 2,
+            "obs/sink のペアが 1 組も無い: {entries:?}"
+        );
+        for (idx, pair) in entries.chunks_exact(2).enumerate() {
+            let observed = pair[0].strip_prefix("obs:").expect("obs entry");
+            let decoded = BASE64
+                .decode(pair[1].strip_prefix("sink:").expect("sink entry"))
+                .expect("valid base64");
+            let sent = String::from_utf8_lossy(&decoded);
+            assert!(
+                observed == sent,
+                "{idx} 番目のチャンク: observer と sink が同じチャンクを見ていない \
+                 (observer {} bytes / sink {} bytes)",
+                observed.len(),
+                decoded.len()
+            );
+        }
     }
 
     /// observer を渡さない経路(本 PR の production 全経路)でも読み取りは壊れない。

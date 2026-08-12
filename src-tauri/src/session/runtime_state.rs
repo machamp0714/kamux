@@ -1732,6 +1732,14 @@ mod tests {
         assert_eq!(mgr.current("fresh"), Idle);
         assert_eq!(mgr.current("dead"), Exited);
         assert_eq!(mgr.current("already"), Interrupted);
+
+        // DB 復元行は理由を持たない = 許可側（契約 §113.5 の既定の極性）。
+        // 禁止側へ倒すと再起動後のセッションが OutputActivity で 🟢 へ戻らなくなる。
+        mgr.sender().send("fresh", In::OutputActivity);
+        assert!(
+            wait_until(|| mgr.current("fresh") == Running),
+            "復元された idle 行が OutputActivity で running へ戻らない"
+        );
     }
 
     /// `error` 行もメモリ上のスナップショットへ必ず載る（契約 §2 / §40.5）。
