@@ -333,10 +333,9 @@ mod tests {
     //     migrate_applies_ddl_v1_over_an_existing_schema_when_the_version_row_is_stray
     //     へ移した（同じ変異でそちらが赤になることを実測している）。
     //
-    // このテスト自体は tempdir + Store::open のまま残す。apply_pragmas + migrate の
-    // 結線（§46.3 落とし穴 2）を通す経路はここにしかない。
+    // このテスト自体は tempdir + Store::open のまま残す。
     #[test]
-    fn migrate_keeps_schema_version_as_a_single_row_after_reapplication() {
+    fn migrate_keeps_schema_version_as_a_single_row_when_it_starts_from_a_stray_version_0_row() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("app.db");
 

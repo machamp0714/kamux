@@ -172,15 +172,19 @@ impl HeuristicRegistry {
     /// - `heuristics_enabled`（`bool` なので拡大 ≡ 削除）:
     ///   `tests::a_silence_suppressed_by_the_session_switch_does_not_re_arm_the_watcher`
     /// - `hook_liveness == Pending`: **`HookLiveness` は 4 値なので「拡大」は単一の編集ではない。**
-    ///   再 arm 集合 `{Pending}` を含む部分集合は 8 通りあり、現行を除く 7 通りが拡大、
-    ///   `∅` の 1 通りが縮小である（round m3-3-t9-fix-r4 で 8 通り全部を実測）。
+    ///   再 arm 集合 `{Pending}` を含む部分集合は 8 通りあり、現行を除く 7 通りが拡大である。
+    ///   `∅`（この 8 通りには入らない）の 1 通りが縮小である
+    ///   （round m3-3-t9-fix-r4 で 拡大 7 + 現行 1 + `∅` の 9 通りを実測）。
     ///   広げた先の値ごとに、それを区別できるテストが違う:
     ///   - `Healthy` を含める → `tests::a_claude_session_with_healthy_hooks_is_never_touched`
     ///   - `NotApplicable` を含める → `tests::a_bel_makes_a_custom_cli_wait_for_input` の後半
     ///   - `Unreachable` を含める →
     ///     `tests::a_claude_session_without_hooks_falls_back_after_the_grace_window` の後半
     ///
-    ///   削除（= 全体集合への拡大）と反転・縮小は上の 3 本のいずれかが捕まえる。
+    ///   削除（= 全体集合への拡大）と反転は上の 3 本が捕まえる。**縮小（`∅`）を
+    ///   捕まえるのは A-1 の 2 本（`tests::a_silence_swallowed_by_the_grace_window_is_re_evaluated_once_the_grace_expires`
+    ///   / `tests::a_grace_boundary_crossed_between_the_two_clock_reads_still_re_arms`）で、
+    ///   上の 3 本はどれも落ちない**（実測 round m3-3-t9-rerev-r4）。
     ///   **どれか 1 本を「拡大方向の観測点」と呼ばないこと** —— 1 本では 4 値の
     ///   1 つしか通らず、残りの値は無検査のまま「見た」と読まれる
     fn rearm_if_the_grace_window_swallowed_it(
@@ -612,11 +616,11 @@ mod tests {
         // `advance` 粒度が決めるので、**この数値からループの周期は読めない** ——
         // 100 ms 周期はコードから導いた未実測の帰結である。
         //
-        // ⚠️ **刻み幅（1_000）は `REARM_MARGIN_MS` 以上でなければならない。**
-        // 小さいと再 arm の `sleep` が 1 度も満了せず、ループしていても `evaluations`
-        // が増えない。**境界は `>=` である**（実測 round m3-3-t9-fix-r4: 刻みを
-        // `REARM_MARGIN_MS` ちょうど = 100 にしても条件を落とす変異はこのテストで赤になる。
-        // 以前ここに書いていた「より大きくなければならない」は未実測の断定だった）。
+        // ⚠️ **ループが進める総時間（歩数 × 刻み）が `REARM_MARGIN_MS` 以上でなければ
+        // ならない。** 足りないと再 arm の `sleep` が 1 度も満了せず、ループしていても
+        // `evaluations` が増えない（実測 round m3-3-t9-rerev-r4: 5 歩 × 20 ms = 100 ms で
+        // 赤（`left: 3`）、5 歩 × 19 ms = 95 ms で緑。刻み 50 でも赤なので、
+        // **刻み単体の下限ではない**）。
         // （実測 round m3-3-t9-fix-r3: 刻みを 1 ms にすると
         // **このテストは**条件を落とす変異を捕まえなくなる —— そのとき赤を出したのは
         // 刻み 1_000 のままの `a_bel_makes_a_custom_cli_wait_for_input` だけだった）。
@@ -642,7 +646,7 @@ mod tests {
     /// hooks が猶予の中に 1 件も来なければ汎用ヒューリスティックへ落ちる。
     ///
     /// **後半は再 arm ガードの第 3 条件を `Unreachable` の側から測る。**
-    /// registry のテストで `HookLiveness::Unreachable` を作っているのはこの fixture だけで、
+    /// 猶予切れの後にウォッチャを立て直す唯一の fixture であり、
     /// 再 arm 集合を `{Pending}` から `{Pending, Unreachable}` へ広げる編集を
     /// 区別できるのはここしか無い（実測 round m3-3-t9-fix-r4: 強化前は
     /// その変異が 120/120 全緑だった）。猶予切れの後に `Idle` で座っている間、
