@@ -134,6 +134,11 @@ mod tests {
 
     /// `handler_with_session` に `HeuristicRegistry` を足した版。
     /// hook 昇格（`note_hook`）を見るテストだけがこちらを使う。
+    //
+    // 戻り値の 7 要素は呼び出し側が `let (handler, store, tx, runtime, id, dir, reg) = ..;`
+    // と 1 行で分解するテスト専用の組み立てヘルパである。型エイリアスを挟むと
+    // この並びが宣言側からしか読めなくなり、doc の分だけ読み手が遠くなるので許可する
+    // （先例: `lib.rs` の `create_session` に付けた `too_many_arguments`）。
     #[allow(clippy::type_complexity)]
     fn handler_with_heuristics() -> (
         HookHandler,

@@ -1297,6 +1297,12 @@ mod tests {
         ///
         /// 2 つの腕（`heuristics_enabled` / `silence_timeout_secs`）を別々に測る ——
         /// 片方だけの条件に縮める変異はもう片方で赤くなる。
+        ///
+        /// **腕は 3 つある。** 3 本目は「反映する値は『パッチの中身』ではなく
+        /// 『書き込み後の行』である」という `apply_session_patch` の doc の主張を測る
+        /// （task-13 レビュー I-1）。各腕の後で**渡していないほうのフィールド**を見るので、
+        /// `updated.*` を `patch.*.unwrap_or(既定)` へ差し替える変異は
+        /// 腕 (2) で `heuristics_active` が、腕 (3) で `silence_timeout_ms` が赤くなる。
         #[test]
         fn update_session_reconfigures_the_running_heuristics() {
             let (_dir, store) = open_temp();
@@ -1356,6 +1362,35 @@ mod tests {
                 format!("{activity:?}").contains("silence_timeout_ms: 120000"),
                 "沈黙タイムアウトが実行中のセッションへ届いていない: {activity:?}"
             );
+            // 腕 (2) のパッチは `heuristics_enabled` を運んでいない。パッチの中身を
+            // 反映すると、腕 (1) でオフにしたヒューリスティックが既定値 true で
+            // 黙って復活する（DB は false のまま）。
+            assert!(
+                !state.heuristics.diagnostics()[0].heuristics_active,
+                "タイムアウトだけのパッチでヒューリスティックが復活している: \
+                 書き込み後の行ではなくパッチの中身を反映している"
+            );
+
+            // (3) オンに戻す腕（`silence_timeout_secs` を伴わない）
+            super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    heuristics_enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("patch");
+            assert!(
+                state.heuristics.diagnostics()[0].heuristics_active,
+                "オンに戻しても実行中のセッションへ届いていない"
+            );
+            // 腕 (3) のパッチは `silence_timeout_secs` を運んでいない。パッチの中身を
+            // 反映すると、腕 (2) で 120 秒にしたタイムアウトが既定値 30 秒へ戻る。
+            assert!(
+                format!("{activity:?}").contains("silence_timeout_ms: 120000"),
+                "オン/オフだけのパッチで沈黙タイムアウトが巻き戻っている: {activity:?}"
+            );
         }
 
         /// M3-3 群 S: PTY 終了でヒューリスティックの登録を外す配線と、**その極性**。
@@ -1411,6 +1446,62 @@ mod tests {
             assert!(
                 state.heuristics.diagnostics().is_empty(),
                 "agent サーフェスの終了でヒューリスティックが外れていない"
+            );
+        }
+
+        /// M3-3 群 S（task-13 レビュー I-2）: `install_app_state_with` が組む
+        /// `HeuristicRegistry` が、**`AppState` に載るその `RuntimeStateManager`** へ
+        /// 繋がっていること。
+        ///
+        /// 端から端までの観測点（`session::mod` の
+        /// `spawning_an_agent_surface_wires_its_output_to_the_state_machine`）は
+        /// `state::test_support::app_state` が組んだ**別のコード**を通る。同じ形の
+        /// 組み立てが `state.rs` と `lib.rs` の 2 箇所にあるため、production 側の
+        /// `ManagerSink::new(runtime.sender())` を別の `RuntimeStateManager` の
+        /// sender へ繋ぎ替えても全テストが緑のままだった（実測）。実害は
+        /// **実機でヒューリスティックが 1 つも UI に届かない**こと。ここが
+        /// production の組み立てを通る唯一の端から端までの観測点である。
+        #[test]
+        fn install_app_state_wires_the_registry_to_the_managed_state_machine() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            // `insert_test_session` は `CliKind::Shell` = ヒューリスティック既定オフ。
+            // BEL を状態機械まで通すため汎用 CLI として登録し直す。
+            let mut session = insert_test_session(&store, &project_id, "live");
+            session.cli_kind = CliKind::Custom;
+            session.heuristics_enabled = true;
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+            let state = app.state::<AppState>();
+
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "前提が崩れている: セッションが running になっていない"
+            );
+
+            // production の spawn 経路と同じ入口。返るオブザーバは
+            // `install_app_state_with` が組んだレジストリに繋がっている。
+            let mut observer = crate::session::heuristics::sink_impl::attach_heuristics(
+                &state.heuristics,
+                &session,
+            );
+            observer.on_chunk(b"continue? \x07"); // 入力待ちの BEL
+
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::WaitingInput),
+                "install_app_state_with のレジストリが AppState.runtime へ繋がっていない\
+                 （現在: {:?}）",
+                state.runtime.current(&session.id)
             );
         }
 
