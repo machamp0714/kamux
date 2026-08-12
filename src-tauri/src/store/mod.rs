@@ -320,10 +320,21 @@ mod tests {
     // M3-3（schema_version 2）で、迷子行の作り方を「一度 Store::open して版を 0 に
     // 巻き戻す」から「schema_version テーブルだけを持つ空の DB を直接作る」へ変えた。
     // 前者は v2 適用済みの DB に対して v2 の ALTER TABLE ADD COLUMN を再実行させる形に
-    // なり、duplicate column name で必ず失敗する（§46.3 落とし穴 1 そのもの）。
-    // これはフィクスチャの作り物であって本番では起こらない —— 版が巻き戻ることは
-    // 無いためである。新しい形は v1 → v2 の 2 反復ぶんループ本体を通すので、
-    // 元の形より強い観測になっている。
+    // なり、duplicate column name で必ず失敗する（§46.3 落とし穴 1 そのもの。旧フィクスチャを
+    // この版へ復元して実測した）。これはフィクスチャの作り物であって本番では起こらない
+    // —— 版が巻き戻ることは無いためである。
+    //
+    // 新旧の観測の差（実測に基づく。「より強い」という一括りの主張はしない）:
+    //   - 新形はループ本体（DELETE → INSERT）を v1 → v2 の 2 反復ぶん通す。
+    //   - 一方で、新形の v1 反復は schema_version しか持たない DB に対して走るため
+    //     「既存スキーマの上へ DDL_V1 を再適用する」経路は通らない。DDL_V1 の
+    //     CREATE TABLE IF NOT EXISTS から IF NOT EXISTS を落とす変異は、この形では
+    //     緑になる（実測）。その観測は schema.rs の
+    //     migrate_applies_ddl_v1_over_an_existing_schema_when_the_version_row_is_stray
+    //     へ移した（同じ変異でそちらが赤になることを実測している）。
+    //
+    // このテスト自体は tempdir + Store::open のまま残す。apply_pragmas + migrate の
+    // 結線（§46.3 落とし穴 2）を通す経路はここにしかない。
     #[test]
     fn migrate_keeps_schema_version_as_a_single_row_after_reapplication() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -224,6 +224,43 @@ mod migration_v2_tests {
         assert_eq!(rows, 1, "v2 適用後に version 行が増えている");
     }
 
+    /// `DDL_V1` が全文 `IF NOT EXISTS` であることに依存した経路を通す。
+    ///
+    /// 契約 §46.3 落とし穴 1 は「version 1 は DDL が全文 `IF NOT EXISTS` なので、
+    /// v1 のコミット後・v2 のコミット前に落ちた DB を次回の `open` が自己修復できる」
+    /// という性質を明文の拠り所にしている。その性質を観測するには、**既にスキーマが
+    /// 存在する DB に対してループの v1 反復を走らせる**必要がある。
+    ///
+    /// ここでは `schema_version` に「迷子の version 0 行」を置いてそれを作る
+    /// （`COALESCE(MAX(version), 0)` は空テーブルと version 0 行を区別しないので、
+    /// `current = 0` すなわち `1..=2` の 2 反復に入る）。v1 は既存スキーマの上を
+    /// `IF NOT EXISTS` で素通りし、v2 は列がまだ無いので成功する。
+    ///
+    /// `v1_conn()` を使わないのは意図的である —— あちらは版 1 を記録するため
+    /// ループが `2..=2` になり、`DDL_V1` が 1 度も実行されない。
+    #[test]
+    fn migrate_applies_ddl_v1_over_an_existing_schema_when_the_version_row_is_stray() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(DDL_V1).expect("v1 ddl");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY NOT NULL);
+             INSERT INTO schema_version (version) VALUES (0);",
+        )
+        .expect("seed a stray version 0 row");
+
+        migrate(&mut conn).expect("v1 が既存スキーマの上を素通りしていない");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 2, "迷子行から v1 → v2 を通した後の版");
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(rows, 1, "version = 0 の迷子行が残っている");
+    }
+
     #[test]
     fn migrating_an_already_migrated_v2_database_is_a_no_op() {
         // `ALTER TABLE ADD COLUMN` に IF NOT EXISTS 形は無い（§46.3 の落とし穴 1）。
