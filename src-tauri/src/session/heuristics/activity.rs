@@ -7,6 +7,37 @@
 //! `silence_timeout_ms` はここでは丸めない。許容範囲へのクランプは
 //! `registry::clamp_timeout_secs`（Task 9）の責務であり、`SessionActivity` は
 //! 渡された値をそのまま使う。
+//!
+//! # `watcher_alive` の解除と再チェックに `SeqCst` を使う理由（緩めてはならない）
+//!
+//! ウォッチャは「フラグを降ろす → もう一度状態を読む」、`record_output` /
+//! `rearm_after` は「状態を書く → フラグを取りに行く」という順で動く。
+//! 2 者がそれぞれ「自分の store の後に、相手が書く変数を load する」形は
+//! **store-buffering** であり、release/acquire では**両方が相手の旧値を見る**結果を
+//! 禁止できない —— `store` には synchronizes-with が生えないし、RMW の
+//! modification order もこの 2 組の前後関係を決めないからである。
+//! 禁止するには 4 アクセスすべてが同じ全順序に載る必要があり、それが `SeqCst` である
+//! （`store` と `load` の間に両者で `fence(SeqCst)` を置いても同じ結果になる）。
+//! **本ターゲットの aarch64（Apple Silicon）は StoreLoad の並べ替えを架構上許すため、
+//! 実機で起こりうる。**
+//!
+//! 対になるのは次の 2 組で、どちらも 4 アクセス全部が `SeqCst` でなければ閉じない。
+//! **片側だけ強めても閉じない。**
+//!
+//! 1. `watcher_alive.store(false)` → `last_activity_ms.load`（`watch_silence` の Fire 腕）
+//!    ↔ `last_activity_ms.store` → `watcher_alive.swap(true)`（`record_output`）
+//! 2. `watcher_alive.store(false)` → `enabled.load`（`watch_silence` の disabled 腕の再チェック）
+//!    ↔ `enabled.store`（`reconfigure`）→ `watcher_alive.swap(true)`（`record_output` / `rearm_after`）
+//!
+//! 緩めたときの帰結は「**ウォッチャが消え、そのアイドル期間の `Silence` が永久に出ない**」。
+//! この harness（単一スレッド・仮想時間の `#[tokio::test(start_paused = true)]`）では
+//! メモリ順序を観測できず、観測するには `loom` のようなモデル検査が要る（本タスクの scope 外）。
+//! **したがってこの注記が唯一の防護である。「過剰だから」と `Relaxed` / `AcqRel` へ戻さないこと。**
+//!
+//! ホットパス（`record_output`）が余分に払うのは 1 チャンクあたり `SeqCst` の store 1 本
+//! （aarch64 では `stlr` 1 命令）と、元から RMW だった `swap` の格上げだけである。
+//! 同じチャンクに対して既に行っている base64 エンコード（契約 §8）より桁で小さい
+//! （設計 §4.1 と同じ論法）。
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,13 +101,19 @@ impl SessionActivity {
     }
 
     /// PTY 読み取りスレッドから毎チャンク呼ばれるホットパス。ロックを取らない。
+    ///
+    /// `SeqCst` が 2 箇所ある理由はモジュール doc の「`watcher_alive` の解除と再チェック」を参照。
+    /// 代償は 1 チャンクあたりバリア 1 本で、同じチャンクの base64 エンコードより桁で小さい。
     pub fn record_output(self: &Arc<Self>, bel_count: usize) {
+        // この load はモジュール doc の 2 つの対のどちらにも含まれない
+        // （フラグを降ろす側と取る側の交差ではない）。ホットパスなので `Relaxed` で足りる。
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
 
         let now = self.clock.now_ms();
-        self.last_activity_ms.store(now, Ordering::Relaxed);
+        // 対 1 の W2。90 行の swap（R2）との組が、Fire 腕の store/load の組と交差する
+        self.last_activity_ms.store(now, Ordering::SeqCst);
 
         if bel_count > 0 && now - self.last_bel_report_ms.load(Ordering::Relaxed) >= BEL_DEBOUNCE_MS
         {
@@ -86,8 +123,9 @@ impl SessionActivity {
             });
         }
 
-        // ウォッチャが既にいれば何もしない。タイマーを作り直さないのが要点
-        if !self.watcher_alive.swap(true, Ordering::AcqRel) {
+        // ウォッチャが既にいれば何もしない。タイマーを作り直さないのが要点。
+        // 対 1・対 2 の R2（`SeqCst` の理由はモジュール doc）
+        if !self.watcher_alive.swap(true, Ordering::SeqCst) {
             self.spawn_watcher(0);
         }
     }
@@ -107,14 +145,17 @@ impl SessionActivity {
     /// （出力が無かった時刻を活動時刻として記録してはならない）。無効なセッションで
     /// 黙るのは `watch_silence` 先頭の `enabled` 判定が担う。
     pub fn rearm_after(self: &Arc<Self>, delay_ms: u64) {
-        if !self.watcher_alive.swap(true, Ordering::AcqRel) {
+        // 対 2 の R2（`record_output` と同じ役目。`SeqCst` の理由はモジュール doc）
+        if !self.watcher_alive.swap(true, Ordering::SeqCst) {
             self.spawn_watcher(delay_ms);
         }
     }
 
     /// セッション設定のライブ変更。寝ているウォッチャを起こして再評価させる。
     pub fn reconfigure(&self, enabled: bool, silence_timeout_ms: u64) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        // 対 2 の W2。disabled 腕の再チェック（`enabled.load`）との組が
+        // `watcher_alive` の store/swap の組と交差する（モジュール doc 参照）
+        self.enabled.store(enabled, Ordering::SeqCst);
         self.silence_timeout_ms
             .store(silence_timeout_ms, Ordering::Relaxed);
         self.reconfigured.notify_waiters();
@@ -133,12 +174,36 @@ impl SessionActivity {
 
     async fn watch_silence(self: Arc<Self>) {
         loop {
+            // ループ先頭の判定は `Relaxed` で足りる —— 順序が要るのは
+            // 「フラグを降ろした後」の再チェック側であり、こちらではない
+            // （同一変数の後続 load はコヒーレンスによりこれより古い値を読まない）
             if !self.enabled.load(Ordering::Relaxed) {
-                self.watcher_alive.store(false, Ordering::Release);
+                // 対 2 の W1（`SeqCst` の理由はモジュール doc）
+                self.watcher_alive.store(false, Ordering::SeqCst);
+
+                // 対 2 の R1: フラグを降ろした後に再有効化を見直す。
+                // ここが無いと、`reconfigure(true, …)` が上の load と store の間に
+                // 割り込んだとき、同時刻の `record_output` は `watcher_alive == true` を
+                // 見て spawn せず、ウォッチャだけが消える。
+                // 順序が要点: `enabled` の load が先、`swap` が後。逆に書くと
+                // 無効なまま `watcher_alive` を立てて return し、以後 `record_output` も
+                // `rearm_after` も永久に spawn しなくなる（短絡評価に依存している）。
+                //
+                // 閉じるのは「`reconfigure(true, …)` がフラグを降ろす前に着弾していた」窓だけである。
+                // 無効な間に有効化され、その後 1 チャンクも出力が来ない場合の再 arm は
+                // ここでは扱わない（消費側 = Task 9 の責務）。
+                if self.enabled.load(Ordering::SeqCst)
+                    && !self.watcher_alive.swap(true, Ordering::SeqCst)
+                {
+                    continue;
+                }
                 return;
             }
 
             let timeout_ms = self.silence_timeout_ms.load(Ordering::Relaxed);
+            // 待ち時間の基準にするだけの読みなので `Relaxed`。古い値を読んでも
+            // 早めに `Fire` 側へ回るだけで、下の再チェック（`SeqCst`）が新しい値を見て
+            // ループを続ける。対 1 に含まれるのは再チェックの load であってこちらではない
             let last = self.last_activity_ms.load(Ordering::Relaxed);
 
             match silence_step(self.clock.now_ms(), last, timeout_ms) {
@@ -153,11 +218,17 @@ impl SessionActivity {
                     let _ = self.tx.send(HeuristicEvent::Silence {
                         session_id: self.session_id.clone(),
                     });
-                    self.watcher_alive.store(false, Ordering::Release);
+                    // 対 1 の W1（`SeqCst` の理由はモジュール doc）
+                    self.watcher_alive.store(false, Ordering::SeqCst);
 
-                    // store の直前に届いた出力を取りこぼさない（lost wakeup 対策）
-                    if self.last_activity_ms.load(Ordering::Relaxed) > last
-                        && !self.watcher_alive.swap(true, Ordering::AcqRel)
+                    // 対 1 の R1: store の直前に届いた出力を取りこぼさない（lost wakeup 対策）。
+                    // この 4 アクセス（ここの store/load と `record_output` の store/swap）が
+                    // すべて `SeqCst` でなければ、「こちらが旧 `last_activity_ms` を読み、
+                    // かつ `record_output` の swap が `true` を返す」結果を禁止できず、
+                    // ウォッチャが消えてこのアイドル期間の `Silence` が永久に出ない。
+                    // 順序は disabled 腕と同じく load が先・swap が後（短絡評価）。
+                    if self.last_activity_ms.load(Ordering::SeqCst) > last
+                        && !self.watcher_alive.swap(true, Ordering::SeqCst)
                     {
                         continue;
                     }

@@ -36,7 +36,7 @@ const _: () = assert!(HOOK_GRACE_MS < DEFAULT_SILENCE_TIMEOUT_SECS as i64 * 1000
 // の範囲に収まらなければならない。Task 11 の範囲検証はこの区間をユーザー入力の
 // 許容範囲として使うため、既定値がこの区間の外に出ると既定値そのものが検証で
 // 弾かれる。3 定数の大小順序をビルドで固定する（下限に 0 を禁じる等の値そのものの
-// 妥当性はクランプ〔Task 7〕の責務であり、この不等式が保証する範囲ではない）。
+// 妥当性はクランプ〔Task 9〕の責務であり、この不等式が保証する範囲ではない）。
 const _: () = assert!(MIN_SILENCE_TIMEOUT_SECS <= DEFAULT_SILENCE_TIMEOUT_SECS);
 const _: () = assert!(DEFAULT_SILENCE_TIMEOUT_SECS <= MAX_SILENCE_TIMEOUT_SECS);
 
