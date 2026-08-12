@@ -439,6 +439,39 @@ mod tests {
         );
     }
 
+    /// `rearm_after` は活動時刻を書き換えない —— 出力が無かった時刻を活動として
+    /// 記録すると、沈黙の基準がずれて発火が遅れる。
+    /// `delay_ms < timeout_ms` のときにだけ両者は区別できる（Task 9 が猶予の残りだけを
+    /// 渡すと実際にこの関係になる）。
+    #[tokio::test(start_paused = true)]
+    async fn rearm_after_keeps_the_original_activity_timestamp() {
+        let (clock, act, mut rx) = setup(5_000);
+        act.record_output(0);
+        tokio::task::yield_now().await;
+
+        advance(&clock, 5_500).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            }
+        );
+
+        // 遅延（1 秒）はタイムアウト（5 秒）より短い。活動時刻を「今」に書き換える実装だと
+        // 遅延明けの経過時間が 1.1 秒しかなくなり、沈黙が消えてしまう
+        act.rearm_after(1_000);
+        tokio::task::yield_now().await;
+
+        advance(&clock, 1_100).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            },
+            "沈黙の基準は最後に出力があった時刻のままでなければならない"
+        );
+    }
+
     /// `rearm_after` がセッション単位のオフスイッチの迂回路になってはならない。
     #[tokio::test(start_paused = true)]
     async fn rearm_after_on_a_disabled_activity_reports_nothing() {
