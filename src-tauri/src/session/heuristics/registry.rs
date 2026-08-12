@@ -141,10 +141,23 @@ impl HeuristicRegistry {
     /// ここで消えるが、`watch_silence` は Fire でウォッチャを終えるため、
     /// **出力が再開しない限り次のウォッチャが立たない。**
     ///
-    /// BEL の抑止では呼ばない。BEL は出力があった証拠であり、同じ `record_output` が
-    /// 既に次のウォッチャを立てている。**この条件を外しても振る舞いは変わらない**
-    /// （そのとき `rearm_after` は生きているウォッチャを見て no-op になる。
-    /// 実測: 外す変異は全緑 —— round m3-3-t9-r1）。意図を残すために書いてある。
+    /// BEL の抑止では呼ばない。**理由は「同じ `record_output` が既に次のウォッチャを
+    /// 立てているので外しても等価」ではない —— それは誤りだった**（round m3-3-t9-r1 の記述を撤回）。
+    /// `record_output` は `tx.send(Bel)` を `watcher_alive.swap(true)` より**先**に行うので、
+    /// 消費側が `Bel` を見た瞬間にはウォッチャがまだ確立していない窓がある
+    /// （Fire 腕で閉じた窓の鏡像である）。そこで再 arm すると消費側が先にフラグを取り、
+    /// `record_output` 側の `spawn_watcher(0)` は `swap` が `true` を返して走らない ——
+    /// **条件を外すと振る舞いは変わる。**
+    ///
+    /// 呼ばない理由は「BEL は出力があった証拠であって、沈黙の再評価を要求しない」である。
+    /// 再評価が要るのは沈黙が猶予に飲まれたときだけで、BEL の抑止はその状況を作らない。
+    ///
+    /// **実測とコードからの導出の切り分け**:
+    /// - 実測: `activity.rs` の送信が `swap` より前であること（現物のコード）。
+    ///   条件を外す変異が `tests::a_suppressed_bel_does_not_re_arm_the_watcher` で
+    ///   赤になること（round m3-3-t9-fix-r1）
+    /// - 導出（未実測）: 本番のマルチスレッドランタイムでその窓を実際に踏む頻度と、
+    ///   踏んだときの遅延が `remaining_grace + REARM_MARGIN_MS` になること
     ///
     /// 抑止の理由が規則 3 であることは `heuristics_enabled && hook_liveness == Pending`
     /// で判定できる —— `gate::heuristic_transition` は規則 1（セッション単位のオフ）→
@@ -162,11 +175,26 @@ impl HeuristicRegistry {
         {
             return;
         }
-        // 猶予切れの判定は `HookLivenessTracker` が正典。ここに写さない
-        let Some(remaining) = self.liveness.remaining_grace_ms(event.session_id()) else {
-            return;
+        // 猶予切れの判定は `HookLivenessTracker` が正典。ここに写さない。
+        //
+        // 🔴 `None` でも再 arm する。`ctx.hook_liveness` と残り猶予は**別々に時計を読む**
+        // （`liveness()` と `remaining_grace_ms()` がそれぞれ lock と `now_ms()` を取る）ので、
+        // 2 つの読みの間に猶予境界をまたぐと「`Pending` だったのに残りは `None`」が起こる。
+        // そこで return すると、A-1 が防ごうとしている「沈黙推定が二度と発火しない」に落ちる。
+        // 猶予は既に切れているので最小の上乗せで起こし直せばよい。
+        //
+        // **ループしない根拠**（コードからの導出。実測は下記テストの後半 2 assert）:
+        // `None` になる原因は「猶予切れ（`Unreachable`）」「hook 到着（`Healthy`）」
+        // 「エントリ消滅」の 3 つで、どれも次の評価で規則 3 を通らないため
+        // ここへ二度は来ない。resume で `on_spawn` が猶予をやり直した場合は
+        // `register` が古い `SessionActivity` を止めているので、この再 arm は空振りする。
+        let delay = match self.liveness.remaining_grace_ms(event.session_id()) {
+            Some(remaining) => rearm_delay_ms(remaining),
+            // 直書きの `REARM_MARGIN_MS` にしない —— 正であることの保証（飽和加算と
+            // const assert）を `rearm_delay_ms` の 1 箇所に保つ
+            None => rearm_delay_ms(0),
         };
-        activity.rearm_after(rearm_delay_ms(remaining));
+        activity.rearm_after(delay);
     }
 
     /// PTY spawn 時に呼ぶ。返り値の `SessionActivity` を `AgentOutputObserver` に渡す。
@@ -187,13 +215,25 @@ impl HeuristicRegistry {
             timeout_ms,
         );
         self.liveness.on_spawn(session_id, cli_kind);
-        self.lock().insert(
+        // 一時 guard は文の終わりで落ちる。`if let` の被検査式に置くと
+        // 下の `reconfigure` までロックを持ち越すので、束縛を分ける
+        let previous = self.lock().insert(
             session_id.to_string(),
             RegistryEntry {
                 enabled,
                 activity: Arc::clone(&activity),
             },
         );
+        // resume（`unregister` を挟まない再 `register`）。押し出された古い
+        // `SessionActivity` を必ず止める —— `HookLivenessTracker::on_spawn` は
+        // 再 spawn で猶予をリセットする（resume 対応）ので、この呼ばれ方は起こりうる。
+        // 止めないと古いウォッチャが**古い活動時刻**を基準に `Silence` を送り続け、
+        // 消費ループは新しいエントリを引くため resume 直後のセッションが即
+        // `SilenceTimeout` を受ける。停止の手順は `unregister` と同じ
+        if let Some(old) = previous {
+            old.activity
+                .reconfigure(false, (MIN_SILENCE_TIMEOUT_SECS as u64) * 1_000);
+        }
         activity
     }
 
@@ -221,10 +261,20 @@ impl HeuristicRegistry {
         // 立てた新しいウォッチャが先頭の `enabled` 判定で `false` を見て降りうる ——
         // disabled 腕の再チェックが救うのは `enabled.store` がその再チェックより前に
         // 着弾した場合だけで、後になればウォッチャは消え、誰も立て直さない。
-        // **単一スレッド・仮想時間の harness ではこの順序を観測できない**
-        // （spawn したタスクが最初に polled されるのは `reconfigure` が返った後なので、
-        // 逆順にしても全テストが緑のままになる。実測: round m3-3-t9-r1）。
-        // したがってこのコメントが唯一の防護である。入れ替えないこと。
+        //
+        // **観測が無い。実測と導出を分けて書く**:
+        // - 実測: 逆順にする変異は round m3-3-t9-r1 と m3-3-t9-rev-r1 の 2 度とも全緑
+        //   だった（= 現行のテスト集合はこの順序を区別しない）
+        // - コードからの導出（未実測）: spawn したタスクが最初に polled されるのは
+        //   `reconfigure` が返った後なので、逆順の帰結（ウォッチャが消える）が
+        //   単一スレッド・仮想時間の harness には現れない
+        //
+        // ⚠️ 以前ここに書いていた「観測できない」および報告側の
+        // 「seam を置くと `HeuristicRegistry` の外形を変えることになる」は**撤回する** ——
+        // `activity.rs` は同型の窓を `#[cfg(test)]` の thread_local seam で
+        // 外形を変えずに 3 本閉じており、後者は事実に反する。観測を置いていないのは
+        // lane-controller の裁定（M-1 は round m3-3-t9-fix-r1 の scope 外）による。
+        // 現状この順序を守らせているのはこのコメントだけである。入れ替えないこと。
         entry.activity.reconfigure(enabled, timeout_ms);
         let re_enabled = (!was_enabled && enabled).then(|| Arc::clone(&entry.activity));
         // ロックを持ったまま spawn 経路へ入らない
@@ -275,7 +325,7 @@ mod tests {
     use super::*;
     use crate::model::RuntimeState;
     use crate::session::heuristics::clock::TestClock;
-    use crate::session::heuristics::FakeSink;
+    use crate::session::heuristics::{FakeSink, HOOK_GRACE_MS};
     use crate::session::runtime_state::StateInput;
     use std::time::Duration;
 
@@ -345,6 +395,26 @@ mod tests {
         fn send(&self, session_id: &str, input: StateInput) {
             self.inner.send(session_id, input);
         }
+    }
+
+    /// `SessionActivity` の内部フラグを production の `Debug` 越しに読む。
+    ///
+    /// **なぜイベントの不在では測れないか**: registry が作った `SessionActivity` の
+    /// `tx` は registry が握っており、届いたイベントは `handle()` が処理する。
+    /// `handle()` はエントリが消えていると early-return するので、
+    /// `sink.sent()` は**ウォッチャが生きていようが死んでいようが空になる** ——
+    /// `unregister` の停止機構をイベントの不在で測ることは原理的にできない
+    /// （実測: 停止機構を丸ごと削る変異は round m3-3-t9-rev-r1 で全緑だった）。
+    fn assert_activity(act: &Arc<SessionActivity>, enabled: bool, watcher_alive: bool, msg: &str) {
+        let snap = format!("{act:?}");
+        assert!(
+            snap.contains(&format!("enabled: {enabled}")),
+            "{msg} —— enabled が {enabled} ではない: {snap}"
+        );
+        assert!(
+            snap.contains(&format!("watcher_alive: {watcher_alive}")),
+            "{msg} —— watcher_alive が {watcher_alive} ではない: {snap}"
+        );
     }
 
     fn setup_counting(
@@ -520,6 +590,149 @@ mod tests {
         );
     }
 
+    /// 抑止された **BEL** では再 arm しない（再 arm は沈黙の抑止に限る）。
+    ///
+    /// `record_output` は `tx.send(Bel)` を `watcher_alive.swap(true)` より先に行うので、
+    /// **消費側が `Bel` を見た瞬間にはウォッチャがまだ立っていない窓がある。**
+    /// その窓で再 arm すると消費側が先にフラグを取り、`record_output` 側の
+    /// `spawn_watcher(0)` は走らない —— ウォッチャが遅延つきで立ち、
+    /// `timeout < grace` のセッションでは最初の沈黙評価が遅れる。
+    ///
+    /// その interleaving を、消費ループの本体（`handle`）を直接呼んで決定的に作る。
+    /// **`record_output` 経由では作れない** —— 単一スレッドの harness では
+    /// `record_output` が `swap` まで走り切ってから消費ループが動くので、
+    /// 変異版でも `rearm_after` が no-op になり判別できない
+    /// （実測: round m3-3-t9-rev-r1 の変異 S3 = 115/115 全緑）。
+    #[tokio::test(start_paused = true)]
+    async fn a_suppressed_bel_does_not_re_arm_the_watcher() {
+        let (_c, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        // 猶予（20 秒）より短いタイムアウト = A-1 が効く条件。出力は与えないので
+        // ウォッチャは 1 本も居ない（= `record_output` が swap する前と同じ状態）
+        let act = reg.register("s1", CliKind::Claude, true, 5);
+        assert_activity(&act, true, false, "前提: ウォッチャが既に立っている");
+
+        reg.handle(&HeuristicEvent::Bel {
+            session_id: "s1".into(),
+        });
+
+        assert!(
+            sink.sent().is_empty(),
+            "前提: 猶予中の BEL はゲート規則 3 で抑止されるはず"
+        );
+        assert_activity(
+            &act,
+            true,
+            false,
+            "抑止された BEL で再 arm している（沈黙の初回評価が猶予切れ後まで遅れる）",
+        );
+    }
+
+    /// `handle()` が猶予を **2 回**読む（`liveness()` と `remaining_grace_ms()` が
+    /// それぞれ別に lock と `now_ms()` を取る）ことを利用して、2 つの読みの間で
+    /// 猶予境界をまたぐ interleaving を決定的に作る時計。
+    ///
+    /// `arm()` してから最初の 1 回だけ現在時刻をそのまま返し、返した**直後**に
+    /// 内側の時計を 1 ミリ秒進める。以後は素通しになる。
+    struct BoundaryCrossingClock {
+        inner: TestClock,
+        armed: std::sync::atomic::AtomicBool,
+        crossed: std::sync::atomic::AtomicBool,
+    }
+
+    impl BoundaryCrossingClock {
+        fn new(inner: TestClock) -> Self {
+            Self {
+                inner,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                crossed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// 差し込みが実際に起きたか。起きていなければテストは何も測っていない（群 P）。
+        fn crossed(&self) -> bool {
+            self.crossed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Clock for BoundaryCrossingClock {
+        fn now_ms(&self) -> i64 {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.inner.now_ms();
+            if self.armed.swap(false, SeqCst) {
+                self.inner.advance_ms(1);
+                self.crossed.store(true, SeqCst);
+            }
+            now
+        }
+    }
+
+    /// **M-3 の観測点**: `ctx.hook_liveness` と `remaining_grace_ms` は別々に時計を読む。
+    /// 2 つの読みの間に猶予境界をまたぐと、`ctx` は `Pending`・残り猶予は `None` になる。
+    /// そこで再 arm せずに return すると、**A-1 が防ごうとしている「沈黙推定が二度と
+    /// 発火しない」そのものに落ちる** —— 抑止された沈黙は消え、`watch_silence` は
+    /// Fire で降りているので、出力が再開しない限り次のウォッチャが立たない。
+    ///
+    /// 後半 2 つの assert は「この経路がループしない」ことの観測点である
+    /// （再 arm 後の評価は `Unreachable` になるので規則 3 を通らず、二度目は来ない）。
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_boundary_crossed_between_the_two_clock_reads_still_re_arms() {
+        let inner = TestClock::new(0);
+        let clock = Arc::new(BoundaryCrossingClock::new(inner.clone()));
+        let sink = Arc::new(CountingSink::new(&[("s1", RuntimeState::Running)]));
+        let reg = HeuristicRegistry::new(
+            clock.clone(),
+            sink.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        // 猶予（20 秒）より短いタイムアウト = A-1 が効く条件。
+        // 出力を与えないのでウォッチャは 1 本も居ない
+        let act = reg.register("s1", CliKind::Claude, true, 5);
+        assert_activity(&act, true, false, "前提: ウォッチャが既に立っている");
+
+        inner.advance_ms(HOOK_GRACE_MS - 1); // 猶予切れの 1 ミリ秒前
+        clock.arm();
+        reg.handle(&HeuristicEvent::Silence {
+            session_id: "s1".into(),
+        });
+
+        assert!(
+            clock.crossed(),
+            "境界をまたぐ差し込みが起きていない —— このテストは何も測っていない"
+        );
+        // これが空であることが「1 度目の読みは Pending だった」ことの証拠である
+        //（`Unreachable` を読んでいれば規則 3 を通過して SilenceTimeout が飛ぶ）
+        assert!(sink.sent().is_empty(), "前提: 1 度目の読みが猶予の中に無い");
+        assert_activity(
+            &act,
+            true,
+            true,
+            "2 つの時計読みの間に猶予が切れると再 arm を取りこぼす",
+        );
+        assert_eq!(sink.evaluations(), 1);
+
+        // 再 arm したウォッチャが猶予切れ後の沈黙を報告する
+        settle().await; // 立てたウォッチャに遅延を登録させる
+        inner.advance_ms(REARM_MARGIN_MS as i64 + 100);
+        tokio::time::advance(Duration::from_millis(REARM_MARGIN_MS + 100)).await;
+        settle().await;
+        assert_eq!(
+            sink.sent(),
+            vec![("s1".to_string(), StateInput::SilenceTimeout)],
+            "再 arm したウォッチャが沈黙を報告していない"
+        );
+
+        // 二度と評価し直さない（この経路が busy loop にならないことの観測点）
+        inner.advance_ms(120_000);
+        tokio::time::advance(Duration::from_millis(120_000)).await;
+        settle().await;
+        assert_eq!(sink.evaluations(), 2, "再 arm の後もループしている");
+        assert_eq!(sink.sent().len(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_late_hook_stops_further_heuristics() {
         let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
@@ -624,17 +837,87 @@ mod tests {
         );
     }
 
+    /// `unregister` は map から消すだけでなく、**走っているウォッチャを止める**。
+    ///
+    /// 🔴 `sink.sent()` の空はこの停止機構を 1 ミリも測っていない ——
+    /// `handle()` はエントリが消えていると early-return するので、ウォッチャが
+    /// 生きたまま `Silence` を送り続けても `sent()` は空のままである
+    /// （実測: `entry.activity.reconfigure(false, ..)` を丸ごと削る変異は
+    /// round m3-3-t9-rev-r1 で 115/115 全緑だった）。止まったことは
+    /// `SessionActivity` 側を直接見るしかない。
     #[tokio::test(start_paused = true)]
     async fn unregister_stops_everything() {
         let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
         let act = reg.register("s1", CliKind::Custom, true, 30);
         act.record_output(0);
-        tokio::task::yield_now().await;
+        // `settle()` で `select!` まで到達させる。`notify_waiters` は**待機登録済みの
+        // waiter だけ**を起こすので、ここが足りないと下の assert が変異と無関係に赤くなる
+        settle().await;
+        assert_activity(&act, true, true, "前提: ウォッチャが 1 本走っていない");
 
         reg.unregister("s1");
+        settle().await;
+        // ここが `unregister` の停止機構の唯一の観測点である
+        assert_activity(
+            &act,
+            false,
+            false,
+            "unregister が走っているウォッチャを止めていない",
+        );
+
         advance(&clock, 120_000).await;
         assert!(sink.sent().is_empty());
         assert!(reg.diagnostics().is_empty());
+    }
+
+    /// `unregister` を挟まない再 `register`（resume）で、押し出された古い
+    /// `SessionActivity` を止める。
+    ///
+    /// `HookLivenessTracker::on_spawn` は「既存エントリがあれば猶予をリセットする
+    /// （resume 対応）」と明言し `on_spawn_resets_the_grace_window` で固定されている ——
+    /// つまり同じ `session_id` の再 `register` は起こりうる呼ばれ方である。
+    /// 止めないと、押し出された古いウォッチャが**古い活動時刻**を基準に `Silence` を送り、
+    /// 消費ループは**新しい**エントリを引くので resume 直後のセッションが即
+    /// `SilenceTimeout` を受ける。
+    ///
+    /// ⚠️ `CliKind::Claude` では判別しない。resume の `on_spawn` が猶予をやり直すため、
+    /// 古いウォッチャの `Silence` が新しい猶予窓の中に着弾してゲート規則 3 で消え、
+    /// **停止機構が無くても `sent()` が空になる。** `NotApplicable` になる `Custom` で測ること。
+    #[tokio::test(start_paused = true)]
+    async fn re_registering_the_same_session_stops_the_previous_activity() {
+        let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let old = reg.register("s1", CliKind::Custom, true, 30);
+        old.record_output(0);
+        settle().await;
+        assert_activity(&old, true, true, "前提: 古いウォッチャが走っていない");
+
+        advance(&clock, 25_000).await; // 沈黙成立まで残り 5 秒
+
+        let new = reg.register("s1", CliKind::Custom, true, 30); // unregister を挟まない resume
+        settle().await;
+        assert_activity(
+            &old,
+            false,
+            false,
+            "押し出された古い activity が止まっていない",
+        );
+
+        // 新しい activity の基準は register 時刻（t=25s）。古い基準（t=0）のウォッチャが
+        // 生き残っていると、ここで沈黙が成立して報告が飛ぶ
+        advance(&clock, 10_000).await; // t=35s
+        assert!(
+            sink.sent().is_empty(),
+            "古いウォッチャが古い活動時刻を基準に沈黙を報告している（resume 直後の誤検知）"
+        );
+
+        // 新しい activity は正しく働く
+        new.record_output(0);
+        settle().await;
+        advance(&clock, 31_000).await;
+        assert_eq!(
+            sink.sent(),
+            vec![("s1".to_string(), StateInput::SilenceTimeout)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -691,6 +974,50 @@ mod tests {
         let diag = reg.diagnostics();
         assert_eq!(diag[0].liveness, HookLiveness::Unreachable);
         assert!(diag[0].heuristics_active, "不達なら推定が働いている");
+    }
+
+    /// **クランプの呼び出し側は 2 箇所ある**（`register` と `reconfigure`）。
+    /// `timeout_secs_are_clamped_into_the_allowed_range` が測っているのは `register` 側
+    /// だけで、`reconfigure` 側だけクランプを外す変異は全緑だった
+    /// （実測: round m3-3-t9-rev-r1 の変異 S2 = 115/115）。純関数が守られていても
+    /// 配線の片方が守られていない、という形（群 S）。
+    ///
+    /// 実害: `update_session` が `timeout_secs = 0` を渡すと `SessionActivity` の
+    /// `timeout_ms == 0` になり、出力チャンクごとに立つウォッチャが必ず即 Fire する。
+    /// チャンク 1 個につき `Silence` → `SilenceTimeout` が 1 件出て
+    /// `Running` ↔ `Idle` が振動し続ける。
+    ///
+    /// ⚠️ `reconfigure` を **t=0 で呼ばない**のは意図的である。経過 0 ミリ秒だと
+    /// `silence_step` が `elapsed <= 0` の早期 return で `Wait { ms: 0 }` を返し、
+    /// クランプを外した実装が Fire ではなく `sleep(0)` のスピンに入る ——
+    /// **赤ではなくハングになって変異が測れない。** 1 秒進めてから呼ぶこと。
+    #[tokio::test(start_paused = true)]
+    async fn reconfigure_clamps_the_timeout_into_the_allowed_range() {
+        let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let act = reg.register("s1", CliKind::Custom, true, 300);
+        act.record_output(0);
+        settle().await;
+
+        advance(&clock, 1_000).await;
+        reg.reconfigure("s1", true, 0); // 下限へ丸められる
+        settle().await;
+        assert!(
+            sink.sent().is_empty(),
+            "reconfigure が 0 をそのまま渡している（経過 1 秒で発火した）"
+        );
+
+        // 丸めた下限に満たないうちは発火しない
+        advance(&clock, (MIN_SILENCE_TIMEOUT_SECS as u64) * 1_000 - 1_500).await;
+        assert!(
+            sink.sent().is_empty(),
+            "丸めた下限より前に発火している（reconfigure 側のクランプが効いていない）"
+        );
+
+        advance(&clock, 1_000).await;
+        assert_eq!(
+            sink.sent(),
+            vec![("s1".to_string(), StateInput::SilenceTimeout)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
