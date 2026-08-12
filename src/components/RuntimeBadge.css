@@ -29,8 +29,9 @@
   color: currentColor;
 }
 
-/* 契約 §53.9.1（確定仕様。components.md「実行状態バッジ」節）: 汎用 CLI 向け
-   ヒューリスティック（BEL 検知 / 沈黙判定）由来の「推定」状態はドットを中空
+/* 確定仕様の正典は .claude/skills/kamux-design-system/components.md
+   「実行状態バッジ」節（契約 §53.5 が定める 3 層のうち「寸法と役割」層）:
+   汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の「推定」状態はドットを中空
    （background: transparent + border: 1.5px solid var(--state-*)）にする。
    色には一切触れない —— currentColor は親要素（RuntimeBadgeView）が既に
    var(--state-*) を color として持っているので、それをそのまま枠色として使う

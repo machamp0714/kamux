@@ -80,7 +80,9 @@ const RUNTIME_STATE_TOKEN: Record<RuntimeState, string> = {
  *
  * M3-3: ヒューリスティック由来の推定状態には `.runtime-badge--estimated`
  * （中空ドット。色は変えない）とラベルへの `~` 前置を足し、ツールチップに
- * 推定である理由を添える（契約 §53.9.1・§76.1 / §76.2。グリフは描かない）。
+ * 推定である理由を添える。確定仕様は `.claude/skills/kamux-design-system/
+ * components.md`「実行状態バッジ」節（契約 §53.5 が定める 3 層の正典のうち
+ * 「寸法と役割」層。§76.1 / §76.2。グリフは描かない）。
  */
 export function RuntimeBadgeView({
   state,
@@ -92,8 +94,9 @@ export function RuntimeBadgeView({
   const label = RUNTIME_LABEL[state];
   const estimated = isEstimated(reason);
   const tooltip = badgeTooltip(state, reason);
-  // 契約 §53.9.1: 推定状態はラベルに `~` を前置する（ドットの中空化だけでは
-  // 8×8 の円では視認性が弱いため、テキストにも推定の合図を持たせる）
+  // components.md「実行状態バッジ」節: 推定状態はラベルに `~` を前置する
+  // （ドットの中空化だけでは 8×8 の円では視認性が弱いため、テキストにも
+  // 推定の合図を持たせる）
   const displayLabel = estimated ? `~${label}` : label;
   return (
     <span

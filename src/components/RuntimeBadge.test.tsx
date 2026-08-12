@@ -96,6 +96,35 @@ describe('RuntimeBadge（runtimeStates の唯一の購読者）', () => {
     expect(screen.getByRole('img')).toHaveAttribute('data-runtime-state', 'idle');
   });
 
+  // M3-3 修正ラウンド 1（レビュー I-1）: runtimeReasons[sessionId] セレクタが
+  // ヒューリスティック由来の reason を実際に RuntimeBadgeView まで届けているかは
+  // 純関数（isEstimated / badgeTooltip / RuntimeBadgeView）のテストだけでは守れない
+  // ——ストア→セレクタ→ビューの継ぎ目が無検査だと、runtimeReasons を誤ったキーで
+  // 読んでも気づけない（変異検証で確認）。`~` 前置は toHaveTextContent の部分一致
+  // ではなく textContent の完全一致で確かめる（`~` が落ちても "アイドル" は
+  // "~アイドル" の部分文字列ではないので拾えるが、念のため完全一致にしておく）。
+  it('推定 reason（silence_timeout）を受けると中空ドット・~前置・推定ツールチップに切り替わる', () => {
+    render(<RuntimeBadge sessionId="s1" />);
+    emit({ session_id: 's1', runtime_state: 'idle', reason: 'silence_timeout' });
+    const el = screen.getByRole('img');
+    expect(el.querySelector('.runtime-badge__label')?.textContent).toBe('~アイドル');
+    expect(el.className).toContain('runtime-badge--estimated');
+    expect(el.getAttribute('title')).toContain('推定');
+  });
+
+  // bel_detected は silence_timeout とは別の reason 値なので、同じストア経路
+  // （runtimeReasons[sessionId] → isEstimated → badgeTooltip）を通ることを
+  // 別の入力で確かめる。ツールチップの分岐文言（「ベル文字を検知」）が
+  // silence_timeout 側と異なるため、tooltip 組み立ての取り違えも拾える。
+  it('推定 reason（bel_detected）を受けても同じ経路で中空ドット・~前置に切り替わる', () => {
+    render(<RuntimeBadge sessionId="s1" />);
+    emit({ session_id: 's1', runtime_state: 'waiting_input', reason: 'bel_detected' });
+    const el = screen.getByRole('img');
+    expect(el.querySelector('.runtime-badge__label')?.textContent).toBe('~入力待ち');
+    expect(el.className).toContain('runtime-badge--estimated');
+    expect(el.getAttribute('title')).toContain('ベル文字');
+  });
+
   // プリミティブなセレクタ 2 本で読んでいる証拠。runtimeStates 全体を select すると
   // 無関係なセッションの遷移でも新しいオブジェクトが返り、ここで再レンダリングされる
   it('無関係なセッションの遷移では再レンダリングしない', () => {
@@ -186,7 +215,8 @@ describe('KanbanCard の中の RuntimeBadge（契約 §25.5 の不変条件）',
 // M3-3 Task 16: 汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の
 // 「推定」表示。契約 §76.2 によりグリフの描画・検証は行わない —— 実装が持つのは
 // ドット + ラベル（M2-1）のみで、推定表示はそこへ中空ドット・`~` 前置ラベル・
-// ツールチップ（契約 §53.9.1）を足す形。
+// ツールチップ（確定仕様は .claude/skills/kamux-design-system/components.md
+// 「実行状態バッジ」節）を足す形。
 describe('isEstimated', () => {
   // StateReason は 13 値（src/types/model.ts）。配列リテラルでは新しい値が増えても
   // 更新が強制されないため、Record<StateReason, boolean> で網羅する
@@ -241,7 +271,7 @@ describe('badgeTooltip', () => {
   });
 });
 
-describe('RuntimeBadgeView の推定表示（契約 §53.9.1 / §76.1: 中空ドット + `~` 前置ラベル）', () => {
+describe('RuntimeBadgeView の推定表示（components.md「実行状態バッジ」節 / 契約 §76.1: 中空ドット + `~` 前置ラベル）', () => {
   // 契約 §76.2: 「グリフを網羅するテスト」の代わりに、権威 / 推定の両方で
   // 6 状態のラベルが正しく描かれることを網羅する。ラベル文字列は CANON
   // （このテストファイル内で固定した表。production の RUNTIME_BADGE_LABEL
