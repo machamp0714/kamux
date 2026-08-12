@@ -530,6 +530,53 @@ mod tests {
         );
     }
 
+    /// 群 S: `spawn_with_sink_and_observer` に渡した observer が
+    /// `PtySurface::spawn` の読み取りスレッドまで**実際に届く**こと。
+    ///
+    /// ここを測らないと、`start_session` から `PtySurface` までの転送が丸ごと
+    /// 無検査になる —— `spawn` / `spawn_with_sink` はどちらも `None` を渡すので、
+    /// 本体が `observer` を捨てて `None` を渡す変異が全テスト緑で通る。
+    #[test]
+    fn spawn_with_sink_and_observer_hands_the_observer_to_the_reader_thread() {
+        struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+        impl crate::session::heuristics::OutputObserver for Recorder {
+            fn on_chunk(&mut self, chunk: &[u8]) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(chunk);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let sink = Arc::new(NullSink { tx });
+        let manager = PtyManager::new();
+        manager
+            .spawn_with_sink_and_observer(
+                sink,
+                manager_spec(
+                    "s-observer:agent",
+                    "/bin/sh",
+                    &["-c", "printf '%s' 'observed-chunk'; exit 0"],
+                ),
+                Some(Box::new(Recorder(Arc::clone(&seen)))),
+            )
+            .expect("spawn");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("exit"),
+            "s-observer:agent"
+        );
+        let got =
+            String::from_utf8_lossy(&seen.lock().unwrap_or_else(|p| p.into_inner())).to_string();
+        assert!(
+            got.contains("observed-chunk"),
+            "observer が読み取りスレッドまで届いていない: {got:?}"
+        );
+    }
+
     // --- 必達 (b): PtyManager::kill の冪等性を 3 パターンで固定する ---
     // (「登録されていない surface_id」は上の kill_on_unknown_surface_is_ok が既に固定済み)
 

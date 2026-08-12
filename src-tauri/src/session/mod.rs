@@ -283,6 +283,15 @@ fn spawn_agent_surface_with(
     spawn(spec, Some(observer)).inspect_err(|_| {
         // spawn に失敗したセッションは読み取りスレッドを持たず、`sink.rs` の `on_exit` も
         // 来ない。ここで外さないとレジストリに死んだ登録が残り続ける。
+        //
+        // **1 つだけ「生きている登録を外す」形になりうる Err がある** ——
+        // `PtyManager` の排他が返す `InvalidState("surface already running")` である。
+        // `start_session` からは到達しない（`plan_agent_spawn_with` の二重起動ガードが
+        // 副作用の前に同じ条件で弾く）が、その `is_alive` チェックと spawn の間には
+        // 窓があり、同じセッションへの `start_session` が並行すると理論上は踏める。
+        // そのとき先行して走った `register` が既に生きているエントリを押し出している
+        // ので、**外さないほうが状態が壊れる**（押し出された側は `register` の resume
+        // 腕で既に停止済みで、レジストリには新しい死んだエントリだけが残る）。
         detach_heuristics(&state.heuristics, &session.id);
     })
 }
