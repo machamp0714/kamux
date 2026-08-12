@@ -185,7 +185,8 @@ describe('KanbanCard の中の RuntimeBadge（契約 §25.5 の不変条件）',
 
 // M3-3 Task 16: 汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の
 // 「推定」表示。契約 §76.2 によりグリフの描画・検証は行わない —— 実装が持つのは
-// ドット + ラベル（M2-1）のみで、推定表示はそこへ破線リングとツールチップを足す形。
+// ドット + ラベル（M2-1）のみで、推定表示はそこへ中空ドット・`~` 前置ラベル・
+// ツールチップ（契約 §53.9.1）を足す形。
 describe('isEstimated', () => {
   // StateReason は 13 値（src/types/model.ts）。配列リテラルでは新しい値が増えても
   // 更新が強制されないため、Record<StateReason, boolean> で網羅する
@@ -240,22 +241,28 @@ describe('badgeTooltip', () => {
   });
 });
 
-describe('RuntimeBadgeView の推定表示（契約 §76.1: ドット + ラベルへ破線リングを足す）', () => {
+describe('RuntimeBadgeView の推定表示（契約 §53.9.1 / §76.1: 中空ドット + `~` 前置ラベル）', () => {
   // 契約 §76.2: 「グリフを網羅するテスト」の代わりに、権威 / 推定の両方で
-  // 6 状態のラベルが正しく描かれることを網羅する。
+  // 6 状態のラベルが正しく描かれることを網羅する。ラベル文字列は CANON
+  // （このテストファイル内で固定した表。production の RUNTIME_BADGE_LABEL
+  // からは導出しない）に `~` を前置するかどうかだけを完全一致で確かめる。
   it('renders the correct label for every state under both authoritative and estimated reasons', () => {
     for (const [state, label] of CANON) {
       const { unmount: unmountAuthoritative } = render(
         <RuntimeBadgeView state={state} reason="spawned" />,
       );
-      expect(screen.getByRole('img')).toHaveTextContent(label);
+      expect(screen.getByRole('img').querySelector('.runtime-badge__label')?.textContent).toBe(
+        label,
+      );
       expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('false');
       unmountAuthoritative();
 
       const { unmount: unmountEstimated } = render(
         <RuntimeBadgeView state={state} reason="silence_timeout" />,
       );
-      expect(screen.getByRole('img')).toHaveTextContent(label);
+      expect(screen.getByRole('img').querySelector('.runtime-badge__label')?.textContent).toBe(
+        `~${label}`,
+      );
       expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('true');
       unmountEstimated();
     }
@@ -278,7 +285,7 @@ describe('RuntimeBadgeView の推定表示（契約 §76.1: ドット + ラベ�
     expect(el.getAttribute('aria-label')).toContain('推定');
   });
 
-  it('applies the estimated modifier class used by the dashed ring', () => {
+  it('applies the estimated modifier class used by the hollow dot', () => {
     render(<RuntimeBadgeView state="idle" reason="silence_timeout" />);
     expect(screen.getByRole('img').className).toContain('runtime-badge--estimated');
   });

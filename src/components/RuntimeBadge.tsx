@@ -79,8 +79,8 @@ const RUNTIME_STATE_TOKEN: Record<RuntimeState, string> = {
  * 背景も枠も持たない（ピル型にしない）。
  *
  * M3-3: ヒューリスティック由来の推定状態には `.runtime-badge--estimated`
- * （破線リング。色は変えない）を足し、ツールチップに推定である理由を添える
- * （契約 §76.1 / §76.2。グリフは描かない）。
+ * （中空ドット。色は変えない）とラベルへの `~` 前置を足し、ツールチップに
+ * 推定である理由を添える（契約 §53.9.1・§76.1 / §76.2。グリフは描かない）。
  */
 export function RuntimeBadgeView({
   state,
@@ -92,6 +92,9 @@ export function RuntimeBadgeView({
   const label = RUNTIME_LABEL[state];
   const estimated = isEstimated(reason);
   const tooltip = badgeTooltip(state, reason);
+  // 契約 §53.9.1: 推定状態はラベルに `~` を前置する（ドットの中空化だけでは
+  // 8×8 の円では視認性が弱いため、テキストにも推定の合図を持たせる）
+  const displayLabel = estimated ? `~${label}` : label;
   return (
     <span
       className={estimated ? 'runtime-badge runtime-badge--estimated' : 'runtime-badge'}
@@ -107,7 +110,7 @@ export function RuntimeBadgeView({
       style={{ color: `var(${RUNTIME_STATE_TOKEN[state]})` }}
     >
       <span className="runtime-badge__dot" />
-      <span className="runtime-badge__label">{label}</span>
+      <span className="runtime-badge__label">{displayLabel}</span>
     </span>
   );
 }
