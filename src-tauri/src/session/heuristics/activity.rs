@@ -34,6 +34,12 @@
 //! メモリ順序を観測できず、観測するには `loom` のようなモデル検査が要る（本タスクの scope 外）。
 //! **したがってこの注記が唯一の防護である。「過剰だから」と `Relaxed` / `AcqRel` へ戻さないこと。**
 //!
+//! ⚠️ ここで「観測できない」と言っているのは**メモリ順序だけ**である。
+//! 「フラグを降ろした後に再チェックする」こと自体は interleaving の性質であって
+//! 順序の性質ではないので、割り込み点さえ作れば観測できる —— disabled 腕には
+//! `#[cfg(test)]` の seam（`tests::run_disabled_arm_seam`）を置いて決定的に観測している。
+//! 2 つを混同して「再チェックの観測にも `loom` が要る」と読まないこと。
+//!
 //! ホットパス（`record_output`）が余分に払うのは 1 チャンクあたり `SeqCst` の store 1 本
 //! （aarch64 では `stlr` 1 命令）と、元から RMW だった `swap` の格上げだけである。
 //! 同じチャンクに対して既に行っている base64 エンコード（契約 §8）より桁で小さい
@@ -105,8 +111,17 @@ impl SessionActivity {
     /// `SeqCst` が 2 箇所ある理由はモジュール doc の「`watcher_alive` の解除と再チェック」を参照。
     /// 代償は 1 チャンクあたりバリア 1 本で、同じチャンクの base64 エンコードより桁で小さい。
     pub fn record_output(self: &Arc<Self>, bel_count: usize) {
-        // この load はモジュール doc の 2 つの対のどちらにも含まれない
-        // （フラグを降ろす側と取る側の交差ではない）。ホットパスなので `Relaxed` で足りる。
+        // ⚠️ この load は ISO のメモリモデル上はモジュール doc の**対 2 の輪の一部**である
+        //（`SeqCst` へ格上げすれば対 2 が閉じる）。`Relaxed` のままで正しい根拠は
+        // ISO のモデルではなく**アーキテクチャ側**にある: すぐ下の
+        // `last_activity_ms.store`（対 1 の W2）が `SeqCst` で、aarch64 ではこれが
+        // release store（`stlr`）へ落ちるため、先行するこの load を順序づける。
+        // その結果、この load は下の `watcher_alive.swap`（対 1・対 2 の R2）より後ろへ
+        // 動けず、輪は架構が閉じる。**つまり正しさはターゲット依存である。**
+        // **依存**: その `SeqCst` store を弱める / 条件付きにする / この load と
+        // `watcher_alive.swap` の間から外す、のいずれかを行うとこの根拠は静かに消える。
+        // そのときはこの load 自身を `SeqCst` へ格上げすること
+        //（ホットパスの代償がモジュール doc 末尾の記述より `ldar` 1 本ぶん増える点も直す）。
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -181,6 +196,18 @@ impl SessionActivity {
             if !self.enabled.load(Ordering::Relaxed) {
                 // 対 2 の W1（`SeqCst` の理由はモジュール doc）
                 self.watcher_alive.store(false, Ordering::SeqCst);
+
+                // テスト専用の割り込み点（seam）。フラグを降ろした「後」・下の再チェックの
+                // 「前」に、テストから `reconfigure(true, …)` を着弾させるために在る。
+                // **これが無いと、下の再チェックのブロックを丸ごと消しても全テストが緑のまま**
+                // になる（実測: round m3-3-t7-rerev-r1 の変異 B = 595 passed / 0 failed）。
+                // 再チェックの存在は interleaving の性質なので、割り込み点さえ作れば
+                // 単一スレッド・仮想時間のまま決定的に観測できる（`loom` が要るのは
+                // メモリ順序のほうだけである）。`#[cfg(test)]` なので production には
+                // 分岐も遅延もアトミック操作も 1 つも増えない。消す前に `tests` 側の
+                // `run_disabled_arm_seam` の doc を読むこと。
+                #[cfg(test)]
+                tests::run_disabled_arm_seam();
 
                 // 対 2 の R1: フラグを降ろした後に再有効化を見直す。
                 // ここが無いと、`reconfigure(true, …)` が上の load と store の間に
@@ -261,6 +288,7 @@ impl std::fmt::Debug for SessionActivity {
 mod tests {
     use super::*;
     use crate::session::heuristics::clock::TestClock;
+    use std::cell::RefCell;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -446,6 +474,102 @@ mod tests {
         act.reconfigure(false, 30_000);
         advance(&clock, 60_000).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    thread_local! {
+        /// disabled 腕の割り込み点（seam）へ差し込む処理。1 回だけ走る（`take` する）。
+        /// production 側の呼び出しは `#[cfg(test)]` なので、リリースビルドには 1 命令も残らない。
+        static DISABLED_ARM_SEAM: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// production の `watch_silence`（disabled 腕）から呼ばれる seam の本体。
+    ///
+    /// **何のために在るか**: 「`watcher_alive` を降ろした後の再チェック」は
+    /// interleaving の性質なので、割り込み点さえあれば単一スレッド・仮想時間のまま
+    /// 決定的に観測できる（メモリ順序と違って `loom` は要らない）。
+    /// **この seam が無いと、再チェックのブロックを丸ごと消しても全テストが緑のままになる**
+    /// —— 実測済み（round m3-3-t7-rerev-r1 の変異 B = 595 passed / 0 failed）。
+    /// 差し込みが登録されていなければ何もしないので、他のテストの挙動は 1 つも変わらない。
+    pub(super) fn run_disabled_arm_seam() {
+        // `f()` は借用の外で呼ぶ（差し込み先から再入しても `RefCell` を二重借用しない）
+        let hook = DISABLED_ARM_SEAM.with(|s| s.borrow_mut().take());
+        if let Some(f) = hook {
+            f();
+        }
+    }
+
+    /// 差し込みを登録する。戻り値の guard が落ちたら必ず外れる ——
+    /// `--test-threads=1` では複数のテストが同じスレッドを共有するため、
+    /// 走らずに残った差し込みが次のテストへ漏れるのを防ぐ（変異 C ではまさに走らない）。
+    #[must_use]
+    fn install_disabled_arm_seam(f: impl FnOnce() + 'static) -> SeamGuard {
+        DISABLED_ARM_SEAM.with(|s| *s.borrow_mut() = Some(Box::new(f)));
+        SeamGuard
+    }
+
+    struct SeamGuard;
+
+    impl Drop for SeamGuard {
+        fn drop(&mut self) {
+            DISABLED_ARM_SEAM.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    /// disabled 腕の**再チェックそのもの**の観測点。
+    ///
+    /// `watcher_alive` を降ろした直後（= 再チェックが `enabled` を読む前）に
+    /// `reconfigure(true, …)` が着弾する interleaving を、seam を使って決定的に作る。
+    /// 着弾点は production コメントが宣言した射程の内側であり、
+    /// deferred 項目（ウォッチャが終了しきった後の再有効化）ではない。
+    ///
+    /// 3 つの assert はそれぞれ別のものを見ている:
+    /// 1. seam が実際に走ったか（走らなければこのテストは何も測っていない —— 群 P）
+    /// 2. 再チェックが在るか（無ければウォッチャが消え、このアイドル期間の `Silence` が永久に出ない）
+    /// 3. 再チェックが `watcher_alive` を**取り直している**か（`swap` を `load` に書き換えると
+    ///    フラグが空いたままになり、続く `rearm_after` が 2 本目のウォッチャを立ててしまう。
+    ///    2 本目を立てる呼び出しがテスト側に無いと、この assert は判別力ゼロになる）
+    #[tokio::test(start_paused = true)]
+    async fn re_enabling_between_the_flag_clear_and_the_recheck_keeps_one_watcher() {
+        let (clock, act, mut rx) = setup(30_000);
+        act.record_output(0);
+        tokio::task::yield_now().await;
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let _seam = {
+            let act = Arc::clone(&act);
+            let hook_ran = Arc::clone(&hook_ran);
+            install_disabled_arm_seam(move || {
+                act.reconfigure(true, 30_000);
+                hook_ran.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // 寝ているウォッチャを起こして disabled 腕へ入れる。
+        // その中で seam が走り、フラグ解除と再チェックの間に再有効化が着弾する
+        act.reconfigure(false, 30_000);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            hook_ran.load(Ordering::SeqCst),
+            "seam が走っていない —— このテストは再チェックを何も測っていない"
+        );
+
+        // 再チェックがフラグを取り直していれば、これは no-op になる（下の 3 つ目の assert）
+        act.rearm_after(0);
+        tokio::task::yield_now().await;
+
+        advance(&clock, 31_000).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            },
+            "フラグ解除と再チェックの間に着弾した再有効化を取りこぼし、ウォッチャが消えている"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "ウォッチャが 2 本立っている —— 再チェックが watcher_alive を取り直していない"
+        );
     }
 
     /// 無効化でウォッチャが降りた後に再有効化し、**次の出力チャンク**が来たら立ち直る。
