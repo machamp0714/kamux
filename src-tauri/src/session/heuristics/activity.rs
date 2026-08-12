@@ -112,7 +112,8 @@ impl SessionActivity {
         }
 
         let now = self.clock.now_ms();
-        // 対 1 の W2。90 行の swap（R2）との組が、Fire 腕の store/load の組と交差する
+        // 対 1 の W2。この直後の `watcher_alive.swap`（R2）との組が、
+        // Fire 腕の store/load の組と交差する
         self.last_activity_ms.store(now, Ordering::SeqCst);
 
         if bel_count > 0 && now - self.last_bel_report_ms.load(Ordering::Relaxed) >= BEL_DEBOUNCE_MS
@@ -442,6 +443,40 @@ mod tests {
         act.reconfigure(false, 30_000);
         advance(&clock, 60_000).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    /// 無効化でウォッチャが降りた後に再有効化し、**次の出力チャンク**が来たら立ち直る。
+    /// disabled 腕が `watcher_alive` を確実に降ろしていることの観測点である ——
+    /// 特に再チェックの短絡順序を取り違えて（`swap` を `enabled` の load より先に書いて）
+    /// フラグを立てたまま return すると、以後 `record_output` も `rearm_after` も
+    /// 二度と spawn しなくなる。既存の disabled 系テストは「発火しないこと」しか見ないため、
+    /// その取り違えを 1 本も捕まえられない。
+    ///
+    /// ⚠️ この経路は disabled 腕の**再チェックそのもの**は通らない（再チェックが効く
+    /// interleaving は単一スレッド・仮想時間の harness では作れない。モジュール doc 参照）。
+    /// 出力が来ないまま再有効化された場合の再 arm は消費側（Task 9）の責務である。
+    #[tokio::test(start_paused = true)]
+    async fn output_after_re_enabling_restarts_the_watcher() {
+        let (clock, act, mut rx) = setup(30_000);
+        act.record_output(0);
+        tokio::task::yield_now().await;
+
+        act.reconfigure(false, 30_000);
+        advance(&clock, 60_000).await; // ウォッチャは disabled 腕で降りる
+        assert!(rx.try_recv().is_err(), "無効な間は発火しない");
+
+        act.reconfigure(true, 30_000);
+        act.record_output(0); // 再有効化後の最初のチャンク
+        tokio::task::yield_now().await;
+
+        advance(&clock, 31_000).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            },
+            "再有効化後の出力でウォッチャが立ち直っていない（watcher_alive が立ったままの疑い）"
+        );
     }
 
     #[tokio::test(start_paused = true)]
