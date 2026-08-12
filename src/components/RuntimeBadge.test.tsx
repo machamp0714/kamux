@@ -2,10 +2,10 @@ import { Profiler, type ProfilerOnRenderCallback } from 'react';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { RuntimeBadge, RuntimeBadgeView } from './RuntimeBadge';
+import { RuntimeBadge, RuntimeBadgeView, badgeTooltip, isEstimated } from './RuntimeBadge';
 import { useAppStore } from '../store';
 import { KanbanCard } from '../views/KanbanView/KanbanCard';
-import type { RuntimeState, Session, SessionStatePayload } from '../types/model';
+import type { RuntimeState, Session, SessionStatePayload, StateReason } from '../types/model';
 
 const emit = (p: SessionStatePayload) => act(() => useAppStore.getState().applyStateEvent(p));
 
@@ -44,7 +44,8 @@ describe('RuntimeBadgeView（純粋な描画。store に触らない）', () => 
 
   it('reason があればツールチップに添える', () => {
     render(<RuntimeBadgeView state="waiting_input" reason="hook_notification" />);
-    expect(screen.getByRole('img')).toHaveAttribute('title', '入力待ち (hook_notification)');
+    // badgeTooltip は権威ある reason では LABEL[state] だけを返す（括弧付きの reason は出さない）
+    expect(screen.getByRole('img')).toHaveAttribute('title', '入力待ち');
   });
 
   it('reason が無ければツールチップはラベルだけ', () => {
@@ -84,7 +85,8 @@ describe('RuntimeBadge（runtimeStates の唯一の購読者）', () => {
   it('reason をツールチップに出す', () => {
     render(<RuntimeBadge sessionId="s1" />);
     emit({ session_id: 's1', runtime_state: 'waiting_input', reason: 'hook_notification' });
-    expect(screen.getByRole('img')).toHaveAttribute('title', '入力待ち (hook_notification)');
+    // badgeTooltip は権威ある reason では LABEL[state] だけを返す（括弧付きの reason は出さない）
+    expect(screen.getByRole('img')).toHaveAttribute('title', '入力待ち');
   });
 
   it('他セッションのイベントでは描画が変わらない', () => {
@@ -178,5 +180,111 @@ describe('KanbanCard の中の RuntimeBadge（契約 §25.5 の不変条件）',
 
     expect(screen.getByText('boom')).toHaveClass('kanban-card__error');
     expect(titleReads()).toBe(1);
+  });
+});
+
+// M3-3 Task 16: 汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の
+// 「推定」表示。契約 §76.2 によりグリフの描画・検証は行わない —— 実装が持つのは
+// ドット + ラベル（M2-1）のみで、推定表示はそこへ破線リングとツールチップを足す形。
+describe('isEstimated', () => {
+  // StateReason は 13 値（src/types/model.ts）。配列リテラルでは新しい値が増えても
+  // 更新が強制されないため、Record<StateReason, boolean> で網羅する
+  // （M3-3 Task 15 の sessionSlice.heuristics.test.ts と同じ形）。
+  const EXPECTED: Record<StateReason, boolean> = {
+    spawned: false,
+    hook_notification: false,
+    hook_stop: false,
+    pty_exited: false,
+    startup_normalize: false,
+    bel_detected: true,
+    silence_timeout: true,
+    user_stopped: false,
+    output_activity: false,
+    user_input: false,
+    hook_permission: false,
+    resume_failed: false,
+    spawn_failed: false,
+  };
+
+  it('flags only the two heuristic-derived reasons as estimated', () => {
+    for (const reason of Object.keys(EXPECTED) as StateReason[]) {
+      expect(isEstimated(reason)).toBe(EXPECTED[reason]);
+    }
+  });
+
+  it('treats a missing reason as certain', () => {
+    expect(isEstimated(undefined)).toBe(false);
+  });
+});
+
+describe('badgeTooltip', () => {
+  it('names the state plainly for authoritative reasons', () => {
+    expect(badgeTooltip('idle', 'hook_stop')).toBe('アイドル');
+    expect(badgeTooltip('waiting_input', 'hook_notification')).toBe('入力待ち');
+  });
+
+  it('marks silence-derived states as estimated and explains why', () => {
+    const tip = badgeTooltip('idle', 'silence_timeout');
+    expect(tip).toContain('アイドル');
+    expect(tip).toContain('推定');
+    expect(tip).toContain('出力が一定時間停止');
+    expect(tip).toContain('誤検知');
+  });
+
+  it('marks bel-derived states as estimated and explains why', () => {
+    const tip = badgeTooltip('waiting_input', 'bel_detected');
+    expect(tip).toContain('入力待ち');
+    expect(tip).toContain('推定');
+    expect(tip).toContain('ベル文字');
+    expect(tip).toContain('誤検知');
+  });
+});
+
+describe('RuntimeBadgeView の推定表示（契約 §76.1: ドット + ラベルへ破線リングを足す）', () => {
+  // 契約 §76.2: 「グリフを網羅するテスト」の代わりに、権威 / 推定の両方で
+  // 6 状態のラベルが正しく描かれることを網羅する。
+  it('renders the correct label for every state under both authoritative and estimated reasons', () => {
+    for (const [state, label] of CANON) {
+      const { unmount: unmountAuthoritative } = render(
+        <RuntimeBadgeView state={state} reason="spawned" />,
+      );
+      expect(screen.getByRole('img')).toHaveTextContent(label);
+      expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('false');
+      unmountAuthoritative();
+
+      const { unmount: unmountEstimated } = render(
+        <RuntimeBadgeView state={state} reason="silence_timeout" />,
+      );
+      expect(screen.getByRole('img')).toHaveTextContent(label);
+      expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('true');
+      unmountEstimated();
+    }
+  });
+
+  it('flags estimated states with data-estimated="true"', () => {
+    render(<RuntimeBadgeView state="idle" reason="silence_timeout" />);
+    expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('true');
+  });
+
+  it('does not flag authoritative states', () => {
+    render(<RuntimeBadgeView state="idle" reason="hook_stop" />);
+    expect(screen.getByRole('img').getAttribute('data-estimated')).toBe('false');
+  });
+
+  it('exposes the tooltip through title and aria-label', () => {
+    render(<RuntimeBadgeView state="waiting_input" reason="bel_detected" />);
+    const el = screen.getByRole('img');
+    expect(el.getAttribute('title')).toContain('推定');
+    expect(el.getAttribute('aria-label')).toContain('推定');
+  });
+
+  it('applies the estimated modifier class used by the dashed ring', () => {
+    render(<RuntimeBadgeView state="idle" reason="silence_timeout" />);
+    expect(screen.getByRole('img').className).toContain('runtime-badge--estimated');
+  });
+
+  it('does not apply the estimated modifier class for authoritative reasons', () => {
+    render(<RuntimeBadgeView state="idle" reason="hook_stop" />);
+    expect(screen.getByRole('img').className).not.toContain('runtime-badge--estimated');
   });
 });

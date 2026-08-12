@@ -1,20 +1,62 @@
 import { useAppStore } from '../store';
 import type { RuntimeState, StateReason } from '../types/model';
+import { RUNTIME_BADGE_LABEL } from '../views/KanbanView/badge';
 import './RuntimeBadge.css';
 
 /**
  * 契約 §33.5 のラベル正典。**6 値すべてを埋めること**
  * （Record<RuntimeState, string> なので 5 値では型エラーになる）。
  * 色は CSS 側の `--state-*`（契約 §53.4）が正典で、ここには持たない。
+ *
+ * 契約 §76.4: `badge.ts` と本ファイルに同じ表が並んでいたのを統合した。
+ * ラベル表の実体は `badge.ts` の `RUNTIME_BADGE_LABEL` に一本化し、
+ * ここではローカル再定義しない（片方だけ直す事故を防ぐ）。
  */
-const RUNTIME_LABEL: Record<RuntimeState, string> = {
-  running: '実行中',
-  waiting_input: '入力待ち',
-  idle: 'アイドル',
-  exited: '終了',
-  interrupted: '中断',
-  error: 'エラー',
+const RUNTIME_LABEL = RUNTIME_BADGE_LABEL;
+
+/**
+ * ヒューリスティック（汎用 CLI 向け BEL 検知 / 沈黙判定）由来の reason だけを
+ * 「推定」として扱う（契約 §33.5 末尾・設計 §4.9）。`StateReason` は 13 値
+ * あるため `Record<StateReason, boolean>` で網羅する —— 配列リテラルでは
+ * 新しい値が増えても更新が強制されない（M3-3 Task 15 の先例。
+ * sessionSlice.heuristics.test.ts の ALL_REASONS と同じ形）。
+ */
+const ESTIMATED_REASON: Record<StateReason, boolean> = {
+  spawned: false,
+  hook_notification: false,
+  hook_stop: false,
+  pty_exited: false,
+  startup_normalize: false,
+  bel_detected: true,
+  silence_timeout: true,
+  user_stopped: false,
+  output_activity: false,
+  user_input: false,
+  hook_permission: false,
+  resume_failed: false,
+  spawn_failed: false,
 };
+
+export function isEstimated(reason: StateReason | undefined): boolean {
+  return reason !== undefined && ESTIMATED_REASON[reason];
+}
+
+/**
+ * ツールチップの組み立て正典（契約 §33.5 末尾）。権威ある reason では
+ * ラベルのみを返し、ヒューリスティック由来の reason では
+ * 「（推定）— 理由。誤検知の注意」を付す。
+ */
+export function badgeTooltip(state: RuntimeState, reason: StateReason | undefined): string {
+  const caveat = '汎用 CLI 向けのヒューリスティックのため誤検知することがあります';
+  switch (reason) {
+    case 'bel_detected':
+      return `${RUNTIME_LABEL[state]}（推定）— ベル文字を検知。${caveat}`;
+    case 'silence_timeout':
+      return `${RUNTIME_LABEL[state]}（推定）— 出力が一定時間停止。${caveat}`;
+    default:
+      return RUNTIME_LABEL[state];
+  }
+}
 
 /**
  * 契約 §53.4 の色の正典。**`--state-{state}` を機械的に組み立てないこと** ——
@@ -35,6 +77,10 @@ const RUNTIME_STATE_TOKEN: Record<RuntimeState, string> = {
  *
  * デザインシステム「実行状態バッジ」節: 色だけで状態を示さず、**必ずドット + ラベル**。
  * 背景も枠も持たない（ピル型にしない）。
+ *
+ * M3-3: ヒューリスティック由来の推定状態には `.runtime-badge--estimated`
+ * （破線リング。色は変えない）を足し、ツールチップに推定である理由を添える
+ * （契約 §76.1 / §76.2。グリフは描かない）。
  */
 export function RuntimeBadgeView({
   state,
@@ -44,13 +90,18 @@ export function RuntimeBadgeView({
   reason?: StateReason;
 }): JSX.Element {
   const label = RUNTIME_LABEL[state];
+  const estimated = isEstimated(reason);
+  const tooltip = badgeTooltip(state, reason);
   return (
     <span
-      className="runtime-badge"
+      className={estimated ? 'runtime-badge runtime-badge--estimated' : 'runtime-badge'}
       data-runtime-state={state}
+      data-estimated={estimated ? 'true' : 'false'}
       role="img"
-      aria-label={label}
-      title={reason === undefined ? label : `${label} (${reason})`}
+      // 推定であることを読み上げにも乗せる。権威ある reason では tooltip === label
+      // なので既存の toHaveAccessibleName(label) の期待とは衝突しない
+      aria-label={tooltip}
+      title={tooltip}
       // 色はトークンへの参照だけを載せる（値は tokens.css がテーマごとに持つ）。
       // ドットとラベルは CSS 側で currentColor として受け取る
       style={{ color: `var(${RUNTIME_STATE_TOKEN[state]})` }}

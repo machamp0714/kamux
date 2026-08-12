@@ -28,3 +28,13 @@
   letter-spacing: 0.2px;
   color: currentColor;
 }
+
+/* M3-3（契約 §76.1 / §76.2）: 汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）
+   由来の「推定」状態を破線リングで示す（設計 §4.9）。色には一切触れない ——
+   ドットの塗りを外して currentColor の破線枠だけにする。box-sizing を border-box に
+   して枠を足しても寸法（8×8）が変わらないようにしてある。 */
+.runtime-badge--estimated .runtime-badge__dot {
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px dashed currentColor;
+}
