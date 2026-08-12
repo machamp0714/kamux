@@ -385,10 +385,15 @@ mod tracker_tests {
         t.on_spawn("s2", CliKind::Shell);
         t.on_hook("s1");
         clock.advance_ms(10);
+        // hook を一度も受信していない Claude セッション。spawned_at_ms(10) と
+        // now(10 + HOOK_GRACE_MS)の両方に依存する Unreachable 分岐を snapshot
+        // 経由で踏ませる(引数の取り違えを検出するため)。
+        t.on_spawn("s3", CliKind::Claude);
+        clock.advance_ms(HOOK_GRACE_MS);
 
         let mut snap = t.snapshot();
         snap.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.len(), 3);
         assert_eq!(
             snap[0],
             (
@@ -404,6 +409,15 @@ mod tracker_tests {
                 "s2".to_string(),
                 CliKind::Shell,
                 HookLiveness::NotApplicable,
+                None
+            )
+        );
+        assert_eq!(
+            snap[2],
+            (
+                "s3".to_string(),
+                CliKind::Claude,
+                HookLiveness::Unreachable,
                 None
             )
         );
