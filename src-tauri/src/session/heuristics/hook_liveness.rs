@@ -371,6 +371,9 @@ mod tracker_tests {
     fn hooks_for_unregistered_sessions_are_ignored_without_panicking() {
         let (_c, t) = setup();
         t.on_hook("ghost");
+        // on_exit を呼ぶ前に確認する: on_hook がエントリを新規作成していないこと
+        // (作成していれば on_exit がそれを消してしまい、下の assert では判別できない)
+        assert_eq!(t.liveness("ghost"), HookLiveness::NotApplicable);
         t.on_exit("ghost");
         assert_eq!(t.liveness("ghost"), HookLiveness::NotApplicable);
     }
