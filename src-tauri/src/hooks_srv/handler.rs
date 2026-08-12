@@ -6,17 +6,29 @@
 use std::sync::Arc;
 
 use crate::hooks_srv::{HookEvent, HookKind, HookSink};
+use crate::session::heuristics::registry::HeuristicRegistry;
 use crate::session::runtime_state::{RuntimeSender, StateInput};
 use crate::store::Store;
 
 pub struct HookHandler {
     store: Arc<Store>,
     runtime_tx: RuntimeSender,
+    /// hooks 疎通の昇格先（M3-3）。`RuntimeSender` と同じく、accept スレッドから
+    /// 同期的に呼べる軽いハンドルとして所有する。
+    heuristics: Arc<HeuristicRegistry>,
 }
 
 impl HookHandler {
-    pub fn new(store: Arc<Store>, runtime_tx: RuntimeSender) -> Self {
-        Self { store, runtime_tx }
+    pub fn new(
+        store: Arc<Store>,
+        runtime_tx: RuntimeSender,
+        heuristics: Arc<HeuristicRegistry>,
+    ) -> Self {
+        Self {
+            store,
+            runtime_tx,
+            heuristics,
+        }
     }
 
     /// DB 上に存在するセッションか。設計 §6-7 のなりすまし防止フィルタ。
@@ -35,6 +47,15 @@ impl HookSink for HookHandler {
             tracing::warn!(session_id = %event.kamux_session_id, "hook for an unknown session, dropped");
             return;
         }
+
+        // 設計 §4.7 / M3-3: **どの hook 種別でも「届いた」事実だけで `Healthy` へ昇格させる。**
+        // 種別で分岐すると、`SessionStart` しか出さない設定のセッションが猶予切れで
+        // 汎用ヒューリスティックへ落ちる。
+        //
+        // **`is_known_session` ガードより後に置くこと。** 前に置くと、なりすまし ID の
+        // hook が実在セッションの疎通判定を動かせる（設計 §6-7 のフィルタは
+        // 状態機械だけでなくここにも掛かる）。
+        self.heuristics.note_hook(&event.kamux_session_id);
 
         match event.kind {
             HookKind::SessionStart => {
@@ -90,6 +111,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::model::{CliKind, RuntimeState, SessionStatePayload, StateReason};
+    use crate::session::heuristics::hook_liveness::HookLiveness;
     use crate::session::runtime_state::StateObserver;
 
     /// Store と RuntimeStateManager だけで組む。SessionManager も PTY も要らない。
@@ -106,6 +128,22 @@ mod tests {
         String,
         tempfile::TempDir,
     ) {
+        let (handler, store, tx, runtime, id, dir, _reg) = handler_with_heuristics();
+        (handler, store, tx, runtime, id, dir)
+    }
+
+    /// `handler_with_session` に `HeuristicRegistry` を足した版。
+    /// hook 昇格（`note_hook`）を見るテストだけがこちらを使う。
+    #[allow(clippy::type_complexity)]
+    fn handler_with_heuristics() -> (
+        HookHandler,
+        Arc<crate::store::Store>,
+        RuntimeSender,
+        Arc<crate::session::runtime_state::RuntimeStateManager>,
+        String,
+        tempfile::TempDir,
+        Arc<crate::session::heuristics::registry::HeuristicRegistry>,
+    ) {
         let (dir, store) = crate::store::test_support::open_temp();
         let store = Arc::new(store);
         let project = store
@@ -121,8 +159,15 @@ mod tests {
         // hook を受ける前提として running にしておく（PTY spawn 相当）。
         tx.send(&session.id, StateInput::Spawned);
 
-        let handler = HookHandler::new(Arc::clone(&store), tx.clone());
-        (handler, store, tx, runtime, session.id, dir)
+        let heuristics = crate::session::heuristics::registry::HeuristicRegistry::new(
+            Arc::new(crate::session::heuristics::clock::SystemClock),
+            Arc::new(crate::session::heuristics::sink_impl::ManagerSink::new(
+                tx.clone(),
+            )),
+            tauri::async_runtime::handle().inner().clone(),
+        );
+        let handler = HookHandler::new(Arc::clone(&store), tx.clone(), Arc::clone(&heuristics));
+        (handler, store, tx, runtime, session.id, dir, heuristics)
     }
 
     /// send() は mpsc 経由で consumer スレッドが処理するので、反映を待つ。
@@ -437,6 +482,82 @@ mod tests {
         // DB も無傷
         assert_eq!(store.get_session(&id).expect("get").claude_session_id, None);
 
+        runtime.begin_shutdown();
+    }
+
+    /// 設計 §4.7 / M3-3: **どの hook 種別でも「届いた」事実だけで `Healthy` へ昇格する。**
+    /// 種別で分岐すると、`SessionStart` しか出さない設定のセッションが猶予切れで
+    /// ヒューリスティックへ落ちる。
+    #[test]
+    fn any_hook_kind_promotes_the_session_to_healthy() {
+        for kind in [
+            HookKind::SessionStart,
+            HookKind::Notification,
+            HookKind::PermissionRequest,
+            HookKind::Stop,
+            HookKind::Other("PreToolUse".to_string()),
+        ] {
+            let (handler, _store, _tx, runtime, id, _dir, heuristics) = handler_with_heuristics();
+            // PTY spawn 相当。claude なので昇格前は Pending
+            heuristics.register(&id, CliKind::Claude, true, 30);
+            assert_eq!(
+                heuristics.diagnostics()[0].liveness,
+                HookLiveness::Pending,
+                "前提が崩れている ({kind:?})"
+            );
+
+            handler.on_hook(HookEvent {
+                kamux_session_id: id.clone(),
+                kind: kind.clone(),
+                claude_session_id: None,
+                source: None,
+            });
+
+            let diag = heuristics.diagnostics();
+            assert_eq!(diag.len(), 1);
+            assert_eq!(
+                diag[0].liveness,
+                HookLiveness::Healthy,
+                "{kind:?} で Healthy へ昇格していない"
+            );
+            runtime.begin_shutdown();
+        }
+    }
+
+    /// 昇格は **`is_known_session` ガードの後**に置く。前に置くと、なりすまし ID の
+    /// hook が実在セッションの疎通判定を動かせてしまう。
+    ///
+    /// **判別力の出どころを正確に書く**: レジストリに載っているのに DB から消えた
+    /// セッション（＝ `is_known_session` が偽で、かつ `liveness` エントリが在る）を
+    /// 作るのがこの観測の要である。単に「DB にも registry にも居ない ID」を投げても、
+    /// `HookLivenessTracker::on_hook` が `if let Some(entry)` で既存エントリしか
+    /// 触らないため**行は端から作られず、ガードの位置に関係なく緑になる**（群 P）。
+    /// 幻の行が出ないことは下の assert で併せて見るが、それを守っているのは
+    /// このガードではなく `on_hook` 側である。
+    #[test]
+    fn a_hook_for_a_session_missing_from_the_db_does_not_promote_liveness() {
+        let (handler, store, _tx, runtime, _id, _dir, heuristics) = handler_with_heuristics();
+        let ghost = "00000000-0000-4000-8000-000000000000";
+        assert!(
+            store.get_session(ghost).is_err(),
+            "前提: ghost は DB に無い"
+        );
+        heuristics.register(ghost, CliKind::Claude, true, 30);
+
+        handler.on_hook(HookEvent {
+            kamux_session_id: ghost.to_string(),
+            kind: HookKind::Notification,
+            claude_session_id: None,
+            source: None,
+        });
+
+        let diag = heuristics.diagnostics();
+        assert_eq!(diag.len(), 1, "幻の行が増えている: {diag:?}");
+        assert_eq!(
+            diag[0].liveness,
+            HookLiveness::Pending,
+            "DB に無いセッションの hook が疎通判定を動かした（ガードより前で昇格している）"
+        );
         runtime.begin_shutdown();
     }
 

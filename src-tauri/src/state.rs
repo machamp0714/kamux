@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::hooks_srv::{HooksRuntime, HooksServer};
 use crate::pty::PtyManager;
+use crate::session::heuristics::registry::HeuristicRegistry;
 use crate::session::runtime_state::RuntimeStateManager;
 use crate::store::Store;
 
@@ -19,6 +20,13 @@ pub struct AppState {
     /// `AppState` という形で実装した。呼び出し元の無い委譲メソッドのためだけに
     /// 空の型を作らず、`AppState.runtime` を唯一の到達経路とする（Task 6 report 参照）。
     pub runtime: Arc<RuntimeStateManager>,
+    /// 汎用 CLI ヒューリスティックの統括（M3-3）。**`RuntimeStateManager` の中には
+    /// 入れない** —— あちらは状態機械の中核で、ヒューリスティックは*そこへ入力を
+    /// 流し込む側*である。中に入れると層が反転し、かつ循環が生まれる。
+    ///
+    /// `heuristics()` のような専用メソッドは作らない。`state.heuristics` が唯一の
+    /// 到達経路である（`hooks` と同じ、契約 §75 の適用）。
+    pub heuristics: Arc<HeuristicRegistry>,
     /// hooks が有効なとき Some。relay 解決に失敗した場合や、Task 13 のブートストラップが
     /// まだ値を渡していない起動経路では None（契約 §75.5 / §84.6.2）。
     /// `Mutex` は不要 —— 起動時に確定し、以後書き換わらない（§84.6.2 の 3 箇所目）。
@@ -32,19 +40,34 @@ pub struct AppState {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{AppState, Arc, Mutex, PtyManager, RuntimeStateManager, Store};
+    use super::{AppState, Arc, HeuristicRegistry, Mutex, PtyManager, RuntimeStateManager, Store};
 
     /// 実 `Store` を `StatePersist` に差した `AppState`。
     /// production の `install_app_state` と同じ結線（persist = その `Store` 自身）を
     /// テスト側で 1 行にする。`normalize_on_startup` は呼ばない —— 起動時正規化を
     /// 検証するテストは `install_app_state` 側を通ること。`hooks` / `hooks_server` は
     /// 既定で無効（hooks を使うテストは `state.hooks = Some(..)` を直接代入する）。
+    ///
+    /// `heuristics` は production と同じ `ManagerSink` + `SystemClock` で組む。
+    /// ランタイムハンドルは `tauri::async_runtime::handle()`（`Handle::current()` は
+    /// 同期テストから呼ぶと panic する）。**仮想時間で沈黙タイムアウトを見るテストは
+    /// ここを通さず、`HeuristicRegistry::new` を自分で組むこと** —— この registry の
+    /// 消費ループは tauri のグローバルランタイム上に載るので `start_paused` が効かない。
     pub(crate) fn app_state(store: Store) -> AppState {
         let store = Arc::new(store);
+        let runtime = RuntimeStateManager::new(Arc::clone(&store) as Arc<_>);
+        let heuristics = HeuristicRegistry::new(
+            Arc::new(crate::session::heuristics::clock::SystemClock),
+            Arc::new(crate::session::heuristics::sink_impl::ManagerSink::new(
+                runtime.sender(),
+            )),
+            tauri::async_runtime::handle().inner().clone(),
+        );
         AppState {
-            store: Arc::clone(&store),
+            store,
             pty: PtyManager::new(),
-            runtime: RuntimeStateManager::new(store),
+            runtime,
+            heuristics,
             hooks: None,
             hooks_server: Mutex::new(None),
         }

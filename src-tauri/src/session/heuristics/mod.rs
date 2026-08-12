@@ -12,6 +12,7 @@ pub mod gate;
 pub mod hook_liveness;
 pub mod registry;
 pub mod silence;
+pub(crate) mod sink_impl;
 pub mod validate;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」

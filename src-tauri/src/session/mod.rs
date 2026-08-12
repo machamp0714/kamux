@@ -11,6 +11,8 @@ use crate::error::{AppError, AppResult};
 use crate::model::{KanbanStatus, Session, SessionPatch, SurfaceKind};
 use crate::pty::launch_env::{probe_login_env, resolve_program, LaunchEnv};
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::session::heuristics::sink_impl::{attach_heuristics, detach_heuristics};
+use crate::session::heuristics::OutputObserver;
 use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
 use cli_args::{apply_hooks, binary_name, build_launch_command, login_shell, ResumeMode};
@@ -262,6 +264,29 @@ fn commit_started_session(state: &AppState, session: &mut Session) -> AppResult<
     )
 }
 
+/// ヒューリスティックの装着と PTY spawn をひとまとめにした 1 手（M3-3）。
+///
+/// `spawn` を引数に出しているのは `plan_agent_spawn_with` と同じ seam の理由による ——
+/// `PtyManager::spawn` は `AppHandle`（= `Wry` 固定。契約 §15）を要求し、
+/// `tauri::test::mock_builder()` の `MockRuntime` からは到達できない。この関数まで
+/// 切り出すと「observer を作って spawn へ渡す」までがユニットテストで固定できる。
+///
+/// **残る無検査の継ぎ目は `start_session` がここへ渡すクロージャ 1 行だけである。**
+/// そこが `spawn`（observer なし）を呼ぶ形に戻っても、ユニットテストからは見えない。
+fn spawn_agent_surface_with(
+    state: &AppState,
+    session: &Session,
+    spec: SpawnSpec,
+    spawn: impl FnOnce(SpawnSpec, Option<Box<dyn OutputObserver>>) -> AppResult<()>,
+) -> AppResult<()> {
+    let observer = attach_heuristics(&state.heuristics, session);
+    spawn(spec, Some(observer)).inspect_err(|_| {
+        // spawn に失敗したセッションは読み取りスレッドを持たず、`sink.rs` の `on_exit` も
+        // 来ない。ここで外さないとレジストリに死んだ登録が残り続ける。
+        detach_heuristics(&state.heuristics, &session.id);
+    })
+}
+
 /// セッションの agent サーフェスを起動する。
 /// サイズは 80x24 で起動し、フロントが attach 直後の fit() → resize_pty で合わせる。
 #[tauri::command]
@@ -284,7 +309,13 @@ pub async fn start_session(
     // **起動フェーズの 5 段目**（契約 §63.4 / §63.5）。ここだけは `plan_agent_spawn_with`
     // の外にあるので、`mark_error` もここで呼ぶ。同じ理由（Wry 固定）でユニットテストから
     // 到達できないため、この 4 行も目視レビューで担保する。
-    if let Err(err) = state.pty.spawn(&app, spec) {
+    //
+    // **M3-3: ヒューリスティックの装着もこの 1 手に含まれる**（`spawn_agent_surface_with`）。
+    // observer を渡す先は agent サーフェスに限る（設計 §4.8）。editor サーフェスは
+    // `pty::editor` が `spawn`（observer なし）を呼んだままにすることで構造的に外れる。
+    if let Err(err) = spawn_agent_surface_with(&state, &session, spec, |spec, observer| {
+        state.pty.spawn_with_observer(&app, spec, observer)
+    }) {
         state.runtime.sender().mark_error(&id, &err.to_string());
         return Err(err);
     }
@@ -306,14 +337,23 @@ pub async fn start_session(
 /// `PtyManager::kill` は冪等（契約 §15）なので、事前の `is_alive` 確認は不要。
 #[tauri::command]
 pub async fn stop_session(state: State<'_, AppState>, id: String) -> AppResult<Session> {
-    let session = state.store.get_session(&id)?;
+    stop_agent_surface(&state, &id)
+}
+
+/// `stop_session` の本体。`AppHandle` を要らないので、そのままユニットテストできる。
+fn stop_agent_surface(state: &AppState, id: &str) -> AppResult<Session> {
+    let session = state.store.get_session(id)?;
     state
         .pty
         .kill(&surface_id(&session.id, SurfaceKind::Agent))?;
+    // **`sink.rs` の `on_exit` 任せにしない。** `kill` は冪等で、既に死んでいる／
+    // そもそも登録が無いサーフェスでは `on_exit` が二度と来ないため、
+    // そこ任せにするとレジストリに登録が残り続ける。`unregister` は冪等。
+    detach_heuristics(&state.heuristics, id);
     // kill は冪等（契約 §15）。既に死んでいても、そもそも登録が無くても Ok が返り、
     // ここで ⛔ が確定する。少し遅れて `sink.rs` から `PtyExited` も届くが、
     // `exited` + `PtyExited` は遷移なしなので DB もイベントも動かない（計画 §6.5）。
-    state.runtime.sender().send(&id, StateInput::UserStopped);
+    state.runtime.sender().send(id, StateInput::UserStopped);
     Ok(session)
 }
 
@@ -1362,5 +1402,138 @@ mod tests {
             wait_for_error_state(&state, &session.id),
             "set_worktree の Err は起動フェーズの失敗なので ❌ にする（契約 §63.5）"
         );
+    }
+
+    // --- M3-3: ヒューリスティックのライフサイクル ---
+
+    mod heuristics_lifecycle {
+        use super::*;
+
+        fn wait_until(f: impl Fn() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            f()
+        }
+
+        fn dummy_spec(session: &Session) -> SpawnSpec {
+            SpawnSpec {
+                surface_id: crate::pty::surface_id(&session.id, SurfaceKind::Agent),
+                program: "/bin/cat".to_string(),
+                args: Vec::new(),
+                cwd: PathBuf::from("/tmp"),
+                env: Vec::new(),
+                cols: crate::pty::DEFAULT_COLS,
+                rows: crate::pty::DEFAULT_ROWS,
+            }
+        }
+
+        /// `CliKind::Custom`（ヒューリスティック既定オン・hooks 非対象）のセッションを
+        /// `running` まで進めた `AppState` を返す。
+        fn running_custom_session() -> (tempfile::TempDir, AppState, Session) {
+            let (dir, store, session) = build_project_and_session(
+                "/tmp/kamux-heuristics",
+                SessionMode::InPlace,
+                CliKind::Custom,
+                Some("my-cli"),
+            );
+            let state = crate::state::test_support::app_state(store);
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "前提が崩れている: セッションが running になっていない"
+            );
+            (dir, state, session)
+        }
+
+        /// **端から端までの観測点**（契約 §96 の陽性の対照）。
+        ///
+        /// PTY の出力チャンク → `AgentOutputObserver` → `SessionActivity` →
+        /// `HeuristicRegistry` の消費ループ → ゲート → `ManagerSink` → 状態機械、
+        /// という production の経路が実際に繋がっていることを 1 本で見る。
+        /// **spawn へ渡す observer を `None` に戻す変異はここで赤くなる** ——
+        /// 緑のままなら Task 13 は端から端まで何も観測していない。
+        #[test]
+        fn spawning_an_agent_surface_wires_its_output_to_the_state_machine() {
+            let (_dir, state, session) = running_custom_session();
+
+            let mut captured: Option<Box<dyn OutputObserver>> = None;
+            spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, observer| {
+                captured = observer;
+                Ok(())
+            })
+            .expect("spawn");
+
+            let mut observer = captured.expect("PTY へ observer が渡っていない");
+            observer.on_chunk(b"continue? \x07"); // 入力待ちの BEL
+
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::WaitingInput),
+                "BEL が状態機械へ届いていない（現在: {:?}）",
+                state.runtime.current(&session.id)
+            );
+        }
+
+        /// spawn 前にレジストリへ登録される。診断行はセッション自身の id で立つ。
+        #[test]
+        fn spawning_an_agent_surface_registers_the_session() {
+            let (_dir, state, session) = running_custom_session();
+            assert!(
+                state.heuristics.diagnostics().is_empty(),
+                "前提が崩れている"
+            );
+
+            spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| Ok(()))
+                .expect("spawn");
+
+            let diag = state.heuristics.diagnostics();
+            assert_eq!(diag.len(), 1);
+            assert_eq!(diag[0].session_id, session.id);
+            assert_eq!(diag[0].cli_kind, CliKind::Custom);
+        }
+
+        /// spawn が失敗したセッションは読み取りスレッドを持たず、`on_exit` も来ない。
+        /// ここで外さないとレジストリに死んだ登録が残り続ける。
+        #[test]
+        fn a_failed_spawn_leaves_no_registration_behind() {
+            let (_dir, state, session) = running_custom_session();
+
+            let err =
+                spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| {
+                    Err(AppError::InvalidState("boom".to_string()))
+                })
+                .expect_err("spawn must fail");
+            assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+
+            assert!(
+                state.heuristics.diagnostics().is_empty(),
+                "spawn 失敗の登録が残っている: {:?}",
+                state.heuristics.diagnostics()
+            );
+        }
+
+        /// `stop_session` でも外す。`PtyManager::kill` は冪等で、既に死んでいる
+        /// サーフェスでは `on_exit` が二度と来ないため、そこ任せにすると登録が残る。
+        #[test]
+        fn stopping_a_session_detaches_the_heuristics() {
+            let (_dir, state, session) = running_custom_session();
+            spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| Ok(()))
+                .expect("spawn");
+            assert_eq!(state.heuristics.diagnostics().len(), 1, "前提が崩れている");
+
+            stop_agent_surface(&state, &session.id).expect("stop");
+
+            assert!(
+                state.heuristics.diagnostics().is_empty(),
+                "stop_session でヒューリスティックが外れていない"
+            );
+        }
     }
 }
