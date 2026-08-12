@@ -2,11 +2,13 @@ use rusqlite::{params, Row};
 
 use crate::error::{AppError, AppResult};
 use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode, SessionPatch};
+use crate::session::heuristics::validate::validate_silence_timeout_secs;
 use crate::store::{now_ms, Store};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, project_id, title, description, kanban_status, \
      sort_order, mode, branch, worktree_path, cli_kind, cli_command, claude_session_id, \
-     last_runtime_state, last_runtime_error, first_started_at, archived_at, created_at, updated_at";
+     last_runtime_state, last_runtime_error, first_started_at, heuristics_enabled, \
+     silence_timeout_secs, archived_at, created_at, updated_at";
 
 pub(crate) fn row_to_session(row: &Row<'_>) -> AppResult<Session> {
     let kanban_status: String = row.get("kanban_status")?;
@@ -37,6 +39,8 @@ pub(crate) fn row_to_session(row: &Row<'_>) -> AppResult<Session> {
         })?,
         last_runtime_error: row.get("last_runtime_error")?,
         first_started_at: row.get("first_started_at")?,
+        heuristics_enabled: row.get("heuristics_enabled")?,
+        silence_timeout_secs: row.get("silence_timeout_secs")?,
         archived_at: row.get("archived_at")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -57,8 +61,13 @@ impl Store {
         Ok(sort_order)
     }
 
-    /// 契約 §17: 組み立て済みの Session をそのまま 18 カラム書く。
+    /// 契約 §17: 組み立て済みの Session をそのまま 20 カラム書く。
     /// id / sort_order / タイムスタンプの決定は呼び出し側の責務。
+    ///
+    /// heuristics_enabled / silence_timeout_secs も **渡された値をそのまま**書く。
+    /// ここで cli_kind から既定値を再計算すると、Session が false を持っていても
+    /// DB には true が入る（構造体と DB の split-brain）。既定値の決定は
+    /// `Session::new_backlog` だけの責務である（契約 §20 / 設計 §4.6）。
     pub fn insert_session(&self, session: &Session) -> AppResult<Session> {
         let conn = self.conn()?;
 
@@ -66,9 +75,11 @@ impl Store {
             "INSERT INTO sessions
                 (id, project_id, title, description, kanban_status, sort_order, mode,
                  branch, worktree_path, cli_kind, cli_command, claude_session_id,
-                 last_runtime_state, last_runtime_error, first_started_at, archived_at,
+                 last_runtime_state, last_runtime_error, first_started_at,
+                 heuristics_enabled, silence_timeout_secs, archived_at,
                  created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20)",
             params![
                 session.id,
                 session.project_id,
@@ -85,6 +96,8 @@ impl Store {
                 session.last_runtime_state.as_db_str(),
                 session.last_runtime_error,
                 session.first_started_at,
+                session.heuristics_enabled,
+                session.silence_timeout_secs,
                 session.archived_at,
                 session.created_at,
                 session.updated_at,
@@ -123,7 +136,7 @@ impl Store {
         rows.collect()
     }
 
-    /// 部分更新。動的 SQL を組まず「読む → Rust 上で patch を当てる → 5 カラム書く」で行う。
+    /// 部分更新。動的 SQL を組まず「読む → Rust 上で patch を当てる → 7 カラム書く」で行う。
     /// 単一 Mutex 配下で他の書き手がいないため、この read-modify-write に競合はない。
     /// branch / worktree_path / claude_session_id / last_runtime_state /
     /// last_runtime_error / first_started_at には触らない
@@ -148,19 +161,30 @@ impl Store {
         if let Some(archived_at) = patch.archived_at {
             session.archived_at = archived_at;
         }
+        // 契約 §20（M3-3）。範囲外は丸めずに拒否する（設計 §4.5）。
+        // `?` で UPDATE の前に抜けるので、同じ patch の他のフィールドも書かれない。
+        if let Some(heuristics_enabled) = patch.heuristics_enabled {
+            session.heuristics_enabled = heuristics_enabled;
+        }
+        if let Some(silence_timeout_secs) = patch.silence_timeout_secs {
+            session.silence_timeout_secs = validate_silence_timeout_secs(silence_timeout_secs)?;
+        }
         session.updated_at = now_ms();
 
         conn.execute(
             "UPDATE sessions
              SET title = ?1, description = ?2, kanban_status = ?3, sort_order = ?4,
-                 archived_at = ?5, updated_at = ?6
-             WHERE id = ?7",
+                 archived_at = ?5, heuristics_enabled = ?6, silence_timeout_secs = ?7,
+                 updated_at = ?8
+             WHERE id = ?9",
             params![
                 session.title,
                 session.description,
                 session.kanban_status.as_db_str(),
                 session.sort_order,
                 session.archived_at,
+                session.heuristics_enabled,
+                session.silence_timeout_secs,
                 session.updated_at,
                 session.id,
             ],
@@ -421,6 +445,8 @@ mod tests {
             last_runtime_state: RuntimeState::Idle,
             last_runtime_error: None,
             first_started_at: None,
+            heuristics_enabled: false,
+            silence_timeout_secs: 30,
             archived_at: None,
             created_at: 1,
             updated_at: 1,
@@ -548,7 +574,8 @@ mod tests {
     #[test]
     fn update_session_does_not_overwrite_columns_owned_by_the_runtime_setters() {
         // update_session が触ってよいのは title / description / kanban_status /
-        // sort_order / archived_at の 5 カラムのみ。branch / worktree_path /
+        // sort_order / archived_at / heuristics_enabled / silence_timeout_secs の
+        // 7 カラムのみ（後ろ 2 つは M3-3）。branch / worktree_path /
         // claude_session_id / last_runtime_state / last_runtime_error /
         // first_started_at は Task 11 のセッタ群が書く値であり、ここで潰すと
         // それらの回帰テストより先にサイレントにデータが失われる。
@@ -574,6 +601,8 @@ mod tests {
             last_runtime_state: RuntimeState::Error,
             last_runtime_error: Some("last-runtime-error-value".to_owned()),
             first_started_at: Some(111),
+            heuristics_enabled: true,
+            silence_timeout_secs: 30,
             archived_at: None,
             created_at: 1,
             updated_at: 1,
@@ -623,14 +652,15 @@ mod tests {
     }
 
     #[test]
-    fn update_session_persists_all_five_patchable_columns_and_bumps_updated_at_in_db() {
+    fn update_session_persists_all_seven_patchable_columns_and_bumps_updated_at_in_db() {
         // 既存テストは各カラムを個別に見ており、`description` の patch 適用経路
         // （if let Some(description) と SET description = ?2 の両方）や、
         // `sort_order` / `updated_at` が実際に DB に書かれたことは
         // どのテストからも検証されていなかった（戻り値は fetch_session 時点の
         // in-memory Session をそのまま返すため、戻り値だけを見るテストは
-        // SET 句からの脱落を検出できない）。5 カラムを 1 回の patch で同時に
-        // 当て、必ず get_session で DB から読み直して検証する。
+        // SET 句からの脱落を検出できない）。7 カラム（M3-3 の heuristics_enabled /
+        // silence_timeout_secs を含む）を 1 回の patch で同時に当て、
+        // 必ず get_session で DB から読み直して検証する。
         let (_dir, store) = open_temp();
         let pid = project(&store);
         let session = Session {
@@ -649,6 +679,8 @@ mod tests {
             last_runtime_state: RuntimeState::Idle,
             last_runtime_error: None,
             first_started_at: None,
+            heuristics_enabled: false,
+            silence_timeout_secs: 30,
             archived_at: None,
             created_at: 1,
             updated_at: 1,
@@ -661,7 +693,8 @@ mod tests {
                 &patch_from_json(
                     r#"{"title":"after-title","description":"after-description",
                         "kanban_status":"review","sort_order":9.5,
-                        "archived_at":1700000000000}"#,
+                        "archived_at":1700000000000,
+                        "heuristics_enabled":true,"silence_timeout_secs":45}"#,
                 ),
             )
             .expect("update");
@@ -690,9 +723,164 @@ mod tests {
             "archived_at が DB に書かれていない"
         );
         assert!(
+            reloaded.heuristics_enabled,
+            "heuristics_enabled が DB に書かれていない"
+        );
+        assert_eq!(
+            reloaded.silence_timeout_secs, 45,
+            "silence_timeout_secs が DB に書かれていない"
+        );
+        assert!(
             reloaded.updated_at > session.updated_at,
             "updated_at が DB 上で進んでいない"
         );
+    }
+
+    /// 設定変更が UPDATE の SET 句に載っていないと、変更はメモリ上でしか効かず
+    /// 再起動で元へ戻る（戻り値は patch 適用後の in-memory Session をそのまま返すので、
+    /// 戻り値だけを見るテストでは検出できない）。必ず get_session で読み直す。
+    #[test]
+    fn heuristics_settings_survive_a_round_trip() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session::new_backlog(
+            &pid,
+            "a",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        store.insert_session(&session).expect("insert");
+        assert!(
+            session.heuristics_enabled,
+            "前提: claude の既定はオン（オフへの変更が既定値と区別できること）"
+        );
+
+        store
+            .update_session(
+                &session.id,
+                &patch_from_json(r#"{"heuristics_enabled":false,"silence_timeout_secs":120}"#),
+            )
+            .expect("update");
+
+        let reloaded = store.get_session(&session.id).expect("reload");
+        assert!(!reloaded.heuristics_enabled, "オフ設定が永続化されていない");
+        assert_eq!(
+            reloaded.silence_timeout_secs, 120,
+            "秒数が永続化されていない"
+        );
+    }
+
+    /// 範囲外の `silence_timeout_secs` は `AppError::InvalidState` で拒否し、
+    /// **同じ patch の他のフィールドも書かない**（検証が UPDATE より前にあること）。
+    ///
+    /// `update_session` は Tauri コマンドとして露出しており（`lib.rs`）、
+    /// Rust 側のユーザー入力境界はここである。`clamp_timeout_secs` は黙って丸める
+    /// 内部の保険で、拒否はしない（設計 §4.5）。
+    #[test]
+    fn update_session_rejects_an_out_of_range_silence_timeout_without_writing_the_row() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session {
+            silence_timeout_secs: 90,
+            ..session_with_sentinel_updated_at(&pid, "sid-timeout-rejected")
+        };
+        store.insert_session(&session).expect("insert");
+
+        for out_of_range in [4_u32, 3601] {
+            let err = store
+                .update_session(
+                    &session.id,
+                    &patch_from_json(&format!(
+                        r#"{{"title":"renamed","silence_timeout_secs":{out_of_range}}}"#
+                    )),
+                )
+                .expect_err("範囲外は拒否するはず");
+            match err {
+                AppError::InvalidState(msg) => {
+                    assert!(msg.contains("silence_timeout_secs"), "メッセージ: {msg}")
+                }
+                other => panic!("InvalidState を期待したが {other:?}"),
+            }
+
+            let reloaded = store.get_session(&session.id).expect("reload");
+            assert_eq!(
+                reloaded.silence_timeout_secs, 90,
+                "拒否したのに秒数が書き換わっている"
+            );
+            assert_eq!(
+                reloaded.title, session.title,
+                "拒否したのに同じ patch の title が書かれている（検証が UPDATE より後にある）"
+            );
+        }
+    }
+
+    /// patch に無いフィールドは変更しない。`SET` 句が既定値を無条件に書いていると、
+    /// 「タイトルを直しただけでヒューリスティック設定が既定へ戻る」という
+    /// 見つけにくい退行になる。既定と区別できる値（shell なのに有効 / 30 でない秒数）
+    /// を仕込まないと、この退行はどちらの列でも緑のまま通る。
+    #[test]
+    fn update_session_leaves_heuristics_settings_unchanged_when_the_patch_omits_them() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session {
+            heuristics_enabled: true,
+            silence_timeout_secs: 90,
+            ..session_with_sentinel_updated_at(&pid, "sid-heuristics-untouched")
+        };
+        store.insert_session(&session).expect("insert");
+
+        store
+            .update_session(&session.id, &patch_from_json(r#"{"title":"after"}"#))
+            .expect("update");
+
+        let reloaded = store.get_session(&session.id).expect("get");
+        assert!(
+            reloaded.heuristics_enabled,
+            "cli_kind の既定（shell = false）で上書きされた"
+        );
+        assert_eq!(
+            reloaded.silence_timeout_secs, 90,
+            "既定の 30 で上書きされた"
+        );
+    }
+
+    /// `insert_session` は渡された `Session` をそのまま書く。ここで `cli_kind` から
+    /// 既定値を再計算すると、`Session` が `false` を持っていても DB には `true` が入り、
+    /// 構造体と DB が食い違う（split-brain）。既定値を決めるのは `Session::new_backlog`
+    /// だけであり、その責務は `new_backlog_takes_the_heuristics_default_from_the_cli_kind`
+    /// が固定している。
+    #[test]
+    fn insert_session_persists_the_sessions_own_heuristics_settings() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        // cli_kind から再計算すると true になる組み合わせを、値としては false で渡す
+        let session = Session {
+            cli_kind: CliKind::Claude,
+            heuristics_enabled: false,
+            silence_timeout_secs: 90,
+            ..session_with_sentinel_updated_at(&pid, "sid-heuristics")
+        };
+        store.insert_session(&session).expect("insert");
+
+        // row_to_session 側で辻褄が合わされていないことを見るため、生の列を読む
+        let conn = store.conn().expect("conn");
+        let (enabled, secs): (i64, i64) = conn
+            .query_row(
+                "SELECT heuristics_enabled, silence_timeout_secs FROM sessions WHERE id = ?1",
+                [&session.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row");
+        assert_eq!(
+            enabled, 0,
+            "cli_kind から既定値を再計算して Session の値を上書きしている"
+        );
+        assert_eq!(secs, 90);
     }
 
     #[test]
@@ -952,7 +1140,7 @@ mod tests {
     fn insert_session_writes_every_field_to_its_own_bound_position() {
         // `new_backlog` は 5 フィールドを常に None に固定するため使わない。
         // INSERT 列 <-> params! の対応が 1 か所でもズレたら必ず落ちるよう、
-        // 18 フィールド全部に相互に区別できる非 NULL 値を入れる
+        // 20 フィールド全部に相互に区別できる非 NULL 値を入れる
         // （特に created_at != updated_at）。往復テスト
         // (row_to_session_round_trips_...) は生 UPDATE で値を入れており
         // insert_session の位置ズレは検出できないため、これで補う。
@@ -975,6 +1163,8 @@ mod tests {
             last_runtime_state: RuntimeState::Error,
             last_runtime_error: Some("last-runtime-error-value".to_owned()),
             first_started_at: Some(111),
+            heuristics_enabled: false,
+            silence_timeout_secs: 90,
             archived_at: Some(222),
             created_at: 333,
             updated_at: 444,
@@ -1013,6 +1203,11 @@ mod tests {
             Some("last-runtime-error-value")
         );
         assert_eq!(fetched.first_started_at, Some(111));
+        assert!(
+            !fetched.heuristics_enabled,
+            "cli_kind = custom の既定（true）で上書きされている"
+        );
+        assert_eq!(fetched.silence_timeout_secs, 90);
         assert_eq!(fetched.archived_at, Some(222));
         assert_eq!(fetched.created_at, 333);
         assert_eq!(
@@ -1146,6 +1341,8 @@ mod tests {
                 last_runtime_state: RuntimeState::Idle,
                 last_runtime_error: None,
                 first_started_at: None,
+                heuristics_enabled: true,
+                silence_timeout_secs: 30,
                 archived_at: None,
                 created_at: 1,
                 updated_at: 1,
@@ -1437,6 +1634,8 @@ mod tests {
                 last_runtime_state: state,
                 last_runtime_error: None,
                 first_started_at: None,
+                heuristics_enabled: true,
+                silence_timeout_secs: 30,
                 archived_at: None,
                 created_at,
                 updated_at: created_at,

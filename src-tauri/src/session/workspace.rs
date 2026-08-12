@@ -111,6 +111,8 @@ mod tests {
             last_runtime_state: RuntimeState::Idle,
             last_runtime_error: None,
             first_started_at: None,
+            heuristics_enabled: true,
+            silence_timeout_secs: 30,
             archived_at: None,
             created_at: 0,
             updated_at: 0,

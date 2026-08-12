@@ -7,8 +7,9 @@ pub enum SilenceStep {
     /// あと `ms` ミリ秒待ってから再評価する。`timeout_ms >= 1` の呼び出しでは `ms` は必ず 1 以上
     /// （`timeout_ms == 0` を渡した場合のみ `ms == 0` になり得る）。この関数自体は
     /// `timeout_ms` をクランプしないため、`timeout_ms == 0` を渡さないことは呼び出し側の
-    /// 責務である（`MIN_SILENCE_TIMEOUT_SECS` はその制約の候補として存在するが、
-    /// 現時点でこの関数の呼び出し元は無く、クランプが実装されているかは未検証）
+    /// 責務である（唯一の呼び出し元は `SessionActivity::watch_silence` で、その
+    /// `silence_timeout_ms` は `registry::clamp_timeout_secs` が
+    /// `MIN_SILENCE_TIMEOUT_SECS` 以上へ丸めた値である）
     Wait { ms: u64 },
     /// 沈黙が成立した。イベントを送ってウォッチャを終了する
     Fire,

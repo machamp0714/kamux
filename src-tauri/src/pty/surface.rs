@@ -13,6 +13,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 
 use crate::error::{AppError, AppResult};
 use crate::pty::backpressure::{Backpressure, PTY_READ_CHUNK};
+use crate::session::heuristics::OutputObserver;
 
 /// spawn 時の既定サイズ。フロントが attach 直後に fit() → resize_pty で合わせる
 pub const DEFAULT_COLS: u16 = 80;
@@ -149,7 +150,15 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl PtySurface {
-    pub fn spawn(spec: SpawnSpec, sink: Arc<dyn PtySink>) -> AppResult<Arc<Self>> {
+    /// `observer` は agent サーフェスのヒューリスティック観測（M3-3）。
+    /// **装着するかどうかを決めるのは呼び出し側である** —— ここで `surface_id` を
+    /// 見て捨てる形にすると、`:agent` / `:editor` の判断が 2 箇所に散る
+    /// （`RuntimeSender::note_surface` が同じ理由でフィルタを内部に閉じている）。
+    pub fn spawn(
+        spec: SpawnSpec,
+        sink: Arc<dyn PtySink>,
+        observer: Option<Box<dyn OutputObserver>>,
+    ) -> AppResult<Arc<Self>> {
         let size = PtySize {
             rows: spec.rows.max(1),
             cols: spec.cols.max(1),
@@ -214,6 +223,7 @@ impl PtySurface {
             Arc::clone(&backpressure),
             Arc::clone(&sink),
             drain_tx,
+            observer,
         ) {
             Ok(handle) => handle,
             Err(err) => {
@@ -453,6 +463,7 @@ fn spawn_reader_thread(
     backpressure: Arc<Backpressure>,
     sink: Arc<dyn PtySink>,
     drain_tx: Sender<()>,
+    mut observer: Option<Box<dyn OutputObserver>>,
 ) -> AppResult<JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("kamux-pty-read-{surface_id}"))
@@ -471,6 +482,16 @@ fn spawn_reader_thread(
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // base64 化と `sink.on_data` より前に観測へ渡す(M3-3 設計 §4.1)。
+                        // 渡すのは生バイトで、encode / send のコストを状態検知が
+                        // 待たされないようにするため。
+                        // なお、このループは read の**前**に `wait_until_drained()` で
+                        // 眠るので、WebView 側が滞留している間は読み取り自体が止まり、
+                        // 観測もそのぶん遅れる。この順序が縮めるのは 1 チャンク内の
+                        // 遅延だけである。
+                        if let Some(obs) = observer.as_mut() {
+                            obs.on_chunk(&buf[..n]);
+                        }
                         let seq = backpressure.record(n);
                         sink.on_data(&surface_id, BASE64.encode(&buf[..n]), seq);
                     }
@@ -707,6 +728,124 @@ mod tests {
         }
     }
 
+    /// 観測順序を固定するために、observer と sink が同じログへ追記する。
+    /// `on_exit` は waiter スレッドから来るのでログには積まない
+    /// (reader スレッドが積む交互の並びを壊さないため)。
+    pub(super) struct LoggingSink {
+        pub tx: Sender<Ev>,
+        pub log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PtySink for LoggingSink {
+        fn on_data(&self, _surface_id: &str, base64: String, seq: u64) {
+            lock_or_recover(&self.log).push(format!("sink:{base64}"));
+            let _ = self.tx.send(Ev::Data { base64, seq });
+        }
+        fn on_exit(&self, _surface_id: &str, exit_code: Option<i32>) {
+            let _ = self.tx.send(Ev::Exit(exit_code));
+        }
+    }
+
+    pub(super) struct RecordingObserver {
+        pub log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl crate::session::heuristics::OutputObserver for RecordingObserver {
+        fn on_chunk(&mut self, chunk: &[u8]) {
+            lock_or_recover(&self.log).push(format!("obs:{}", String::from_utf8_lossy(chunk)));
+        }
+    }
+
+    /// 読み取りスレッドは各チャンクを observer へ渡す。渡すのは base64 化と
+    /// `sink.on_data` より**前**である(M3-3 設計 §4.1)。
+    #[test]
+    fn reader_thread_hands_each_chunk_to_the_observer_before_the_sink() {
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec(
+                "/bin/sh",
+                &["-c", "printf '%s\\n' 'observed-kamux'; sleep 30"],
+            ),
+            Arc::new(LoggingSink {
+                tx,
+                log: Arc::clone(&log),
+            }),
+            Some(Box::new(RecordingObserver {
+                log: Arc::clone(&log),
+            })),
+        )
+        .expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("observed-kamux")
+        });
+        assert!(out.contains("observed-kamux"), "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
+
+        let entries = lock_or_recover(&log).clone();
+        assert!(
+            !entries.is_empty(),
+            "observer も sink も一度も呼ばれていない"
+        );
+        let observed: String = entries
+            .iter()
+            .filter_map(|e| e.strip_prefix("obs:"))
+            .collect();
+        assert!(
+            observed.contains("observed-kamux"),
+            "observer が生チャンクを受け取っていない: {entries:?}"
+        );
+        // reader スレッドは 1 チャンクにつき「observer → sink」の順に 1 回ずつ呼ぶ。
+        // 順序を入れ替える変異はここで落ちる。
+        for (i, entry) in entries.iter().enumerate() {
+            let expected = if i % 2 == 0 { "obs:" } else { "sink:" };
+            assert!(
+                entry.starts_with(expected),
+                "{i} 番目が {expected} で始まらない: {entries:?}"
+            );
+        }
+        // observer と sink は同じチャンクを見る。observer へ渡すスライス境界
+        // (`&buf[..n]`)を落とすと、使い回している `buf` の前回分の残骸まで
+        // observer が読むのでここが落ちる。
+        assert!(
+            entries.len() >= 2,
+            "obs/sink のペアが 1 組も無い: {entries:?}"
+        );
+        for (idx, pair) in entries.chunks_exact(2).enumerate() {
+            let observed = pair[0].strip_prefix("obs:").expect("obs entry");
+            let decoded = BASE64
+                .decode(pair[1].strip_prefix("sink:").expect("sink entry"))
+                .expect("valid base64");
+            let sent = String::from_utf8_lossy(&decoded);
+            assert!(
+                observed == sent,
+                "{idx} 番目のチャンク: observer と sink が同じチャンクを見ていない \
+                 (observer {} bytes / sink {} bytes)",
+                observed.len(),
+                decoded.len()
+            );
+        }
+    }
+
+    /// observer を渡さない経路(本 PR の production 全経路)でも読み取りは壊れない。
+    #[test]
+    fn a_surface_without_an_observer_still_delivers_output() {
+        let (tx, rx) = channel();
+        let surface = PtySurface::spawn(
+            spec("/bin/sh", &["-c", "printf '%s\\n' 'no-observer'; sleep 30"]),
+            Arc::new(ChannelSink { tx }),
+            None,
+        )
+        .expect("spawn /bin/sh");
+        let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
+            acc.contains("no-observer")
+        });
+        assert!(out.contains("no-observer"), "actual output: {out:?}");
+        surface.kill().expect("kill");
+        drain_until_exit_after_kill(&rx, &surface);
+    }
+
     #[test]
     fn echo_emits_its_output_while_the_child_stays_alive() {
         // fix round 1: 子プロセスを生かしたまま観測してから kill() する形に
@@ -717,6 +856,7 @@ mod tests {
         let surface = PtySurface::spawn(
             spec("/bin/sh", &["-c", "printf '%s\\n' 'hello-kamux'; sleep 30"]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
@@ -739,6 +879,7 @@ mod tests {
         let surface = PtySurface::spawn(
             spec("/bin/sh", &["-c", "exit 0"]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let (_out, code) = drain(&rx, &surface);
@@ -752,6 +893,7 @@ mod tests {
         let err = PtySurface::spawn(
             spec("/nonexistent/kamux-no-such-binary", &[]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect_err("must fail");
         assert!(
@@ -771,6 +913,7 @@ mod tests {
                 &["-c", "printf '%s\\n' 'あいうえお-🍣'; sleep 30"],
             ),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
@@ -810,6 +953,7 @@ mod tests {
                 &["-c", "yes 0123456789abcdef | head -n 5000; sleep 30"],
             ),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(20), |acc| {
@@ -925,6 +1069,7 @@ mod tests {
             Arc::clone(&backpressure),
             Arc::clone(&sink),
             drain_tx,
+            None,
         )
         .expect("spawn reader thread");
 
@@ -1065,6 +1210,7 @@ mod tests {
             Arc::clone(&backpressure),
             Arc::clone(&sink),
             drain_tx,
+            None,
         )
         .expect("spawn reader thread");
 
@@ -1166,6 +1312,7 @@ mod tests {
             Arc::clone(&backpressure),
             Arc::clone(&sink),
             drain_tx,
+            None,
         )
         .expect("spawn reader thread");
 
@@ -1249,7 +1396,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mut s = spec("/bin/sh", &["-c", "pwd -P; sleep 30"]);
         s.cwd = dir.path().to_path_buf();
-        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let surface =
+            PtySurface::spawn(s, Arc::new(ChannelSink { tx }), None).expect("spawn /bin/sh");
         let expected = std::fs::canonicalize(dir.path())
             .expect("canonicalize temp dir")
             .to_string_lossy()
@@ -1280,7 +1428,8 @@ mod tests {
         s.rows = 40;
         assert_ne!(s.cols, DEFAULT_COLS);
         assert_ne!(s.rows, DEFAULT_ROWS);
-        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let surface =
+            PtySurface::spawn(s, Arc::new(ChannelSink { tx }), None).expect("spawn /bin/sh");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
             acc.trim() == "40 100"
         });
@@ -1306,7 +1455,8 @@ mod tests {
             &["-c", "printf \"%s\\n\" \"$KAMUX_TEST_ENV\"; sleep 30"],
         );
         s.env = vec![("KAMUX_TEST_ENV".to_string(), "kamux-env-ok".to_string())];
-        let surface = PtySurface::spawn(s, Arc::new(ChannelSink { tx })).expect("spawn /bin/sh");
+        let surface =
+            PtySurface::spawn(s, Arc::new(ChannelSink { tx }), None).expect("spawn /bin/sh");
         let out = observe_while_alive(&rx, &surface, Duration::from_secs(10), |acc| {
             acc.contains("kamux-env-ok")
         });
@@ -1351,6 +1501,7 @@ mod tests {
                 ],
             ),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let mut ready = String::new();
@@ -1387,7 +1538,7 @@ mod tests {
     #[test]
     fn resize_updates_the_pty_window_size() {
         let (tx, rx) = channel();
-        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }), None)
             .expect("spawn /bin/cat");
         assert_eq!(
             surface.size().expect("initial size"),
@@ -1402,7 +1553,7 @@ mod tests {
     #[test]
     fn resize_clamps_zero_to_one() {
         let (tx, rx) = channel();
-        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }), None)
             .expect("spawn /bin/cat");
         surface.resize(0, 0).expect("resize");
         assert_eq!(surface.size().expect("size"), (1, 1));
@@ -1413,7 +1564,7 @@ mod tests {
     #[test]
     fn kill_terminates_a_long_running_child_and_emits_exit() {
         let (tx, rx) = channel();
-        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }), None)
             .expect("spawn /bin/cat");
         assert!(surface.is_alive());
         surface.kill().expect("kill");
@@ -1425,7 +1576,7 @@ mod tests {
     #[test]
     fn kill_is_idempotent() {
         let (tx, rx) = channel();
-        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }))
+        let surface = PtySurface::spawn(spec("/bin/cat", &[]), Arc::new(ChannelSink { tx }), None)
             .expect("spawn /bin/cat");
         surface.kill().expect("first kill");
         let _ = drain(&rx, &surface);
@@ -1453,6 +1604,7 @@ mod tests {
                 ],
             ),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         assert!(surface.is_alive());
@@ -1494,6 +1646,7 @@ mod tests {
         let surface = PtySurface::spawn(
             spec("/bin/echo", &["reap-then-kill"]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/echo");
         let (_out, code) = drain(&rx, &surface);
@@ -1535,6 +1688,7 @@ mod tests {
                 ],
             ),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /bin/sh");
         let pid = surface
@@ -1598,6 +1752,7 @@ mod tests {
         let surface = PtySurface::spawn(
             spec("/usr/bin/yes", &["kamux"]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /usr/bin/yes");
 
@@ -1684,6 +1839,7 @@ mod tests {
         let surface = PtySurface::spawn(
             spec("/usr/bin/yes", &["kamux"]),
             Arc::new(ChannelSink { tx }),
+            None,
         )
         .expect("spawn /usr/bin/yes");
 

@@ -65,6 +65,21 @@ impl<R: Runtime> PtySink for TauriSink<R> {
         let _ = self
             .app
             .emit(&data_topic(surface_id), PtyDataPayload { base64, seq });
+        // M3-3: `StateInput::OutputActivity` の唯一の production 送信点（契約 §118.2）。
+        //
+        // **ここにフィルタを書かないこと。** `:editor` を弾く判定も、遷移しない入力を
+        // 捨てる判定も `RuntimeSender::note_surface` の内部に閉じている
+        // （`on_exit` の同じ注意書きを参照）。
+        //
+        // **ここは PTY 読み取り専用の OS スレッドである。** `note_surface` は
+        // read-lock 1 回で遷移しない入力を捨て、`String` の確保もチャネル送信も
+        // 行わない（契約 §118.2 の条件 2）。これ以上の処理を足さないこと。
+        if let Some(state) = self.app.try_state::<crate::state::AppState>() {
+            state.runtime.sender().note_surface(
+                surface_id,
+                crate::session::runtime_state::StateInput::OutputActivity,
+            );
+        }
     }
 
     fn on_exit(&self, surface_id: &str, exit_code: Option<i32>) {

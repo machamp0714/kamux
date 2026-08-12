@@ -312,24 +312,43 @@ mod tests {
     }
 
     // COALESCE(MAX(version), 0) は「空テーブル」と「version = 0 の行が 1 本ある」を
-    // 区別できない。version 1 しか存在しない現状では 2 回目の open のループ本体が
-    // 空範囲になり素通りしてしまうので、意図的に「version = 0 の迷子行」を作って
-    // ループ本体（DELETE → INSERT）を強制的に再実行させる（契約 §46.3 落とし穴 3）。
+    // 区別できない。既に最新版まで適用済みの DB を再 open してもループ本体が
+    // 空範囲になり素通りしてしまうので、意図的に「version = 0 の迷子行」だけを
+    // 持つ DB を作り、ループ本体（DELETE → INSERT）を強制的に実行させる
+    // （契約 §46.3 落とし穴 3）。
+    //
+    // M3-3（schema_version 2）で、迷子行の作り方を「一度 Store::open して版を 0 に
+    // 巻き戻す」から「schema_version テーブルだけを持つ空の DB を直接作る」へ変えた。
+    // 前者は v2 適用済みの DB に対して v2 の ALTER TABLE ADD COLUMN を再実行させる形に
+    // なり、duplicate column name で必ず失敗する（§46.3 落とし穴 1 そのもの。旧フィクスチャを
+    // この版へ復元して実測した）。これはフィクスチャの作り物であって本番では起こらない
+    // —— 版が巻き戻ることは無いためである。
+    //
+    // 新旧の観測の差（実測に基づく。「より強い」という一括りの主張はしない）:
+    //   - 新形はループ本体（DELETE → INSERT）を v1 → v2 の 2 反復ぶん通す。
+    //   - 一方で、新形の v1 反復は schema_version しか持たない DB に対して走るため
+    //     「既存スキーマの上へ DDL_V1 を再適用する」経路は通らない。DDL_V1 の
+    //     CREATE TABLE IF NOT EXISTS から IF NOT EXISTS を落とす変異は、この形では
+    //     緑になる（実測）。その観測は schema.rs の
+    //     migrate_applies_ddl_v1_over_an_existing_schema_when_the_version_row_is_stray
+    //     へ移した（同じ変異でそちらが赤になることを実測している）。
+    //
+    // このテスト自体は tempdir + Store::open のまま残す。
     #[test]
-    fn migrate_keeps_schema_version_as_a_single_row_after_reapplication() {
+    fn migrate_keeps_schema_version_as_a_single_row_when_it_starts_from_a_stray_version_0_row() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("app.db");
 
         {
-            let store = Store::open(&path).expect("first open");
-            let conn = store.conn().expect("conn");
-            conn.execute("DELETE FROM schema_version", [])
-                .expect("clear schema_version");
-            conn.execute("INSERT INTO schema_version (version) VALUES (0)", [])
-                .expect("seed a stray version 0 row");
+            let conn = rusqlite::Connection::open(&path).expect("seed conn");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (0);",
+            )
+            .expect("seed a stray version 0 row");
         }
 
-        let store = Store::open(&path).expect("second open re-runs migrate for version 1");
+        let store = Store::open(&path).expect("open re-runs migrate from the stray version 0");
         let conn = store.conn().expect("conn");
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
@@ -502,6 +521,24 @@ mod tests {
                 "INTEGER".to_owned(),
                 1,
                 None,
+                0,
+            ),
+            // 契約 §20（schema_version 2 / M3-3）の ALTER TABLE から書き写す。
+            // 数値リテラルの既定値はクォート無しで返る（実測で確認済み）。
+            (
+                18,
+                "heuristics_enabled".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                Some("1".to_owned()),
+                0,
+            ),
+            (
+                19,
+                "silence_timeout_secs".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                Some("30".to_owned()),
                 0,
             ),
         ];

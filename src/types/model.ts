@@ -23,6 +23,8 @@ export interface Project {
 }
 
 // 契約 §34.3: last_runtime_error の直後、archived_at の直前に first_started_at を置く（18 フィールド）。
+// 契約 §20（M3-3）: heuristics_enabled / silence_timeout_secs は first_started_at の後、archived_at の前
+// （src-tauri/src/model.rs の pub struct Session と同じ位置）。
 export interface Session {
   id: string;
   project_id: string;
@@ -39,6 +41,8 @@ export interface Session {
   last_runtime_state: RuntimeState;
   last_runtime_error: string | null;
   first_started_at: number | null;
+  heuristics_enabled: boolean;
+  silence_timeout_secs: number;
   archived_at: number | null;
   created_at: number;
   updated_at: number;
@@ -55,6 +59,10 @@ export interface SessionPatch {
   kanban_status?: KanbanStatus;
   sort_order?: number;
   archived_at?: number | null;
+  // 契約 §20（M3-3）: lane-controller の解釈で追加。計画は interface Session のみを指示しているが、
+  // Rust の SessionPatch（src-tauri/src/model.rs）に同じ Task 10 で 2 フィールドが入ったため揃えた。
+  heuristics_enabled?: boolean;
+  silence_timeout_secs?: number;
 }
 
 export type AppErrorCode =

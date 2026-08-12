@@ -61,6 +61,42 @@ impl StateInput {
     }
 }
 
+/// 現在の状態と、**その状態になった理由**。`next_state` の入力である。
+///
+/// 理由を判定に使うなら `next_state` の入力でなければならない(契約 §41.4 / §113.5.1)
+/// —— 遷移の判断が遷移表の外に出た瞬間、契約 §2 の不変条件を型で守れなくなる。
+///
+/// `reason: None` は「理由を持たない状態」である: `current()` の既定、DB の
+/// `DEFAULT 'idle'`、一度も起動していないセッション(契約 §113.1 の実測 11)。
+/// **この既定は必ず許可側に落ちること。** P1 の禁止条件は
+/// 「理由が `HookStop` のとき」と書く —— 「`SilenceTimeout` なら許可」と書くと
+/// 既定が禁止側へ反転し、初期状態から一度も 🟢 になれないセッションが生まれる
+/// (契約 §113.5 の逐語)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub runtime_state: RuntimeState,
+    pub reason: Option<StateReason>,
+}
+
+impl RuntimeSnapshot {
+    pub fn new(runtime_state: RuntimeState, reason: Option<StateReason>) -> Self {
+        Self {
+            runtime_state,
+            reason,
+        }
+    }
+}
+
+impl From<RuntimeState> for RuntimeSnapshot {
+    /// 理由を持たない現在状態。P1 は発動せず、P2(許可)側に落ちる。
+    fn from(runtime_state: RuntimeState) -> Self {
+        Self {
+            runtime_state,
+            reason: None,
+        }
+    }
+}
+
 /// 状態遷移の唯一の判断。副作用なし。
 ///
 /// `None` は「遷移しない」を意味し、呼び出し側は DB 書き込みもイベント発火も行わない。
@@ -68,11 +104,22 @@ impl StateInput {
 /// すでに `running` なら何も起きない(契約 §0 のアイドル CPU 要件)。
 ///
 /// 戻り値に `RuntimeState::Interrupted` は決して現れない(契約 §2)。
-pub fn next_state(current: RuntimeState, input: StateInput) -> Option<(RuntimeState, StateReason)> {
+///
+/// **引数は `RuntimeSnapshot` である**(契約 §113.5 の P1)。`RuntimeState` を
+/// 直に渡す呼び出しは `From` 経由で「理由不明 = 許可」に落ちる。
+pub fn next_state(
+    current: RuntimeSnapshot,
+    input: StateInput,
+) -> Option<(RuntimeState, StateReason)> {
     use RuntimeState::*;
     use StateInput as In;
 
-    let target = match (current, input) {
+    let RuntimeSnapshot {
+        runtime_state: current_state,
+        reason: current_reason,
+    } = current;
+
+    let target = match (current_state, input) {
         // Spawned はあらゆる状態(exited / interrupted を含む)から running へ戻す唯一の入力
         (_, In::Spawned) => Running,
 
@@ -85,6 +132,17 @@ pub fn next_state(current: RuntimeState, input: StateInput) -> Option<(RuntimeSt
         // ここを許すと Notification 直後に 🟡 が 🟢 へ戻り、通知の意味が失われる。
         (WaitingInput, In::OutputActivity) | (WaitingInput, In::SilenceTimeout) => return None,
 
+        // 契約 §113.5 の P1: `HookStop`(claude が「応答が終わった」と言った)で
+        // ⚪ になったセッションは、出力活動では 🟢 へ戻さない。+7.5 秒の再描画で
+        // ⚪ が消える —— 印字可能文字を 1 つも持たない再描画は「エージェントが
+        // 働き始めた」信号ではない。
+        //
+        // **止めるのは `OutputActivity` という駆動元 1 つだけである。** 他の入力
+        // (hook 由来 / `Spawned` / `UserInput` / `PtyExited` …)は一切妨げない。
+        // ⚪ → 🟡 は `Stop` の約 60 秒後の `idle_prompt` の Notification が起こす
+        // (契約 §112.6。設計は変えない)。
+        (Idle, In::OutputActivity) if current_reason == Some(StateReason::HookStop) => return None,
+
         (_, In::OutputActivity) | (_, In::UserInput) => Running,
         // 契約 §12.4: PermissionRequest は「ユーザーの承認待ち」の最も直接的な信号。
         // Notification と両方登録し、どちらが来ても 🟡 へ遷移させる。
@@ -94,7 +152,7 @@ pub fn next_state(current: RuntimeState, input: StateInput) -> Option<(RuntimeSt
         (_, In::PtyExited) | (_, In::ResumeFailed) | (_, In::UserStopped) => Exited,
     };
 
-    if target == current {
+    if target == current_state {
         None
     } else {
         Some((target, input.reason()))
@@ -123,7 +181,10 @@ pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
 /// surface_id の suffix（契約 §5）。agent サーフェスだけが状態機械に影響する。
 const SURFACE_KIND_AGENT: &str = "agent";
 
-pub type StateMap = HashMap<String, RuntimeState>;
+/// 値は `RuntimeState` ではなく `RuntimeSnapshot` である ——
+/// 契約 §113.5 の P1 が「その状態になった理由」を判定材料に要求する。
+/// DB は理由を持たないので、起動時正規化で埋まる行の理由は `None`(許可側)になる。
+pub type StateMap = HashMap<String, RuntimeSnapshot>;
 
 /// ロック毒化で panic しないためのヘルパ（契約 §0: unwrap 禁止）。
 /// 毒化は「別スレッドが保持中に panic した」だけで、マップ自体の不変条件は壊れていない。
@@ -173,10 +234,16 @@ impl RuntimeSender {
 
     /// 現在の runtime_state。未知のセッションは `Idle`。
     pub fn current(&self, session_id: &str) -> RuntimeState {
+        self.snapshot(session_id).runtime_state
+    }
+
+    /// 現在の状態と理由。未知のセッションは「`Idle` / 理由なし」(契約 §113.1 の実測 11)。
+    /// 事前フィルタが `next_state` に**同じことを聞く**ために要る(契約 §113.5.1)。
+    fn snapshot(&self, session_id: &str) -> RuntimeSnapshot {
         read_map(&self.states)
             .get(session_id)
             .copied()
-            .unwrap_or(RuntimeState::Idle)
+            .unwrap_or_else(|| RuntimeSnapshot::from(RuntimeState::Idle))
     }
 
     /// session_id を直接指定して入力を送る。M2-2（hooks）/ M3-3（ヒューリスティック）用。
@@ -204,7 +271,10 @@ impl RuntimeSender {
         if kind != SURFACE_KIND_AGENT {
             return;
         }
-        if next_state(self.current(session_id), input).is_none() {
+        // **理由まで込みで**同じことを聞く。理由を落として聞くと、P1(契約 §113.5)で
+        // 捨てられる入力をキューへ流してしまい、フィルタが `next_state` と別の
+        // 質問をすることになる。
+        if next_state(self.snapshot(session_id), input).is_none() {
             return;
         }
         self.send(session_id, input);
@@ -343,7 +413,7 @@ impl RuntimeStateManager {
     pub fn current(&self, session_id: &str) -> RuntimeState {
         read_map(&self.states)
             .get(session_id)
-            .copied()
+            .map(|snapshot| snapshot.runtime_state)
             .unwrap_or(RuntimeState::Idle)
     }
 
@@ -401,7 +471,8 @@ impl RuntimeStateManager {
                 }
                 None => last,
             };
-            map.insert(id, effective);
+            // DB は理由を持たない。理由なし = 許可側(契約 §113.5 の P2 / 既定の極性)。
+            map.insert(id, RuntimeSnapshot::from(effective));
         }
 
         Ok(changed)
@@ -437,10 +508,13 @@ fn consume_loop(
                     }
                 }
 
+                // **理由まで読む。** 契約 §113.5 の P1 は「その状態になった理由」を
+                // 判定材料にするので、ここで理由を落とすと P1 が production で死ぬ
+                // (`next_state` の単体テストは全部緑のまま)。
                 let current = read_map(&states)
                     .get(&session_id)
                     .copied()
-                    .unwrap_or(RuntimeState::Idle);
+                    .unwrap_or_else(|| RuntimeSnapshot::from(RuntimeState::Idle));
 
                 let Some((next, reason)) = next_state(current, input) else {
                     continue;
@@ -452,7 +526,11 @@ fn consume_loop(
                     continue;
                 }
 
-                write_map(&states).insert(session_id.clone(), next);
+                // **いま確定した遷移の理由**を一緒に書く(契約 §113.5)。
+                // `current.reason`(遷移前の理由)を書くと、次の入力が 1 つ前の
+                // 理由で判定される。
+                write_map(&states)
+                    .insert(session_id.clone(), RuntimeSnapshot::new(next, Some(reason)));
 
                 if let Err(err) = persist.set_last_runtime_state(&session_id, next) {
                     // DB 書き込み失敗で状態機械を止めない。真実はメモリ側にある。
@@ -482,7 +560,10 @@ fn consume_loop(
                     continue;
                 }
 
-                write_map(&states).insert(session_id.clone(), RuntimeState::Error);
+                write_map(&states).insert(
+                    session_id.clone(),
+                    RuntimeSnapshot::new(RuntimeState::Error, Some(StateReason::SpawnFailed)),
+                );
 
                 // `set_last_runtime_state(id, Error)` は使わない ——
                 // メッセージの無い error 行ができる(契約 §17 / §38.8)。
@@ -732,6 +813,136 @@ mod tests {
         (Error, In::SilenceTimeout, None),
     ];
 
+    /// 契約 §113.5 の P1 の行。**`HookStop` によって `idle` になった**セッションに
+    /// 全 11 入力を当てた期待値である。TABLE（理由を持たない行）との違いは
+    /// `OutputActivity` の 1 セルだけで、それを
+    /// `p1_differs_from_a_reason_less_idle_in_exactly_one_cell` が固定する。
+    ///
+    /// P1 は `OutputActivity` という**駆動元 1 つだけ**を止める。hook 由来の入力
+    /// （`HookNotification` / `HookPermission` / `HookStop`）と `Spawned` /
+    /// `UserInput` / `PtyExited` は一切妨げない（契約 §113.5 の逐語）。
+    const HOOK_STOP_IDLE_ROW: [(StateInput, Option<(RuntimeState, StateReason)>); 11] = [
+        (In::Spawned, Some((Running, StateReason::Spawned))),
+        // ← P1。ここだけが理由を持たない idle 行と違う
+        (In::OutputActivity, None),
+        (In::UserInput, Some((Running, StateReason::UserInput))),
+        (
+            In::HookNotification,
+            Some((WaitingInput, StateReason::HookNotification)),
+        ),
+        (
+            In::HookPermission,
+            Some((WaitingInput, StateReason::HookPermission)),
+        ),
+        (In::HookStop, None),
+        (In::PtyExited, Some((Exited, StateReason::PtyExited))),
+        (In::ResumeFailed, Some((Exited, StateReason::ResumeFailed))),
+        (In::UserStopped, Some((Exited, StateReason::UserStopped))),
+        (
+            In::BelDetected,
+            Some((WaitingInput, StateReason::BelDetected)),
+        ),
+        (In::SilenceTimeout, None),
+    ];
+
+    /// `StateInput` が増えたときに P1 側の被覆が黙って抜けるのを防ぐ。
+    #[test]
+    fn hook_stop_idle_row_is_complete() {
+        assert_eq!(HOOK_STOP_IDLE_ROW.len(), StateInput::ALL.len());
+        for input in StateInput::ALL {
+            let hits = HOOK_STOP_IDLE_ROW
+                .iter()
+                .filter(|(i, _)| *i == input)
+                .count();
+            assert_eq!(hits, 1, "P1 の行に {:?} が {} 件", input, hits);
+        }
+    }
+
+    /// P1: `HookStop` 由来の `idle` に対する `next_state` の全 11 セル。
+    #[test]
+    fn next_state_matches_the_hook_stop_idle_row() {
+        for (input, expected) in HOOK_STOP_IDLE_ROW {
+            let current = RuntimeSnapshot::new(Idle, Some(StateReason::HookStop));
+            assert_eq!(
+                next_state(current, input),
+                expected,
+                "HookStop 由来の idle x {:?}",
+                input
+            );
+        }
+    }
+
+    /// P1 が止めるのは `OutputActivity` という駆動元 1 つだけである（契約 §113.5）。
+    /// P1 を広げすぎる変異はここで落ちる。
+    #[test]
+    fn p1_differs_from_a_reason_less_idle_in_exactly_one_cell() {
+        for (input, hook_stop_expected) in HOOK_STOP_IDLE_ROW {
+            let plain = TABLE
+                .iter()
+                .find(|(s, i, _)| *s == Idle && *i == input)
+                .map(|(_, _, next)| *next)
+                .expect("TABLE に idle 行がある");
+            if input == In::OutputActivity {
+                assert_ne!(
+                    hook_stop_expected, plain,
+                    "P1 は OutputActivity で理由なし idle と異なるはず"
+                );
+            } else {
+                assert_eq!(
+                    hook_stop_expected, plain,
+                    "P1 は {:?} を妨げてはいけない",
+                    input
+                );
+            }
+        }
+    }
+
+    /// P2 と既定の極性（契約 §113.5 / §113.1 の実測 11）。
+    /// **禁止条件は「理由が `HookStop` のとき」であって「`SilenceTimeout` なら許可」ではない。**
+    /// 理由が不明・無い `idle`（`current()` の既定 / DB の `DEFAULT 'idle'` / 未起動）は
+    /// 許可側に落ちなければ、一度も 🟢 になれないセッションが生まれる。
+    #[test]
+    fn p2_idle_from_every_currently_defined_non_hook_stop_reason_returns_to_running() {
+        // 契約 §8 の `StateReason` 13 バリアントから `HookStop` を除いた 12 個 + 理由なし。
+        // **この配列は手書きである** —— `StateReason` にバリアントが増えても
+        // ここは自動では広がらない。増やした者はこの配列にも足すこと
+        // （テスト名を「every」ではなく「currently defined」にしてあるのは、
+        // 網羅を主張して穴が塞がったように見せないためである）。
+        const NOT_HOOK_STOP: [Option<StateReason>; 13] = [
+            None,
+            Some(StateReason::Spawned),
+            Some(StateReason::HookNotification),
+            Some(StateReason::PtyExited),
+            Some(StateReason::StartupNormalize),
+            Some(StateReason::BelDetected),
+            Some(StateReason::SilenceTimeout),
+            Some(StateReason::UserStopped),
+            Some(StateReason::OutputActivity),
+            Some(StateReason::UserInput),
+            Some(StateReason::HookPermission),
+            Some(StateReason::ResumeFailed),
+            Some(StateReason::SpawnFailed),
+        ];
+        for reason in NOT_HOOK_STOP {
+            assert_eq!(
+                next_state(RuntimeSnapshot::new(Idle, reason), In::OutputActivity),
+                Some((Running, StateReason::OutputActivity)),
+                "idle(reason={:?}) は OutputActivity で running へ戻るはず",
+                reason
+            );
+        }
+    }
+
+    /// 理由を渡さない呼び出し（`RuntimeState` からの変換）は「理由不明 = 許可」に落ちる。
+    #[test]
+    fn a_reason_less_snapshot_defaults_to_the_permissive_side() {
+        assert_eq!(RuntimeSnapshot::from(Idle).reason, None);
+        assert_eq!(
+            next_state(RuntimeSnapshot::from(Idle), In::OutputActivity),
+            Some((Running, StateReason::OutputActivity))
+        );
+    }
+
     #[test]
     fn transition_table_is_complete() {
         assert_eq!(TABLE.len(), ALL_STATES.len() * StateInput::ALL.len());
@@ -763,7 +974,9 @@ mod tests {
     #[test]
     fn next_state_matches_table() {
         for (current, input, expected) in TABLE {
-            let actual = next_state(current, input);
+            // TABLE は「理由を持たない行」である（`From<RuntimeState>` が
+            // reason: None へ落とす）。P1 の行は HOOK_STOP_IDLE_ROW が持つ。
+            let actual = next_state(current.into(), input);
             assert_eq!(actual, expected, "{:?} x {:?}", current, input);
         }
     }
@@ -773,7 +986,7 @@ mod tests {
     fn next_state_never_yields_interrupted() {
         for state in ALL_STATES {
             for input in StateInput::ALL {
-                if let Some((next, _)) = next_state(state, input) {
+                if let Some((next, _)) = next_state(state.into(), input) {
                     assert_ne!(
                         next, Interrupted,
                         "{:?} x {:?} が interrupted を生成した",
@@ -789,7 +1002,7 @@ mod tests {
     fn transitions_always_change_state() {
         for state in ALL_STATES {
             for input in StateInput::ALL {
-                if let Some((next, _)) = next_state(state, input) {
+                if let Some((next, _)) = next_state(state.into(), input) {
                     assert_ne!(next, state, "{:?} x {:?} が同一状態を返した", state, input);
                 }
             }
@@ -801,7 +1014,7 @@ mod tests {
     fn terminal_states_only_exit_via_spawned() {
         for state in [Exited, Interrupted] {
             for input in StateInput::ALL {
-                let result = next_state(state, input);
+                let result = next_state(state.into(), input);
                 if input == In::Spawned {
                     assert_eq!(result.map(|(s, _)| s), Some(Running));
                 } else {
@@ -814,10 +1027,10 @@ mod tests {
     /// 🟡 を出力活動で消さない（M2-3 の Dock バッジを守る）。
     #[test]
     fn waiting_input_is_not_cleared_by_output_or_silence() {
-        assert!(next_state(WaitingInput, In::OutputActivity).is_none());
-        assert!(next_state(WaitingInput, In::SilenceTimeout).is_none());
+        assert!(next_state(WaitingInput.into(), In::OutputActivity).is_none());
+        assert!(next_state(WaitingInput.into(), In::SilenceTimeout).is_none());
         assert_eq!(
-            next_state(WaitingInput, In::UserInput).map(|(s, _)| s),
+            next_state(WaitingInput.into(), In::UserInput).map(|(s, _)| s),
             Some(Running)
         );
     }
@@ -828,14 +1041,14 @@ mod tests {
     fn hook_permission_behaves_exactly_like_hook_notification() {
         for state in ALL_STATES {
             assert_eq!(
-                next_state(state, In::HookPermission).map(|(s, _)| s),
-                next_state(state, In::HookNotification).map(|(s, _)| s),
+                next_state(state.into(), In::HookPermission).map(|(s, _)| s),
+                next_state(state.into(), In::HookNotification).map(|(s, _)| s),
                 "{:?} で HookPermission と HookNotification の遷移先が違う",
                 state
             );
         }
         // reason は区別できる（UI のツールチップ用）
-        let (_, reason) = next_state(Running, In::HookPermission).expect("遷移するはず");
+        let (_, reason) = next_state(Running.into(), In::HookPermission).expect("遷移するはず");
         assert_eq!(reason, StateReason::HookPermission);
     }
 
@@ -887,7 +1100,20 @@ mod tests {
     ) -> (RuntimeSender, mpsc::Receiver<RuntimeEvent>) {
         let map: StateMap = initial
             .iter()
-            .map(|(k, v)| ((*k).to_string(), *v))
+            .map(|(k, v)| ((*k).to_string(), RuntimeSnapshot::from(*v)))
+            .collect();
+        let states = Arc::new(RwLock::new(map));
+        let (tx, rx) = mpsc::channel();
+        (RuntimeSender::new(states, Arc::new(Mutex::new(tx))), rx)
+    }
+
+    /// 理由付きのスナップショットから sender を作る（契約 §113.5 の P1 / P2 用）。
+    fn sender_with_snapshots(
+        initial: &[(&str, RuntimeState, Option<StateReason>)],
+    ) -> (RuntimeSender, mpsc::Receiver<RuntimeEvent>) {
+        let map: StateMap = initial
+            .iter()
+            .map(|(k, st, reason)| ((*k).to_string(), RuntimeSnapshot::new(*st, *reason)))
             .collect();
         let states = Arc::new(RwLock::new(map));
         let (tx, rx) = mpsc::channel();
@@ -963,6 +1189,37 @@ mod tests {
         sender.note_surface("s1:agent", In::UserInput);
         let ev = rx.try_recv().expect("送信されるはず");
         assert_eq!(expect_input(ev).1, In::UserInput);
+    }
+
+    /// 事前フィルタは `next_state` に**同じことを聞く**（契約 §113.5.1）。
+    /// 理由を落として聞くと、P1 で捨てられる入力をキューへ流してしまう。
+    #[test]
+    fn note_surface_drops_output_activity_for_a_hook_stop_idle_session() {
+        let (sender, rx) = sender_with_snapshots(&[("s1", Idle, Some(StateReason::HookStop))]);
+        sender.note_surface("s1:agent", In::OutputActivity);
+        assert!(
+            rx.try_recv().is_err(),
+            "P1: HookStop 由来の idle への OutputActivity は送信しない"
+        );
+    }
+
+    /// 陽性の対照。P2 側（`SilenceTimeout` 由来）は今までどおり送る。
+    #[test]
+    fn note_surface_sends_output_activity_for_a_silence_timeout_idle_session() {
+        let (sender, rx) =
+            sender_with_snapshots(&[("s1", Idle, Some(StateReason::SilenceTimeout))]);
+        sender.note_surface("s1:agent", In::OutputActivity);
+        let ev = rx.try_recv().expect("P2: 送信されるはず");
+        assert_eq!(expect_input(ev), ("s1".to_string(), In::OutputActivity));
+    }
+
+    /// P1 は `OutputActivity` だけを止める。`UserInput` は妨げない（契約 §113.5）。
+    #[test]
+    fn note_surface_still_sends_user_input_for_a_hook_stop_idle_session() {
+        let (sender, rx) = sender_with_snapshots(&[("s1", Idle, Some(StateReason::HookStop))]);
+        sender.note_surface("s1:agent", In::UserInput);
+        let ev = rx.try_recv().expect("UserInput は妨げない");
+        assert_eq!(expect_input(ev), ("s1".to_string(), In::UserInput));
     }
 
     #[test]
@@ -1340,6 +1597,61 @@ mod tests {
         assert_eq!(persist.writes(), vec![("s1".to_string(), Idle)]);
     }
 
+    /// 契約 §113.5 の P1 / P2 を **manager 越し**に固定する。
+    ///
+    /// `next_state` の単体テストは純関数しか守らない。ここが守るのは配線 ——
+    /// **consumer が遷移の `StateReason` をスナップショットへ書き、次の入力の判定で
+    /// 読み戻していること**である。理由を保存し忘れる / 渡し忘れる / 極性を反転する
+    /// のいずれの変異でもここが赤くなる。
+    ///
+    /// s2 は陽性の対照（P2）。1 本の consumer が FIFO で処理するので、s2 の復帰が
+    /// 観測できた時点で、先に送った s1 の `OutputActivity` は処理済みである
+    /// （「何も起きない」を待たずに判定できる）。
+    #[test]
+    fn hook_stop_idle_resists_output_activity_while_silence_idle_returns_to_running() {
+        let persist = FakePersist::with_rows(&[]);
+        let mgr = RuntimeStateManager::new(persist.clone());
+        let obs = Arc::new(RecordingObserver::default());
+        mgr.register_observer(obs.clone());
+        let sender = mgr.sender();
+
+        // s1: HookStop 由来の ⚪（P1 の対象）
+        sender.send("s1", In::Spawned);
+        sender.send("s1", In::HookStop);
+        // s2: SilenceTimeout 由来の ⚪（P2 の対象）
+        sender.send("s2", In::Spawned);
+        sender.send("s2", In::SilenceTimeout);
+        assert!(
+            wait_until(|| obs.seen().len() == 4),
+            "前提の 4 遷移が揃わない: {:?}",
+            obs.seen()
+        );
+        assert_eq!(
+            obs.seen()[1],
+            ("s1".to_string(), Idle, StateReason::HookStop)
+        );
+        assert_eq!(
+            obs.seen()[3],
+            ("s2".to_string(), Idle, StateReason::SilenceTimeout)
+        );
+
+        sender.send("s1", In::OutputActivity);
+        sender.send("s2", In::OutputActivity);
+
+        assert!(
+            wait_until(|| obs.seen().len() == 5),
+            "P2: s2 は OutputActivity で running へ戻るはず: {:?}",
+            obs.seen()
+        );
+        assert_eq!(
+            obs.seen()[4],
+            ("s2".to_string(), Running, StateReason::OutputActivity)
+        );
+        assert_eq!(obs.seen().len(), 5, "P1: s1 が遷移した: {:?}", obs.seen());
+        assert_eq!(mgr.current("s1"), Idle, "P1: s1 は ⚪ のまま");
+        assert_eq!(mgr.current("s2"), Running);
+    }
+
     /// sender 経由の note_surface が manager のスナップショットを見ていること。
     #[test]
     fn sender_shares_snapshot_with_manager() {
@@ -1420,6 +1732,14 @@ mod tests {
         assert_eq!(mgr.current("fresh"), Idle);
         assert_eq!(mgr.current("dead"), Exited);
         assert_eq!(mgr.current("already"), Interrupted);
+
+        // DB 復元行は理由を持たない = 許可側（契約 §113.5 の既定の極性）。
+        // 禁止側へ倒すと再起動後のセッションが OutputActivity で 🟢 へ戻らなくなる。
+        mgr.sender().send("fresh", In::OutputActivity);
+        assert!(
+            wait_until(|| mgr.current("fresh") == Running),
+            "復元された idle 行が OutputActivity で running へ戻らない"
+        );
     }
 
     /// `error` 行もメモリ上のスナップショットへ必ず載る（契約 §2 / §40.5）。
@@ -1886,6 +2206,11 @@ mod tests {
     /// 事故 2: エディタの出力活動が idle を running に戻さない（契約 §2）。
     /// nvim はカーソル移動のたびに出力するため、これを弾かないと
     /// 「エディタを開いているだけで永遠に 🟢」になり ⚪ / 🟡 バッジが無意味になる。
+    ///
+    /// **Idle へ落とすのに `SilenceTimeout` を使う（`HookStop` ではない）。**
+    /// 契約 §113.5 の P1 が入った後、`HookStop` 由来の ⚪ は `:agent` から
+    /// `OutputActivity` を送っても遷移しない —— そこを起点にすると、
+    /// `:editor` フィルタを丸ごと消しても本テストは緑のままになり、弁別力が消える。
     #[test]
     fn editor_output_does_not_revive_an_idle_session() {
         let persist = FakePersist::with_rows(&[]);
@@ -1894,7 +2219,7 @@ mod tests {
 
         sender.send("s1", In::Spawned);
         assert!(wait_until(|| mgr.current("s1") == Running));
-        sender.send("s1", In::HookStop);
+        sender.send("s1", In::SilenceTimeout);
         assert!(wait_until(|| mgr.current("s1") == Idle));
 
         // エディタでカーソルを動かし続けた相当
@@ -1908,6 +2233,9 @@ mod tests {
     }
 
     /// 対照群: 同じ入力でも agent サーフェスなら遷移する（フィルタが効き過ぎていない）。
+    /// こちらも `SilenceTimeout` 起点である（理由は上のテストの doc）。
+    /// これは契約 §113.5 の P2 でもある —— `HookStop` 以外の理由で ⚪ の
+    /// セッションは `OutputActivity` で 🟢 へ戻る。
     #[test]
     fn agent_output_does_revive_an_idle_session() {
         let persist = FakePersist::with_rows(&[]);
@@ -1916,7 +2244,7 @@ mod tests {
 
         sender.send("s1", In::Spawned);
         assert!(wait_until(|| mgr.current("s1") == Running));
-        sender.send("s1", In::HookStop);
+        sender.send("s1", In::SilenceTimeout);
         assert!(wait_until(|| mgr.current("s1") == Idle));
 
         sender.note_surface("s1:agent", In::OutputActivity);
@@ -1959,9 +2287,12 @@ mod tests {
         // Spawned による 1 回だけ。エディタ由来の書き込みは 1 件も無い
         assert_eq!(persist.writes(), vec![("s1".to_string(), Running)]);
 
-        // Idle へ落とす。ここでの HookStop は agent 由来の正当な遷移であり、
+        // Idle へ落とす。ここでの SilenceTimeout は agent 由来の正当な遷移であり、
         // この書き込みはエディタフィルタとは無関係。
-        sender.send("s1", In::HookStop);
+        // **`HookStop` を使わない** —— 契約 §113.5 の P1 により `HookStop` 由来の
+        // ⚪ は `OutputActivity` で遷移しなくなるので、エディタフィルタを消しても
+        // 下の assert が緑のままになり、弁別力が消える。
+        sender.send("s1", In::SilenceTimeout);
         assert!(wait_until(|| {
             persist.writes() == vec![("s1".to_string(), Running), ("s1".to_string(), Idle)]
         }));

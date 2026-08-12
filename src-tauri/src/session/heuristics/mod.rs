@@ -5,18 +5,24 @@
 //! ここで導出される状態は必ず `gate::heuristic_transition` を通り、
 //! hook 由来の権威ある遷移を上書きしない。
 
+pub mod activity;
 pub mod bel;
 pub mod clock;
 pub mod gate;
 pub mod hook_liveness;
+pub mod registry;
 pub mod silence;
+pub mod validate;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
-/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になるため、
-/// クランプ・範囲検証（Task 7 / Task 11）でこの下限を強制する予定である。
-/// **現時点でこの定数を読む実装は無い**（下記 const assert が固定するのは
-/// `DEFAULT_SILENCE_TIMEOUT_SECS` との大小順序だけで、0 を禁じる強制ではない）。
+/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になる。
+/// **この下限を実際に強制しているのは `registry::clamp_timeout_secs` である** ——
+/// `HeuristicRegistry::register` / `::reconfigure` が `SessionActivity` へ渡す
+/// `silence_timeout_ms` は必ずそこを通る。**範囲検証（設定値を丸めずに弾く側）は
+/// `validate::validate_silence_timeout_secs` が持つ**: クランプは黙って丸めるだけで、範囲外の入力を拒否しない。
+/// （下記 const assert が固定するのは `DEFAULT_SILENCE_TIMEOUT_SECS` との
+/// 大小順序だけで、0 を禁じる強制ではない。0 を禁じるのはクランプの側である。）
 pub const MIN_SILENCE_TIMEOUT_SECS: u32 = 5;
 /// ユーザーが設定できる上限（1 時間）
 pub const MAX_SILENCE_TIMEOUT_SECS: u32 = 3600;
@@ -35,13 +41,15 @@ const _: () = assert!(HOOK_GRACE_MS < DEFAULT_SILENCE_TIMEOUT_SECS as i64 * 1000
 // の範囲に収まらなければならない。Task 11 の範囲検証はこの区間をユーザー入力の
 // 許容範囲として使うため、既定値がこの区間の外に出ると既定値そのものが検証で
 // 弾かれる。3 定数の大小順序をビルドで固定する（下限に 0 を禁じる等の値そのものの
-// 妥当性はクランプ〔Task 7〕の責務であり、この不等式が保証する範囲ではない）。
+// 妥当性は `registry::clamp_timeout_secs` の責務であり、この不等式が保証する範囲ではない）。
 const _: () = assert!(MIN_SILENCE_TIMEOUT_SECS <= DEFAULT_SILENCE_TIMEOUT_SECS);
 const _: () = assert!(DEFAULT_SILENCE_TIMEOUT_SECS <= MAX_SILENCE_TIMEOUT_SECS);
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use self::activity::SessionActivity;
+use self::bel::BelScanner;
 use crate::model::RuntimeState;
 use crate::session::runtime_state::{next_state, StateInput};
 
@@ -80,6 +88,34 @@ impl HeuristicEvent {
             HeuristicEvent::Bel { .. } => gate::HeuristicInput::Bel,
             HeuristicEvent::Silence { .. } => gate::HeuristicInput::Silence,
         }
+    }
+}
+
+/// agent サーフェスの読み取りスレッドが所有するオブザーバ。
+/// `BelScanner` を所有するのでロックが要らない。
+///
+/// editor サーフェス（nvim）には**装着しない**。nvim は常時 BEL を鳴らし、
+/// ユーザーが編集していない間は当然沈黙するため、混ぜると値が壊れる（設計 §4.8）。
+/// 装着するかどうかを決めるのは `PtySurface::spawn` の呼び出し側であり、
+/// `spawn` の中で `surface_id` を見て捨てる形にはしない（判断が 2 箇所に散る）。
+pub struct AgentOutputObserver {
+    activity: Arc<SessionActivity>,
+    scanner: BelScanner,
+}
+
+impl AgentOutputObserver {
+    pub fn new(activity: Arc<SessionActivity>) -> Self {
+        Self {
+            activity,
+            scanner: BelScanner::new(),
+        }
+    }
+}
+
+impl OutputObserver for AgentOutputObserver {
+    fn on_chunk(&mut self, chunk: &[u8]) {
+        let bel_count = self.scanner.scan(chunk);
+        self.activity.record_output(bel_count);
     }
 }
 
@@ -130,14 +166,105 @@ impl RuntimeStateSink for FakeSink {
         guard.sent.push((session_id.to_string(), input));
         // 遷移表を写さず M2-1 の next_state を引く（契約 §41.4）。
         // 遷移が起きない入力は状態を動かさない —— 本番の consumer と同じ振る舞い。
+        //
+        // ⚠️ ここは**理由を持たない**スナップショットを渡す（このフェイクは
+        // `RuntimeState` しか保持していない）。したがって契約 §113.5 の P1
+        // （`HookStop` 由来の `idle` × `OutputActivity`）は **FakeSink 越しには
+        // 一度も発動しない**。P1 を検証したい者は `RuntimeStateManager` 越しに
+        // 見ること（`runtime_state.rs` の
+        // `hook_stop_idle_resists_output_activity_while_silence_idle_returns_to_running`）。
         let current = guard
             .states
             .get(session_id)
             .copied()
             .unwrap_or(RuntimeState::Idle);
-        if let Some((next, _reason)) = next_state(current, input) {
+        if let Some((next, _reason)) = next_state(current.into(), input) {
             guard.states.insert(session_id.to_string(), next);
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::activity::SessionActivity;
+    use super::clock::TestClock;
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn setup() -> (
+        TestClock,
+        Box<dyn OutputObserver>,
+        mpsc::UnboundedReceiver<HeuristicEvent>,
+    ) {
+        let clock = TestClock::new(0);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let activity = SessionActivity::new(
+            "s1".to_string(),
+            Arc::new(clock.clone()),
+            tx,
+            tokio::runtime::Handle::current(),
+            true,
+            30_000,
+        );
+        (clock, Box::new(AgentOutputObserver::new(activity)), rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_real_bel_in_a_chunk_produces_an_event() {
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"waiting for input\x07");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Bel {
+                session_id: "s1".into()
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_osc_title_sequence_produces_no_event() {
+        // シェルのプロンプトが毎回吐くシーケンス。ここで誤検知すると実用にならない
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"\x1b]0;user@host: ~/repo\x07$ ");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_state_survives_across_chunks() {
+        let (_c, mut obs, mut rx) = setup();
+        obs.on_chunk(b"\x1b]0;split-");
+        obs.on_chunk(b"title\x07");
+        assert!(
+            rx.try_recv().is_err(),
+            "チャンク跨ぎの OSC 終端子を誤検知した"
+        );
+
+        obs.on_chunk(b"\x07");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Bel {
+                session_id: "s1".into()
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plain_output_starts_the_silence_watcher() {
+        let (clock, mut obs, mut rx) = setup();
+        obs.on_chunk(b"building...\n");
+        tokio::task::yield_now().await;
+
+        clock.advance_ms(31_000);
+        tokio::time::advance(std::time::Duration::from_millis(31_000)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            }
+        );
     }
 }
 
