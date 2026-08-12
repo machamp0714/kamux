@@ -298,6 +298,60 @@ mod tests {
         (clock, sink, reg)
     }
 
+    /// 消費ループが**何回走ったか**を数える `FakeSink` のラッパ。
+    ///
+    /// **抑止されたイベントは `sent()` に 1 件も現れない。** そのため
+    /// 「再 arm の遅延が短すぎて評価を繰り返している（= 契約 §0 のアイドル CPU を
+    /// 食い潰している）」ことは消費履歴では観測できない。`current` は `handle` 1 回に
+    /// つきちょうど 1 回呼ばれるので、ここが評価回数の観測点になる。
+    struct CountingSink {
+        inner: FakeSink,
+        evaluations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSink {
+        fn new(initial: &[(&str, RuntimeState)]) -> Self {
+            Self {
+                inner: FakeSink::new(initial),
+                evaluations: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// 消費ループがゲートを評価した回数（抑止された分も含む）
+        fn evaluations(&self) -> usize {
+            self.evaluations.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sent(&self) -> Vec<(String, StateInput)> {
+            self.inner.sent()
+        }
+    }
+
+    impl RuntimeStateSink for CountingSink {
+        fn current(&self, session_id: &str) -> Option<RuntimeState> {
+            self.evaluations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.current(session_id)
+        }
+
+        fn send(&self, session_id: &str, input: StateInput) {
+            self.inner.send(session_id, input);
+        }
+    }
+
+    fn setup_counting(
+        initial: &[(&str, RuntimeState)],
+    ) -> (TestClock, Arc<CountingSink>, Arc<HeuristicRegistry>) {
+        let clock = TestClock::new(0);
+        let sink = Arc::new(CountingSink::new(initial));
+        let reg = HeuristicRegistry::new(
+            Arc::new(clock.clone()),
+            sink.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        (clock, sink, reg)
+    }
+
     #[test]
     fn defaults_are_on_except_for_shell() {
         assert!(default_heuristics_enabled(CliKind::Claude));
@@ -421,7 +475,7 @@ mod tests {
     /// 消費ループが猶予切れ後の再評価を予約しなければ**沈黙推定は二度と発火しない**。
     #[tokio::test(start_paused = true)]
     async fn a_silence_swallowed_by_the_grace_window_is_re_evaluated_once_the_grace_expires() {
-        let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let (clock, sink, reg) = setup_counting(&[("s1", RuntimeState::Running)]);
         // 5 秒 < 猶予 20 秒。沈黙が先に成立する
         let act = reg.register("s1", CliKind::Claude, true, 5);
         act.record_output(0); // 出力はここ 1 回きり
@@ -446,6 +500,16 @@ mod tests {
         // 猶予をまたいで報告は 1 件きり
         advance(&clock, 60_000).await;
         assert_eq!(sink.sent().len(), 1, "沈黙 1 回につき報告は 1 件のはず");
+
+        // **再 arm の遅延が効いていることの観測点。** 猶予 20 秒の間に評価するのは
+        // 「抑止された 1 回」と「猶予切れ後の 1 回」だけである。遅延を 0 や
+        // 猶予より短い値にすると、抑止 → 即再評価 → 抑止…… を繰り返して
+        // ここが跳ね上がる（`sent()` は 1 件のままなので件数では見えない）。
+        assert_eq!(
+            sink.evaluations(),
+            2,
+            "消費ループが余分に走っている（再 arm の遅延が短すぎる）"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -523,6 +587,32 @@ mod tests {
             sink.sent(),
             vec![("s1".to_string(), StateInput::SilenceTimeout)],
             "再有効化しても次の出力まで沈黙が評価されていない"
+        );
+    }
+
+    /// **A-2 の裏返し**: 既に有効なセッションの `reconfigure` は再 arm しない。
+    ///
+    /// 立て直しが要るのは「無効な間ウォッチャが 1 本も居なかった」場合だけである。
+    /// 有効なままの設定変更は `SessionActivity::reconfigure` の起床通知で足りる ——
+    /// 発火し終えて降りたウォッチャまで無条件に立て直すと、同じ抑止を何度も評価し直す。
+    #[tokio::test(start_paused = true)]
+    async fn reconfiguring_an_already_enabled_session_does_not_re_arm_a_finished_watcher() {
+        let (clock, sink, reg) = setup_counting(&[("s1", RuntimeState::WaitingInput)]);
+        let act = reg.register("s1", CliKind::Custom, true, 30);
+        act.record_output(0);
+        settle().await;
+
+        // 沈黙は成立するが WaitingInput の方が情報量が多いので抑止される
+        advance(&clock, 31_000).await;
+        assert!(sink.sent().is_empty());
+        assert_eq!(sink.evaluations(), 1, "抑止された評価が 1 回だけ起きる");
+
+        reg.reconfigure("s1", true, 30); // true → true
+        settle().await;
+        assert_eq!(
+            sink.evaluations(),
+            1,
+            "有効なままの設定変更で評価が増えている（再 arm の条件が広すぎる）"
         );
     }
 
