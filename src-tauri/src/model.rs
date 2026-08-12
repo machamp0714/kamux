@@ -118,6 +118,12 @@ pub struct Session {
     /// 最初に PTY spawn に成功した時刻（epoch ms）。None = 一度も起動していない。
     /// 一度書いたら上書きしない（契約 §34）。書き手は M2-1 の SessionManager だけ
     pub first_started_at: Option<i64>,
+    /// 汎用 CLI ヒューリスティック検知のオン/オフ（契約 §20 / M3-3）。
+    /// 既定値は `cli_kind` ごとに `new_backlog` が決める（設計 §4.6）
+    pub heuristics_enabled: bool,
+    /// 沈黙タイムアウト（秒）。許容範囲は
+    /// `MIN_SILENCE_TIMEOUT_SECS..=MAX_SILENCE_TIMEOUT_SECS`（契約 §20 / M3-3）
+    pub silence_timeout_secs: u32,
     pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -156,6 +162,12 @@ impl Session {
             last_runtime_state: RuntimeState::Idle,
             last_runtime_error: None,
             first_started_at: None,
+            // 既定値を決めるのはこの構築点だけ（契約 §20 / 設計 §4.6）。
+            // DAO 側で cli_kind から再計算すると構造体と DB が食い違う
+            heuristics_enabled: crate::session::heuristics::registry::default_heuristics_enabled(
+                cli_kind,
+            ),
+            silence_timeout_secs: crate::session::heuristics::DEFAULT_SILENCE_TIMEOUT_SECS,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -188,6 +200,12 @@ pub struct SessionPatch {
     pub sort_order: Option<f64>,
     #[serde(default, deserialize_with = "double_option")]
     pub archived_at: Option<Option<i64>>,
+    /// 契約 §20（M3-3）。NOT NULL 列なので「null 明示」に意味は無く、
+    /// archived_at のような `Option<Option<_>>` にはしない
+    #[serde(default)]
+    pub heuristics_enabled: Option<bool>,
+    #[serde(default)]
+    pub silence_timeout_secs: Option<u32>,
 }
 
 #[cfg(test)]
@@ -352,6 +370,8 @@ mod tests {
             last_runtime_state: RuntimeState::Idle,
             last_runtime_error: None,
             first_started_at: None,
+            heuristics_enabled: true,
+            silence_timeout_secs: 30,
             archived_at: None,
             created_at: 1,
             updated_at: 2,
@@ -368,6 +388,9 @@ mod tests {
         assert_eq!(v["claude_session_id"], serde_json::Value::Null);
         assert_eq!(v["last_runtime_error"], serde_json::Value::Null);
         assert_eq!(v["archived_at"], serde_json::Value::Null);
+        // 契約 §20（M3-3）。フロントの `Session` はこの 2 キーを読む
+        assert_eq!(v["heuristics_enabled"], true);
+        assert_eq!(v["silence_timeout_secs"], 30);
         // 契約 §22: 禁止名が漏れていないこと
         assert!(v.get("status").is_none());
         assert!(v.get("state").is_none());
@@ -395,6 +418,8 @@ mod tests {
         assert!(patch.kanban_status.is_none());
         assert!(patch.sort_order.is_none());
         assert!(patch.archived_at.is_none(), "不在は「変更しない」");
+        assert!(patch.heuristics_enabled.is_none());
+        assert!(patch.silence_timeout_secs.is_none());
     }
 
     #[test]
@@ -417,11 +442,15 @@ mod tests {
 
     #[test]
     fn session_patch_reads_snake_case_keys() {
-        let patch: SessionPatch =
-            serde_json::from_str(r#"{"kanban_status":"review","sort_order":1.5}"#)
-                .expect("deserialize");
+        let patch: SessionPatch = serde_json::from_str(
+            r#"{"kanban_status":"review","sort_order":1.5,
+                "heuristics_enabled":false,"silence_timeout_secs":120}"#,
+        )
+        .expect("deserialize");
         assert_eq!(patch.kanban_status, Some(KanbanStatus::Review));
         assert_eq!(patch.sort_order, Some(1.5));
+        assert_eq!(patch.heuristics_enabled, Some(false));
+        assert_eq!(patch.silence_timeout_secs, Some(120));
     }
 
     #[test]
@@ -452,6 +481,64 @@ mod tests {
         assert_eq!(s.id.len(), 36, "UUID v4 のハイフン付き文字列");
         assert_eq!(s.created_at, 1700000000000);
         assert_eq!(s.updated_at, 1700000000000, "作成時は両方同じ");
+    }
+
+    /// `cli_kind` 別の既定値を決める場所は `new_backlog` **だけ**である（契約 §20 / 設計 §4.6）。
+    /// DAO 側（`insert_session`）で既定値を再計算すると、`Session` が
+    /// `heuristics_enabled: false` を持っていても DB には true が書かれ、
+    /// 構造体と DB が食い違う。DAO 側は素通しであることを
+    /// `insert_session_persists_the_sessions_own_heuristics_settings` が固定している。
+    #[test]
+    fn new_backlog_takes_the_heuristics_default_from_the_cli_kind() {
+        fn built_with(cli_kind: CliKind) -> Session {
+            Session::new_backlog(
+                "p",
+                "t",
+                "",
+                SessionMode::InPlace,
+                None,
+                cli_kind,
+                None,
+                1.0,
+                1,
+            )
+        }
+
+        assert!(
+            !built_with(CliKind::Shell).heuristics_enabled,
+            "shell は既定オフ（対話シェルは補完失敗のたびに BEL を鳴らす）"
+        );
+        assert!(
+            built_with(CliKind::Claude).heuristics_enabled,
+            "claude は既定オン"
+        );
+        assert!(
+            built_with(CliKind::Custom).heuristics_enabled,
+            "custom は既定オン"
+        );
+    }
+
+    #[test]
+    fn new_backlog_uses_the_default_silence_timeout() {
+        let s = Session::new_backlog(
+            "p",
+            "t",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Claude,
+            None,
+            1.0,
+            1,
+        );
+        assert_eq!(
+            s.silence_timeout_secs,
+            crate::session::heuristics::DEFAULT_SILENCE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            s.silence_timeout_secs, 30,
+            "契約 §20 の DDL の DEFAULT 30 と同じ値であること"
+        );
     }
 
     #[test]
