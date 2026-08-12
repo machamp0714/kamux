@@ -163,6 +163,18 @@ impl HeuristicRegistry {
     /// で判定できる —— `gate::heuristic_transition` は規則 1（セッション単位のオフ）→
     /// 規則 2/3（`Healthy` / `Pending`）→ 規則 4 以降の順に見るので、規則 1 を通過して
     /// `Pending` なら止めたのは規則 3 である。**この推論は gate.rs の規則順に依存している。**
+    ///
+    /// **3 条件それぞれの観測点**（round m3-3-t9-fix-r3 で 3 条件 × 削除／反転／拡大／縮小を
+    /// 実測し、緑だった 2 件を塞いだ）:
+    ///
+    /// - `input == Silence`: `tests::a_suppressed_bel_does_not_re_arm_the_watcher`
+    /// - `heuristics_enabled`:
+    ///   `tests::a_silence_suppressed_by_the_session_switch_does_not_re_arm_the_watcher`
+    /// - `hook_liveness == Pending`: 削除・反転は
+    ///   `tests::a_claude_session_with_healthy_hooks_is_never_touched`、
+    ///   **拡大**（`== Healthy` などへ広げる方向）は
+    ///   `tests::a_bel_makes_a_custom_cli_wait_for_input` の後半。
+    ///   広げる方向は別のテストが要る —— 削除方向の観測は `Healthy` しか通らない
     fn rearm_if_the_grace_window_swallowed_it(
         &self,
         ctx: &HeuristicContext,
@@ -186,10 +198,20 @@ impl HeuristicRegistry {
         // **ループしない根拠**（コードからの導出。実測は下記テストの後半 2 assert）:
         // `None` になる原因は「猶予切れ（`Unreachable`）」「hook 到着（`Healthy`）」
         // 「resume で `cli_kind` が変わった（`NotApplicable`）」「エントリ消滅」など
-        // だが、いずれも次の評価では規則 3 を通らない（規則 4 以降が `Some` を返して
-        // `send` するか、エントリが無くて early-return する）ためここへ二度は来ない。
+        // だが、二度ここへ来ないことを保証しているのは**上のガードの第 3 条件**である:
+        // エントリが消えていれば `handle` の冒頭で return するし、それ以外のどの原因でも
+        // 次の評価の `hook_liveness` は `Pending` ではないので第 3 条件が return する。
+        //
+        // ⚠️ 保証の出所は**ゲート側ではない。** round m3-3-t9-fix-r2 がここに書いた
+        // 「規則 4 以降が `Some` を返して `send` する」は**偽なので訂正する** ——
+        // `Healthy` は規則 2 で止まるし、`Idle` / `WaitingInput` の沈黙は規則 8 により
+        // **どの liveness でも `None`** である。保証をゲート側に付け替えると、
+        // 第 3 条件を**広げる**編集（`!= Pending` → `== Healthy`）が安全に見えてしまう
+        // —— 実際その変異は全緑だった（round m3-3-t9-rerev-r2 の R7。観測は
+        // `tests::a_bel_makes_a_custom_cli_wait_for_input` の後半で塞いだ）。
+        //
         // **原因を数え上げて網羅を主張しているのではない** —— 効いているのは
-        // 「次の評価は規則 3 を通らない」の一点である。resume で猶予をやり直した場合は
+        // 「次の評価は第 3 条件を通らない」の一点である。resume で猶予をやり直した場合は
         // `register` が古い `SessionActivity` を止めているので、この再 arm は空振りする。
         let delay = match self.liveness.remaining_grace_ms(event.session_id()) {
             Some(remaining) => rearm_delay_ms(remaining),
@@ -502,9 +524,22 @@ mod tests {
         );
     }
 
+    /// BEL で入力待ちになった非 Claude セッションは、そのまま座り続けても再 arm されない。
+    ///
+    /// **後半が再 arm ガードの第 3 条件（`hook_liveness == Pending`）を**拡大**方向から
+    /// 測る唯一の観測点である。** `NotApplicable`（Custom / Codex）や `Unreachable`
+    /// （hooks が死んだ Claude）のセッションが `WaitingInput` で座っている間、沈黙は
+    /// ゲート規則 8 で `None` になり続ける —— 条件を `!= Pending` から
+    /// `== Healthy` へ広げると、その `None` が毎回 `rearm_delay_ms(0)` の腕へ落ちて
+    /// 「再 arm → 即 Fire → 規則 8 で `None` → 再 arm」の 10 Hz ループになる。
+    /// **これは hooks を持たない CLI の最も普通の定常状態なので、影響範囲は
+    /// `a_claude_session_with_healthy_hooks_is_never_touched`（削除方向）より広い。**
+    ///
+    /// 小刻みに進める理由と刻み幅の下限は、そのテストのコメントを参照
+    /// （大きな `advance` 1 回では再 arm の sleep が満了せず空振りする）。
     #[tokio::test(start_paused = true)]
     async fn a_bel_makes_a_custom_cli_wait_for_input() {
-        let (_c, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let (clock, sink, reg) = setup_counting(&[("s1", RuntimeState::Running)]);
         let act = reg.register("s1", CliKind::Custom, true, 30);
         act.record_output(1);
         settle().await;
@@ -513,6 +548,12 @@ mod tests {
             sink.sent(),
             vec![("s1".to_string(), StateInput::BelDetected)]
         );
+
+        advance(&clock, 31_000).await; // 沈黙成立（WaitingInput なので規則 8 で None）
+        for _ in 0..5 {
+            advance(&clock, 1_000).await;
+        }
+        assert_eq!(sink.evaluations(), 2, "抑止された沈黙を繰り返している");
     }
 
     /// hooks が健全なら推定は 1 件も適用されない。
@@ -546,6 +587,14 @@ mod tests {
         // 進めるたびに +1 で増え続け、5 歩で 2 → 7 になる）。刻み幅は harness の
         // `advance` 粒度が決めるので、**この数値からループの周期は読めない** ——
         // 100 ms 周期はコードから導いた未実測の帰結である。
+        //
+        // ⚠️ **刻み幅（1_000）は `REARM_MARGIN_MS` より大きくなければならない。**
+        // 小さいと再 arm の `sleep` が 1 度も満了せず、ループしていても `evaluations`
+        // が増えない（実測: 刻みを 1 ms にすると条件を落とす変異が全緑へ戻る。
+        // round m3-3-t9-fix-r3）。逆に定数を刻み以上へ上げてこの観測を静かに殺すことは
+        // できない —— `REARM_MARGIN_MS` を 900 にした時点で
+        // `a_silence_swallowed_by_the_grace_window_is_re_evaluated_once_the_grace_expires`
+        // が先に赤くなる（同ラウンドで実測）。刻みを縮めるときはこの関係を測り直すこと。
         for _ in 0..5 {
             advance(&clock, 1_000).await;
         }
@@ -659,6 +708,55 @@ mod tests {
             true,
             false,
             "抑止された BEL で再 arm している（沈黙の初回評価が猶予切れ後まで遅れる）",
+        );
+    }
+
+    /// 抑止の理由が**セッション単位のオフ**（ゲート規則 1）なら再 arm しない。
+    ///
+    /// 再 arm ガードの第 2 条件（`heuristics_enabled`）の観測点である。無効な
+    /// セッションでウォッチャを立てると、`watch_silence` は先頭の `enabled` 判定で
+    /// すぐ降りるが、**降りるまでの遅延（残り猶予 + `REARM_MARGIN_MS`）の間
+    /// `watcher_alive` を握る。** その窓で `reconfigure(false → true)` が来ると
+    /// A-2 の `rearm_after(0)` が `swap` で `true` を見て空振りし、再有効化しても
+    /// 沈黙の再評価が幻のウォッチャの遅延ぶん遅れる（A-2 が防ごうとしている遅延そのもの）。
+    ///
+    /// **第 2 条件だけが判別していることを構造的に固定する** —— `liveness == Pending`
+    /// の前提 assert が無いと、第 3 条件で return しただけの場合と区別が付かず、
+    /// このテストは何も測っていないことになる（群 P）。
+    ///
+    /// 無効なので `record_output` は早期 return する。すなわちウォッチャが 0 本の
+    /// 状態を作れるのは `handle()` を直接呼ぶ形だけである
+    /// （`a_suppressed_bel_does_not_re_arm_the_watcher` と同じ理由）。
+    #[tokio::test(start_paused = true)]
+    async fn a_silence_suppressed_by_the_session_switch_does_not_re_arm_the_watcher() {
+        let (_c, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        // 猶予（20 秒）より短いタイムアウト = A-1 が効く条件
+        let act = reg.register("s1", CliKind::Claude, false, 5);
+        assert_eq!(
+            reg.diagnostics()[0].liveness,
+            HookLiveness::Pending,
+            "前提が崩れている: 猶予の外なのでガードの第 3 条件が先に return する"
+        );
+        assert_activity(
+            &act,
+            false,
+            false,
+            "前提が崩れている: 無効なのにウォッチャが立っている",
+        );
+
+        reg.handle(&HeuristicEvent::Silence {
+            session_id: "s1".into(),
+        });
+
+        assert!(
+            sink.sent().is_empty(),
+            "前提: 無効なセッションはゲート規則 1 で抑止されるはず"
+        );
+        assert_activity(
+            &act,
+            false,
+            false,
+            "無効なセッションで再 arm している（幻のウォッチャが watcher_alive を握る）",
         );
     }
 
