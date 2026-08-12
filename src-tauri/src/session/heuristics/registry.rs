@@ -164,17 +164,25 @@ impl HeuristicRegistry {
     /// 規則 2/3（`Healthy` / `Pending`）→ 規則 4 以降の順に見るので、規則 1 を通過して
     /// `Pending` なら止めたのは規則 3 である。**この推論は gate.rs の規則順に依存している。**
     ///
-    /// **3 条件それぞれの観測点**（round m3-3-t9-fix-r3 で 3 条件 × 削除／反転／拡大／縮小を
-    /// 実測し、緑だった 2 件を塞いだ）:
+    /// **3 条件それぞれの観測点**（round m3-3-t9-fix-r3 / -r4 で 3 条件 × 削除／反転／拡大／縮小を
+    /// 実測し、緑だった 3 件を塞いだ）:
     ///
-    /// - `input == Silence`: `tests::a_suppressed_bel_does_not_re_arm_the_watcher`
-    /// - `heuristics_enabled`:
+    /// - `input == Silence`（`HeuristicInput` は 2 値なので拡大 ≡ 削除）:
+    ///   `tests::a_suppressed_bel_does_not_re_arm_the_watcher`
+    /// - `heuristics_enabled`（`bool` なので拡大 ≡ 削除）:
     ///   `tests::a_silence_suppressed_by_the_session_switch_does_not_re_arm_the_watcher`
-    /// - `hook_liveness == Pending`: 削除・反転は
-    ///   `tests::a_claude_session_with_healthy_hooks_is_never_touched`、
-    ///   **拡大**（`== Healthy` などへ広げる方向）は
-    ///   `tests::a_bel_makes_a_custom_cli_wait_for_input` の後半。
-    ///   広げる方向は別のテストが要る —— 削除方向の観測は `Healthy` しか通らない
+    /// - `hook_liveness == Pending`: **`HookLiveness` は 4 値なので「拡大」は単一の編集ではない。**
+    ///   再 arm 集合 `{Pending}` を含む部分集合は 8 通りあり、現行を除く 7 通りが拡大、
+    ///   `∅` の 1 通りが縮小である（round m3-3-t9-fix-r4 で 8 通り全部を実測）。
+    ///   広げた先の値ごとに、それを区別できるテストが違う:
+    ///   - `Healthy` を含める → `tests::a_claude_session_with_healthy_hooks_is_never_touched`
+    ///   - `NotApplicable` を含める → `tests::a_bel_makes_a_custom_cli_wait_for_input` の後半
+    ///   - `Unreachable` を含める →
+    ///     `tests::a_claude_session_without_hooks_falls_back_after_the_grace_window` の後半
+    ///
+    ///   削除（= 全体集合への拡大）と反転・縮小は上の 3 本のいずれかが捕まえる。
+    ///   **どれか 1 本を「拡大方向の観測点」と呼ばないこと** —— 1 本では 4 値の
+    ///   1 つしか通らず、残りの値は無検査のまま「見た」と読まれる
     fn rearm_if_the_grace_window_swallowed_it(
         &self,
         ctx: &HeuristicContext,
@@ -435,6 +443,16 @@ mod tests {
     /// `sink.sent()` は**ウォッチャが生きていようが死んでいようが空になる** ——
     /// `unregister` の停止機構をイベントの不在で測ることは原理的にできない
     /// （実測: 停止機構を丸ごと削る変異は round m3-3-t9-rev-r1 で全緑だった）。
+    ///
+    /// ⚠️ **2 つの `bool` の位置を測っているのは、期待値が食い違う呼び出し点だけである。**
+    /// `enabled` と `watcher_alive` は同じ素の型で、呼び出し側は裸のリテラルなので
+    /// 契約 §81.2 の 2 条件に当たる。位置の判別力を持つのは
+    /// `a_suppressed_bel_does_not_re_arm_the_watcher`（`(true, false)`）と
+    /// `a_grace_boundary_crossed_between_the_two_clock_reads_still_re_arms`
+    /// （`(true, false)` と `(true, true)`）で、この本体の 2 つの `format!` を
+    /// 入れ替える変異はそこで赤になる（実測 round m3-3-t9-fix-r4）。
+    /// **期待値が一致する呼び出し点（`(false, false)` など）では位置は原理的に観測できない**
+    /// —— そこでの引数入れ替えは恒等変換なので、そのテストが位置を守っているとは書かないこと。
     fn assert_activity(act: &Arc<SessionActivity>, enabled: bool, watcher_alive: bool, msg: &str) {
         let snap = format!("{act:?}");
         assert!(
@@ -526,9 +544,15 @@ mod tests {
 
     /// BEL で入力待ちになった非 Claude セッションは、そのまま座り続けても再 arm されない。
     ///
-    /// **後半が再 arm ガードの第 3 条件（`hook_liveness == Pending`）を**拡大**方向から
-    /// 測る唯一の観測点である。** `NotApplicable`（Custom / Codex）や `Unreachable`
-    /// （hooks が死んだ Claude）のセッションが `WaitingInput` で座っている間、沈黙は
+    /// **後半は再 arm ガードの第 3 条件（`hook_liveness == Pending`）を**拡大**方向から
+    /// 測る。ただし測っているのは `NotApplicable`（Custom / Codex）だけである** ——
+    /// この fixture は `CliKind::Custom` の 1 点きりで、`Unreachable` は 1 度も作られない。
+    /// `Unreachable` 側は `a_claude_session_without_hooks_falls_back_after_the_grace_window`
+    /// の後半が測る。**「拡大方向の唯一の観測点」ではない** —— `HookLiveness` は 4 値なので
+    /// 再 arm 集合 `{Pending}` の拡大は単一の編集ではなく、`{Pending}` を含む部分集合
+    /// 8 通りのうち現行を除く 7 通りある（round m3-3-t9-fix-r4 で全 7 通りを実測）。
+    ///
+    /// `NotApplicable` のセッションが `WaitingInput` で座っている間、沈黙は
     /// ゲート規則 8 で `None` になり続ける —— 条件を `!= Pending` から
     /// `== Healthy` へ広げると、その `None` が毎回 `rearm_delay_ms(0)` の腕へ落ちて
     /// 「再 arm → 即 Fire → 規則 8 で `None` → 再 arm」の 10 Hz ループになる。
@@ -588,9 +612,12 @@ mod tests {
         // `advance` 粒度が決めるので、**この数値からループの周期は読めない** ——
         // 100 ms 周期はコードから導いた未実測の帰結である。
         //
-        // ⚠️ **刻み幅（1_000）は `REARM_MARGIN_MS` より大きくなければならない。**
+        // ⚠️ **刻み幅（1_000）は `REARM_MARGIN_MS` 以上でなければならない。**
         // 小さいと再 arm の `sleep` が 1 度も満了せず、ループしていても `evaluations`
-        // が増えない（実測 round m3-3-t9-fix-r3: 刻みを 1 ms にすると
+        // が増えない。**境界は `>=` である**（実測 round m3-3-t9-fix-r4: 刻みを
+        // `REARM_MARGIN_MS` ちょうど = 100 にしても条件を落とす変異はこのテストで赤になる。
+        // 以前ここに書いていた「より大きくなければならない」は未実測の断定だった）。
+        // （実測 round m3-3-t9-fix-r3: 刻みを 1 ms にすると
         // **このテストは**条件を落とす変異を捕まえなくなる —— そのとき赤を出したのは
         // 刻み 1_000 のままの `a_bel_makes_a_custom_cli_wait_for_input` だけだった）。
         // 逆に定数を刻み以上へ上げてこの観測を静かに殺すことはできない ——
@@ -612,10 +639,23 @@ mod tests {
         assert!(sink.sent().is_empty(), "猶予中は hook を待つ");
     }
 
+    /// hooks が猶予の中に 1 件も来なければ汎用ヒューリスティックへ落ちる。
+    ///
+    /// **後半は再 arm ガードの第 3 条件を `Unreachable` の側から測る。**
+    /// registry のテストで `HookLiveness::Unreachable` を作っているのはこの fixture だけで、
+    /// 再 arm 集合を `{Pending}` から `{Pending, Unreachable}` へ広げる編集を
+    /// 区別できるのはここしか無い（実測 round m3-3-t9-fix-r4: 強化前は
+    /// その変異が 120/120 全緑だった）。猶予切れの後に `Idle` で座っている間、
+    /// 沈黙はゲート規則 8 でどの liveness でも `None` になり続けるので、
+    /// 広げた版はその `None` が毎回 `rearm_delay_ms(0)` の腕へ落ちて
+    /// 「再 arm → 即 Fire → 規則 8 で `None` → 再 arm」の 10 Hz ループになる（契約 §0）。
+    ///
+    /// 小刻みに進める理由と刻み幅の下限は
+    /// `a_claude_session_with_healthy_hooks_is_never_touched` のコメントを参照。
     #[tokio::test(start_paused = true)]
     async fn a_claude_session_without_hooks_falls_back_after_the_grace_window() {
         // 設計書 §12「hooks 不達 → 汎用ヒューリスティックへ自動フォールバック」
-        let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let (clock, sink, reg) = setup_counting(&[("s1", RuntimeState::Running)]);
         let act = reg.register("s1", CliKind::Claude, true, 30);
         act.record_output(0);
         tokio::task::yield_now().await;
@@ -625,6 +665,15 @@ mod tests {
             sink.sent(),
             vec![("s1".to_string(), StateInput::SilenceTimeout)]
         );
+
+        // 猶予切れ（`Unreachable`）の後、入力待ち／アイドルで座っている間に
+        // 抑止された沈黙を再 arm し続けないこと（契約 §0）
+        act.record_output(0); // 状態は Idle。ウォッチャをもう 1 本立てる
+        advance(&clock, 31_000).await; // 沈黙成立。Idle なのでゲート規則 8 で None
+        for _ in 0..5 {
+            advance(&clock, 1_000).await;
+        }
+        assert_eq!(sink.evaluations(), 2, "抑止された沈黙を繰り返している");
     }
 
     /// **A-1 の観測点**: 沈黙タイムアウトが猶予（`HOOK_GRACE_MS`）より短い claude セッション。
