@@ -135,11 +135,13 @@ mod tests {
     /// `handler_with_session` に `HeuristicRegistry` を足した版。
     /// hook 昇格（`note_hook`）を見るテストだけがこちらを使う。
     //
-    // 戻り値の 7 要素は呼び出し側が `let (handler, store, tx, runtime, id, dir, reg) = ..;`
-    // と 1 行で分解するテスト専用の組み立てヘルパである。型エイリアスを挟むと
-    // この並びが宣言側からしか読めなくなり、doc の分だけ読み手が遠くなるので許可する
-    // （先例: `lib.rs` の `create_session` に付けた `too_many_arguments`）。
-    #[allow(clippy::type_complexity)]
+    // **`#[allow(clippy::type_complexity)]` は置かない**（task-13 レビュー I-3）。
+    // 一度は「理由コメントが無い」として付け足す方向で見ていたが、実測すると
+    // この 7 要素タプルは `type_complexity` を**発火させない** —— 属性を外した状態で
+    // `cargo clippy --workspace --all-targets -- -D warnings` が clippy 1.89
+    // （CI 固定）でも 1.93（ローカル）でも 0 件で通る。同じ位置に閾値を超える型を
+    // 置いた対照では両方の版で警告が出るので、lint 自体はこのモジュールで生きている。
+    // 発火しない lint を抑止する属性を残すと、本当に複雑化したときに信号が出ない。
     fn handler_with_heuristics() -> (
         HookHandler,
         Arc<crate::store::Store>,
