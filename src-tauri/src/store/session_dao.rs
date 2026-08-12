@@ -2,6 +2,7 @@ use rusqlite::{params, Row};
 
 use crate::error::{AppError, AppResult};
 use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode, SessionPatch};
+use crate::session::heuristics::validate::validate_silence_timeout_secs;
 use crate::store::{now_ms, Store};
 
 pub(crate) const SESSION_COLUMNS: &str = "id, project_id, title, description, kanban_status, \
@@ -160,12 +161,13 @@ impl Store {
         if let Some(archived_at) = patch.archived_at {
             session.archived_at = archived_at;
         }
-        // 契約 §20（M3-3）。範囲の検証・拒否は Task 11 の責務であり、ここでは丸めない
+        // 契約 §20（M3-3）。範囲外は丸めずに拒否する（設計 §4.5）。
+        // `?` で UPDATE の前に抜けるので、同じ patch の他のフィールドも書かれない。
         if let Some(heuristics_enabled) = patch.heuristics_enabled {
             session.heuristics_enabled = heuristics_enabled;
         }
         if let Some(silence_timeout_secs) = patch.silence_timeout_secs {
-            session.silence_timeout_secs = silence_timeout_secs;
+            session.silence_timeout_secs = validate_silence_timeout_secs(silence_timeout_secs)?;
         }
         session.updated_at = now_ms();
 
@@ -771,6 +773,50 @@ mod tests {
             reloaded.silence_timeout_secs, 120,
             "秒数が永続化されていない"
         );
+    }
+
+    /// 範囲外の `silence_timeout_secs` は `AppError::InvalidState` で拒否し、
+    /// **同じ patch の他のフィールドも書かない**（検証が UPDATE より前にあること）。
+    ///
+    /// `update_session` は Tauri コマンドとして露出しており（`lib.rs`）、
+    /// Rust 側のユーザー入力境界はここである。`clamp_timeout_secs` は黙って丸める
+    /// 内部の保険で、拒否はしない（設計 §4.5）。
+    #[test]
+    fn update_session_rejects_an_out_of_range_silence_timeout_without_writing_the_row() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = Session {
+            silence_timeout_secs: 90,
+            ..session_with_sentinel_updated_at(&pid, "sid-timeout-rejected")
+        };
+        store.insert_session(&session).expect("insert");
+
+        for out_of_range in [4_u32, 3601] {
+            let err = store
+                .update_session(
+                    &session.id,
+                    &patch_from_json(&format!(
+                        r#"{{"title":"renamed","silence_timeout_secs":{out_of_range}}}"#
+                    )),
+                )
+                .expect_err("範囲外は拒否するはず");
+            match err {
+                AppError::InvalidState(msg) => {
+                    assert!(msg.contains("silence_timeout_secs"), "メッセージ: {msg}")
+                }
+                other => panic!("InvalidState を期待したが {other:?}"),
+            }
+
+            let reloaded = store.get_session(&session.id).expect("reload");
+            assert_eq!(
+                reloaded.silence_timeout_secs, 90,
+                "拒否したのに秒数が書き換わっている"
+            );
+            assert_eq!(
+                reloaded.title, session.title,
+                "拒否したのに同じ patch の title が書かれている（検証が UPDATE より後にある）"
+            );
+        }
     }
 
     /// patch に無いフィールドは変更しない。`SET` 句が既定値を無条件に書いていると、
