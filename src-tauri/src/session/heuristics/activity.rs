@@ -202,9 +202,12 @@ impl SessionActivity {
             }
 
             let timeout_ms = self.silence_timeout_ms.load(Ordering::Relaxed);
-            // 待ち時間の基準にするだけの読みなので `Relaxed`。古い値を読んでも
-            // 早めに `Fire` 側へ回るだけで、下の再チェック（`SeqCst`）が新しい値を見て
-            // ループを続ける。対 1 に含まれるのは再チェックの load であってこちらではない
+            // 待ち時間の基準にするだけの読みなので `Relaxed`。対 1 に含まれるのは
+            // 再チェック（下の `SeqCst` の load）であってこちらではない。
+            // ⚠️ ただし古い値（= より小さい基準）を読むと経過時間が過大になり、
+            // `Silence` が 1 本余分に出る余地はある。ウォッチャ自体は再チェックが
+            // 新しい値を見てループを続けるので消えない。`4a353cf` 以前からある性質で、
+            // 消すならこの load も `SeqCst` にする必要がある
             let last = self.last_activity_ms.load(Ordering::Relaxed);
 
             match silence_step(self.clock.now_ms(), last, timeout_ms) {
