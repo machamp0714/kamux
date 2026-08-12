@@ -10,14 +10,18 @@ pub mod bel;
 pub mod clock;
 pub mod gate;
 pub mod hook_liveness;
+pub mod registry;
 pub mod silence;
 
 /// 沈黙タイムアウトの既定値（秒）。設計書 §9.2「既定 30 秒」
 pub const DEFAULT_SILENCE_TIMEOUT_SECS: u32 = 30;
-/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になるため、
-/// クランプ・範囲検証（Task 9 / Task 11）でこの下限を強制する予定である。
-/// **現時点でこの定数を読む実装は無い**（下記 const assert が固定するのは
-/// `DEFAULT_SILENCE_TIMEOUT_SECS` との大小順序だけで、0 を禁じる強制ではない）。
+/// ユーザーが設定できる下限。0 を許すとウォッチャが busy loop になる。
+/// **この下限を実際に強制しているのは `registry::clamp_timeout_secs` である** ——
+/// `HeuristicRegistry::register` / `::reconfigure` が `SessionActivity` へ渡す
+/// `silence_timeout_ms` は必ずそこを通る。**範囲検証（設定値を丸めずに弾く側）は
+/// Task 11 に残っている**: クランプは黙って丸めるだけで、範囲外の入力を拒否しない。
+/// （下記 const assert が固定するのは `DEFAULT_SILENCE_TIMEOUT_SECS` との
+/// 大小順序だけで、0 を禁じる強制ではない。0 を禁じるのはクランプの側である。）
 pub const MIN_SILENCE_TIMEOUT_SECS: u32 = 5;
 /// ユーザーが設定できる上限（1 時間）
 pub const MAX_SILENCE_TIMEOUT_SECS: u32 = 3600;
@@ -36,7 +40,7 @@ const _: () = assert!(HOOK_GRACE_MS < DEFAULT_SILENCE_TIMEOUT_SECS as i64 * 1000
 // の範囲に収まらなければならない。Task 11 の範囲検証はこの区間をユーザー入力の
 // 許容範囲として使うため、既定値がこの区間の外に出ると既定値そのものが検証で
 // 弾かれる。3 定数の大小順序をビルドで固定する（下限に 0 を禁じる等の値そのものの
-// 妥当性はクランプ〔Task 9〕の責務であり、この不等式が保証する範囲ではない）。
+// 妥当性は `registry::clamp_timeout_secs` の責務であり、この不等式が保証する範囲ではない）。
 const _: () = assert!(MIN_SILENCE_TIMEOUT_SECS <= DEFAULT_SILENCE_TIMEOUT_SECS);
 const _: () = assert!(DEFAULT_SILENCE_TIMEOUT_SECS <= MAX_SILENCE_TIMEOUT_SECS);
 
