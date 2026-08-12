@@ -185,8 +185,11 @@ impl HeuristicRegistry {
         //
         // **ループしない根拠**（コードからの導出。実測は下記テストの後半 2 assert）:
         // `None` になる原因は「猶予切れ（`Unreachable`）」「hook 到着（`Healthy`）」
-        // 「エントリ消滅」の 3 つで、どれも次の評価で規則 3 を通らないため
-        // ここへ二度は来ない。resume で `on_spawn` が猶予をやり直した場合は
+        // 「resume で `cli_kind` が変わった（`NotApplicable`）」「エントリ消滅」など
+        // だが、いずれも次の評価では規則 3 を通らない（規則 4 以降が `Some` を返して
+        // `send` するか、エントリが無くて early-return する）ためここへ二度は来ない。
+        // **原因を数え上げて網羅を主張しているのではない** —— 効いているのは
+        // 「次の評価は規則 3 を通らない」の一点である。resume で猶予をやり直した場合は
         // `register` が古い `SessionActivity` を止めているので、この再 arm は空振りする。
         let delay = match self.liveness.remaining_grace_ms(event.session_id()) {
             Some(remaining) => rearm_delay_ms(remaining),
@@ -229,7 +232,12 @@ impl HeuristicRegistry {
         // 再 spawn で猶予をリセットする（resume 対応）ので、この呼ばれ方は起こりうる。
         // 止めないと古いウォッチャが**古い活動時刻**を基準に `Silence` を送り続け、
         // 消費ループは新しいエントリを引くため resume 直後のセッションが即
-        // `SilenceTimeout` を受ける。停止の手順は `unregister` と同じ
+        // `SilenceTimeout` を受ける。停止の手順は `unregister` と同じ。
+        //
+        // `insert` の前に止めても保証は変わらない —— `SessionActivity::reconfigure` は
+        // フラグの store と `notify_waiters` だけで、**停止は非同期**である
+        // （旧ウォッチャはどちらの順序でも次の起床まで生きる）。差は `insert` と停止の
+        // 間の数命令ぶんに縮むだけで、既にチャンネルへ載ったイベントを回収できない点も同じ
         if let Some(old) = previous {
             old.activity
                 .reconfigure(false, (MIN_SILENCE_TIMEOUT_SECS as u64) * 1_000);
@@ -507,9 +515,18 @@ mod tests {
         );
     }
 
+    /// hooks が健全なら推定は 1 件も適用されない。
+    ///
+    /// **`sent()` の空だけでは足りない。** ゲート規則 2 で抑止された評価は
+    /// `RuntimeStateSink` に 1 件も届かないので、抑止 → 再 arm → 抑止…… の
+    /// busy loop（契約 §0「アイドル CPU ほぼ 0%」）が `sent()` では原理的に見えない。
+    /// 再 arm ガードの `hook_liveness == Pending` 条件を落とすと `Healthy` の沈黙が
+    /// `rearm_delay_ms(0)` の腕へ落ちてこのループに入る（実測: 落とす変異は
+    /// round m3-3-t9-rerev-r1 の D1 = 119/119 全緑だった）。そこで `CountingSink` で
+    /// 評価回数を数える。
     #[tokio::test(start_paused = true)]
     async fn a_claude_session_with_healthy_hooks_is_never_touched() {
-        let (clock, sink, reg) = setup(&[("s1", RuntimeState::Running)]);
+        let (clock, sink, reg) = setup_counting(&[("s1", RuntimeState::Running)]);
         let act = reg.register("s1", CliKind::Claude, true, 30);
         reg.note_hook("s1"); // SessionStart 相当
         act.record_output(1);
@@ -520,6 +537,19 @@ mod tests {
             sink.sent().is_empty(),
             "hooks が生きている間は推定を一切適用しない"
         );
+
+        // 抑止した評価を再 arm し続けていないこと（契約 §0）。
+        // 🔴 小刻みに進めないとこの観測は空振りする —— 大きな advance を 1 回だけ打つと
+        // 再 arm の sleep が満了せず、ループしていても evaluations が増えない。
+        //
+        // 測っているのは「繰り返しに**上限が無い**」ことである（実測: 条件を落とすと
+        // 進めるたびに +1 で増え続け、5 歩で 2 → 7 になる）。刻み幅は harness の
+        // `advance` 粒度が決めるので、**この数値からループの周期は読めない** ——
+        // 100 ms 周期はコードから導いた未実測の帰結である。
+        for _ in 0..5 {
+            advance(&clock, 1_000).await;
+        }
+        assert_eq!(sink.evaluations(), 2, "抑止された評価を繰り返している");
     }
 
     #[tokio::test(start_paused = true)]
@@ -609,7 +639,12 @@ mod tests {
         // 猶予（20 秒）より短いタイムアウト = A-1 が効く条件。出力は与えないので
         // ウォッチャは 1 本も居ない（= `record_output` が swap する前と同じ状態）
         let act = reg.register("s1", CliKind::Claude, true, 5);
-        assert_activity(&act, true, false, "前提: ウォッチャが既に立っている");
+        assert_activity(
+            &act,
+            true,
+            false,
+            "前提が崩れている: 出力を与えていないのにウォッチャが立っている",
+        );
 
         reg.handle(&HeuristicEvent::Bel {
             session_id: "s1".into(),
@@ -691,7 +726,12 @@ mod tests {
         // 猶予（20 秒）より短いタイムアウト = A-1 が効く条件。
         // 出力を与えないのでウォッチャは 1 本も居ない
         let act = reg.register("s1", CliKind::Claude, true, 5);
-        assert_activity(&act, true, false, "前提: ウォッチャが既に立っている");
+        assert_activity(
+            &act,
+            true,
+            false,
+            "前提が崩れている: 出力を与えていないのにウォッチャが立っている",
+        );
 
         inner.advance_ms(HOOK_GRACE_MS - 1); // 猶予切れの 1 ミリ秒前
         clock.arm();
@@ -853,7 +893,12 @@ mod tests {
         // `settle()` で `select!` まで到達させる。`notify_waiters` は**待機登録済みの
         // waiter だけ**を起こすので、ここが足りないと下の assert が変異と無関係に赤くなる
         settle().await;
-        assert_activity(&act, true, true, "前提: ウォッチャが 1 本走っていない");
+        assert_activity(
+            &act,
+            true,
+            true,
+            "前提が崩れている: ウォッチャが 1 本も走っていない",
+        );
 
         reg.unregister("s1");
         settle().await;
@@ -889,7 +934,12 @@ mod tests {
         let old = reg.register("s1", CliKind::Custom, true, 30);
         old.record_output(0);
         settle().await;
-        assert_activity(&old, true, true, "前提: 古いウォッチャが走っていない");
+        assert_activity(
+            &old,
+            true,
+            true,
+            "前提が崩れている: 古いウォッチャが走っていない",
+        );
 
         advance(&clock, 25_000).await; // 沈黙成立まで残り 5 秒
 
