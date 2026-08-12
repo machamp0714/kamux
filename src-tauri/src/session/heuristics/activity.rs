@@ -605,8 +605,12 @@ mod tests {
     /// 二度と spawn しなくなる。既存の disabled 系テストは「発火しないこと」しか見ないため、
     /// その取り違えを 1 本も捕まえられない。
     ///
-    /// ⚠️ この経路は disabled 腕の**再チェックそのもの**は通らない（再チェックが効く
-    /// interleaving は単一スレッド・仮想時間の harness では作れない。モジュール doc 参照）。
+    /// ⚠️ この経路は disabled 腕の**再チェックそのもの**は通らない（ここでの再有効化は
+    /// ウォッチャが降りきった後に着弾するため）。再チェックが効く interleaving は
+    /// `#[cfg(test)]` の seam を使って別の 2 本
+    /// （`re_enabling_between_the_flag_clear_and_the_recheck_keeps_the_watcher_alive` /
+    /// `the_recheck_reclaims_the_watcher_flag`）で決定的に作ってある ——
+    /// **「この harness では作れない」は偽である。**
     /// 出力が来ないまま再有効化された場合の再 arm は消費側（Task 9）の責務である。
     #[tokio::test(start_paused = true)]
     async fn output_after_re_enabling_restarts_the_watcher() {
