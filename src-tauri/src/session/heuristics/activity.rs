@@ -515,27 +515,28 @@ mod tests {
         }
     }
 
-    /// disabled 腕の**再チェックそのもの**の観測点。
+    /// disabled 腕の**再チェックそのもの**を観測するための段取り。
     ///
     /// `watcher_alive` を降ろした直後（= 再チェックが `enabled` を読む前）に
     /// `reconfigure(true, …)` が着弾する interleaving を、seam を使って決定的に作る。
     /// 着弾点は production コメントが宣言した射程の内側であり、
     /// deferred 項目（ウォッチャが終了しきった後の再有効化）ではない。
     ///
-    /// 3 つの assert はそれぞれ別のものを見ている:
-    /// 1. seam が実際に走ったか（走らなければこのテストは何も測っていない —— 群 P）
-    /// 2. 再チェックが在るか（無ければウォッチャが消え、このアイドル期間の `Silence` が永久に出ない）
-    /// 3. 再チェックが `watcher_alive` を**取り直している**か（`swap` を `load` に書き換えると
-    ///    フラグが空いたままになり、続く `rearm_after` が 2 本目のウォッチャを立ててしまう。
-    ///    2 本目を立てる呼び出しがテスト側に無いと、この assert は判別力ゼロになる）
-    #[tokio::test(start_paused = true)]
-    async fn re_enabling_between_the_flag_clear_and_the_recheck_keeps_one_watcher() {
-        let (clock, act, mut rx) = setup(30_000);
+    /// 戻り値の `SeamGuard` は呼び出し側が保持すること（落とすと差し込みが外れる）。
+    /// seam が実際に走ったことはここで assert する —— 走っていなければ、
+    /// これを使うテストは再チェックを 1 つも測っていない（群 P）。
+    async fn arrange_a_re_enable_landing_at_the_seam() -> (
+        TestClock,
+        Arc<SessionActivity>,
+        mpsc::UnboundedReceiver<HeuristicEvent>,
+        SeamGuard,
+    ) {
+        let (clock, act, rx) = setup(30_000);
         act.record_output(0);
         tokio::task::yield_now().await;
 
         let hook_ran = Arc::new(AtomicBool::new(false));
-        let _seam = {
+        let seam = {
             let act = Arc::clone(&act);
             let hook_ran = Arc::clone(&hook_ran);
             install_disabled_arm_seam(move || {
@@ -554,9 +555,19 @@ mod tests {
             "seam が走っていない —— このテストは再チェックを何も測っていない"
         );
 
-        // 再チェックがフラグを取り直していれば、これは no-op になる（下の 3 つ目の assert）
-        act.rearm_after(0);
-        tokio::task::yield_now().await;
+        (clock, act, rx, seam)
+    }
+
+    /// 再チェックが**在る**ことの観測点。無ければウォッチャが消え、
+    /// このアイドル期間の `Silence` が永久に出ない。
+    ///
+    /// ⚠️ このテストで `rearm_after` を呼んではならない。再チェックを削除した実装でも
+    /// `rearm_after` が 2 本目のウォッチャを立てて `Silence` を出してしまい、
+    /// 観測が消える（実測: 呼んでいた版では再チェック削除の変異が緑になった）。
+    /// フラグの取り直しは下の別テストで測る。
+    #[tokio::test(start_paused = true)]
+    async fn re_enabling_between_the_flag_clear_and_the_recheck_keeps_the_watcher_alive() {
+        let (clock, _act, mut rx, _seam) = arrange_a_re_enable_landing_at_the_seam().await;
 
         advance(&clock, 31_000).await;
         assert_eq!(
@@ -566,6 +577,21 @@ mod tests {
             },
             "フラグ解除と再チェックの間に着弾した再有効化を取りこぼし、ウォッチャが消えている"
         );
+    }
+
+    /// 再チェックが `watcher_alive` を**取り直している**ことの観測点。
+    /// `swap` を `load` に書き換えるとフラグが空いたままになり、
+    /// 続く `rearm_after` が 2 本目のウォッチャを立てて `Silence` が 2 本出る。
+    #[tokio::test(start_paused = true)]
+    async fn the_recheck_reclaims_the_watcher_flag() {
+        let (clock, act, mut rx, _seam) = arrange_a_re_enable_landing_at_the_seam().await;
+
+        // 再チェックがフラグを取り直していれば、これは no-op になる
+        act.rearm_after(0);
+        tokio::task::yield_now().await;
+
+        advance(&clock, 31_000).await;
+        assert!(rx.try_recv().is_ok(), "沈黙が 1 本も出ていない");
         assert!(
             rx.try_recv().is_err(),
             "ウォッチャが 2 本立っている —— 再チェックが watcher_alive を取り直していない"
