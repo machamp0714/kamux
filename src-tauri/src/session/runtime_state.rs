@@ -902,8 +902,12 @@ mod tests {
     /// 理由が不明・無い `idle`（`current()` の既定 / DB の `DEFAULT 'idle'` / 未起動）は
     /// 許可側に落ちなければ、一度も 🟢 になれないセッションが生まれる。
     #[test]
-    fn p2_every_idle_that_is_not_from_hook_stop_returns_to_running() {
+    fn p2_idle_from_every_currently_defined_non_hook_stop_reason_returns_to_running() {
         // 契約 §8 の `StateReason` 13 バリアントから `HookStop` を除いた 12 個 + 理由なし。
+        // **この配列は手書きである** —— `StateReason` にバリアントが増えても
+        // ここは自動では広がらない。増やした者はこの配列にも足すこと
+        // （テスト名を「every」ではなく「currently defined」にしてあるのは、
+        // 網羅を主張して穴が塞がったように見せないためである）。
         const NOT_HOOK_STOP: [Option<StateReason>; 13] = [
             None,
             Some(StateReason::Spawned),
