@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Session } from '../../types/model';
+import type { Session, SessionPatch } from '../../types/model';
 import {
   buildCreateSessionArgs,
   buildSessionPatch,
@@ -214,6 +214,28 @@ describe('buildSessionPatch', () => {
       values(),
     );
     expect(patch).not.toHaveProperty('archived_at');
+  });
+});
+
+describe('SessionPatch のヒューリスティック設定キー（契約 §20 / M3-3）', () => {
+  // Rust の SessionPatch は全フィールド #[serde(default)] で deny_unknown_fields を持たない。
+  // キー名を綴り違える／camelCase で送ると Rust 側は None として受け取り、update_session は
+  // その列に触らない ——「設定変更がメモリ上でしか効かず再起動で戻る」が無音で成立する
+  // （sessionForm.ts の buildSessionPatch の doc が既に明文化している罠と同じもの）。
+  // 型注釈付きリテラルで組むことで、キー名の欠落・改名を tsc の excess property check に
+  // 拾わせる。値の読み出し（下の 2 行）は、キーの型が変わった場合も赤にする。
+  it('snake_case の 2 キーを型注釈付きリテラルで受け取る', () => {
+    const patch: SessionPatch = { heuristics_enabled: false, silence_timeout_secs: 120 };
+
+    expect(Object.keys(patch).sort()).toEqual(['heuristics_enabled', 'silence_timeout_secs']);
+    expect(patch.silence_timeout_secs).toBe(120);
+    expect(patch.heuristics_enabled).toBe(false);
+  });
+
+  it('2 キーを省いた patch は JSON 化でキーごと落ちる（= 変更しない）', () => {
+    const patch: SessionPatch = { title: '別のタイトル' };
+
+    expect(JSON.parse(JSON.stringify(patch))).toEqual({ title: '別のタイトル' });
   });
 });
 
