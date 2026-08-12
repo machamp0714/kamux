@@ -590,9 +590,11 @@ mod tests {
         //
         // ⚠️ **刻み幅（1_000）は `REARM_MARGIN_MS` より大きくなければならない。**
         // 小さいと再 arm の `sleep` が 1 度も満了せず、ループしていても `evaluations`
-        // が増えない（実測: 刻みを 1 ms にすると条件を落とす変異が全緑へ戻る。
-        // round m3-3-t9-fix-r3）。逆に定数を刻み以上へ上げてこの観測を静かに殺すことは
-        // できない —— `REARM_MARGIN_MS` を 900 にした時点で
+        // が増えない（実測 round m3-3-t9-fix-r3: 刻みを 1 ms にすると
+        // **このテストは**条件を落とす変異を捕まえなくなる —— そのとき赤を出したのは
+        // 刻み 1_000 のままの `a_bel_makes_a_custom_cli_wait_for_input` だけだった）。
+        // 逆に定数を刻み以上へ上げてこの観測を静かに殺すことはできない ——
+        // `REARM_MARGIN_MS` を 900 にした時点で
         // `a_silence_swallowed_by_the_grace_window_is_re_evaluated_once_the_grace_expires`
         // が先に赤くなる（同ラウンドで実測）。刻みを縮めるときはこの関係を測り直すこと。
         for _ in 0..5 {
