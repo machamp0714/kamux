@@ -8,7 +8,9 @@
 //! 下げた場合はこの前提が成立しない** —— 沈黙イベントが猶予の中に着弾し、
 //! ゲート規則 3（`hook_liveness == Pending`）で抑止される。この手当ては
 //! `SessionActivity::rearm_after`（機構）と、消費ループがゲートで抑止した
-//! ときにそれを呼ぶこと（方針）が持ち、本モジュールは関知しない。
+//! ときにそれを呼ぶこと（方針）が持つ。本モジュールが提供するのは
+//! 「いつ再評価すればよいか」を答える `remaining_grace_ms` までで、
+//! 再評価そのものには関知しない。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -112,6 +114,31 @@ impl HookLivenessTracker {
             Some(e) => liveness_after_grace(e.cli_kind, e.spawned_at_ms, e.last_hook_at_ms, now),
             None => HookLiveness::NotApplicable,
         }
+    }
+
+    /// hook をまだ待っているセッションについて、猶予が切れるまでの残り（ms）。
+    ///
+    /// 返るのは `liveness(session_id) == Pending` のときだけで、その値は**常に正**である
+    /// —— `Pending` は `now - spawned_at < HOOK_GRACE_MS` と同値なので、
+    /// 差は必ず 1 以上になる。この同値性は `liveness_after_grace` が持っており、
+    /// ここで猶予切れの判定を書き直さない（判定の正典を 2 つにしない）。
+    ///
+    /// 消費側（`registry`）がゲート規則 3 で沈黙を抑止したとき、
+    /// 「いつもう一度評価すればよいか」を知るために使う。
+    pub fn remaining_grace_ms(&self, session_id: &str) -> Option<i64> {
+        let now = self.clock.now_ms();
+        let guard = self.lock();
+        let entry = guard.get(session_id)?;
+        if liveness_after_grace(
+            entry.cli_kind,
+            entry.spawned_at_ms,
+            entry.last_hook_at_ms,
+            now,
+        ) != HookLiveness::Pending
+        {
+            return None;
+        }
+        Some(HOOK_GRACE_MS - (now - entry.spawned_at_ms))
     }
 
     pub fn last_hook_at(&self, session_id: &str) -> Option<i64> {
@@ -376,6 +403,49 @@ mod tracker_tests {
         assert_eq!(t.liveness("ghost"), HookLiveness::NotApplicable);
         t.on_exit("ghost");
         assert_eq!(t.liveness("ghost"), HookLiveness::NotApplicable);
+    }
+
+    /// 猶予の残りは `Pending` の間だけ返り、必ず**正**である。
+    /// 境界（`now - spawned_at == HOOK_GRACE_MS`）で `None` へ落ちることが
+    /// `>=` / `>` の取り違えと off-by-one を判別する唯一の入力である。
+    #[test]
+    fn remaining_grace_counts_down_and_ends_at_the_boundary() {
+        let (clock, t) = setup();
+        t.on_spawn("s1", CliKind::Claude);
+        assert_eq!(t.remaining_grace_ms("s1"), Some(HOOK_GRACE_MS));
+
+        clock.advance_ms(HOOK_GRACE_MS - 1);
+        assert_eq!(t.remaining_grace_ms("s1"), Some(1));
+
+        clock.advance_ms(1);
+        assert_eq!(
+            t.remaining_grace_ms("s1"),
+            None,
+            "猶予が切れたセッションは待たせる相手が居ない"
+        );
+    }
+
+    /// hook を待っていないセッションには残り猶予が無い。
+    /// （`Healthy` / `NotApplicable` / 未登録）
+    #[test]
+    fn remaining_grace_is_none_unless_the_session_is_still_waiting_for_a_hook() {
+        let (clock, t) = setup();
+        t.on_spawn("claude-with-hook", CliKind::Claude);
+        t.on_hook("claude-with-hook");
+        t.on_spawn("codex", CliKind::Codex);
+        t.on_spawn("shell", CliKind::Shell);
+        t.on_spawn("custom", CliKind::Custom);
+        clock.advance_ms(1_000);
+
+        for id in [
+            "claude-with-hook",
+            "codex",
+            "shell",
+            "custom",
+            "never-registered",
+        ] {
+            assert_eq!(t.remaining_grace_ms(id), None, "{id}");
+        }
     }
 
     #[test]

@@ -40,6 +40,29 @@
 //! `#[cfg(test)]` の seam（`tests::run_disabled_arm_seam`）を置いて決定的に観測している。
 //! 2 つを混同して「再チェックの観測にも `loom` が要る」と読まないこと。
 //!
+//! # Fire 腕で `watcher_alive.store(false)` を `tx.send` より**前**に置く理由（入れ替えてはならない）
+//!
+//! 消費側（`HeuristicRegistry`）は `Silence` を受け取ってから `rearm_after` を呼びうる ——
+//! ゲート規則 3（`hook_liveness == Pending`）で抑止したときに、猶予切れの後で
+//! もう一度評価させるためである。`rearm_after` は `watcher_alive.swap(true)` が `true` を
+//! 返したら**何もしない**ので、その呼び出しが `store(false)` より前に着弾すると空振りし、
+//! 直後にウォッチャ自身も return する。帰結は `SeqCst` を緩めたときと同じ
+//! 「**ウォッチャが消え、そのアイドル期間の `Silence` が永久に出ない**」である。
+//!
+//! `store(false)` を先に置くと、この窓は**メモリモデルの上で**閉じる ——
+//! `store` は同一スレッドの `tx.send` に happens-before し、`send` は受信側の `recv` に
+//! happens-before する。したがって消費側が `Silence` を見た時点で `watcher_alive == false` は
+//! 可視であり、`swap` は必ず `false` を返して新しいウォッチャを立てる。
+//! **上の `SeqCst` の議論と違ってアーキテクチャ依存ではない**（ここで効いているのは
+//! store-buffering の禁止ではなく、チャンネルが張る happens-before である）。
+//!
+//! 順序を守らせる型もコンパイラ検査も無いので、観測点は
+//! `tests::a_rearm_from_the_consumer_is_not_swallowed_by_the_firing_watcher` 1 本である
+//! （`tx.send` 直後の `#[cfg(test)]` seam を使う）。**実測: 順序を戻すとこのテストだけが赤くなる。**
+//!
+//! フラグが降りている窓が `tx.send` の分だけ広がるが、その間に `record_output` が来ても
+//! 新しいウォッチャが 1 本立つだけである（`swap` が相互排他を担う）。
+//!
 //! ホットパス（`record_output`）が余分に払うのは 1 チャンクあたり `SeqCst` の store 1 本
 //! （aarch64 では `stlr` 1 命令）と、元から RMW だった `swap` の格上げだけである。
 //! 同じチャンクに対して既に行っている base64 エンコード（契約 §8）より桁で小さい
@@ -246,11 +269,22 @@ impl SessionActivity {
                     }
                 }
                 SilenceStep::Fire => {
+                    // 対 1 の W1（`SeqCst` の理由はモジュール doc）。
+                    // 🔴 **`tx.send` より前でなければならない**（モジュール doc
+                    // 「消費側の再 arm を飲み込まない」を参照）。逆にすると、
+                    // イベントを見た消費側の `rearm_after` がここより先に走り、
+                    // `swap` が `true` を返して空振りする。
+                    self.watcher_alive.store(false, Ordering::SeqCst);
+
                     let _ = self.tx.send(HeuristicEvent::Silence {
                         session_id: self.session_id.clone(),
                     });
-                    // 対 1 の W1（`SeqCst` の理由はモジュール doc）
-                    self.watcher_alive.store(false, Ordering::SeqCst);
+
+                    // テスト専用の割り込み点（seam）。**消費側が動ける最初の瞬間**がここである
+                    // （`tx.send` の後）。消費側は `Silence` を見てから `rearm_after` を
+                    // 呼びうるので、その着弾を単一スレッド・仮想時間のまま決定的に作る。
+                    #[cfg(test)]
+                    tests::run_fire_arm_seam();
 
                     // 対 1 の R1: store の直前に届いた出力を取りこぼさない（lost wakeup 対策）。
                     // この 4 アクセス（ここの store/load と `record_output` の store/swap）が
@@ -476,10 +510,15 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    type SeamSlot = RefCell<Option<Box<dyn FnOnce()>>>;
+
     thread_local! {
         /// disabled 腕の割り込み点（seam）へ差し込む処理。1 回だけ走る（`take` する）。
         /// production 側の呼び出しは `#[cfg(test)]` なので、リリースビルドには 1 命令も残らない。
-        static DISABLED_ARM_SEAM: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static DISABLED_ARM_SEAM: SeamSlot = const { RefCell::new(None) };
+        /// Fire 腕の `tx.send` 直後の割り込み点。消費側（`HeuristicRegistry`）が
+        /// `Silence` を見て `rearm_after` を呼ぶ瞬間を、ここへ差し込んで再現する。
+        static FIRE_ARM_SEAM: SeamSlot = const { RefCell::new(None) };
     }
 
     /// production の `watch_silence`（disabled 腕）から呼ばれる seam の本体。
@@ -491,8 +530,23 @@ mod tests {
     /// —— 実測済み（round m3-3-t7-rerev-r1 の変異 B = 595 passed / 0 failed）。
     /// 差し込みが登録されていなければ何もしないので、他のテストの挙動は 1 つも変わらない。
     pub(super) fn run_disabled_arm_seam() {
+        run_seam(&DISABLED_ARM_SEAM);
+    }
+
+    /// production の `watch_silence`（Fire 腕・`tx.send` の直後）から呼ばれる seam の本体。
+    ///
+    /// **何のために在るか**: 消費側は `Silence` を受け取ってから `rearm_after` を呼ぶ。
+    /// その呼び出しが `watcher_alive.store(false)` より**前**に着弾すると `swap` が
+    /// `true` を返して空振りし、直後にウォッチャも消える —— ウォッチャ 0 本・再 arm 無しで、
+    /// その沈黙期間は二度と評価されない。順序（store が先、send が後）がこの窓を閉じており、
+    /// **この seam がその順序の唯一の観測点である。**
+    pub(super) fn run_fire_arm_seam() {
+        run_seam(&FIRE_ARM_SEAM);
+    }
+
+    fn run_seam(slot: &'static std::thread::LocalKey<SeamSlot>) {
         // `f()` は借用の外で呼ぶ（差し込み先から再入しても `RefCell` を二重借用しない）
-        let hook = DISABLED_ARM_SEAM.with(|s| s.borrow_mut().take());
+        let hook = slot.with(|s| s.borrow_mut().take());
         if let Some(f) = hook {
             f();
         }
@@ -503,8 +557,21 @@ mod tests {
     /// 走らずに残った差し込みが次のテストへ漏れるのを防ぐ（変異 C ではまさに走らない）。
     #[must_use]
     fn install_disabled_arm_seam(f: impl FnOnce() + 'static) -> SeamGuard {
-        DISABLED_ARM_SEAM.with(|s| *s.borrow_mut() = Some(Box::new(f)));
-        SeamGuard
+        install_seam(&DISABLED_ARM_SEAM, f)
+    }
+
+    /// Fire 腕の seam 版。guard の役割は `install_disabled_arm_seam` と同じ。
+    #[must_use]
+    fn install_fire_arm_seam(f: impl FnOnce() + 'static) -> SeamGuard {
+        install_seam(&FIRE_ARM_SEAM, f)
+    }
+
+    fn install_seam(
+        slot: &'static std::thread::LocalKey<SeamSlot>,
+        f: impl FnOnce() + 'static,
+    ) -> SeamGuard {
+        slot.with(|s| *s.borrow_mut() = Some(Box::new(f)));
+        SeamGuard(slot)
     }
 
     /// `install_disabled_arm_seam` が返す RAII ガード。
@@ -528,11 +595,14 @@ mod tests {
     /// 終わるテスト」を作る必要があるが、その振る舞いは libtest がワーカースレッドを使い回すという
     /// harness の実装詳細に依存する。これは安定した契約ではないため、依存したテストは
     /// harness の更新で意味を失うか、逆にフレークになる。
-    struct SeamGuard;
+    ///
+    /// 自分が登録した slot だけを空にする（登録先を保持する理由）。両方を空にする形にすると、
+    /// 片方の guard が落ちたときにもう片方の差し込みまで消える。
+    struct SeamGuard(&'static std::thread::LocalKey<SeamSlot>);
 
     impl Drop for SeamGuard {
         fn drop(&mut self) {
-            DISABLED_ARM_SEAM.with(|s| *s.borrow_mut() = None);
+            self.0.with(|s| *s.borrow_mut() = None);
         }
     }
 
@@ -654,6 +724,54 @@ mod tests {
                 session_id: "s1".into()
             },
             "再有効化後の出力でウォッチャが立ち直っていない（watcher_alive が立ったままの疑い）"
+        );
+    }
+
+    /// 消費側が `Silence` を見た直後に呼ぶ `rearm_after` を、Fire 腕が飲み込まないこと。
+    ///
+    /// 消費側（`HeuristicRegistry`）はゲート規則 3 で沈黙を抑止したとき `rearm_after` を呼ぶ。
+    /// その呼び出しが `watcher_alive.store(false)` より**前**に着弾すると `swap` が `true` を
+    /// 返して空振りし、直後にウォッチャ自身も return する —— **ウォッチャ 0 本・再 arm 無し**で、
+    /// その沈黙期間は二度と評価されない。単一スレッドの harness ではこの interleaving を
+    /// 偶然には踏まないが、本番のマルチスレッドランタイムでは踏みうる。
+    ///
+    /// 手当ては順序である: `store(false)` を `tx.send` より前に置く。`store` は `send` に
+    /// happens-before し、`send` は受信側の `recv` に happens-before するので、
+    /// **消費側の `swap` は必ず `false` を見る**（アーキテクチャ依存の論法ではない）。
+    /// この seam がその順序の唯一の観測点である —— 順序を戻すとこのテストが赤くなる。
+    #[tokio::test(start_paused = true)]
+    async fn a_rearm_from_the_consumer_is_not_swallowed_by_the_firing_watcher() {
+        let (clock, act, mut rx) = setup(5_000);
+        act.record_output(0);
+        tokio::task::yield_now().await;
+
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let _seam = {
+            let act = Arc::clone(&act);
+            let hook_ran = Arc::clone(&hook_ran);
+            install_fire_arm_seam(move || {
+                // 消費側が「猶予の残り」を渡して再評価を予約する動きと同じ
+                act.rearm_after(1_000);
+                hook_ran.store(true, Ordering::SeqCst);
+            })
+        };
+
+        advance(&clock, 5_500).await;
+        assert!(
+            hook_ran.load(Ordering::SeqCst),
+            "seam が走っていない —— このテストは何も測っていない"
+        );
+        assert!(rx.try_recv().is_ok(), "1 本目の沈黙が出ていない");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        advance(&clock, 1_100).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HeuristicEvent::Silence {
+                session_id: "s1".into()
+            },
+            "消費側の rearm_after が空振りし、ウォッチャが消えている"
         );
     }
 
