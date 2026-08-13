@@ -16,13 +16,15 @@ printf '\033]0;fake-generic-cli\007fake-generic-cli started\n'
 printf '\033[32m[1/3]\033[0m building\n'
 printf '\033[32m[2/3]\033[0m linking\n'
 
-# 本物のベル。ここで waiting_input(黄・破線)になるのが期待値
+# 本物のベル。手動スモーク項目 1: session://state/{session_id} を読み、
+# runtime_state == "waiting_input" かつ reason == "bel_detected" になるのが期待値(🟡)
 printf 'continue? [y/N] \007'
 read -r _answer
 
 printf '\033[32m[3/3]\033[0m done\n'
 
-# 沈黙して待機。silence_timeout_secs 経過後に idle(白・破線)になるのが期待値。
+# 沈黙して待機。silence_timeout_secs 経過後、手動スモーク項目 3: reason == "silence_timeout"
+# になるのが期待値(⚪)。
 # 契約 §118.5: スモークの設定(silence_timeout_secs = 5)より長く待ってから、
 # 入力を読まずに自力で 1 行印字する。これが手動スモーク項目 5 の唯一の駆動源である
 # -- 人間が Enter を押すと UserInput で緑になり、OutputActivity を 1 度も測らない。

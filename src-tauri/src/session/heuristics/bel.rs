@@ -469,4 +469,26 @@ mod fixture_tests {
             "汎用 CLI 役が session id を参照している"
         );
     }
+
+    /// 推定状態の見た目は「破線」ではない —— `RuntimeBadge.css:41-44` の
+    /// `.runtime-badge--estimated .runtime-badge__dot` は
+    /// `box-sizing: border-box; background: transparent; border: 1.5px solid currentColor;`
+    /// であり、これは**実線**の中空ドットである。確定仕様は「中空ドット + ラベルへの
+    /// `~` 前置」(`.claude/skills/kamux-design-system/components.md`「実行状態バッジ」節)。
+    /// `HeuristicsSettings.tsx:81` も「『破線』という文言は実装に存在しないため使わない」
+    /// と自ら書いている。
+    ///
+    /// このフィクスチャは手動スモーク専用であり、実施者はスクリプトのコメントを読んで
+    /// 期待値を探す。コメントに「破線」と書くと、実装に存在しないものを探して
+    /// 不合格を報告するか、混乱する。よって本文(コメント含む)全体に「破線」という
+    /// 語が 1 文字も現れないことを機械的に固定する。
+    #[test]
+    fn the_fixture_script_comments_do_not_claim_a_dashed_ring() {
+        let path = fixture_script_path();
+        let body = std::fs::read_to_string(&path).expect("read fixture");
+        assert!(
+            !body.contains("破線"),
+            "フィクスチャのコメントに、実装に存在しない「破線」という語がある"
+        );
+    }
 }
