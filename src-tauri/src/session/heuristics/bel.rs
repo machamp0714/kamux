@@ -288,9 +288,12 @@ mod fixture_tests {
 
         // `cursor` は「本文のどこまで読んだか」。needle を表の順に前から探し、見つかった
         // 位置より後ろだけを次の needle の探索範囲にする ―― 出現の有無だけを見ると、
-        // 印字ブロックを 1 つ別の位置へ移す変異(例: `[3/3] done` を BEL プロンプトより
-        // 前へ)が全緑で生き延びる。手動スモークの項目 2/3/5 は印字の順序そのものを
-        // 見る手順なので、表は集合ではなく列として固定する
+        // 印字ブロックの並び順を入れ替える変異(例: `[1/3] building` と `[2/3] linking`
+        // の 2 行を入れ替える)が全緑で生き延びる。実測: この入れ替えは他の全 assert
+        // (BEL 個数・OSC 導入子・沈黙区間)には触れないため、この cursor 順序の assert
+        // だけが単独で赤にする(`cargo test --lib session::heuristics` で確認済み)。
+        // 手動スモークの項目 2/3/5 は印字の順序そのものを見る手順なので、表は集合では
+        // なく列として固定する
         let mut cursor = 0usize;
         for (chunk, needles) in FIXTURE_CHUNKS {
             let chunk_text = String::from_utf8_lossy(chunk);
