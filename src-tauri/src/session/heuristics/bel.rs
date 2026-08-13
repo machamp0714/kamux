@@ -264,6 +264,10 @@ mod fixture_tests {
     /// 欠陥 4 の手当て: `FIXTURE_CHUNKS` の各定数が実際のスクリプト本文と対応していることを
     /// 機械的に固定する。この assert が無いと、`FIXTURE_CHUNKS` から要素を落としても
     /// `the_whole_fixture_session_yields_exactly_one_bell` は緑のまま通ってしまう。
+    ///
+    /// 🔴 `contains` と `printf == 6` の 2 assert だけでは不十分だったことが変異検証で
+    /// 判明した(片方向の検査であり、`FIXTURE_CHUNKS` の要素数にも重複にも依らないため)。
+    /// `len() + 1 == printf_count` と needle の重複チェックを追加している。
     #[test]
     fn the_fixture_chunks_match_the_script_body() {
         let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
@@ -282,6 +286,28 @@ mod fixture_tests {
         assert_eq!(
             printf_count, 6,
             "printf の出現数が想定と異なる(区間が定数と食い違っている可能性)"
+        );
+
+        // `FIXTURE_CHUNKS` の区間数を printf の数へ結び付ける。これが無いと配列から
+        // 行を落とす変異(型注釈も要素数に合わせて直す)が緑で生き延びる
+        // (printf の出現数はスクリプト側のカウントで、配列の要素数には依らないため)。
+        // +1 は `FIXTURE_PROGRESS` だけが 2 つの printf を束ねている分。
+        assert_eq!(
+            FIXTURE_CHUNKS.len() + 1,
+            printf_count,
+            "FIXTURE_CHUNKS の区間数とスクリプトの printf 数が対応していない"
+        );
+
+        // needle が重複していると「1 行を別の行の複製で置き換える」変異が
+        // 型注釈も要素数も変えずに(コンパイルエラーにもならずに)通ってしまう
+        let mut needles: Vec<&str> = FIXTURE_CHUNKS.iter().map(|(_, n)| *n).collect();
+        let unique_count = needles.len();
+        needles.sort_unstable();
+        needles.dedup();
+        assert_eq!(
+            needles.len(),
+            unique_count,
+            "FIXTURE_CHUNKS の needle が重複している"
         );
     }
 
