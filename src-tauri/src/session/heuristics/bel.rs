@@ -286,6 +286,12 @@ mod fixture_tests {
     fn the_fixture_chunks_match_the_script_body() {
         let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
 
+        // `cursor` は「本文のどこまで読んだか」。needle を表の順に前から探し、見つかった
+        // 位置より後ろだけを次の needle の探索範囲にする ―― 出現の有無だけを見ると、
+        // 印字ブロックを 1 つ別の位置へ移す変異(例: `[3/3] done` を BEL プロンプトより
+        // 前へ)が全緑で生き延びる。手動スモークの項目 2/3/5 は印字の順序そのものを
+        // 見る手順なので、表は集合ではなく列として固定する
+        let mut cursor = 0usize;
         for (chunk, needles) in FIXTURE_CHUNKS {
             let chunk_text = String::from_utf8_lossy(chunk);
             for needle in needles {
@@ -297,6 +303,10 @@ mod fixture_tests {
                     body.contains(needle),
                     "FIXTURE_CHUNKS の区間 {needle:?} がスクリプト本文に見つからない"
                 );
+                let Some(offset) = body[cursor..].find(needle) else {
+                    panic!("FIXTURE_CHUNKS の needle {needle:?} が表の順(= 印字順)に現れない");
+                };
+                cursor += offset + needle.len();
             }
         }
 
@@ -405,6 +415,31 @@ mod fixture_tests {
         assert!(
             !silence_gap.contains("read "),
             "`DONE` から再開印字までの区間で stdin を読んでいる"
+        );
+
+        // 区間の中身は `sleep <n>` の 1 行だけであること。始点と終点を錨づけても、
+        // 中身の検査が「`read ` が無い」の 1 本だけでは、`[post]` へ到達させない別の
+        // 阻害要因(`while true; do sleep 3600; done` を前へ移す / `head -n 1` を挿す)を
+        // 差し込めてしまい、スクリプトが `[post] resumed after idle` を永久に印字しない
+        // まま全緑になる ―― 手動スモーク項目 5 の唯一の駆動源が静かに消える。
+        // 期待値 1 はリテラルであり秒数には依存しない(`sleep 30` へ変えても緑のまま)。
+        let gap_lines: Vec<&str> = silence_gap.lines().collect();
+        // 先頭は `[3/3]` を含む printf 行の断片、末尾は `[post]` を含む printf 行の断片
+        let inner = gap_lines
+            .get(1..gap_lines.len().saturating_sub(1))
+            .unwrap_or(&[]);
+        let effective: Vec<&str> = inner
+            .iter()
+            .copied()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .collect();
+        assert_eq!(
+            effective.len(),
+            1,
+            "沈黙区間の実効行は `sleep <n>` の 1 行だけであること (実際: {effective:?})"
         );
     }
 
