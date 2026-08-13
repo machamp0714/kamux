@@ -333,6 +333,25 @@ mod fixture_tests {
             unique_count,
             "FIXTURE_CHUNKS の needle が重複している"
         );
+
+        // 🔴 レビュー(task-19-review.md 新 Important 3): needle は印字可能テキストしか
+        // 覆っておらず、制御バイト(BEL)は定数側・スクリプト側のどちらからも自由に動けた
+        // (OSC 終端子の BEL / 本物のプロンプト BEL を落としても上の assert は反応しない)。
+        // BEL の個数を両側で数え、リテラル 2(OSC 終端子 1 + プロンプト 1)にも固定する
+        // ―― 交差等値だけでは両側から同時に 1 個ずつ消す変異が生き延びるため。
+        let script_bels = body.matches("\\007").count();
+        let const_bels: usize = FIXTURE_CHUNKS
+            .iter()
+            .map(|(chunk, _)| chunk.iter().filter(|b| **b == 0x07).count())
+            .sum();
+        assert_eq!(
+            script_bels, 2,
+            "スクリプトの BEL は OSC 終端子とプロンプトの 2 つ"
+        );
+        assert_eq!(
+            const_bels, script_bels,
+            "定数側とスクリプト側の BEL 数が食い違っている"
+        );
     }
 
     /// 契約 §118.5: `DONE` の後の待ちは、手動スモークの `silence_timeout_secs`(= 5)より
@@ -343,9 +362,16 @@ mod fixture_tests {
     fn the_fixture_waits_longer_than_the_smoke_silence_timeout() {
         const SMOKE_SILENCE_TIMEOUT_SECS: u64 = 5;
         let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
+
+        // 🔴 レビュー(task-19-review.md 新 Important 4): 抽出が位置に依らなかったため
+        // 「`DONE` の後」(M-G: `sleep` を `DONE` の前へ移動)と「入力を読まずに」
+        // (M-H: `sleep` と再開印字の間に `read` を挿入)の 2 節が壊れても全緑だった。
+        // `[3/3]`(DONE の印字)以降へ錨づけ、抽出も read の不在検査も同じ区間で行う。
+        let (_, after_done) = body.split_once("[3/3]").expect("`DONE` の行が無い");
+
         // 行頭が `sleep ` の最初の行を採る。`while true; do sleep 3600; done` の
         // `sleep 3600` は字下げ済みで行頭が一致しないため拾わない。
-        let secs: u64 = body
+        let secs: u64 = after_done
             .lines()
             .find_map(|l| l.strip_prefix("sleep "))
             .and_then(|s| s.trim().parse().ok())
@@ -353,6 +379,14 @@ mod fixture_tests {
         assert!(
             secs > SMOKE_SILENCE_TIMEOUT_SECS,
             "sleep {secs} はスモークの沈黙タイムアウト {SMOKE_SILENCE_TIMEOUT_SECS} 秒以下"
+        );
+
+        // `DONE` から再開印字までの区間は、入力を読まずに自力で印字すること
+        // (契約 §118.5)。読むと手動スモーク項目 5 が `UserInput` 経路へ戻る。
+        let (silence_gap, _) = after_done.split_once("[post]").expect("再開の印字が無い");
+        assert!(
+            !silence_gap.contains("read "),
+            "`DONE` から再開印字までの区間で stdin を読んでいる"
         );
     }
 
