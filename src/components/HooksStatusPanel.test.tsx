@@ -111,9 +111,16 @@ describe('HooksStatusPanel', () => {
   });
 
   it('fetches exactly once on mount and never polls', async () => {
-    vi.useFakeTimers();
     vi.mocked(getHooksDiagnostics).mockResolvedValue(diagnostics());
     render(<HooksStatusPanel sessionTitles={{}} />);
+    // 取得結果が描画される（= 状態更新による再レンダリングが済む）まで待ってから数える。
+    // ここを待たずに数えると useEffect の依存配列 [] を外す変異が緑を通り抜ける
+    // ——実測で確認済み。フェイクタイマだけでは再レンダリングまで進まない。
+    await screen.findByTestId('hooks-socket-path');
+    expect(getHooksDiagnostics).toHaveBeenCalledTimes(1);
+
+    // そのうえで時間を進め、定期リフレッシュが仕掛けられていないことを見る。
+    vi.useFakeTimers();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(getHooksDiagnostics).toHaveBeenCalledTimes(1);
   });
