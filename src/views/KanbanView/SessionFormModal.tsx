@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { useAppStore } from '../../store';
 import { toAppError, type ModalState } from '../../store/uiSlice';
 import { proposeBranchName } from '../../lib/branchName';
+import { HeuristicsSettings } from '../../components/HeuristicsSettings';
 import type { CliKind, SessionMode } from '../../types/model';
 import { resolveDialogMode } from './dialogMode';
 import {
@@ -129,21 +130,39 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
             </label>
 
             {dialogMode.kind === 'edit' ? (
-              <dl className="session-form-modal__readonly">
-                <dt>分離モード</dt>
-                <dd>{dialogMode.session.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
-                <dt>ブランチ</dt>
-                <dd>{dialogMode.session.branch ?? '—'}</dd>
-                <dt>CLI</dt>
-                <dd>
-                  {dialogMode.session.cli_kind}
-                  {dialogMode.session.cli_command !== null
-                    ? ` (${dialogMode.session.cli_command})`
-                    : ''}
-                </dd>
-                <dt />
-                <dd className="session-form-modal__note">これらは作成時のみ設定できます</dd>
-              </dl>
+              <>
+                <dl className="session-form-modal__readonly">
+                  <dt>分離モード</dt>
+                  <dd>{dialogMode.session.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
+                  <dt>ブランチ</dt>
+                  <dd>{dialogMode.session.branch ?? '—'}</dd>
+                  <dt>CLI</dt>
+                  <dd>
+                    {dialogMode.session.cli_kind}
+                    {dialogMode.session.cli_command !== null
+                      ? ` (${dialogMode.session.cli_command})`
+                      : ''}
+                  </dd>
+                  <dt />
+                  <dd className="session-form-modal__note">これらは作成時のみ設定できます</dd>
+                </dl>
+
+                <HeuristicsSettings
+                  session={dialogMode.session}
+                  // liveness の配線は Task 18（hooks 疎通ステータスパネル）の所有。
+                  // getHooksDiagnostics() を消費する箇所がまだ無いため、ここでは渡さない
+                  // （task-17-brief 読み替え #5）。
+                  onChange={(patch) => {
+                    // ヒューリスティック設定は他のフィールド（タイトル/説明）と違い、
+                    // values に溜めず即時保存する（edit モード限定。lane-controller の
+                    // 統合裁定）。そのため「キャンセルを押しても取り消されない」——
+                    // 意図した挙動である。
+                    editSession(dialogMode.session.id, patch).catch((err: unknown) =>
+                      setError(toAppError(err)),
+                    );
+                  }}
+                />
+              </>
             ) : (
               <>
                 <fieldset className="session-form-modal__radio-group">
