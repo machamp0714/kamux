@@ -10,9 +10,10 @@ vi.mock('../../ipc/commands', () => ({
   updateSession: vi.fn(),
   listSessions: vi.fn(),
   moveSession: vi.fn(),
+  getHooksDiagnostics: vi.fn(),
 }));
 
-import { updateSession } from '../../ipc/commands';
+import { getHooksDiagnostics, updateSession } from '../../ipc/commands';
 import { useAppStore } from '../../store';
 import type { Session } from '../../types/model';
 import { SessionFormModal } from './SessionFormModal';
@@ -47,6 +48,13 @@ function session(overrides: Partial<Session> = {}): Session {
 
 beforeEach(() => {
   vi.mocked(updateSession).mockReset();
+  vi.mocked(getHooksDiagnostics).mockReset();
+  // 既定は「診断は取れたが対象セッションの行は無い」= liveness undefined。
+  vi.mocked(getHooksDiagnostics).mockResolvedValue({
+    socket_path: '/tmp/kamux-hooks-1234.sock',
+    listener_alive: true,
+    sessions: [],
+  });
   useAppStore.setState({
     projects: [],
     activeProjectId: 'p1',
@@ -82,6 +90,54 @@ describe('SessionFormModal と HeuristicsSettings の統合点', () => {
     await waitFor(() => {
       expect(screen.getByLabelText('ヒューリスティック検知')).not.toBeChecked();
     });
+  });
+
+  it('hooks が届いているセッションでは検知方式が hooks（確実）になる', async () => {
+    // 診断の sessions は 2 件入れ、編集対象を先頭以外に置く。
+    // sessions.find(...) を sessions[0] に潰す変異はここで
+    // 「ヒューリスティック（推定）」に転んで落ちる（契約 §81 の条件1+2）。
+    const s = session({ id: 'sess-42', heuristics_enabled: true });
+    useAppStore.setState({
+      sessions: { [s.id]: s },
+      modal: { kind: 'edit_session', sessionId: s.id },
+    });
+    vi.mocked(getHooksDiagnostics).mockResolvedValue({
+      socket_path: '/tmp/kamux-hooks-1234.sock',
+      listener_alive: true,
+      sessions: [
+        {
+          session_id: 'other-1',
+          cli_kind: 'claude',
+          liveness: 'unreachable',
+          last_hook_at: null,
+          heuristics_active: true,
+        },
+        {
+          session_id: s.id,
+          cli_kind: 'custom',
+          liveness: 'healthy',
+          last_hook_at: 1,
+          heuristics_active: false,
+        },
+      ],
+    });
+
+    render(<SessionFormModal />);
+
+    await waitFor(() => expect(screen.getByText('hooks（確実）')).toBeInTheDocument());
+  });
+
+  it('診断に当該セッションの行が無ければ検知方式はヒューリスティック（推定）のまま', async () => {
+    const s = session({ id: 'sess-42', heuristics_enabled: true });
+    useAppStore.setState({
+      sessions: { [s.id]: s },
+      modal: { kind: 'edit_session', sessionId: s.id },
+    });
+
+    render(<SessionFormModal />);
+
+    await waitFor(() => expect(getHooksDiagnostics).toHaveBeenCalled());
+    expect(screen.getByText('ヒューリスティック（推定）')).toBeInTheDocument();
   });
 
   it('create モードでは HeuristicsSettings が描画されない', () => {

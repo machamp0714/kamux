@@ -1,0 +1,122 @@
+/* .claude/skills/kamux-design-system/components.md「パネル・表」節をそのまま使う。
+   色・余白・角丸・文字サイズはすべて tokens.css の変数で、literal は書かない。 */
+.hooks-status {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* components.md「パネル・表」の表ヘッダ相当（--bg-app / 600 / letter-spacing）。
+   letter-spacing はスケールを持たない字詰めの値で components.md が直接指定する。 */
+.hooks-status__heading {
+  margin: 0;
+  padding: var(--space-5) var(--space-7);
+  background: var(--bg-app);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+}
+
+.hooks-status__summary {
+  display: grid;
+  /* ラベル列は内容幅、値列が残りを取る。--space-* は余白用でトラック幅のスケールは無い */
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-3) var(--space-6);
+  margin: 0;
+  padding: var(--space-5) var(--space-7);
+  border-bottom: 1px solid var(--border);
+}
+
+.hooks-status__summary dt {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: var(--text-secondary);
+}
+
+.hooks-status__summary dd {
+  margin: 0;
+  font-size: var(--text-md);
+}
+
+/* パスは components.md「入力欄」節と同じ理由で mono にする */
+.hooks-status__path {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.hooks-status__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* 行の区切りと padding は components.md「パネル・表」節の値 */
+.hooks-status__row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-6);
+  padding: var(--space-5) var(--space-7);
+  border-bottom: 1px solid var(--border);
+}
+
+.hooks-status__row:last-child {
+  border-bottom: none;
+}
+
+.hooks-status__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hooks-status__cli {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+}
+
+.hooks-status__liveness {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.hooks-status__heuristics {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* components.md「空状態」節: 説明は --text-xs / --leading-normal / --text-muted */
+.hooks-status__empty {
+  margin: 0;
+  padding: var(--space-7);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+.hooks-status__loading {
+  margin: 0;
+  padding: var(--space-7);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}

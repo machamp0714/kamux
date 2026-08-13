@@ -1,0 +1,111 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// store / HooksStatusPanel が読む IPC コマンドをまとめてモックする
+// （SessionFormModal.test.tsx と同じ形。store がモジュールロード時に import する）。
+vi.mock('../../ipc/commands', () => ({
+  createProject: vi.fn(),
+  listProjects: vi.fn(),
+  createSession: vi.fn(),
+  updateSession: vi.fn(),
+  listSessions: vi.fn(),
+  moveSession: vi.fn(),
+  getHooksDiagnostics: vi.fn(),
+}));
+
+import { getHooksDiagnostics } from '../../ipc/commands';
+import { useAppStore } from '../../store';
+import type { Session } from '../../types/model';
+import { KanbanView } from './index';
+
+afterEach(cleanup);
+
+function session(overrides: Partial<Session> = {}): Session {
+  return {
+    id: 's1',
+    project_id: 'p1',
+    title: 'fix login',
+    description: '',
+    kanban_status: 'backlog',
+    sort_order: 1,
+    mode: 'in_place',
+    branch: null,
+    worktree_path: null,
+    cli_kind: 'shell',
+    cli_command: null,
+    claude_session_id: null,
+    last_runtime_state: 'idle',
+    last_runtime_error: null,
+    first_started_at: null,
+    heuristics_enabled: true,
+    silence_timeout_secs: 30,
+    archived_at: null,
+    created_at: 0,
+    updated_at: 0,
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.mocked(getHooksDiagnostics).mockReset();
+  useAppStore.setState({
+    projects: [],
+    activeProjectId: 'p1',
+    sessions: {},
+    modal: null,
+  });
+});
+
+describe('KanbanView と HooksStatusPanel の統合点', () => {
+  it('既定では hooks 疎通ステータスのドロワーは開いていない', () => {
+    vi.mocked(getHooksDiagnostics).mockResolvedValue({
+      socket_path: '/tmp/kamux-hooks-1234.sock',
+      listener_alive: true,
+      sessions: [],
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.queryByTestId('hooks-socket-path')).toBeNull();
+    // 閉じている間はパネルがマウントされないので IPC も呼ばれない（契約 §0）
+    expect(getHooksDiagnostics).not.toHaveBeenCalled();
+  });
+
+  it('ボタンでドロワーを開くとパネルの中身が現れ、閉じると消える', async () => {
+    // セッションは 1 件だけ置き、その id を診断側の session_id と一致させる。
+    // sessionTitles を空オブジェクトに潰す変異はここでタイトルが出ずに落ちる。
+    const s = session({ id: 'sess-42', title: 'fix login' });
+    useAppStore.setState({
+      sessions: { [s.id]: s },
+      sessionOrder: { backlog: [s.id], in_progress: [], review: [], done: [] },
+    });
+    vi.mocked(getHooksDiagnostics).mockResolvedValue({
+      socket_path: '/tmp/kamux-hooks-1234.sock',
+      listener_alive: true,
+      sessions: [
+        {
+          session_id: s.id,
+          cli_kind: 'shell',
+          liveness: 'unreachable',
+          last_hook_at: null,
+          heuristics_active: true,
+        },
+      ],
+    });
+
+    render(<KanbanView />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'hooks 疎通ステータス' }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('hooks-socket-path').textContent).toContain(
+        '/tmp/kamux-hooks-1234.sock',
+      ),
+    );
+    expect(screen.getByTestId('hooks-row-sess-42').textContent).toContain('fix login');
+
+    fireEvent.click(screen.getByRole('button', { name: '閉じる' }));
+
+    expect(screen.queryByTestId('hooks-socket-path')).toBeNull();
+  });
+});

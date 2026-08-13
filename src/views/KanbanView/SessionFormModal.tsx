@@ -3,6 +3,7 @@ import { useAppStore } from '../../store';
 import { toAppError, type ModalState } from '../../store/uiSlice';
 import { proposeBranchName } from '../../lib/branchName';
 import { HeuristicsSettings } from '../../components/HeuristicsSettings';
+import { getHooksDiagnostics, type HookLiveness } from '../../ipc/commands';
 import type { CliKind, SessionMode } from '../../types/model';
 import { resolveDialogMode } from './dialogMode';
 import {
@@ -46,6 +47,30 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
       : initialSessionFormValues(project?.default_cli ?? 'claude'),
   );
   const [busy, setBusy] = useState(false);
+  const [liveness, setLiveness] = useState<HookLiveness | undefined>(undefined);
+
+  // 検知方式の表示（HeuristicsSettings の detectionMethodLabel）に要る hooks の疎通状態を、
+  // このダイアログを開いたときに 1 回だけ引く。定期リフレッシュはしない（契約 §0）。
+  // HooksStatusPanel と同じ「マウント時 1 回 + cancelled ガード」だが、共有フックへは
+  // 抽出しない —— src/hooks/ の新設はモジュールツリーの変更になるため（統合裁定）。
+  const editingSessionId = dialogMode.kind === 'edit' ? dialogMode.session.id : null;
+  useEffect(() => {
+    if (editingSessionId === null) return;
+    let cancelled = false;
+    getHooksDiagnostics()
+      .then((d) => {
+        if (!cancelled) {
+          setLiveness(d.sessions.find((s) => s.session_id === editingSessionId)?.liveness);
+        }
+      })
+      .catch(() => {
+        // 診断が取れないときは liveness 未確定のまま（= 推定表示）にする
+        if (!cancelled) setLiveness(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editingSessionId]);
 
   // 編集モードで開いている間に対象セッションがストアから消えた場合（アーカイブ等）、
   // 作成モードへフォールバックせず閉じる（dialogMode.ts 参照）。
@@ -149,9 +174,9 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
 
                 <HeuristicsSettings
                   session={dialogMode.session}
-                  // liveness の配線は Task 18（hooks 疎通ステータスパネル）の所有。
-                  // getHooksDiagnostics() を消費する箇所がまだ無いため、ここでは渡さない
-                  // （task-17-brief 読み替え #5）。
+                  // getHooksDiagnostics() から引いた当該セッションの疎通状態。
+                  // undefined（診断に行が無い / 取得失敗）なら推定表示のままになる。
+                  liveness={liveness}
                   onChange={(patch) => {
                     // ヒューリスティック設定は他のフィールド（タイトル/説明）と違い、
                     // values に溜めず即時保存する（edit モード限定。lane-controller の

@@ -13,12 +13,23 @@ import {
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable';
 import { useAppStore } from '../../store';
 import { toAppError } from '../../store/uiSlice';
-import { KANBAN_STATUSES } from '../../types/model';
+import { HooksStatusPanel } from '../../components/HooksStatusPanel';
+import { KANBAN_STATUSES, type Session } from '../../types/model';
 import { KanbanCard } from './KanbanCard';
 import { KanbanColumn } from './KanbanColumn';
 import { resolveDragEnd } from './dragEnd';
 import { KANBAN_KEYBOARD_CODES, KANBAN_POINTER_ACTIVATION_DISTANCE } from './sensors';
 import './kanban.css';
+
+/**
+ * HooksStatusPanel は全セッション横断のパネルなので、activeProjectId で絞らず
+ * ストアの sessions を全件そのまま渡す（lane-controller の統合裁定）。
+ */
+function toSessionTitles(sessions: Record<string, Session>): Record<string, string> {
+  const titles: Record<string, string> = {};
+  for (const s of Object.values(sessions)) titles[s.id] = s.title;
+  return titles;
+}
 
 export function KanbanView() {
   const sessions = useAppStore((s) => s.sessions);
@@ -27,6 +38,9 @@ export function KanbanView() {
   const openModal = useAppStore((s) => s.openModal);
   const setError = useAppStore((s) => s.setError);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  // ドロワーの開閉はこのビューのローカル state に置く（uiSlice には足さない。
+  // M3-4 の ArchivedDrawer が同じファイルへ showArchived を足す予定のため）。
+  const [hooksOpen, setHooksOpen] = useState(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -57,14 +71,44 @@ export function KanbanView() {
     <div className="kanban-view">
       <header className="kanban-view__header">
         <h1 className="kanban-view__heading">カンバン</h1>
-        <button
-          type="button"
-          className="kanban-view__new"
-          onClick={() => openModal({ kind: 'create_session' })}
-        >
-          新規セッション <kbd>⌘N</kbd>
-        </button>
+        <div className="kanban-view__actions">
+          <button type="button" className="kanban-view__hooks" onClick={() => setHooksOpen(true)}>
+            hooks 疎通ステータス
+          </button>
+          <button
+            type="button"
+            className="kanban-view__new"
+            onClick={() => openModal({ kind: 'create_session' })}
+          >
+            新規セッション <kbd>⌘N</kbd>
+          </button>
+        </div>
       </header>
+
+      {/* パネルは開いている間だけマウントする。マウント時に 1 回だけ取得する設計
+          （HooksStatusPanel 参照）なので、開くたびに最新の診断が読まれる。 */}
+      {hooksOpen ? (
+        <div className="kanban-view__drawer-scrim" onMouseDown={() => setHooksOpen(false)}>
+          <aside
+            className="kanban-view__drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="hooks 疎通ステータス"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="kanban-view__drawer-header">
+              <button
+                type="button"
+                className="kanban-view__drawer-close"
+                onClick={() => setHooksOpen(false)}
+              >
+                閉じる
+              </button>
+            </div>
+            <HooksStatusPanel sessionTitles={toSessionTitles(sessions)} />
+          </aside>
+        </div>
+      ) : null}
 
       <DndContext
         sensors={sensors}
