@@ -352,6 +352,23 @@ mod fixture_tests {
             const_bels, script_bels,
             "定数側とスクリプト側の BEL 数が食い違っている"
         );
+
+        // 🔴 レビュー(task-19-review.md 再レビュー / 修正ラウンド 2 の束ね分): BEL の個数
+        // だけでは OSC 列の構造(導入子 `ESC ] 0 ;`)が固定されない。導入子だけを落として
+        // BEL を残すと(`printf 'fake-generic-cli started\007\n'`)、上の BEL カウントは
+        // 2 のまま変わらないため全緑で生き延びる。導入子が素のベルへ変わると手動スモーク
+        // 項目 2(誤検知が起きないこと)の意味が逆転する(契約 §118.5 / RULINGS §14.10)。
+        // `body` はスクリプトのソーステキストであり、`printf` の引数に書かれた `\033` は
+        // 実行時に解釈される前の文字通り 4 文字のリテラルである(`script_bels` が `\007`
+        // を 4 文字として数えているのと同じ理由)。
+        assert!(
+            body.contains("\\033]0;"),
+            "スクリプト本文に OSC 導入子(\\033]0;)が見つからない"
+        );
+        assert!(
+            FIXTURE_BANNER.windows(4).any(|w| w == b"\x1b]0;"),
+            "FIXTURE_BANNER に OSC 導入子(ESC ] 0 ;)が無い"
+        );
     }
 
     /// 契約 §118.5: `DONE` の後の待ちは、手動スモークの `silence_timeout_secs`(= 5)より
@@ -363,19 +380,21 @@ mod fixture_tests {
         const SMOKE_SILENCE_TIMEOUT_SECS: u64 = 5;
         let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
 
-        // 🔴 レビュー(task-19-review.md 新 Important 4): 抽出が位置に依らなかったため
-        // 「`DONE` の後」(M-G: `sleep` を `DONE` の前へ移動)と「入力を読まずに」
-        // (M-H: `sleep` と再開印字の間に `read` を挿入)の 2 節が壊れても全緑だった。
-        // `[3/3]`(DONE の印字)以降へ錨づけ、抽出も read の不在検査も同じ区間で行う。
+        // `[3/3]`(DONE の印字)と `[post]`(再開の印字)で挟まれた区間を切り出す。
+        // 秒数の抽出も read の不在検査も、この 1 つの `silence_gap` に対してのみ行う
+        // ―― 抽出をこの区間の外(例: ファイル末尾まで)に対して回すと、`sleep` を
+        // 再開印字より後ろへ移す変異(M-J。沈黙区間そのものが消える)が緑のまま
+        // 生き延びる(task-19-review.md 新 Important 5)。
         let (_, after_done) = body.split_once("[3/3]").expect("`DONE` の行が無い");
+        let (silence_gap, _) = after_done.split_once("[post]").expect("再開の印字が無い");
 
         // 行頭が `sleep ` の最初の行を採る。`while true; do sleep 3600; done` の
-        // `sleep 3600` は字下げ済みで行頭が一致しないため拾わない。
-        let secs: u64 = after_done
+        // `sleep 3600` は `silence_gap` の外(`[post]` より後ろ)にあるため対象外。
+        let secs: u64 = silence_gap
             .lines()
             .find_map(|l| l.strip_prefix("sleep "))
             .and_then(|s| s.trim().parse().ok())
-            .expect("`DONE` 後の沈黙 sleep 行が読めない");
+            .expect("`DONE` と再開印字の間の沈黙 sleep 行が読めない");
         assert!(
             secs > SMOKE_SILENCE_TIMEOUT_SECS,
             "sleep {secs} はスモークの沈黙タイムアウト {SMOKE_SILENCE_TIMEOUT_SECS} 秒以下"
@@ -383,7 +402,6 @@ mod fixture_tests {
 
         // `DONE` から再開印字までの区間は、入力を読まずに自力で印字すること
         // (契約 §118.5)。読むと手動スモーク項目 5 が `UserInput` 経路へ戻る。
-        let (silence_gap, _) = after_done.split_once("[post]").expect("再開の印字が無い");
         assert!(
             !silence_gap.contains("read "),
             "`DONE` から再開印字までの区間で stdin を読んでいる"
