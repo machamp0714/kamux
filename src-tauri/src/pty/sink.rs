@@ -109,6 +109,25 @@ impl<R: Runtime> PtySink for TauriSink<R> {
         // （契約 §41.3 決定 (3)）。M2-1 では `ResumeTracker` がまだ無い。
         if let Some(state) = self.app.try_state::<crate::state::AppState>() {
             state.runtime.sender().note_pty_exit(surface_id);
+            // M3-3: ヒューリスティックの登録を外す。**production で唯一の PTY 終了経路**
+            // なので、ここに置かないと終了したセッションのウォッチャが残る。
+            //
+            // 🔴 **上の 2 つの注意書き（「ここにフィルタを書かないこと」）はここには
+            // 掛からない。** あれは `RuntimeSender::note_surface` の内部に閉じた
+            // *状態機械の入力* フィルタの話である。レジストリは `session_id` を
+            // キーにしていて `note_surface` 相当の入口を持たないので、
+            // agent 限定の判定は呼び出し側が行うしかない。極性を手書きで散らさないよう、
+            // 判定そのものは `pty::agent_session_id`（純関数）1 箇所に置いてある。
+            //
+            // `s1:editor` の終了で `unregister("s1")` を呼ぶと、nvim を閉じただけで
+            // agent 側の沈黙推定が死ぬ。`unregister` は未知 ID で no-op なので、
+            // この誤りはコンパイルでも黙って通る。
+            if let Some(session_id) = crate::pty::agent_session_id(surface_id) {
+                crate::session::heuristics::sink_impl::detach_heuristics(
+                    &state.heuristics,
+                    session_id,
+                );
+            }
         }
     }
 }

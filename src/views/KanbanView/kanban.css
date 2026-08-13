@@ -22,6 +22,73 @@
 }
 
 /* components.md「ボタン」節の「主」行。⌘N のキーヒントは同節末尾の指定どおり */
+.kanban-view__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+/* components.md「ボタン」節の「副」（--bg-hover / --text-primary / 1px solid var(--border)）。
+   画面の主操作は「新規セッション」1 つだけなので、こちらは一段落とす。 */
+.kanban-view__hooks {
+  padding: var(--space-4) var(--space-7);
+  border-radius: var(--radius-md);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+/* hooks 疎通ステータスのドロワー。パネル本体の見た目は
+   src/components/HooksStatusPanel.css が持ち、ここは配置と背面だけを担う。
+   スクリムと重なり順は tokens.css の --scrim / --z-scrim（コメントが
+   「モーダルの背面とパネル本体」と定めている）をそのまま使う。 */
+.kanban-view__drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-scrim);
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.kanban-view__drawer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  /* components.md「モーダル・ダイアログ」節のパネル幅 500〜600px に合わせた部品固有の寸法 */
+  width: 520px;
+  max-width: 100%;
+  padding: var(--space-9);
+  overflow: auto;
+  background: var(--bg-elevated);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border-left: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-modal);
+}
+
+.kanban-view__drawer-header {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* components.md「ボタン」節の「ゴースト」（背景・枠なし / --text-muted） */
+.kanban-view__drawer-close {
+  padding: var(--space-4) var(--space-7);
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+}
+
 .kanban-view__new {
   display: inline-flex;
   align-items: center;

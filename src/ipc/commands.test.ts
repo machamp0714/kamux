@@ -7,6 +7,7 @@ import {
   ackPty,
   createProject,
   createSession,
+  getHooksDiagnostics,
   listProjects,
   listSessions,
   moveSession,
@@ -151,5 +152,27 @@ describe('ipc/commands', () => {
 
     expect(invoke).toHaveBeenCalledWith('spawn_editor', { sessionId: 's1' });
     expect(got).toBe('s1:editor');
+  });
+
+  it('getHooksDiagnostics が引数なしで invoke し、戻り値をそのまま返す', async () => {
+    const diagnostics = {
+      socket_path: '/tmp/kamux-hooks-42.sock',
+      listener_alive: true,
+      sessions: [
+        {
+          session_id: 's1',
+          cli_kind: 'claude',
+          liveness: 'healthy',
+          last_hook_at: 123,
+          heuristics_active: false,
+        },
+      ],
+    };
+    invoke.mockResolvedValue(diagnostics);
+
+    const got = await getHooksDiagnostics();
+
+    expect(invoke).toHaveBeenCalledWith('get_hooks_diagnostics');
+    expect(got).toEqual(diagnostics);
   });
 });

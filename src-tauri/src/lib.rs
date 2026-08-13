@@ -88,7 +88,26 @@ async fn update_session(
     id: String,
     patch: SessionPatch,
 ) -> AppResult<Session> {
-    state.store.update_session(&id, &patch)
+    apply_session_patch(&state, &id, &patch)
+}
+
+/// `update_session` の本体。`State` を剥がしてあるのでそのままユニットテストできる。
+///
+/// 範囲検証（`silence_timeout_secs`）は `Store::update_session` が DB 書き込みより前に
+/// 済ませている。**ここで二重に呼ばない。**
+fn apply_session_patch(state: &AppState, id: &str, patch: &SessionPatch) -> AppResult<Session> {
+    let updated = state.store.update_session(id, patch)?;
+    // M3-3: 実行中のセッションへ即座に反映する。**DB 書き込みの後**に置くこと ——
+    // 反映する値は「パッチの中身」ではなく「書き込み後の行」である（部分更新なので、
+    // 片方だけ来たパッチからもう片方の現在値は分からない）。
+    // 未登録のセッションでは `reconfigure` が no-op なので、起動していない
+    // セッションの設定変更もそのまま通る。
+    if patch.heuristics_enabled.is_some() || patch.silence_timeout_secs.is_some() {
+        state
+            .heuristics
+            .reconfigure(id, updated.heuristics_enabled, updated.silence_timeout_secs);
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -116,6 +135,16 @@ async fn move_session(
     to_index: usize,
 ) -> AppResult<Vec<Session>> {
     state.store.move_session(&id, to_status, to_index)
+}
+
+// hooks 疎通ステータス（契約 §7.1、M3-3、設計書 §12 が明示的に要求）。
+// `State<'_, AppState>` はテストから構築できないため、本体は薄いラッパに徹し、
+// ロジックは `diagnostics_from_state`（テストから直接呼べる自由関数）へ出す。
+#[tauri::command]
+async fn get_hooks_diagnostics(
+    state: State<'_, AppState>,
+) -> AppResult<crate::session::heuristics::diagnostics::HooksDiagnostics> {
+    Ok(crate::session::heuristics::diagnostics::diagnostics_from_state(&state))
 }
 
 /// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
@@ -374,6 +403,25 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         Err(err) => eprintln!("[kamux] startup normalize failed: {err}"),
     }
 
+    // 汎用 CLI ヒューリスティック（M3-3）。
+    //
+    // **`normalize_on_startup()` の `match` が終わった後に置くこと。** `ManagerSink` は
+    // `RuntimeSender` を直接持つので、`manage()` の前でも状態機械へ到達できる形になる ——
+    // 上の「まだ配らない」で塞ぐ手が効かない唯一の相手である。正規化が終わっていれば、
+    // その後にレジストリが `send` しても DB 由来の古い値への巻き戻しは起きない。
+    //
+    // ランタイムハンドルは `tauri::async_runtime::handle()` から明示的に取る。
+    // ここは `tauri::Builder::setup()` の中 = tokio ランタイム文脈の**外**なので、
+    // `Handle::current()` や素の `tokio::spawn` は panic する（テストは常にランタイム
+    // 内から呼ぶため `cargo test` では再現しない）。
+    let heuristics = crate::session::heuristics::registry::HeuristicRegistry::new(
+        Arc::new(crate::session::heuristics::clock::SystemClock),
+        Arc::new(crate::session::heuristics::sink_impl::ManagerSink::new(
+            runtime.sender(),
+        )),
+        tauri::async_runtime::handle().inner().clone(),
+    );
+
     // hooks ブートストラップ。`runtime.sender()` は Clone + Send + Sync なので
     // accept スレッドから同期的に呼べる（HookHandler の doc コメント参照）。
     //
@@ -384,6 +432,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     let hook_handler: Arc<dyn HookSink> = Arc::new(crate::hooks_srv::HookHandler::new(
         Arc::clone(&store),
         runtime.sender(),
+        Arc::clone(&heuristics),
     ));
     let (hooks, hooks_server) = bootstrap(hook_handler);
 
@@ -391,6 +440,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         store,
         pty: pty::PtyManager::new(),
         runtime,
+        heuristics,
         hooks,
         hooks_server: Mutex::new(hooks_server),
     });
@@ -457,6 +507,7 @@ pub fn run() {
             list_sessions,
             delete_project,
             move_session,
+            get_hooks_diagnostics,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,
@@ -1247,6 +1298,222 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
             assert_eq!(payload["session_id"], serde_json::json!(session.id));
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// M3-3: `update_session` の設定変更が**実行中のセッションへ即座に届く**こと。
+        ///
+        /// `reconfigure` の呼び出しを消すと、設定画面でオフにしても次の起動まで
+        /// ヒューリスティックが動き続ける。DB は正しいのに挙動だけが古い、という
+        /// 一番気づきにくい壊れ方をする。
+        ///
+        /// 2 つの腕（`heuristics_enabled` / `silence_timeout_secs`）を別々に測る ——
+        /// 片方だけの条件に縮める変異はもう片方で赤くなる。
+        ///
+        /// **腕は 3 つある。** 3 本目は「反映する値は『パッチの中身』ではなく
+        /// 『書き込み後の行』である」という `apply_session_patch` の doc の主張を測る
+        /// （task-13 レビュー I-1）。各腕の後で**渡していないほうのフィールド**を見るので、
+        /// `updated.*` を `patch.*.unwrap_or(既定)` へ差し替える変異は
+        /// 腕 (2) で `heuristics_active` が、腕 (3) で `silence_timeout_ms` が赤くなる。
+        #[test]
+        fn update_session_reconfigures_the_running_heuristics() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let session = crate::model::Session::new_backlog(
+                &project_id,
+                "live",
+                "",
+                crate::model::SessionMode::InPlace,
+                None,
+                CliKind::Custom,
+                None,
+                1.0,
+                crate::store::now_ms(),
+            );
+            let session = store.insert_session(&session).expect("insert_session");
+            assert!(session.heuristics_enabled, "前提が崩れている");
+
+            let state = crate::state::test_support::app_state(store);
+            let activity = state
+                .heuristics
+                .register(&session.id, CliKind::Custom, true, 30);
+            assert!(
+                state.heuristics.diagnostics()[0].heuristics_active,
+                "前提が崩れている"
+            );
+
+            // (1) オン/オフの腕
+            super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    heuristics_enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .expect("patch");
+            assert!(
+                !state.heuristics.diagnostics()[0].heuristics_active,
+                "オフにしても実行中のセッションへ届いていない"
+            );
+
+            // (2) 沈黙タイムアウトだけの腕（`heuristics_enabled` を伴わない）
+            super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    silence_timeout_secs: Some(120),
+                    ..Default::default()
+                },
+            )
+            .expect("patch");
+            assert!(
+                format!("{activity:?}").contains("silence_timeout_ms: 120000"),
+                "沈黙タイムアウトが実行中のセッションへ届いていない: {activity:?}"
+            );
+            // 腕 (2) のパッチは `heuristics_enabled` を運んでいない。パッチの中身を
+            // 反映すると、腕 (1) でオフにしたヒューリスティックが既定値 true で
+            // 黙って復活する（DB は false のまま）。
+            assert!(
+                !state.heuristics.diagnostics()[0].heuristics_active,
+                "タイムアウトだけのパッチでヒューリスティックが復活している: \
+                 書き込み後の行ではなくパッチの中身を反映している"
+            );
+
+            // (3) オンに戻す腕（`silence_timeout_secs` を伴わない）
+            super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    heuristics_enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("patch");
+            assert!(
+                state.heuristics.diagnostics()[0].heuristics_active,
+                "オンに戻しても実行中のセッションへ届いていない"
+            );
+            // 腕 (3) のパッチは `silence_timeout_secs` を運んでいない。パッチの中身を
+            // 反映すると、腕 (2) で 120 秒にしたタイムアウトが既定値 30 秒へ戻る。
+            assert!(
+                format!("{activity:?}").contains("silence_timeout_ms: 120000"),
+                "オン/オフだけのパッチで沈黙タイムアウトが巻き戻っている: {activity:?}"
+            );
+        }
+
+        /// M3-3 群 S: PTY 終了でヒューリスティックの登録を外す配線と、**その極性**。
+        ///
+        /// 🔴 レジストリのキーは `session_id` であって `surface_id` ではない。
+        /// `s1:editor` の終了で `unregister("s1")` を呼ぶと、**nvim を閉じただけで
+        /// agent 側の沈黙推定が死ぬ。** `unregister` は未知 ID で no-op なので、
+        /// この誤りはコンパイルでも他のテストでも黙って通る。ここが唯一の観測点である。
+        ///
+        /// `note_surface` 側の `:editor` フィルタとは別物である —— あちらは
+        /// `RuntimeSender` の内部に閉じた状態機械の入力フィルタで、レジストリは
+        /// `note_surface` 相当の入口を持たない。極性は `pty::agent_session_id` に
+        /// 1 箇所だけ置いてある。
+        #[test]
+        fn pty_exit_detaches_the_heuristics_only_for_the_agent_surface() {
+            use crate::pty::surface::PtySink;
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+
+            let handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            state
+                .heuristics
+                .register(&session.id, CliKind::Custom, true, 30);
+            assert_eq!(state.heuristics.diagnostics().len(), 1, "前提が崩れている");
+
+            let sink = crate::pty::sink::TauriSink::new(handle);
+
+            sink.on_exit(
+                &crate::pty::surface_id(&session.id, crate::model::SurfaceKind::Editor),
+                Some(0),
+            );
+            assert_eq!(
+                state.heuristics.diagnostics().len(),
+                1,
+                "nvim を閉じただけで agent 側の沈黙推定が死んでいる"
+            );
+
+            sink.on_exit(
+                &crate::pty::surface_id(&session.id, crate::model::SurfaceKind::Agent),
+                Some(0),
+            );
+            assert!(
+                state.heuristics.diagnostics().is_empty(),
+                "agent サーフェスの終了でヒューリスティックが外れていない"
+            );
+        }
+
+        /// M3-3 群 S（task-13 レビュー I-2）: `install_app_state_with` が組む
+        /// `HeuristicRegistry` が、**`AppState` に載るその `RuntimeStateManager`** へ
+        /// 繋がっていること。
+        ///
+        /// 端から端までの観測点（`session::mod` の
+        /// `spawning_an_agent_surface_wires_its_output_to_the_state_machine`）は
+        /// `state::test_support::app_state` が組んだ**別のコード**を通る。同じ形の
+        /// 組み立てが `state.rs` と `lib.rs` の 2 箇所にあるため、production 側の
+        /// `ManagerSink::new(runtime.sender())` を別の `RuntimeStateManager` の
+        /// sender へ繋ぎ替えても全テストが緑のままだった（実測）。実害は
+        /// **実機でヒューリスティックが 1 つも UI に届かない**こと。ここが
+        /// production の組み立てを通る唯一の端から端までの観測点である。
+        #[test]
+        fn install_app_state_wires_the_registry_to_the_managed_state_machine() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            // `insert_test_session` は `CliKind::Shell` = ヒューリスティック既定オフ。
+            // BEL を状態機械まで通すため汎用 CLI として登録し直す。
+            let mut session = insert_test_session(&store, &project_id, "live");
+            session.cli_kind = CliKind::Custom;
+            session.heuristics_enabled = true;
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+            let state = app.state::<AppState>();
+
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "前提が崩れている: セッションが running になっていない"
+            );
+
+            // production の spawn 経路と同じ入口。返るオブザーバは
+            // `install_app_state_with` が組んだレジストリに繋がっている。
+            let mut observer = crate::session::heuristics::sink_impl::attach_heuristics(
+                &state.heuristics,
+                &session,
+            );
+            observer.on_chunk(b"continue? \x07"); // 入力待ちの BEL
+
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::WaitingInput),
+                "install_app_state_with のレジストリが AppState.runtime へ繋がっていない\
+                 （現在: {:?}）",
+                state.runtime.current(&session.id)
+            );
         }
 
         /// 群 S（task-13 レビュー I-3）: `bootstrap(hook_handler)` の戻り値が

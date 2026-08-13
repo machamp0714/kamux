@@ -7,6 +7,7 @@ use tauri::AppHandle;
 use crate::error::{AppError, AppResult};
 use crate::model::SurfaceKind;
 use crate::pty::sink::TauriSink;
+use crate::session::heuristics::OutputObserver;
 
 pub mod backpressure;
 pub mod commands;
@@ -23,6 +24,17 @@ pub use surface::{PtySink, PtySurface, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 /// 文字列表現は `SurfaceKind::as_db_str`（model.rs の `db_enum!`）を単一の情報源として使う。
 pub fn surface_id(session_id: &str, kind: SurfaceKind) -> String {
     format!("{}:{}", session_id, kind.as_db_str())
+}
+
+/// `surface_id` の逆関数。**agent サーフェスのときだけ** `session_id` を返す。
+///
+/// **極性（`:agent` に限る）をここ 1 箇所に閉じるための純関数である。** 呼び出し側で
+/// `rsplit_once(':')` を手書きすると、片方だけ直した瞬間に「nvim を閉じただけで
+/// セッション側の何かが死ぬ」が戻ってくる。`session_id` そのものには `:` が
+/// 含まれうる（`surface_id` は末尾に付ける）ので分解は右からである。
+pub fn agent_session_id(surface_id: &str) -> Option<&str> {
+    let (session_id, kind) = surface_id.rsplit_once(':')?;
+    (kind == SurfaceKind::Agent.as_db_str()).then_some(session_id)
 }
 
 /// レジストリの 1 エントリ。`valid` は「この世代の sink 経由コールバックがまだ
@@ -147,7 +159,37 @@ impl PtyManager {
     /// 出力は `pty://data/{surface_id}`、終了は `pty://exit/{surface_id}` で emit される。
     /// 同じ surface_id が生存中なら AppError::InvalidState を返す。
     pub fn spawn(&self, app: &AppHandle, spec: SpawnSpec) -> AppResult<()> {
-        self.spawn_with_sink(TauriSink::new(app.clone()), spec)
+        self.spawn_with_observer(app, spec, None)
+    }
+
+    /// M3-3 のヒューリスティック観測を伴う spawn。
+    ///
+    /// **`spawn` の署名を変えずに observer を運ぶための兄弟メソッドである**（契約 §15 は
+    /// `spawn` を含む 7 つのシグネチャを凍結している）。`spawn_with_sink` 自体が
+    /// 「§15 に無い `pub(crate)` の兄弟を足して依存を注入する」という同じ形の先例である。
+    ///
+    /// `observer` を渡してよいのは **agent サーフェスだけ**である（設計 §4.8）。
+    /// nvim は常時 BEL を鳴らし、編集していない間は当然沈黙するので、editor サーフェスに
+    /// 付けると値が壊れる。`editor.rs` が `spawn` を呼んだままなのは、その条件を
+    /// **呼び出し側の構造で**満たす形である —— `spawn` の中で `surface_id` を見て
+    /// 捨てる形にはしない（判断が 2 箇所に散る）。
+    pub(crate) fn spawn_with_observer(
+        &self,
+        app: &AppHandle,
+        spec: SpawnSpec,
+        observer: Option<Box<dyn OutputObserver>>,
+    ) -> AppResult<()> {
+        self.spawn_with_sink_and_observer(TauriSink::new(app.clone()), spec, observer)
+    }
+
+    /// sink を差し替えられる内部版（observer なし）。
+    /// `spawn_with_sink_and_observer` の 2 引数版で、ヒューリスティックを見ない
+    /// テストがそのまま使う。**production の経路はここを通らない**
+    /// （`spawn` / `spawn_with_observer` は observer 引数を明示する側へ直接入る）ので、
+    /// テスト専用にしてある。
+    #[cfg(test)]
+    pub(crate) fn spawn_with_sink(&self, sink: Arc<dyn PtySink>, spec: SpawnSpec) -> AppResult<()> {
+        self.spawn_with_sink_and_observer(sink, spec, None)
     }
 
     /// sink を差し替えられる内部版。テストが `AppHandle` を作らずに済むようにする。
@@ -169,7 +211,12 @@ impl PtyManager {
     /// (フロントに一生 exit が届かない実質的なリークになる)。新しい
     /// `PtySurface` の生成に成功してから初めて旧エントリを無効化し、
     /// レジストリを置き換える。
-    pub(crate) fn spawn_with_sink(&self, sink: Arc<dyn PtySink>, spec: SpawnSpec) -> AppResult<()> {
+    pub(crate) fn spawn_with_sink_and_observer(
+        &self,
+        sink: Arc<dyn PtySink>,
+        spec: SpawnSpec,
+        observer: Option<Box<dyn OutputObserver>>,
+    ) -> AppResult<()> {
         let id = spec.surface_id.clone();
         let mut guard = self.lock();
         if let Some(entry) = guard.get(&id) {
@@ -187,10 +234,7 @@ impl PtyManager {
             valid: Arc::clone(&valid),
             registry: Arc::downgrade(&self.surfaces),
         });
-        // M3-3: observer は本 PR ではまだ誰も構築しない（Task 13 が `HeuristicRegistry`
-        // 越しに渡す高さを決める）。契約 §44.1 により、呼び出し側が無いことを
-        // 欠陥として扱わない。
-        let surface = PtySurface::spawn(spec, wrapped, None)?;
+        let surface = PtySurface::spawn(spec, wrapped, observer)?;
 
         if let Some(old) = guard.get(&id) {
             // 旧世代がまだ on_exit を送出していなければ、ここで無効化する。
@@ -259,6 +303,31 @@ impl PtyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `surface_id` の逆関数。agent サーフェス以外は `None` になる。
+    #[test]
+    fn agent_session_id_accepts_only_the_agent_surface() {
+        let sid = "3f2a9c1e-0000-4000-8000-000000000001";
+        assert_eq!(
+            agent_session_id(&surface_id(sid, SurfaceKind::Agent)),
+            Some(sid)
+        );
+        assert_eq!(
+            agent_session_id(&surface_id(sid, SurfaceKind::Editor)),
+            None
+        );
+    }
+
+    /// 分解できない形は `None`。ここで `Some(surface_id)` を返すと、
+    /// 素の `session_id` が誤って agent サーフェスとして通ってしまう。
+    #[test]
+    fn agent_session_id_rejects_a_malformed_surface_id() {
+        assert_eq!(agent_session_id("no-colon-here"), None);
+        assert_eq!(agent_session_id("s1:"), None);
+        assert_eq!(agent_session_id(""), None);
+        // セッション id に `:` が含まれても、種別は最後の `:` の後ろで決まる
+        assert_eq!(agent_session_id("a:b:agent"), Some("a:b"));
+    }
 
     #[test]
     fn surface_id_joins_session_and_kind_with_colon() {
@@ -458,6 +527,53 @@ mod tests {
             "registry must be the sole strong owner: once on_exit fires and the entry is \
              deregistered, the PtySurface must actually drop (Task 4 のリーク封鎖はこれに \
              全面依存している)"
+        );
+    }
+
+    /// 群 S: `spawn_with_sink_and_observer` に渡した observer が
+    /// `PtySurface::spawn` の読み取りスレッドまで**実際に届く**こと。
+    ///
+    /// ここを測らないと、`start_session` から `PtySurface` までの転送が丸ごと
+    /// 無検査になる —— `spawn` / `spawn_with_sink` はどちらも `None` を渡すので、
+    /// 本体が `observer` を捨てて `None` を渡す変異が全テスト緑で通る。
+    #[test]
+    fn spawn_with_sink_and_observer_hands_the_observer_to_the_reader_thread() {
+        struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+        impl crate::session::heuristics::OutputObserver for Recorder {
+            fn on_chunk(&mut self, chunk: &[u8]) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(chunk);
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = channel();
+        let sink = Arc::new(NullSink { tx });
+        let manager = PtyManager::new();
+        manager
+            .spawn_with_sink_and_observer(
+                sink,
+                manager_spec(
+                    "s-observer:agent",
+                    "/bin/sh",
+                    &["-c", "printf '%s' 'observed-chunk'; exit 0"],
+                ),
+                Some(Box::new(Recorder(Arc::clone(&seen)))),
+            )
+            .expect("spawn");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).expect("exit"),
+            "s-observer:agent"
+        );
+        let got =
+            String::from_utf8_lossy(&seen.lock().unwrap_or_else(|p| p.into_inner())).to_string();
+        assert!(
+            got.contains("observed-chunk"),
+            "observer が読み取りスレッドまで届いていない: {got:?}"
         );
     }
 

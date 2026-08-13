@@ -2,6 +2,8 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { useAppStore } from '../../store';
 import { toAppError, type ModalState } from '../../store/uiSlice';
 import { proposeBranchName } from '../../lib/branchName';
+import { HeuristicsSettings } from '../../components/HeuristicsSettings';
+import { getHooksDiagnostics, type HookLiveness } from '../../ipc/commands';
 import type { CliKind, SessionMode } from '../../types/model';
 import { resolveDialogMode } from './dialogMode';
 import {
@@ -45,6 +47,32 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
       : initialSessionFormValues(project?.default_cli ?? 'claude'),
   );
   const [busy, setBusy] = useState(false);
+  const [liveness, setLiveness] = useState<HookLiveness | undefined>(undefined);
+
+  // 検知方式の表示（HeuristicsSettings の detectionMethodLabel）に要る hooks の疎通状態を、
+  // このダイアログを開いたときに 1 回だけ引く。定期リフレッシュはしない（契約 §0）。
+  // HooksStatusPanel と同じ「マウント時 1 回 + cancelled ガード」だが、共有フックへは
+  // 抽出しない —— 呼び出しは 2 箇所で、返す値（HooksDiagnostics 全体 / 当該セッションの
+  // liveness 1 個）も依存配列（[] / [editingSessionId]）も違うため、共通化しても
+  // 引数で分岐するだけになる（統合裁定）。
+  const editingSessionId = dialogMode.kind === 'edit' ? dialogMode.session.id : null;
+  useEffect(() => {
+    if (editingSessionId === null) return;
+    let cancelled = false;
+    getHooksDiagnostics()
+      .then((d) => {
+        if (!cancelled) {
+          setLiveness(d.sessions.find((s) => s.session_id === editingSessionId)?.liveness);
+        }
+      })
+      .catch(() => {
+        // 診断が取れないときは liveness 未確定のまま（= 推定表示）にする
+        if (!cancelled) setLiveness(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editingSessionId]);
 
   // 編集モードで開いている間に対象セッションがストアから消えた場合（アーカイブ等）、
   // 作成モードへフォールバックせず閉じる（dialogMode.ts 参照）。
@@ -129,21 +157,39 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
             </label>
 
             {dialogMode.kind === 'edit' ? (
-              <dl className="session-form-modal__readonly">
-                <dt>分離モード</dt>
-                <dd>{dialogMode.session.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
-                <dt>ブランチ</dt>
-                <dd>{dialogMode.session.branch ?? '—'}</dd>
-                <dt>CLI</dt>
-                <dd>
-                  {dialogMode.session.cli_kind}
-                  {dialogMode.session.cli_command !== null
-                    ? ` (${dialogMode.session.cli_command})`
-                    : ''}
-                </dd>
-                <dt />
-                <dd className="session-form-modal__note">これらは作成時のみ設定できます</dd>
-              </dl>
+              <>
+                <dl className="session-form-modal__readonly">
+                  <dt>分離モード</dt>
+                  <dd>{dialogMode.session.mode === 'worktree' ? 'worktree 分離' : 'リポ直上'}</dd>
+                  <dt>ブランチ</dt>
+                  <dd>{dialogMode.session.branch ?? '—'}</dd>
+                  <dt>CLI</dt>
+                  <dd>
+                    {dialogMode.session.cli_kind}
+                    {dialogMode.session.cli_command !== null
+                      ? ` (${dialogMode.session.cli_command})`
+                      : ''}
+                  </dd>
+                  <dt />
+                  <dd className="session-form-modal__note">これらは作成時のみ設定できます</dd>
+                </dl>
+
+                <HeuristicsSettings
+                  session={dialogMode.session}
+                  // getHooksDiagnostics() から引いた当該セッションの疎通状態。
+                  // undefined（診断に行が無い / 取得失敗）なら推定表示のままになる。
+                  liveness={liveness}
+                  onChange={(patch) => {
+                    // ヒューリスティック設定は他のフィールド（タイトル/説明）と違い、
+                    // values に溜めず即時保存する（edit モード限定。lane-controller の
+                    // 統合裁定）。そのため「キャンセルを押しても取り消されない」——
+                    // 意図した挙動である。
+                    editSession(dialogMode.session.id, patch).catch((err: unknown) =>
+                      setError(toAppError(err)),
+                    );
+                  }}
+                />
+              </>
             ) : (
               <>
                 <fieldset className="session-form-modal__radio-group">

@@ -71,3 +71,25 @@ export const ackPty = (surfaceId: string, seq: number): Promise<void> =>
 /** nvim 用 PTY を遅延起動し surface_id を返す。既に起動済みなら同じ値を返す。 */
 export const spawnEditor = (sessionId: string): Promise<string> =>
   invoke('spawn_editor', { sessionId });
+
+export type HookLiveness = 'not_applicable' | 'pending' | 'healthy' | 'unreachable';
+
+export interface SessionHookStatus {
+  session_id: string;
+  cli_kind: CliKind;
+  liveness: HookLiveness;
+  last_hook_at: number | null;
+  heuristics_active: boolean;
+}
+
+export interface HooksDiagnostics {
+  socket_path: string;
+  listener_alive: boolean;
+  sessions: SessionHookStatus[];
+}
+
+/** 設定画面向けの hooks 疎通ステータス。定期リフレッシュはしない
+ *  （パネルと編集ダイアログを開いたとき = マウント時に 1 回だけ呼ぶ。
+ *  `session://state` での再取得は未実装）。 */
+export const getHooksDiagnostics = (): Promise<HooksDiagnostics> =>
+  invoke<HooksDiagnostics>('get_hooks_diagnostics');

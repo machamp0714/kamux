@@ -28,3 +28,18 @@
   letter-spacing: 0.2px;
   color: currentColor;
 }
+
+/* 確定仕様の正典は .claude/skills/kamux-design-system/components.md
+   「実行状態バッジ」節（契約 §53.5 が定める 3 層のうち「寸法と役割」層）:
+   汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の「推定」状態はドットを中空
+   （background: transparent + border: 1.5px solid var(--state-*)）にする。
+   色には一切触れない —— currentColor は親要素（RuntimeBadgeView）が既に
+   var(--state-*) を color として持っているので、それをそのまま枠色として使う
+   だけで済む。box-sizing を border-box にして枠を足しても寸法（8×8）が
+   変わらないようにしてある。ラベル側の `~` 前置は RuntimeBadgeView が担う。
+   アニメーションは付けない（契約 §0「アイドル時 CPU ほぼ 0%」）。 */
+.runtime-badge--estimated .runtime-badge__dot {
+  box-sizing: border-box;
+  background: transparent;
+  border: 1.5px solid currentColor;
+}
