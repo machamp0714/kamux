@@ -213,12 +213,18 @@ mod fixture_tests {
     /// 定数 → スクリプト本文の対応表。契約 §118.5 の「定数を持たない区間があると
     /// the_whole_fixture_session_yields_exactly_one_bell が網羅を偽って主張する」を
     /// 実際に赤くするための表である(コメントだけでは担保にならない)。
-    const FIXTURE_CHUNKS: [(&[u8], &str); 5] = [
-        (FIXTURE_BANNER, "fake-generic-cli started"),
-        (FIXTURE_PROGRESS, "[1/3]"),
-        (FIXTURE_PROMPT, "continue? [y/N]"),
-        (FIXTURE_DONE, "[3/3]"),
-        (FIXTURE_RESUMED, "resumed after idle"),
+    ///
+    /// 🔴 レビュー(task-19-review.md §3)で判明: needle 1 本だけでは「定数のバイト列と
+    /// needle が同じ区間のものであること」を検査できず、needle が覆っていない領域
+    /// (`FIXTURE_PROGRESS` の `[2/3] linking` 側)も自由に動けた。各区間の needle を
+    /// 複数へ広げ、`the_fixture_chunks_match_the_script_body` で「定数側」と
+    /// 「スクリプト本文側」の両方に現れることを検査する。
+    const FIXTURE_CHUNKS: [(&[u8], &[&str]); 5] = [
+        (FIXTURE_BANNER, &["fake-generic-cli started"]),
+        (FIXTURE_PROGRESS, &["[1/3]", "building", "[2/3]", "linking"]),
+        (FIXTURE_PROMPT, &["continue? [y/N]"]),
+        (FIXTURE_DONE, &["[3/3]", "done"]),
+        (FIXTURE_RESUMED, &["[post]", "resumed after idle"]),
     ];
 
     fn fixture_script_path() -> std::path::PathBuf {
@@ -265,18 +271,33 @@ mod fixture_tests {
     /// 機械的に固定する。この assert が無いと、`FIXTURE_CHUNKS` から要素を落としても
     /// `the_whole_fixture_session_yields_exactly_one_bell` は緑のまま通ってしまう。
     ///
-    /// 🔴 `contains` と `printf == 6` の 2 assert だけでは不十分だったことが変異検証で
-    /// 判明した(片方向の検査であり、`FIXTURE_CHUNKS` の要素数にも重複にも依らないため)。
-    /// `len() + 1 == printf_count` と needle の重複チェックを追加している。
+    /// 🔴 レビュー(task-19-review.md §3)で判明した不足を反映している:
+    /// - `contains` と `printf == 6` の 2 assert だけでは、`FIXTURE_CHUNKS` の要素数にも
+    ///   重複にも依らない片方向の検査だったため、行を削る/複製ですり替える変異が生き延びた
+    ///   → `len() + 1 == printf_count` と needle の重複チェックを追加(ただしこの
+    ///   `len() + 1` は直前の `printf_count == 6` の下で実質 `len() == 5` に縮退しており、
+    ///   「区間数を printf 数へ結び付ける」働きはしていない。恒真ではないが、この assert
+    ///   単独が捕まえる変異は「スクリプトを変えずに表の行だけ増減する」形のみである)
+    /// - needle が定数(バイト列)側と対応していることを測る assert が無く、定数の文言だけ
+    ///   差し替える/表の行を入れ替える/needle が覆っていない領域を書き換える、の 3 変異が
+    ///   すべて生き延びた → needle を複数へ広げ、各 needle が「定数側」と「スクリプト本文側」
+    ///   の両方に現れることを検査する
     #[test]
     fn the_fixture_chunks_match_the_script_body() {
         let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
 
-        for (_, needle) in FIXTURE_CHUNKS {
-            assert!(
-                body.contains(needle),
-                "FIXTURE_CHUNKS の区間 {needle:?} がスクリプト本文に見つからない"
-            );
+        for (chunk, needles) in FIXTURE_CHUNKS {
+            let chunk_text = String::from_utf8_lossy(chunk);
+            for needle in needles {
+                assert!(
+                    chunk_text.contains(needle),
+                    "FIXTURE_CHUNKS の定数と needle {needle:?} が対応していない"
+                );
+                assert!(
+                    body.contains(needle),
+                    "FIXTURE_CHUNKS の区間 {needle:?} がスクリプト本文に見つからない"
+                );
+            }
         }
 
         // 内訳: banner 1 + progress 2 + prompt 1 + done 1 + resumed 1 = 6
@@ -288,10 +309,10 @@ mod fixture_tests {
             "printf の出現数が想定と異なる(区間が定数と食い違っている可能性)"
         );
 
-        // `FIXTURE_CHUNKS` の区間数を printf の数へ結び付ける。これが無いと配列から
-        // 行を落とす変異(型注釈も要素数に合わせて直す)が緑で生き延びる
-        // (printf の出現数はスクリプト側のカウントで、配列の要素数には依らないため)。
-        // +1 は `FIXTURE_PROGRESS` だけが 2 つの printf を束ねている分。
+        // `FIXTURE_CHUNKS` の区間数を printf の数へ結び付ける形を意図しているが、直前の
+        // `printf_count == 6` により実質 `FIXTURE_CHUNKS.len() == 5` に縮退しており、両辺の
+        // 関係式としては働いていない(恒真ではないが「結び付ける」効果は無い。上のコメント
+        // 参照)。単独では「スクリプトを変えずに表の行だけ増減する」変異のみ捕まえる。
         assert_eq!(
             FIXTURE_CHUNKS.len() + 1,
             printf_count,
@@ -300,7 +321,10 @@ mod fixture_tests {
 
         // needle が重複していると「1 行を別の行の複製で置き換える」変異が
         // 型注釈も要素数も変えずに(コンパイルエラーにもならずに)通ってしまう
-        let mut needles: Vec<&str> = FIXTURE_CHUNKS.iter().map(|(_, n)| *n).collect();
+        let mut needles: Vec<&str> = FIXTURE_CHUNKS
+            .iter()
+            .flat_map(|(_, ns)| ns.iter().copied())
+            .collect();
         let unique_count = needles.len();
         needles.sort_unstable();
         needles.dedup();
@@ -308,6 +332,27 @@ mod fixture_tests {
             needles.len(),
             unique_count,
             "FIXTURE_CHUNKS の needle が重複している"
+        );
+    }
+
+    /// 契約 §118.5: `DONE` の後の待ちは、手動スモークの `silence_timeout_secs`(= 5)より
+    /// 長いこと。`sleep 12` → `sleep 1` のように短くすると、沈黙タイムアウトを経由せずに
+    /// 出力が再開してしまい、手動スモーク項目 5(`reason == "output_activity"` の機械読み)
+    /// がテスト緑のまま静かに観測不能になる(task-19-review.md Important 2)。
+    #[test]
+    fn the_fixture_waits_longer_than_the_smoke_silence_timeout() {
+        const SMOKE_SILENCE_TIMEOUT_SECS: u64 = 5;
+        let body = std::fs::read_to_string(fixture_script_path()).expect("read fixture");
+        // 行頭が `sleep ` の最初の行を採る。`while true; do sleep 3600; done` の
+        // `sleep 3600` は字下げ済みで行頭が一致しないため拾わない。
+        let secs: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("sleep "))
+            .and_then(|s| s.trim().parse().ok())
+            .expect("`DONE` 後の沈黙 sleep 行が読めない");
+        assert!(
+            secs > SMOKE_SILENCE_TIMEOUT_SECS,
+            "sleep {secs} はスモークの沈黙タイムアウト {SMOKE_SILENCE_TIMEOUT_SECS} 秒以下"
         );
     }
 
