@@ -89,7 +89,7 @@ export function KanbanView() {
           （HooksStatusPanel 参照）なので、開くたびに最新の診断が読まれる。 */}
       {hooksOpen ? (
         <div className="kanban-view__drawer-scrim" onMouseDown={() => setHooksOpen(false)}>
-          {/* aria-modal は宣言しない。SessionFormModal（session-form-modal.tsx:122-123）は
+          {/* aria-modal は宣言しない。SessionFormModal（SessionFormModal.tsx:122-123）は
               keymap.ts:77 経由で Escape が効くが、このドロワーは開閉をローカル state
               （hooksOpen）に置いているため resolveKeymap の modalOpen 判定に乗らず、
               Escape で閉じる手段が無い。focus trap も無い（inert / tabIndex 管理は無し。
