@@ -56,6 +56,41 @@ beforeEach(() => {
   });
 });
 
+/** セッション 1 件と、その id を持つ診断をストア／IPC モックに仕込む。 */
+function seedOneSession() {
+  const s = session({ id: 'sess-42', title: 'fix login' });
+  useAppStore.setState({
+    sessions: { [s.id]: s },
+    sessionOrder: { backlog: [s.id], in_progress: [], review: [], done: [] },
+  });
+  vi.mocked(getHooksDiagnostics).mockResolvedValue({
+    socket_path: '/tmp/kamux-hooks-1234.sock',
+    listener_alive: true,
+    sessions: [
+      {
+        session_id: s.id,
+        cli_kind: 'shell',
+        liveness: 'unreachable',
+        last_hook_at: null,
+        heuristics_active: true,
+      },
+    ],
+  });
+  return s;
+}
+
+/** 開閉ボタンを押し、パネルの中身が描画されるまで待つ。 */
+async function openDrawer() {
+  fireEvent.click(screen.getByRole('button', { name: 'hooks 疎通ステータス' }));
+  await waitFor(() => expect(screen.getByTestId('hooks-socket-path')).toBeInTheDocument());
+}
+
+/** querySelector の null を非 null アサーション（禁止）なしで潰す。 */
+function requireElement(node: Element | null): Element {
+  if (node === null) throw new Error('要素が見つからない');
+  return node;
+}
+
 describe('KanbanView と HooksStatusPanel の統合点', () => {
   it('既定では hooks 疎通ステータスのドロワーは開いていない', () => {
     vi.mocked(getHooksDiagnostics).mockResolvedValue({
@@ -71,41 +106,46 @@ describe('KanbanView と HooksStatusPanel の統合点', () => {
     expect(getHooksDiagnostics).not.toHaveBeenCalled();
   });
 
-  it('ボタンでドロワーを開くとパネルの中身が現れ、閉じると消える', async () => {
+  it('ボタンでドロワーを開くとパネルの中身が現れ、閉じるボタンで消える', async () => {
     // セッションは 1 件だけ置き、その id を診断側の session_id と一致させる。
     // sessionTitles を空オブジェクトに潰す変異はここでタイトルが出ずに落ちる。
-    const s = session({ id: 'sess-42', title: 'fix login' });
-    useAppStore.setState({
-      sessions: { [s.id]: s },
-      sessionOrder: { backlog: [s.id], in_progress: [], review: [], done: [] },
-    });
-    vi.mocked(getHooksDiagnostics).mockResolvedValue({
-      socket_path: '/tmp/kamux-hooks-1234.sock',
-      listener_alive: true,
-      sessions: [
-        {
-          session_id: s.id,
-          cli_kind: 'shell',
-          liveness: 'unreachable',
-          last_hook_at: null,
-          heuristics_active: true,
-        },
-      ],
-    });
+    seedOneSession();
 
     render(<KanbanView />);
+    await openDrawer();
 
-    fireEvent.click(screen.getByRole('button', { name: 'hooks 疎通ステータス' }));
-
-    await waitFor(() =>
-      expect(screen.getByTestId('hooks-socket-path').textContent).toContain(
-        '/tmp/kamux-hooks-1234.sock',
-      ),
+    expect(screen.getByTestId('hooks-socket-path').textContent).toContain(
+      '/tmp/kamux-hooks-1234.sock',
     );
     expect(screen.getByTestId('hooks-row-sess-42').textContent).toContain('fix login');
 
     fireEvent.click(screen.getByRole('button', { name: '閉じる' }));
 
     expect(screen.queryByTestId('hooks-socket-path')).toBeNull();
+  });
+
+  it('スクリムを押すとドロワーが閉じる', async () => {
+    seedOneSession();
+
+    const { container } = render(<KanbanView />);
+    await openDrawer();
+
+    fireEvent.mouseDown(requireElement(container.querySelector('.kanban-view__drawer-scrim')));
+
+    expect(screen.queryByTestId('hooks-socket-path')).toBeNull();
+  });
+
+  it('パネルの中を押してもドロワーは閉じない', async () => {
+    // ドロワー本体の stopPropagation が消えると、ソケットパスを選択しようとした
+    // 瞬間にスクリムまで mousedown が届いて閉じてしまう。上のスクリムのテストだけ
+    // では殺せないので、対で置く。
+    seedOneSession();
+
+    render(<KanbanView />);
+    await openDrawer();
+
+    fireEvent.mouseDown(screen.getByTestId('hooks-socket-path'));
+
+    expect(screen.getByTestId('hooks-socket-path')).toBeInTheDocument();
   });
 });

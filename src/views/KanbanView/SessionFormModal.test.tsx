@@ -125,6 +125,10 @@ describe('SessionFormModal と HeuristicsSettings の統合点', () => {
     render(<SessionFormModal />);
 
     await waitFor(() => expect(screen.getByText('hooks（確実）')).toBeInTheDocument());
+    // 回数は waitFor の外で見る。waitFor の中に入れると述語が一瞬でも真になれば
+    // 成功してしまい、上限が固定されない（= 依存配列を外す変異を殺せない）。
+    // liveness が実際に変化する（= 再レンダリングが起きる）このケースに置くこと。
+    expect(getHooksDiagnostics).toHaveBeenCalledTimes(1);
   });
 
   it('診断に当該セッションの行が無ければ検知方式はヒューリスティック（推定）のまま', async () => {
@@ -146,5 +150,9 @@ describe('SessionFormModal と HeuristicsSettings の統合点', () => {
     render(<SessionFormModal />);
 
     expect(screen.queryByLabelText('ヒューリスティック検知')).toBeNull();
+    // 設定 UI が無いだけでなく、診断の取得自体が走らないこと。
+    // これが無いと「編集モード以外では IPC を呼ばない」early return を消す変異が
+    // 全緑を通り抜ける（実測で確認済み）。
+    expect(getHooksDiagnostics).not.toHaveBeenCalled();
   });
 });

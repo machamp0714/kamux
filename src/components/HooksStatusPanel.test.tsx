@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // HooksStatusPanel が読む IPC コマンドをモックする（SessionFormModal.test.tsx と同じ形）。
@@ -90,14 +90,21 @@ describe('HooksStatusPanel', () => {
             session_id: 's9',
             cli_kind: 'codex',
             liveness: 'not_applicable',
+            // 唯一 heuristics_active: false を通すフィクスチャ。他のフィクスチャは
+            // すべて true なので、ここを true にすると三項演算子の false 側
+            //（hooks が健全に届いている成功ケースの表示）が誰にも観測されなくなる。
             last_hook_at: null,
-            heuristics_active: true,
+            heuristics_active: false,
           },
         ],
       }),
     );
     render(<HooksStatusPanel sessionTitles={{}} />);
-    await waitFor(() => expect(screen.getByTestId('hooks-row-s9').textContent).toContain('s9'));
+    await waitFor(() => {
+      const row = screen.getByTestId('hooks-row-s9');
+      expect(row.textContent).toContain('s9');
+      expect(row.textContent).toContain('推定は使用していません');
+    });
   });
 
   it('shows an empty note when no sessions are running', async () => {
@@ -112,16 +119,23 @@ describe('HooksStatusPanel', () => {
 
   it('fetches exactly once on mount and never polls', async () => {
     vi.mocked(getHooksDiagnostics).mockResolvedValue(diagnostics());
+    // フェイクタイマは render の前に入れる。あとから入れると、マウント時に登録された
+    // タイマは実タイマのままでフェイククロックが到達できず、setInterval を注入する
+    // 変異が緑を通り抜ける（実測で確認済み）。
+    vi.useFakeTimers();
     render(<HooksStatusPanel sessionTitles={{}} />);
-    // 取得結果が描画される（= 状態更新による再レンダリングが済む）まで待ってから数える。
-    // ここを待たずに数えると useEffect の依存配列 [] を外す変異が緑を通り抜ける
-    // ——実測で確認済み。フェイクタイマだけでは再レンダリングまで進まない。
-    await screen.findByTestId('hooks-socket-path');
+
+    // findBy/waitFor はフェイククロック下で進まないので使わない。act で
+    // マウント時の promise と、それによる再レンダリングを流す。ここまで進めずに
+    // 数えると useEffect の依存配列 [] を外す変異が緑を通り抜ける（実測で確認済み）。
+    await act(async () => {});
+    expect(screen.getByTestId('hooks-socket-path')).toBeTruthy();
     expect(getHooksDiagnostics).toHaveBeenCalledTimes(1);
 
-    // そのうえで時間を進め、定期リフレッシュが仕掛けられていないことを見る。
-    vi.useFakeTimers();
-    await vi.advanceTimersByTimeAsync(60_000);
+    // そのうえで時間を進め、定期リフレッシュが仕掛けられていないことを見る（契約 §0）。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
     expect(getHooksDiagnostics).toHaveBeenCalledTimes(1);
   });
 });
