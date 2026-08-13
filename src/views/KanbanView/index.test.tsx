@@ -135,6 +135,16 @@ describe('KanbanView と HooksStatusPanel の統合点', () => {
     expect(screen.queryByTestId('hooks-socket-path')).toBeNull();
   });
 
+  it('ドロワーは aria-modal を宣言しない（Escape で閉じる手段も focus trap も無いため）', async () => {
+    seedOneSession();
+
+    render(<KanbanView />);
+    await openDrawer();
+
+    const dialog = screen.getByRole('dialog', { name: 'hooks 疎通ステータス' });
+    expect(dialog.getAttribute('aria-modal')).toBeNull();
+  });
+
   it('パネルの中を押してもドロワーは閉じない', async () => {
     // ドロワー本体の stopPropagation が消えると、ソケットパスを選択しようとした
     // 瞬間にスクリムまで mousedown が届いて閉じてしまう。上のスクリムのテストだけ
