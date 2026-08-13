@@ -79,10 +79,11 @@ const RUNTIME_STATE_TOKEN: Record<RuntimeState, string> = {
  * 背景も枠も持たない（ピル型にしない）。
  *
  * M3-3: ヒューリスティック由来の推定状態には `.runtime-badge--estimated`
- * （中空ドット。色は変えない）とラベルへの `~` 前置を足し、ツールチップに
- * 推定である理由を添える。確定仕様は `.claude/skills/kamux-design-system/
- * components.md`「実行状態バッジ」節（契約 §53.5 が定める 3 層の正典のうち
- * 「寸法と役割」層。§76.1 / §76.2。グリフは描かない）。
+ * （中空ドット。色は変えない）とラベルへの `~` 前置を足す。この 2 点の確定仕様は
+ * `.claude/skills/kamux-design-system/components.md`「実行状態バッジ」節（契約
+ * §53.5 が定める 3 層の正典のうち「寸法と役割」層。§76.1 / §76.2。グリフは
+ * 描かない）。ツールチップに推定である理由を添える組み立ては badgeTooltip の
+ * 正典（契約 §33.5 末尾）に従う。
  */
 export function RuntimeBadgeView({
   state,

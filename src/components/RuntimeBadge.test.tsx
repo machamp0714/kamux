@@ -214,9 +214,9 @@ describe('KanbanCard の中の RuntimeBadge（契約 §25.5 の不変条件）',
 
 // M3-3 Task 16: 汎用 CLI 向けヒューリスティック（BEL 検知 / 沈黙判定）由来の
 // 「推定」表示。契約 §76.2 によりグリフの描画・検証は行わない —— 実装が持つのは
-// ドット + ラベル（M2-1）のみで、推定表示はそこへ中空ドット・`~` 前置ラベル・
-// ツールチップ（確定仕様は .claude/skills/kamux-design-system/components.md
-// 「実行状態バッジ」節）を足す形。
+// ドット + ラベル（M2-1）のみで、推定表示はそこへ中空ドット・`~` 前置ラベル
+// （確定仕様は .claude/skills/kamux-design-system/components.md「実行状態バッジ」
+// 節）と、ツールチップ（組み立て正典は契約 §33.5 末尾 / badgeTooltip）を足す形。
 describe('isEstimated', () => {
   // StateReason は 13 値（src/types/model.ts）。配列リテラルでは新しい値が増えても
   // 更新が強制されないため、Record<StateReason, boolean> で網羅する
