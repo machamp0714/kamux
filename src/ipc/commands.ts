@@ -89,6 +89,7 @@ export interface HooksDiagnostics {
 }
 
 /** 設定画面向けの hooks 疎通ステータス。定期リフレッシュはしない
- *  （パネルを開いたときと session://state を受けたときにだけ呼ぶ）。 */
+ *  （パネルと編集ダイアログを開いたとき = マウント時に 1 回だけ呼ぶ。
+ *  `session://state` での再取得は未実装）。 */
 export const getHooksDiagnostics = (): Promise<HooksDiagnostics> =>
   invoke<HooksDiagnostics>('get_hooks_diagnostics');

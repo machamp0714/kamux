@@ -19,8 +19,11 @@ export function livenessLabel(liveness: HookLiveness): string {
 /**
  * 設計書 §12「設定画面に hooks 疎通ステータスを表示」。
  * マウント時に 1 回だけ取得する。定期リフレッシュはしない（契約 §0 のポーリング禁止）。
- * 最新化が必要なときは呼び出し側が key を変えて再マウントするか、
- * `session://state` 受信時に再マウントする。
+ * 唯一の呼び出し側（KanbanView/index.tsx）はドロワーの開閉でマウント / アンマウントされるため
+ * 開くたびに取得は走るが、開いたままの更新は起きない。
+ * `session://state` 受信時の再取得は未実装の将来案である
+ * （現在 `session://state/{session_id}` を購読するのは `src/hooks/useRuntimeStateEvents.ts` だけで、
+ *  本パネルには結線されていない）。
  */
 export function HooksStatusPanel({ sessionTitles }: { sessionTitles: Record<string, string> }) {
   const [diag, setDiag] = useState<HooksDiagnostics | null>(null);

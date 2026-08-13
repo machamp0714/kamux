@@ -52,7 +52,9 @@ function SessionFormDialog({ modal }: { modal: ModalState }) {
   // 検知方式の表示（HeuristicsSettings の detectionMethodLabel）に要る hooks の疎通状態を、
   // このダイアログを開いたときに 1 回だけ引く。定期リフレッシュはしない（契約 §0）。
   // HooksStatusPanel と同じ「マウント時 1 回 + cancelled ガード」だが、共有フックへは
-  // 抽出しない —— src/hooks/ の新設はモジュールツリーの変更になるため（統合裁定）。
+  // 抽出しない —— 呼び出しは 2 箇所で、返す値（HooksDiagnostics 全体 / 当該セッションの
+  // liveness 1 個）も依存配列（[] / [editingSessionId]）も違うため、共通化しても
+  // 引数で分岐するだけになる（統合裁定）。
   const editingSessionId = dialogMode.kind === 'edit' ? dialogMode.session.id : null;
   useEffect(() => {
     if (editingSessionId === null) return;
