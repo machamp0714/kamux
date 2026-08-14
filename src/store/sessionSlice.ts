@@ -4,6 +4,7 @@ import {
   createSession,
   listSessions,
   moveSession,
+  resumeSession as resumeSessionCmd,
   updateSession as updateSessionCmd,
   type CreateSessionArgs,
 } from '../ipc/commands';
@@ -17,6 +18,7 @@ import type {
 } from '../types/model';
 import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
+import { toAppError } from './uiSlice';
 
 export { emptySessionOrder, indexSessions } from './kanbanOrder';
 
@@ -49,6 +51,12 @@ export interface SessionSlice {
    * 購読してよいのは KanbanCardError だけ（契約 §38.3 の許可リスト）。
    */
   runtimeErrors: Record<string, string>;
+  /**
+   * reason: 'resume_failed'（契約 §8 の StateReason）を受け取ったセッションの id 集合。
+   * InterruptedOverlay / KanbanCardResume の「新しい会話として開始」導線と
+   * retryResumeAsFresh はこの配列だけを見る（第1部 §4.4）。
+   */
+  resumeFailedSessionIds: string[];
 
   loadSessions: (projectId: string) => Promise<void>;
   addSession: (args: CreateSessionArgs) => Promise<Session>;
@@ -68,6 +76,13 @@ export interface SessionSlice {
    * 許可リスト（契約 §40.3）の複製はしない。ズレの境界は契約 §42.3.1 が定めている。
    */
   setRuntimeError: (sessionId: string, message: string) => void;
+  /** カードの再開ボタン / InterruptedOverlay が呼ぶ（第1部 §4.4: 経路を分けない）。 */
+  resumeSession: (sessionId: string) => Promise<void>;
+  /**
+   * 無効な claude_session_id を捨ててから再開する（第1部 §4.2）。
+   * SessionPatch は claude_session_id のクリアだけを受け付ける（§4.9）。
+   */
+  retryResumeAsFresh: (sessionId: string) => Promise<void>;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
@@ -76,6 +91,7 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
   runtimeStates: {},
   runtimeReasons: {},
   runtimeErrors: {},
+  resumeFailedSessionIds: [],
 
   loadSessions: async (projectId) => {
     // アーカイブ済みは表示しない（復活 UX は M3-4）
@@ -196,25 +212,60 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       // DB 側の §17（set_last_runtime_state が state != Error で NULL に戻す）と同じ規則。
       // error のときは触らない —— メッセージはイベントで来ないので、消すと空になる。
       const dropError = p.runtime_state !== 'error' && s.runtimeErrors[p.session_id] !== undefined;
+      // resume_failed（契約 §8 の StateReason）だけを積む。既に積んであれば内容は変わらない
+      // ので、恒等ガードのために「実際に変わるか」を先に判定する（新しい配列を無条件に
+      // 作ると、他の 3 項が同値でも参照だけが毎回変わってしまう）。
+      const resumeFailedChanged =
+        p.reason === 'resume_failed' && !s.resumeFailedSessionIds.includes(p.session_id);
       if (
         s.runtimeStates[p.session_id] === p.runtime_state &&
         s.runtimeReasons[p.session_id] === p.reason &&
-        !dropError
+        !dropError &&
+        !resumeFailedChanged
       ) {
         // 新しいオブジェクトを作らない = 無関係な購読者を再レンダリングさせない
         return {};
       }
       const runtimeErrors = dropError ? { ...s.runtimeErrors } : s.runtimeErrors;
       if (dropError) delete runtimeErrors[p.session_id];
+      const resumeFailedSessionIds = resumeFailedChanged
+        ? [...new Set([...s.resumeFailedSessionIds, p.session_id])]
+        : s.resumeFailedSessionIds;
       return {
         runtimeStates: { ...s.runtimeStates, [p.session_id]: p.runtime_state },
         runtimeReasons: { ...s.runtimeReasons, [p.session_id]: p.reason },
         runtimeErrors,
+        resumeFailedSessionIds,
       };
     }),
 
   setRuntimeError: (sessionId, message) =>
     set((s) => ({ runtimeErrors: { ...s.runtimeErrors, [sessionId]: message } })),
+
+  resumeSession: async (sessionId) => {
+    // 失敗時は生 stderr をストアへ残す（契約 §42.3 規約 4）。
+    // カードの kanban-card__error はこれを読む。トーストは呼び出し側が出す。
+    let session: Session;
+    try {
+      session = await resumeSessionCmd(sessionId);
+    } catch (e: unknown) {
+      get().setRuntimeError(sessionId, toAppError(e).message);
+      throw e;
+    }
+    set((s) => ({
+      sessions: { ...s.sessions, [sessionId]: session },
+      resumeFailedSessionIds: s.resumeFailedSessionIds.filter((id) => id !== sessionId),
+    }));
+  },
+
+  // クリア結果は resumeSession の成否によらず先にストアへ反映する。そうしないと
+  // 再開が失敗したとき、ストアだけ古い ID を持ち続けてカードのラベルが
+  // 「会話を再開」に戻り、DB と食い違う。
+  retryResumeAsFresh: async (sessionId) => {
+    const cleared = await updateSessionCmd(sessionId, { claude_session_id: null });
+    set((s) => ({ sessions: { ...s.sessions, [sessionId]: cleared } }));
+    await get().resumeSession(sessionId);
+  },
 
   seedRuntimeStates: (list, reset = false) =>
     set((s) => {

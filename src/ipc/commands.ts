@@ -46,6 +46,8 @@ export const moveSession = (
 
 export const startSession = (id: string): Promise<Session> => invoke('start_session', { id });
 
+export const resumeSession = (id: string): Promise<Session> => invoke('resume_session', { id });
+
 export const stopSession = (id: string): Promise<Session> => invoke('stop_session', { id });
 
 /** ブランチ名の提案。衝突していれば空いている候補が返る。ユーザーは編集できる。
