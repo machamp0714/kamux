@@ -317,8 +317,7 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
         }
         return { runtimeStates: fresh, runtimeReasons: {}, runtimeErrors: freshErrors };
       }
-      // 非 reset には除外を適用しない（契約 §34.6）。呼び出し元は start_session /
-      // resume_session の戻り値だけで、渡されるのは「たった今起動した」セッションに限られる。
+      // 非 reset には除外を適用しない（契約 §34.6）。呼び出し元は start_session の戻り値だけで、渡されるのは「たった今起動した」セッションに限られる。
       // 戻り値の Session は mark_first_started の非同期コミットより前に読まれて
       // first_started_at === null を持ちうるため、ここで除外すると §4.5 の自己修復が壊れる。
       let changed = false;

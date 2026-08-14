@@ -15,7 +15,7 @@ import { tauriMockScript } from './support/tauriMock';
  *
  * `⚠ ${note}` の前置（`InterruptedOverlay.tsx:41`）は現ビルドのどこにもマウントされて
  * いない（§6.0(a) の 🔴 実測: `InterruptedOverlay` の import/JSX 使用は 0 件）ため、
- * ここでは移さない。カード側（`KanbanCardResume.tsx:58`）は `title={note}` のみで
+ * ここでは移さない。カード側（`KanbanCardResume.tsx:60`）は `title={note}` のみで
  * ⚠ を付けないので、`title` 属性の値だけを見る。
  *
  * fixture の前提（落とすと全 assert が無関係な理由で赤くなる）:
