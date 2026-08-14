@@ -250,10 +250,12 @@ fn plan_agent_spawn_with(
 /// `plan_agent_spawn_with` の実環境版。契約 §18 の公開 API（`probe_login_env` /
 /// `resolve_program`）へ委譲する薄いラッパ（契約 §60.4）。
 ///
-/// `intent` をここにも通してあるのは、実環境の PATH 解決（`resolve_program`）と
-/// ログイン env 探査（`probe_login_env`）へ入る口がこの関数だけだからである
-/// （契約 §123.6 の 2）。M2-4 の `resume_session` はここへ
-/// `SpawnIntent::Resume` を渡す。
+/// `intent` をここにも通してあるのは、agent サーフェスの起動が実環境の PATH 解決
+/// （`resolve_program`）とログイン env 探査（`probe_login_env`）へ入る口が
+/// この関数だからである（契約 §123.6 の 2。editor サーフェスは
+/// `pty::editor::plan_editor_spawn` が別に持つ）。ここへ通さないと M2-4 の
+/// `resume_session` は §18 の 2 つを自前で呼ぶことになり、resume 経路だけが
+/// 別の解決手順を持つ。`resume_session` はここへ `SpawnIntent::Resume` を渡す。
 fn plan_agent_spawn(
     state: &AppState,
     id: &str,
