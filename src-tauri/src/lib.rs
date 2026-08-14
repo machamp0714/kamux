@@ -1513,8 +1513,9 @@ mod tests {
         /// 間に DB 書き込みが無いため、フレークの余地は無い）。一方 `get_session` を
         /// `updated.claude_session_id = None` の直書きへ差し替える変異は、`now_ms()`
         /// がミリ秒解像度で、書き込み後の 2 回の DAO 呼び出しがほぼ同時に起きるため、
-        /// 両者が同じミリ秒に収まった回だけ見逃す（実測: 1 回あたり検知確率 約 1/5〜1/6）。
-        /// 80 回繰り返すことで見逃し確率を無視できる水準まで下げる
+        /// 両者が同じミリ秒に収まった回だけ見逃す（単発の検知確率は低いが無視できない
+        /// 水準にある）。80 回繰り返す根拠は出荷形そのものへの直接測定である ——
+        /// この変異を当てると loop=80 で 10 回連続赤、変異を戻すと 10 回連続緑
         /// （production 側に手を入れず、テスト側だけで判別力を作る）。
         #[test]
         fn apply_session_patch_clears_claude_session_id_and_returns_the_updated_row() {
@@ -1563,8 +1564,9 @@ mod tests {
         /// M2-4 レビュー Important: `session_patch_guard_tests` はガード関数
         /// `validate_session_patch` を**直接**呼ぶだけで、`update_session` コマンドの
         /// 実体である `apply_session_patch` へ捏造 ID を送るテストが無かった
-        /// （`apply_session_patch` から `validate_session_patch(patch)?;` の呼び出し行を
-        /// 消しても `cargo test --workspace` が全緑で通ってしまう）。
+        /// （このテストを追加する前は、`apply_session_patch` から
+        /// `validate_session_patch(patch)?;` の呼び出し行を消しても
+        /// `cargo test --workspace` が全緑で通ってしまっていた）。
         #[test]
         fn apply_session_patch_rejects_a_fabricated_claude_session_id_via_the_command_path() {
             let (_dir, store) = open_temp();
