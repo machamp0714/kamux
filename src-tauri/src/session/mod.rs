@@ -469,6 +469,15 @@ pub async fn resume_session(
     if let Err(err) = spawn_agent_surface_with(&state, &session, spec, |spec, observer| {
         state.pty.spawn_with_observer(&app, spec, observer)
     }) {
+        // 上で記録した試行を破棄する。**PTY が上がらなかった終了は
+        // `PtySink::on_exit` を通らないので `classify_exit` による消費が起きない。**
+        // 残すと、次にこのセッションで起きた非ゼロ終了（`start_session` = 会話
+        // 復元を試みない起動を含む）が `ResumeFailed` に化ける。何を消すかの
+        // 判断は `ResumeTracker` 側にあり（`clear_resume_attempt` の doc）、
+        // ここに在るのは呼び出し 1 行だけである —— この関数はユニットテストから
+        // 到達できないため（契約 §15 / §96.4）、条件をここに書くと外す変異が
+        // 緑になる。
+        state.resume_tracker.clear_resume_attempt(&id);
         state.runtime.sender().mark_error(&id, &err.to_string());
         return Err(err);
     }

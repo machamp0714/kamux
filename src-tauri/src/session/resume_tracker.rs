@@ -68,6 +68,28 @@ impl ResumeTracker {
         );
     }
 
+    /// 記録した試行を破棄する。**PTY が上がらなかったときに呼ぶ**（`resume_session`
+    /// の spawn 失敗腕）。冪等 —— 未知のセッションでは何もしない。
+    ///
+    /// **これが無いと `mark_resume_attempt` の記録が漏れ出す。** 記録は spawn の
+    /// **直前**（契約 §123.6 の 5）なので、spawn が `Err` を返した終了は
+    /// `PtySink::on_exit` を一度も通らず、`classify_exit` による消費が起こらない。
+    /// 残った試行は次にそのセッションで起きた非ゼロ終了 —— たとえば
+    /// `start_session`（会話復元を試みない起動）—— を `ResumeFailed` に化けさせる。
+    /// `mark_resume_attempt` の `FreshStart` ガードが閉じたのと同じ害
+    /// （復元を試みてすらいない起動に「会話は復元されませんでした」が出る）が、
+    /// 別経路で開いたままになる。
+    ///
+    /// **判断をここへ置く理由も `mark_resume_attempt` と同じである。** 呼び出し側の
+    /// `resume_session` は `state.pty.spawn_with_observer`（Wry 固定。契約 §15）を
+    /// 含みユニットテストから到達できない（契約 §96.4）ため、あちらに条件を書くと
+    /// 外す変異が緑になる。ここなら観測できる —— **本体を no-op（`{}`）にする変異は
+    /// `a_cleared_attempt_is_no_longer_classified_as_a_resume_failure` を赤にする
+    /// ことを実測した**（Task 8 の変異 M-11）。
+    pub fn clear_resume_attempt(&self, session_id: &str) {
+        self.lock().remove(session_id);
+    }
+
     /// SessionStart hook 受信時に呼ぶ(source の値によらず)。
     /// 試行が記録されていないセッションでは何もしない。
     pub fn note_session_start(&self, session_id: &str) {
@@ -256,6 +278,43 @@ mod tests {
             },
         );
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
+    }
+
+    /// spawn が失敗した試行は破棄され、次の起動へ持ち越さない。
+    ///
+    /// 破棄しないと、`start_session`(会話復元を試みない起動)の PTY が非ゼロ終了
+    /// しただけで `ResumeFailed` になる —— `mark_resume_attempt` の `FreshStart`
+    /// ガードが閉じた害と同型のものが、spawn 失敗という別経路で開く。
+    ///
+    /// 陽性の対照は
+    /// `resume_attempt_without_session_start_and_nonzero_exit_is_resume_failed`
+    /// が持つ ——**破棄しない同じ入力は `ResumeFailed` になる。** 片側だけだと、
+    /// `classify_exit` が常に `PtyExited` を返しているのか、破棄が効いているのかを
+    /// 区別できない。
+    #[test]
+    fn a_cleared_attempt_is_no_longer_classified_as_a_resume_failure() {
+        let t = ResumeTracker::new();
+        t.mark_resume_attempt(S, &ATTEMPTED);
+        t.clear_resume_attempt(S);
+        assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
+    }
+
+    /// 冪等性: 未知のセッションの破棄は no-op で、幻のエントリも作らない。
+    /// (`classify_exit` の戻り値からは観測できないので `attempts` を直接見る。
+    /// `note_session_start_does_not_create_an_entry_for_an_unknown_session` と同じ形)
+    #[test]
+    fn clearing_an_unknown_session_is_a_no_op() {
+        let t = ResumeTracker::new();
+        t.clear_resume_attempt(S);
+        assert_eq!(t.lock().len(), 0);
+        // 既に破棄済みの試行をもう一度破棄しても、他のセッションを巻き込まない。
+        let other = "22222222-2222-4222-8222-222222222222";
+        t.mark_resume_attempt(other, &ATTEMPTED);
+        t.clear_resume_attempt(S);
+        assert_eq!(
+            t.classify_exit(&format!("{other}:agent"), Some(1)),
+            StateReason::ResumeFailed
+        );
     }
 
     #[test]
