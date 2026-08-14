@@ -219,6 +219,21 @@ impl Store {
         Ok(())
     }
 
+    /// 無効な claude_session_id を破棄する（第1部 §4.2 の回復経路。M2-4）。
+    /// --continue フォールバックで再取得するまでの間、null に戻しておくことで
+    /// 次回の再開判定（`resume_plan`）が誤って `ClaudeResume` に乗らないようにする。
+    pub fn clear_claude_session_id(&self, id: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET claude_session_id = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
     /// runtime_state の表示復元用ヒントを書く（M2-1）。
     /// DAO は Interrupted を弾かない。付与経路の制限（契約 §2）は SessionManager の責務。
     /// error 以外へ遷移したら last_runtime_error を NULL に戻す（契約 §17）。
@@ -2316,5 +2331,115 @@ mod tests {
             other_high_after.sort_order, 2.0,
             "他プロジェクトの行の sort_order が動いた"
         );
+    }
+}
+
+#[cfg(test)]
+mod claude_session_id_tests {
+    use crate::error::AppError;
+    use crate::model::{CliKind, KanbanStatus, SessionMode};
+    use crate::session::cli_args::{resume_plan, ResumePlan};
+    use crate::store::test_support::{insert_test_session, open_temp};
+    use crate::store::{now_ms, Store};
+
+    const ID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const ID_B: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    fn project(store: &Store) -> String {
+        store
+            .insert_project("kamux", "/repo", CliKind::Claude)
+            .expect("project")
+            .id
+    }
+
+    /// 一時 DB にプロジェクト 1 件とセッション 1 件を作り、session_id を返す。
+    /// TempDir を呼び出し側で束縛し続けさせるため、そのまま返す。
+    fn fixture() -> (tempfile::TempDir, Store, String) {
+        let (dir, store) = open_temp();
+        let pid = project(&store);
+        let session = insert_test_session(&store, &pid, "fix login");
+        (dir, store, session.id)
+    }
+
+    #[test]
+    fn newly_created_session_has_no_claude_session_id() {
+        let (_dir, store, id) = fixture();
+        let s = store.get_session(&id).expect("get");
+        assert_eq!(s.claude_session_id, None);
+    }
+
+    /// --resume 経路では同じ ID が来る（契約 §12.6）。冪等であることを固定する。
+    /// set_claude_session_id_persists_and_overwrites（本ファイル上部）は上書きのみ見ており、
+    /// 同一 ID の再設定は別の分岐なので固定しておく。
+    #[test]
+    fn set_with_the_same_id_is_idempotent() {
+        let (_dir, store, id) = fixture();
+        store.set_claude_session_id(&id, ID_A).expect("set");
+        store.set_claude_session_id(&id, ID_A).expect("set again");
+        let s = store.get_session(&id).expect("get");
+        assert_eq!(s.claude_session_id.as_deref(), Some(ID_A));
+    }
+
+    /// 第1部 §3.1: --continue フォールバックの自己修復。
+    /// clear（無効 ID 破棄 or 未捕捉）→ --continue 起動 → 新 ID 書き戻し、で
+    /// 次回は --resume 経路に戻れる状態になる。
+    /// insert_test_session は CliKind::Shell 固定で resume_plan が FreshStart になってしまう
+    /// ため、ここだけ Session::new_backlog を直接使って CliKind::Claude にする。
+    #[test]
+    fn continue_fallback_repairs_itself_after_write_back() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let sort_order = store
+            .next_sort_order(&pid, KanbanStatus::Backlog)
+            .expect("next_sort_order");
+        let session = crate::model::Session::new_backlog(
+            &pid,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/fix-login".to_owned()),
+            CliKind::Claude,
+            None,
+            sort_order,
+            now_ms(),
+        );
+        let session = store.insert_session(&session).expect("insert");
+        let id = session.id;
+
+        store.clear_claude_session_id(&id).expect("clear");
+        assert_eq!(store.get_session(&id).expect("get").claude_session_id, None);
+
+        // --continue で起動した claude の SessionStart が新 ID を返す
+        store.set_claude_session_id(&id, ID_B).expect("write back");
+
+        let s = store.get_session(&id).expect("get");
+        assert_eq!(s.claude_session_id.as_deref(), Some(ID_B));
+        // 次回の再開は分岐表 行 1（ClaudeResume）に乗る
+        assert_eq!(
+            resume_plan(&s),
+            ResumePlan::ClaudeResume {
+                claude_session_id: ID_B.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn clear_sets_it_back_to_null() {
+        let (_dir, store, id) = fixture();
+        store.set_claude_session_id(&id, ID_A).expect("set");
+        store.clear_claude_session_id(&id).expect("clear");
+        let s = store.get_session(&id).expect("get");
+        assert_eq!(s.claude_session_id, None);
+    }
+
+    /// set 側の同種テスト（setting_claude_session_id_for_unknown_session_is_not_found、
+    /// 本ファイル上部）はあるが、clear 側の不在チェックはどこにも無い。
+    #[test]
+    fn clear_on_missing_session_is_not_found() {
+        let (_dir, store) = open_temp();
+        let err = store
+            .clear_claude_session_id("99999999-9999-4999-8999-999999999999")
+            .expect_err("should fail");
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }
