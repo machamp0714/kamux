@@ -250,6 +250,8 @@
 | 187 | 2026-08-14 | — | M2-4 引き継ぎ | **`origin/main` が作業ブランチの祖先でないことを team-lead が見落とした**（merge-base = `ead958f`、main は `1f3d7c1`）。**契約 §101.2 の P1 でマージ手順に入る側が `git merge origin/main` を当てる必要がある。** 後継レーンが着手前スキャンで見つけて申告した | `SKILL.md` | — |
 | 188 | 2026-08-14 | stage5 | PR #76 | **持ち越し `minor (deferred)` の最終判定者と判定タイミングが定義に無い。** PR 単位レビューの dispatch が個別に指示して初めて 10 件が判定された（`lane-controller.md` はフェーズ最終報告での「列挙」しか持たない） | `lane-controller.md` | — |
 | 189 | 2026-08-14 | stage5 | PR #76 | **production の doc コメントへ絶対テスト本数（`750 passed`）が測定日もコミットも無しで焼かれ、マージ時点の実測 767 と食い違った。** 同種は同 PR の Task 4 でも起きており 2 回目 | `rust-implementer.md` / `web-implementer.md` | — |
+| 190 | 2026-08-14 | — | PR #76 | **production の doc が引用する測定コミット（`424d8a2`）が、squash マージのため `origin/main` から到達不能になった**（`git merge-base --is-ancestor 424d8a2 origin/main` = 偽）。**断定そのものは正しく、壊れているのは引用の形だけである。** #189（測定日もコミットも無い絶対テスト本数を doc に焼いた）の手当てが次の穴を作った形。マージ後に advisor 指摘で発覚し、直せず Task 8 への申し送りになった | `rust-implementer.md` / `web-implementer.md` | — |
+| 191 | 2026-08-14 | — | PR #76 | **team-lead が作った `.claude/worktrees/team-lead`（main を checkout）が、レーンの `gh pr merge --delete-branch` を `fatal: 'main' is already used by worktree` で失敗させた。** GitHub 側のマージと検証 D は成立しており実害はローカルのブランチ削除だけだが、**レーンは「マージが失敗した」と読める出力を受け取る**（台帳 #118 と同型 —— worktree から `gh pr merge` を打つと成功しても失敗に見える） | `SKILL.md` | — |
 
 **`ステージ` 列は棄却判定に要る。** 「初出からいくつステージを跨いだか」は、日付や PR 番号からは求まらない（ステージは日付でも PR 番号でも区切られない）。**レーンの外で行った作業は `—` と書く**（次のステージ完了ゲートを 1 つ目として数える）。
 
