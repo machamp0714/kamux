@@ -1,5 +1,6 @@
 pub mod cli_args;
 pub mod heuristics;
+pub mod resume_tracker;
 pub mod runtime_state;
 pub mod workspace;
 
