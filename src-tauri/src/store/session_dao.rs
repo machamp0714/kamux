@@ -1747,9 +1747,9 @@ mod tests {
 
     #[test]
     fn setters_only_modify_the_targeted_session_row() {
-        // 5 つのセッタ（set_worktree / set_claude_session_id / set_last_runtime_state /
-        // set_runtime_error / mark_first_started）はどれも `WHERE id = ?1` で
-        // 対象行を絞っている。DB に 1 行しかないテストでは、この WHERE 句を
+        // 6 つのセッタ（set_worktree / set_claude_session_id / clear_claude_session_id /
+        // set_last_runtime_state / set_runtime_error / mark_first_started）はどれも
+        // `WHERE id = ?1` で対象行を絞っている。DB に 1 行しかないテストでは、この WHERE 句を
         // 丸ごと落として「全行 UPDATE」に退行しても、対象行と全行の結果が
         // 一致してしまい検出できない。2 行目（bystander）を用意し、
         // 各セッタを呼ぶたびに bystander が無変化のままであることを
@@ -1757,7 +1757,12 @@ mod tests {
         let (_dir, store) = open_temp();
         let pid = project(&store);
         let target = session_with_sentinel_updated_at(&pid, "sid-target");
-        let bystander = session_with_sentinel_updated_at(&pid, "sid-bystander");
+        // bystander の claude_session_id は insert 時点で非 None の値を仕込む。
+        // set_claude_session_id 経由で後から仕込むと、そのセッタ自身が bystander の
+        // updated_at を動かしてしまい、下の update_session の sentinel 検査
+        // （updated_at == 1）を壊す。
+        let mut bystander = session_with_sentinel_updated_at(&pid, "sid-bystander");
+        bystander.claude_session_id = Some("cc-bystander-sentinel".to_owned());
         store.insert_session(&target).expect("insert target");
         store.insert_session(&bystander).expect("insert bystander");
 
@@ -1783,9 +1788,29 @@ mod tests {
             .expect("set_claude_session_id");
         let after_claude = store.get_session(&bystander.id).expect("get");
         assert_eq!(
-            after_claude.claude_session_id, None,
+            after_claude.claude_session_id,
+            Some("cc-bystander-sentinel".to_string()),
             "set_claude_session_id が無関係な行の claude_session_id を書き換えた"
         );
+
+        // clear は「NULL 化」なので、bystander が事前に持つ非 None の値（insert 時に
+        // 仕込んだ sentinel）が変化しないことを見て初めて WHERE 句の退行を検出できる。
+        // None のまま比較すると None == None の恒真になる。
+        store
+            .clear_claude_session_id(&target.id)
+            .expect("clear_claude_session_id");
+        let after_clear = store.get_session(&bystander.id).expect("get");
+        assert_eq!(
+            after_clear.claude_session_id,
+            Some("cc-bystander-sentinel".to_string()),
+            "clear_claude_session_id が無関係な行の claude_session_id を NULL 化した"
+        );
+        // target 側は clear によって claude_session_id が None に戻っているはず。
+        // 以降の target_after 検査（cc-target を期待）と整合させるため、実際の
+        // 運用経路（--continue で再取得した ID を set し直す）に沿って書き戻す。
+        store
+            .set_claude_session_id(&target.id, "cc-target")
+            .expect("set_claude_session_id restore after clear");
 
         store
             .set_last_runtime_state(&target.id, RuntimeState::Running)
