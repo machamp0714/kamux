@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, State, WindowEvent};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
 use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
@@ -95,8 +95,21 @@ async fn update_session(
 ///
 /// 範囲検証（`silence_timeout_secs`）は `Store::update_session` が DB 書き込みより前に
 /// 済ませている。**ここで二重に呼ばない。**
+///
+/// M2-4: `claude_session_id` のクリアは **`update_session` の後**に行う。
+/// `Store::update_session` は範囲外の `silence_timeout_secs` を DB 書き込みの前に
+/// `?` で弾くため、先にクリアしてしまうと「パッチ全体は拒否されたのに
+/// `claude_session_id` だけ消える」という部分書き込みが起きる
+/// （`apply_session_patch_rejects_the_whole_patch_and_leaves_claude_session_id_intact_when_silence_timeout_is_out_of_range`
+/// が観測点）。クリア後に `get_session` で読み直すのは、`clear_claude_session_id` が
+/// `updated_at` も動かすため、戻り値を DB の最新行と一致させるため。
 fn apply_session_patch(state: &AppState, id: &str, patch: &SessionPatch) -> AppResult<Session> {
-    let updated = state.store.update_session(id, patch)?;
+    validate_session_patch(patch)?;
+    let mut updated = state.store.update_session(id, patch)?;
+    if matches!(patch.claude_session_id, Some(None)) {
+        state.store.clear_claude_session_id(id)?;
+        updated = state.store.get_session(id)?;
+    }
     // M3-3: 実行中のセッションへ即座に反映する。**DB 書き込みの後**に置くこと ——
     // 反映する値は「パッチの中身」ではなく「書き込み後の行」である（部分更新なので、
     // 片方だけ来たパッチからもう片方の現在値は分からない）。
@@ -108,6 +121,56 @@ fn apply_session_patch(state: &AppState, id: &str, patch: &SessionPatch) -> AppR
             .reconfigure(id, updated.heuristics_enabled, updated.silence_timeout_secs);
     }
     Ok(updated)
+}
+
+/// `SessionPatch` の書き込み権限を検証する。
+/// `claude_session_id` は hooks から導出されるシステム値なので、
+/// フロントには「消す」権限だけを与える（第1部 §4.9）。
+pub fn validate_session_patch(patch: &SessionPatch) -> AppResult<()> {
+    if let Some(Some(_)) = patch.claude_session_id {
+        return Err(AppError::InvalidState(
+            "claude_session_id can only be cleared, not set".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_patch_guard_tests {
+    use super::*;
+    use crate::error::AppError;
+    use crate::model::SessionPatch;
+
+    #[test]
+    fn clearing_claude_session_id_is_allowed() {
+        let patch = SessionPatch {
+            claude_session_id: Some(None),
+            ..Default::default()
+        };
+        assert!(validate_session_patch(&patch).is_ok());
+    }
+
+    /// 第1部 §4.9: フロントから任意の値を書けると捏造 ID が DB に入る。
+    #[test]
+    fn setting_claude_session_id_is_rejected() {
+        let patch = SessionPatch {
+            claude_session_id: Some(Some("fabricated".to_string())),
+            ..Default::default()
+        };
+        let err = validate_session_patch(&patch).expect_err("should be rejected");
+        match err {
+            AppError::InvalidState(msg) => {
+                assert!(msg.contains("claude_session_id"), "got {msg}");
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn omitting_the_field_is_allowed() {
+        let patch = SessionPatch::default();
+        assert!(validate_session_patch(&patch).is_ok());
+    }
 }
 
 #[tauri::command]
@@ -1401,6 +1464,138 @@ mod tests {
             assert!(
                 format!("{activity:?}").contains("silence_timeout_ms: 120000"),
                 "オン/オフだけのパッチで沈黙タイムアウトが巻き戻っている: {activity:?}"
+            );
+        }
+
+        /// M2-4: クリア要求（`Some(None)`）と範囲外 `silence_timeout_secs` が同じパッチに
+        /// 混ざったとき、`Store::update_session` の範囲検証が DB 書き込みより前に `?` で
+        /// 抜けるため、`claude_session_id` のクリアも実行されてはならない
+        /// （先にクリアしてから patch を当てる実装だと、この検証だけが赤くなる）。
+        #[test]
+        fn apply_session_patch_rejects_the_whole_patch_and_leaves_claude_session_id_intact_when_silence_timeout_is_out_of_range(
+        ) {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+            store
+                .set_claude_session_id(&session.id, "abc123")
+                .expect("set_claude_session_id");
+
+            let state = crate::state::test_support::app_state(store);
+            let err = super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    claude_session_id: Some(None),
+                    silence_timeout_secs: Some(99999),
+                    ..Default::default()
+                },
+            )
+            .expect_err("範囲外の silence_timeout_secs は拒否されるべき");
+            assert!(matches!(err, AppError::InvalidState(_)), "got {err:?}");
+
+            let row = state.store.get_session(&session.id).expect("get_session");
+            assert_eq!(
+                row.claude_session_id,
+                Some("abc123".to_string()),
+                "拒否されたパッチの一部（クリア）だけが先に書き込まれてはいけない"
+            );
+        }
+
+        /// M2-4: クリアが実際に DB へ効き、戻り値の `Session.claude_session_id` が
+        /// 書き込み後の行（`get_session` で読み直した値）から取り直されていること。
+        ///
+        /// `updated.updated_at == row.updated_at` は、正しい実装では**必ず**成立する
+        /// （`apply_session_patch` 内の `get_session` とこのテストの `get_session` の
+        /// 間に DB 書き込みが無いため、フレークの余地は無い）。一方 `get_session` を
+        /// `updated.claude_session_id = None` の直書きへ差し替える変異は、`now_ms()`
+        /// がミリ秒解像度で、書き込み後の 2 回の DAO 呼び出しがほぼ同時に起きるため、
+        /// 両者が同じミリ秒に収まった回だけ見逃す（単発の検知確率は低いが無視できない
+        /// 水準にある）。80 回繰り返す根拠は出荷形そのものへの直接測定である ——
+        /// この変異を当てると loop=80 で 10 回連続赤、変異を戻すと 10 回連続緑
+        /// （production 側に手を入れず、テスト側だけで判別力を作る）。
+        #[test]
+        fn apply_session_patch_clears_claude_session_id_and_returns_the_updated_row() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let state = crate::state::test_support::app_state(store);
+
+            for i in 0..80 {
+                let session = insert_test_session(&state.store, &project_id, &format!("live-{i}"));
+                state
+                    .store
+                    .set_claude_session_id(&session.id, "abc123")
+                    .expect("set_claude_session_id");
+
+                let updated = super::super::apply_session_patch(
+                    &state,
+                    &session.id,
+                    &crate::model::SessionPatch {
+                        claude_session_id: Some(None),
+                        ..Default::default()
+                    },
+                )
+                .expect("patch");
+                assert_eq!(
+                    updated.claude_session_id, None,
+                    "戻り値でクリアが反映されていない（iteration {i}）"
+                );
+
+                let row = state.store.get_session(&session.id).expect("get_session");
+                assert_eq!(
+                    row.claude_session_id, None,
+                    "DB でクリアが反映されていない（iteration {i}）"
+                );
+                assert_eq!(
+                    updated.updated_at, row.updated_at,
+                    "戻り値の updated_at が DB の最新行と一致していない（iteration {i}）: \
+                     get_session で読み直さず updated.claude_session_id を直書きすると \
+                     更新前の updated_at のまま返ってしまう"
+                );
+            }
+        }
+
+        /// M2-4 レビュー Important: `session_patch_guard_tests` はガード関数
+        /// `validate_session_patch` を**直接**呼ぶだけで、`update_session` コマンドの
+        /// 実体である `apply_session_patch` へ捏造 ID を送るテストが無かった
+        /// （このテストを追加する前は、`apply_session_patch` から
+        /// `validate_session_patch(patch)?;` の呼び出し行を消しても
+        /// `cargo test --workspace` が全緑で通ってしまっていた）。
+        #[test]
+        fn apply_session_patch_rejects_a_fabricated_claude_session_id_via_the_command_path() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+            store
+                .set_claude_session_id(&session.id, "abc123")
+                .expect("set_claude_session_id");
+
+            let state = crate::state::test_support::app_state(store);
+            let err = super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    claude_session_id: Some(Some("fabricated".to_string())),
+                    ..Default::default()
+                },
+            )
+            .expect_err("捏造 ID の設定はコマンド経路でも拒否されるべき");
+            assert!(matches!(err, AppError::InvalidState(_)), "got {err:?}");
+
+            let row = state.store.get_session(&session.id).expect("get_session");
+            assert_eq!(
+                row.claude_session_id,
+                Some("abc123".to_string()),
+                "拒否されたパッチで claude_session_id が書き換わってはいけない"
             );
         }
 

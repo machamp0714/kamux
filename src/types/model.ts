@@ -63,6 +63,8 @@ export interface SessionPatch {
   // Rust の SessionPatch（src-tauri/src/model.rs）に同じ Task 10 で 2 フィールドが入ったため揃えた。
   heuristics_enabled?: boolean;
   silence_timeout_secs?: number;
+  /** クリア専用。null 以外を渡すと invalid_state で拒否される */
+  claude_session_id?: null;
 }
 
 export type AppErrorCode =

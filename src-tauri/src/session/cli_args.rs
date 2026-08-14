@@ -1,9 +1,50 @@
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::error::{AppError, AppResult};
 use crate::hooks_srv::HooksRuntime;
-use crate::model::{CliKind, Session};
+use crate::model::{CliKind, Session, SessionMode};
 use crate::pty::launch_env::LaunchEnv;
+
+/// 再開時にどうやって会話を復元するかの決定(第1部 §3 分岐表)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ResumePlan {
+    ClaudeResume { claude_session_id: String },
+    ClaudeContinue,
+    FreshStart { reason: FreshStartReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshStartReason {
+    /// claude / in_place / claude_session_id 欠損。
+    /// 同一 cwd に複数セッションが同居しうるため --continue を使わない。
+    AmbiguousInPlaceConversation,
+    /// cli_kind が会話復元に対応しない(shell / custom / codex)。
+    NoConversationRestore,
+}
+
+/// 第1部 §3 の分岐表をそのまま実装した純粋関数。
+/// ファイルシステム・環境変数・時刻に一切触れない。
+pub fn resume_plan(session: &Session) -> ResumePlan {
+    match session.cli_kind {
+        CliKind::Claude => match (&session.claude_session_id, session.mode) {
+            (Some(id), _) => ResumePlan::ClaudeResume {
+                claude_session_id: id.clone(),
+            },
+            (None, SessionMode::Worktree) => ResumePlan::ClaudeContinue,
+            (None, SessionMode::InPlace) => ResumePlan::FreshStart {
+                reason: FreshStartReason::AmbiguousInPlaceConversation,
+            },
+        },
+        // codex は resume フラグが未確認のため、保守的に会話復元を試みない。
+        CliKind::Codex | CliKind::Shell | CliKind::Custom => ResumePlan::FreshStart {
+            reason: FreshStartReason::NoConversationRestore,
+        },
+    }
+}
 
 /// PTY で起動するプログラム・引数・作業ディレクトリ・追加環境変数（契約 §23）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +64,26 @@ pub enum ResumeMode<'a> {
     Continue,
     /// claude --resume <id>
     SessionId(&'a str),
+}
+
+/// `resume_plan()` の決定を `build_launch_command` が受け取る形へ移す**純粋関数**。
+///
+/// 戻り値の `ResumeMode<'_>` は引数の `ResumePlan` が持つ `String` を借りるので、
+/// 呼び出し側は `ResumePlan` を先に `let` で束縛してからこの関数を呼ぶ
+/// （一時値のままだと文の終わりで drop される）。
+///
+/// **`cli_kind` をここで見ない。** 分岐表(第1部 §3)の判断は `resume_plan()` が
+/// 1 箇所で持っており、この関数はその決定を写すだけである。`FreshStart` は
+/// 理由によらず `ResumeMode::None` へ落ちる —— codex / shell / custom は
+/// `resume_plan()` が必ず `FreshStart` を返す(行 5〜16)ので、
+/// `build_launch_command` の `CliKind::Claude | CliKind::Codex` の腕へ
+/// 非 `None` の `ResumeMode` が届く経路ができない。
+pub fn resume_mode(plan: &ResumePlan) -> ResumeMode<'_> {
+    match plan {
+        ResumePlan::ClaudeResume { claude_session_id } => ResumeMode::SessionId(claude_session_id),
+        ResumePlan::ClaudeContinue => ResumeMode::Continue,
+        ResumePlan::FreshStart { .. } => ResumeMode::None,
+    }
 }
 
 /// `cli_kind` が必要とする実行ファイル名。**純粋関数**。
@@ -1039,5 +1100,295 @@ pub(crate) mod tests {
             );
             seen.push(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_plan_tests {
+    use super::*;
+    use crate::model::{CliKind, KanbanStatus, RuntimeState, Session, SessionMode};
+
+    /// テスト用の Session を組み立てる。分岐に関係するフィールドだけ引数で受ける。
+    fn session(cli_kind: CliKind, claude_session_id: Option<&str>, mode: SessionMode) -> Session {
+        Session {
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+            project_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            title: "fix login".to_string(),
+            description: String::new(),
+            kanban_status: KanbanStatus::InProgress,
+            sort_order: 1.0,
+            mode,
+            branch: match mode {
+                SessionMode::Worktree => Some("session/fix-login".to_string()),
+                SessionMode::InPlace => None,
+            },
+            worktree_path: match mode {
+                SessionMode::Worktree => Some("/repo/.worktrees/session-fix-login".to_string()),
+                SessionMode::InPlace => None,
+            },
+            cli_kind,
+            cli_command: match cli_kind {
+                CliKind::Custom => Some("my-agent --flag".to_string()),
+                _ => None,
+            },
+            claude_session_id: claude_session_id.map(|s| s.to_string()),
+            last_runtime_state: RuntimeState::Interrupted,
+            last_runtime_error: None,
+            first_started_at: None,
+            heuristics_enabled: true,
+            silence_timeout_secs: 30,
+            archived_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    const ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// 第1部 §3 分岐表の 16 行。行 17(`custom` + `cli_command == None`)は
+    /// `resume_plan` の射程外であり、`build_launch_command` の Custom 腕へ委譲される
+    /// (下の `branch_table_row_17_is_rejected_by_build_launch_command`)。
+    #[test]
+    fn covers_every_row_of_the_branch_table() {
+        use CliKind::*;
+        use FreshStartReason::*;
+        use SessionMode::*;
+
+        let cases: Vec<(u32, CliKind, Option<&str>, SessionMode, ResumePlan)> = vec![
+            (
+                1,
+                Claude,
+                Some(ID),
+                Worktree,
+                ResumePlan::ClaudeResume {
+                    claude_session_id: ID.to_string(),
+                },
+            ),
+            (
+                2,
+                Claude,
+                Some(ID),
+                InPlace,
+                ResumePlan::ClaudeResume {
+                    claude_session_id: ID.to_string(),
+                },
+            ),
+            (3, Claude, None, Worktree, ResumePlan::ClaudeContinue),
+            (
+                4,
+                Claude,
+                None,
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: AmbiguousInPlaceConversation,
+                },
+            ),
+            (
+                5,
+                Codex,
+                Some(ID),
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                6,
+                Codex,
+                Some(ID),
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                7,
+                Codex,
+                None,
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                8,
+                Codex,
+                None,
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                9,
+                Shell,
+                Some(ID),
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                10,
+                Shell,
+                Some(ID),
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                11,
+                Shell,
+                None,
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                12,
+                Shell,
+                None,
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                13,
+                Custom,
+                Some(ID),
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                14,
+                Custom,
+                Some(ID),
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                15,
+                Custom,
+                None,
+                Worktree,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+            (
+                16,
+                Custom,
+                None,
+                InPlace,
+                ResumePlan::FreshStart {
+                    reason: NoConversationRestore,
+                },
+            ),
+        ];
+
+        assert_eq!(cases.len(), 16, "分岐表の行が欠けている");
+
+        for (row, cli_kind, csid, mode, expected) in cases {
+            let actual = resume_plan(&session(cli_kind, csid, mode));
+            assert_eq!(actual, expected, "分岐表 行 {row} が一致しない");
+        }
+    }
+
+    /// 第1部 §3 分岐表の 16 行を `ResumeMode` まで通した対応表。
+    ///
+    /// 上の `covers_every_row_of_the_branch_table` が `Session` -> `ResumePlan` を
+    /// 固定するのに対し、こちらは `resume_plan()` -> `resume_mode()` の合成を固定する。
+    /// `ResumeMode` から先(`program` / `args`)は `build_launch_command` の既存テスト群が
+    /// 持っているので、ここでは列を持たない。
+    #[test]
+    fn resume_mode_covers_every_row_of_the_branch_table() {
+        use CliKind::*;
+        use SessionMode::*;
+
+        let cases: Vec<(u32, CliKind, Option<&str>, SessionMode, ResumeMode<'_>)> = vec![
+            (1, Claude, Some(ID), Worktree, ResumeMode::SessionId(ID)),
+            (2, Claude, Some(ID), InPlace, ResumeMode::SessionId(ID)),
+            (3, Claude, None, Worktree, ResumeMode::Continue),
+            (4, Claude, None, InPlace, ResumeMode::None),
+            (5, Codex, Some(ID), Worktree, ResumeMode::None),
+            (6, Codex, Some(ID), InPlace, ResumeMode::None),
+            (7, Codex, None, Worktree, ResumeMode::None),
+            (8, Codex, None, InPlace, ResumeMode::None),
+            (9, Shell, Some(ID), Worktree, ResumeMode::None),
+            (10, Shell, Some(ID), InPlace, ResumeMode::None),
+            (11, Shell, None, Worktree, ResumeMode::None),
+            (12, Shell, None, InPlace, ResumeMode::None),
+            (13, Custom, Some(ID), Worktree, ResumeMode::None),
+            (14, Custom, Some(ID), InPlace, ResumeMode::None),
+            (15, Custom, None, Worktree, ResumeMode::None),
+            (16, Custom, None, InPlace, ResumeMode::None),
+        ];
+
+        assert_eq!(cases.len(), 16, "分岐表の行が欠けている");
+
+        for (row, cli_kind, csid, mode, expected) in cases {
+            let plan = resume_plan(&session(cli_kind, csid, mode));
+            assert_eq!(resume_mode(&plan), expected, "分岐表 行 {row} が一致しない");
+        }
+    }
+
+    /// 分岐表 行 5〜8。codex は resume フラグ体系が未実測(契約 §12.6 の表は claude の
+    /// 実測しか持たない)なので、`build_launch_command` の
+    /// `CliKind::Claude | CliKind::Codex` の腕へ非 `None` の `ResumeMode` が届かない
+    /// ことを、`cli_kind` の分岐ではなく `resume_plan` の出力の側で固定する。
+    #[test]
+    fn codex_never_receives_a_non_none_resume_mode() {
+        for (csid, mode) in [
+            (Some(ID), SessionMode::Worktree),
+            (Some(ID), SessionMode::InPlace),
+            (None, SessionMode::Worktree),
+            (None, SessionMode::InPlace),
+        ] {
+            let plan = resume_plan(&session(CliKind::Codex, csid, mode));
+            assert_eq!(
+                resume_mode(&plan),
+                ResumeMode::None,
+                "codex へ非 None の ResumeMode が渡る経路ができている ({csid:?} / {mode:?})"
+            );
+        }
+    }
+
+    /// 分岐表 行 17。`resume_plan` はここを扱わず、`build_launch_command` の Custom 腕へ
+    /// 委譲する —— 委譲先が `AppError::InvalidState` を返すことをこのテストが固定する。
+    #[test]
+    fn branch_table_row_17_is_rejected_by_build_launch_command() {
+        let mut target = session(CliKind::Custom, None, SessionMode::Worktree);
+        target.cli_command = None;
+        let plan = resume_plan(&target);
+
+        let err = build_launch_command(
+            &target,
+            "/bin/zsh",
+            Path::new("/work"),
+            &LaunchEnv {
+                path: "/fake/bin".to_string(),
+                lang: "ja_JP.UTF-8".to_string(),
+            },
+            resume_mode(&plan),
+        )
+        .expect_err("行 17 は cli_command が無いので起動コマンドを組めない");
+        assert!(matches!(err, AppError::InvalidState(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn in_place_claude_without_id_never_uses_continue() {
+        let plan = resume_plan(&session(CliKind::Claude, None, SessionMode::InPlace));
+        assert_ne!(
+            plan,
+            ResumePlan::ClaudeContinue,
+            "in_place で --continue を選ぶと別セッションの会話に誤結合する"
+        );
     }
 }

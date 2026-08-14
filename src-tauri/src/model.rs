@@ -206,6 +206,9 @@ pub struct SessionPatch {
     pub heuristics_enabled: Option<bool>,
     #[serde(default)]
     pub silence_timeout_secs: Option<u32>,
+    /// システム由来値。クリア（Some(None)）のみ許可し、値の設定は拒否する（第1部 §4.9）。
+    #[serde(default, deserialize_with = "double_option")]
+    pub claude_session_id: Option<Option<String>>,
 }
 
 #[cfg(test)]
@@ -437,6 +440,26 @@ mod tests {
             set.archived_at,
             Some(Some(1700000000000)),
             "数値 = アーカイブ"
+        );
+    }
+
+    /// M2-4: `claude_session_id` は `archived_at` と同じ 3 分岐（不在 / null / 値あり）を
+    /// 区別しなければならない（`deserialize_with = "double_option"` が要る理由）。
+    #[test]
+    fn session_patch_distinguishes_absent_null_and_value_for_claude_session_id() {
+        let absent: SessionPatch = serde_json::from_str(r#"{"title":"t"}"#).expect("deserialize");
+        assert_eq!(absent.claude_session_id, None, "不在 = 変更しない");
+
+        let cleared: SessionPatch =
+            serde_json::from_str(r#"{"claude_session_id":null}"#).expect("deserialize");
+        assert_eq!(cleared.claude_session_id, Some(None), "null = クリア要求");
+
+        let set: SessionPatch =
+            serde_json::from_str(r#"{"claude_session_id":"abc"}"#).expect("deserialize");
+        assert_eq!(
+            set.claude_session_id,
+            Some(Some("abc".to_string())),
+            "値あり = 設定要求（validate_session_patch が拒否する）"
         );
     }
 
