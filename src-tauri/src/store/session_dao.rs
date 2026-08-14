@@ -2407,7 +2407,11 @@ mod claude_session_id_tests {
         let id = session.id;
 
         store.clear_claude_session_id(&id).expect("clear");
-        assert_eq!(store.get_session(&id).expect("get").claude_session_id, None);
+        let cleared = store.get_session(&id).expect("get");
+        assert_eq!(cleared.claude_session_id, None);
+        // clear の目的そのもの: claude_session_id を消すことで、次回起動が
+        // 誤って ClaudeResume（無効な ID を渡す）ではなく ClaudeContinue に落ちる。
+        assert_eq!(resume_plan(&cleared), ResumePlan::ClaudeContinue);
 
         // --continue で起動した claude の SessionStart が新 ID を返す
         store.set_claude_session_id(&id, ID_B).expect("write back");
@@ -2423,13 +2427,38 @@ mod claude_session_id_tests {
         );
     }
 
+    /// updated_at をセンチネル値 1 で挿入し、set を経由せず直接 claude_session_id 付きで
+    /// 作る（§38.2 と同じ手筋。兄弟セッタ set_claude_session_id_persists_and_overwrites を
+    /// 参照）ことで、「clear 自身が updated_at を動かすか」を set の副作用と混同せず見る。
     #[test]
-    fn clear_sets_it_back_to_null() {
-        let (_dir, store, id) = fixture();
-        store.set_claude_session_id(&id, ID_A).expect("set");
+    fn clear_sets_it_back_to_null_and_moves_updated_at() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let sort_order = store
+            .next_sort_order(&pid, KanbanStatus::Backlog)
+            .expect("next_sort_order");
+        let mut session = crate::model::Session::new_backlog(
+            &pid,
+            "fix login",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Shell,
+            None,
+            sort_order,
+            1,
+        );
+        session.claude_session_id = Some(ID_A.to_owned());
+        let session = store.insert_session(&session).expect("insert");
+        let id = session.id;
+
         store.clear_claude_session_id(&id).expect("clear");
         let s = store.get_session(&id).expect("get");
         assert_eq!(s.claude_session_id, None);
+        assert!(
+            s.updated_at > 1,
+            "updated_at が動いていない（センチネル値 1 のまま）"
+        );
     }
 
     /// set 側の同種テスト（setting_claude_session_id_for_unknown_session_is_not_found、
