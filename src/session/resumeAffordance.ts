@@ -45,7 +45,7 @@ export function resumeAffordance(session: Session): ResumeAffordance {
     };
   }
 
-  // in_place は同一 cwd に複数会話がありうるため --continue を使わない（第1部 §4.1）
+  // in_place は同一 cwd に複数会話がありうるため --continue を使わない（§4.1）
   return {
     plan: { kind: 'fresh_start', reason: 'ambiguous_in_place_conversation' },
     label: '新しい会話で開始',
