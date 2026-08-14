@@ -40,11 +40,27 @@ fn tracker_classifies_the_fake_agent_exit_as_resume_failed() {
         .output()
         .expect("fake agent should run");
 
+    // フィクスチャが存在しない/差し替えられている場合、/bin/sh は 127 のような
+    // 別の非ゼロ終了コードを返す。それでも classify_exit は「非ゼロなら
+    // ResumeFailed」の 1 ビットしか見ないため、下の assert_eq! だけでは
+    // フィクスチャ不在を判別できない(このフィクスチャが表す「exit 3」の
+    // 主張を独立に固定する)。
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "終了コードが契約と違う(フィクスチャが想定と別物になっている)"
+    );
+
+    // session_id(map のキー)と claude_session_id(ResumePlan の中身)は
+    // 同じ String 型で名前も同義に読めるため、意図的に別値にしておく
+    // (契約 §81.2 条件 1・2)。同値のままだと、tracker が誤って
+    // claude_session_id をキーに使っていても本テストは気づけない。
+    let claude_session_id = "550e8400-e29b-41d4-a716-446655440000";
     let tracker = ResumeTracker::new();
     tracker.mark_resume_attempt(
         SID,
         &ResumePlan::ClaudeResume {
-            claude_session_id: SID.to_string(),
+            claude_session_id: claude_session_id.to_string(),
         },
     );
     // SessionStart は届かない(fake-agent が発火しない)
