@@ -66,6 +66,26 @@ pub enum ResumeMode<'a> {
     SessionId(&'a str),
 }
 
+/// `resume_plan()` の決定を `build_launch_command` が受け取る形へ移す**純粋関数**。
+///
+/// 戻り値の `ResumeMode<'_>` は引数の `ResumePlan` が持つ `String` を借りるので、
+/// 呼び出し側は `ResumePlan` を先に `let` で束縛してからこの関数を呼ぶ
+/// （一時値のままだと文の終わりで drop される）。
+///
+/// **`cli_kind` をここで見ない。** 分岐表(第1部 §3)の判断は `resume_plan()` が
+/// 1 箇所で持っており、この関数はその決定を写すだけである。`FreshStart` は
+/// 理由によらず `ResumeMode::None` へ落ちる —— codex / shell / custom は
+/// `resume_plan()` が必ず `FreshStart` を返す(行 5〜16)ので、
+/// `build_launch_command` の `CliKind::Claude | CliKind::Codex` の腕へ
+/// 非 `None` の `ResumeMode` が届く経路ができない。
+pub fn resume_mode(plan: &ResumePlan) -> ResumeMode<'_> {
+    match plan {
+        ResumePlan::ClaudeResume { claude_session_id } => ResumeMode::SessionId(claude_session_id),
+        ResumePlan::ClaudeContinue => ResumeMode::Continue,
+        ResumePlan::FreshStart { .. } => ResumeMode::None,
+    }
+}
+
 /// `cli_kind` が必要とする実行ファイル名。**純粋関数**。
 /// Shell / Custom はログインシェル自身を起動するので None。
 pub fn binary_name(cli_kind: CliKind) -> Option<&'static str> {
@@ -1125,7 +1145,9 @@ mod resume_plan_tests {
 
     const ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-    /// 第1部 §3 分岐表の 16 行(行 17 は build_resume_invocation 側でテストする)
+    /// 第1部 §3 分岐表の 16 行。行 17(`custom` + `cli_command == None`)は
+    /// `resume_plan` の射程外であり、`build_launch_command` の Custom 腕へ委譲される
+    /// (下の `branch_table_row_17_is_rejected_by_build_launch_command`)。
     #[test]
     fn covers_every_row_of_the_branch_table() {
         use CliKind::*;
@@ -1277,6 +1299,87 @@ mod resume_plan_tests {
             let actual = resume_plan(&session(cli_kind, csid, mode));
             assert_eq!(actual, expected, "分岐表 行 {row} が一致しない");
         }
+    }
+
+    /// 第1部 §3 分岐表の 16 行を `ResumeMode` まで通した対応表。
+    ///
+    /// 上の `covers_every_row_of_the_branch_table` が `Session` -> `ResumePlan` を
+    /// 固定するのに対し、こちらは `resume_plan()` -> `resume_mode()` の合成を固定する。
+    /// `ResumeMode` から先(`program` / `args`)は `build_launch_command` の既存テスト群が
+    /// 持っているので、ここでは列を持たない。
+    #[test]
+    fn resume_mode_covers_every_row_of_the_branch_table() {
+        use CliKind::*;
+        use SessionMode::*;
+
+        let cases: Vec<(u32, CliKind, Option<&str>, SessionMode, ResumeMode<'_>)> = vec![
+            (1, Claude, Some(ID), Worktree, ResumeMode::SessionId(ID)),
+            (2, Claude, Some(ID), InPlace, ResumeMode::SessionId(ID)),
+            (3, Claude, None, Worktree, ResumeMode::Continue),
+            (4, Claude, None, InPlace, ResumeMode::None),
+            (5, Codex, Some(ID), Worktree, ResumeMode::None),
+            (6, Codex, Some(ID), InPlace, ResumeMode::None),
+            (7, Codex, None, Worktree, ResumeMode::None),
+            (8, Codex, None, InPlace, ResumeMode::None),
+            (9, Shell, Some(ID), Worktree, ResumeMode::None),
+            (10, Shell, Some(ID), InPlace, ResumeMode::None),
+            (11, Shell, None, Worktree, ResumeMode::None),
+            (12, Shell, None, InPlace, ResumeMode::None),
+            (13, Custom, Some(ID), Worktree, ResumeMode::None),
+            (14, Custom, Some(ID), InPlace, ResumeMode::None),
+            (15, Custom, None, Worktree, ResumeMode::None),
+            (16, Custom, None, InPlace, ResumeMode::None),
+        ];
+
+        assert_eq!(cases.len(), 16, "分岐表の行が欠けている");
+
+        for (row, cli_kind, csid, mode, expected) in cases {
+            let plan = resume_plan(&session(cli_kind, csid, mode));
+            assert_eq!(resume_mode(&plan), expected, "分岐表 行 {row} が一致しない");
+        }
+    }
+
+    /// 分岐表 行 5〜8。codex は resume フラグ体系が未実測(契約 §12.6 の表は claude の
+    /// 実測しか持たない)なので、`build_launch_command` の
+    /// `CliKind::Claude | CliKind::Codex` の腕へ非 `None` の `ResumeMode` が届かない
+    /// ことを、`cli_kind` の分岐ではなく `resume_plan` の出力の側で固定する。
+    #[test]
+    fn codex_never_receives_a_non_none_resume_mode() {
+        for (csid, mode) in [
+            (Some(ID), SessionMode::Worktree),
+            (Some(ID), SessionMode::InPlace),
+            (None, SessionMode::Worktree),
+            (None, SessionMode::InPlace),
+        ] {
+            let plan = resume_plan(&session(CliKind::Codex, csid, mode));
+            assert_eq!(
+                resume_mode(&plan),
+                ResumeMode::None,
+                "codex へ非 None の ResumeMode が渡る経路ができている ({csid:?} / {mode:?})"
+            );
+        }
+    }
+
+    /// 分岐表 行 17。`resume_plan` はここを扱わず、`build_launch_command` の Custom 腕へ
+    /// 委譲する —— 委譲先が `AppError::InvalidState` を返すことをこのテストが固定する。
+    #[test]
+    fn branch_table_row_17_is_rejected_by_build_launch_command() {
+        let mut target = session(CliKind::Custom, None, SessionMode::Worktree);
+        target.cli_command = None;
+        let plan = resume_plan(&target);
+
+        let err = build_launch_command(
+            &target,
+            "/bin/zsh",
+            Path::new("/work"),
+            &LaunchEnv {
+                path: "/fake/bin".to_string(),
+                lang: "ja_JP.UTF-8".to_string(),
+            },
+            resume_mode(&plan),
+        )
+        .expect_err("行 17 は cli_command が無いので起動コマンドを組めない");
+        assert!(matches!(err, AppError::InvalidState(_)), "got {err:?}");
     }
 
     #[test]

@@ -15,7 +15,10 @@ use crate::session::heuristics::sink_impl::{attach_heuristics, detach_heuristics
 use crate::session::heuristics::OutputObserver;
 use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
-use cli_args::{apply_hooks, binary_name, build_launch_command, login_shell, ResumeMode};
+use cli_args::{
+    apply_hooks, binary_name, build_launch_command, login_shell, resume_mode, resume_plan,
+    ResumeMode,
+};
 use workspace::{apply_start_kanban_transition, prepare_worktree};
 
 /// `start_session` の `AppHandle` を必要としない部分だけを切り出した純関数（注入版）。
@@ -33,6 +36,24 @@ use workspace::{apply_start_kanban_transition, prepare_worktree};
 /// 呼ぶすべてのテストが実行環境の `$SHELL` と実 `claude` の有無に依存してしまい、
 /// 契約 §14「実 `claude` は使わない」を満たせなくなる。`plan_agent_spawn`（下）が
 /// 実環境版へ委譲する薄いラッパである。
+/// 起動が「新規」か「再開」かの判別子（M2-4）。
+///
+/// **`ResumeMode` そのものを引数にできない。** `ResumeMode<'a>` は
+/// `SessionId(&'a str)` で借りるが、その借用元の `Session` は
+/// `plan_agent_spawn_with` の**中**で `state.store.get_session(id)` される
+/// （契約 §123.6 のハザード）。判別子だけを渡し、`ResumeMode` は関数の中で
+/// `resume_plan()` から導く。
+///
+/// `Fresh` は `ResumePlan::FreshStart` とは別物である —— こちらは「そもそも
+/// 会話復元を試みない起動」であり、`claude_session_id` の有無を見ない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnIntent {
+    /// `start_session`。会話は復元しない。
+    Fresh,
+    /// `resume_session`（M2-4）。復元方法は `resume_plan()` が決める。
+    Resume,
+}
+
 fn plan_agent_spawn_with(
     state: &AppState,
     id: &str,
@@ -41,6 +62,7 @@ fn plan_agent_spawn_with(
     // 本物の `crate::pty::launch_env::resolve_program` をシャドウし、関数内で
     // どちらを呼んでいるか読みにくくなる。注入されたクロージャだと分かる名前にする。
     resolve: impl Fn(&str) -> AppResult<PathBuf>,
+    intent: SpawnIntent,
 ) -> AppResult<(Session, SpawnSpec)> {
     let sid = surface_id(id, SurfaceKind::Agent);
 
@@ -168,9 +190,26 @@ fn plan_agent_spawn_with(
             )));
         }
 
+        // 再開の決定（M2-4）。`ResumeMode` は必ず `resume_plan()` から導き、ここで
+        // `cli_kind` を直接見て組み立てない（契約 §123.6 の 4）—— codex / shell /
+        // custom は `resume_plan()` が必ず `FreshStart` を返すので、非 `None` の
+        // `ResumeMode` が `build_launch_command` の
+        // `CliKind::Claude | CliKind::Codex` の腕へ届く経路が構造上できない。
+        //
+        // `ResumePlan` を先に `let` で束縛するのは、`ResumeMode<'a>` が
+        // `ResumePlan` の中の `String` を借りるためである（契約 §123.6 のハザード）。
+        // 一時値のままだと文の終わりで drop される。
+        let plan = match intent {
+            SpawnIntent::Fresh => None,
+            SpawnIntent::Resume => Some(resume_plan(&session)),
+        };
+        let resume = match &plan {
+            Some(plan) => resume_mode(plan),
+            None => ResumeMode::None,
+        };
+
         // 起動コマンドを組み立てる（契約 §23 の純粋関数）。
-        // M1-4 は常に ResumeMode::None。M2-4 が resume_session で他の値を渡す。
-        let launch = build_launch_command(&session, &program, &cwd, launch_env, ResumeMode::None)?;
+        let launch = build_launch_command(&session, &program, &cwd, launch_env, resume)?;
 
         // hooks 由来の値を重ねる。argv（`--settings`）は claude 限定、env
         // （`KAMUX_HOOKS_SOCK`）は全 cli_kind 共通である（契約 §30.2。分界の理由は
@@ -210,8 +249,17 @@ fn plan_agent_spawn_with(
 
 /// `plan_agent_spawn_with` の実環境版。契約 §18 の公開 API（`probe_login_env` /
 /// `resolve_program`）へ委譲する薄いラッパ（契約 §60.4）。
-fn plan_agent_spawn(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec)> {
-    plan_agent_spawn_with(state, id, probe_login_env(), resolve_program)
+///
+/// `intent` をここにも通してあるのは、実環境の PATH 解決（`resolve_program`）と
+/// ログイン env 探査（`probe_login_env`）へ入る口がこの関数だけだからである
+/// （契約 §123.6 の 2）。M2-4 の `resume_session` はここへ
+/// `SpawnIntent::Resume` を渡す。
+fn plan_agent_spawn(
+    state: &AppState,
+    id: &str,
+    intent: SpawnIntent,
+) -> AppResult<(Session, SpawnSpec)> {
+    plan_agent_spawn_with(state, id, probe_login_env(), resolve_program, intent)
 }
 
 /// PTY spawn が成功した**後**にのみ呼ぶ。カンバン列の遷移判定・永続化を行う
@@ -308,7 +356,7 @@ pub async fn start_session(
     // `build_launch_command`）の Err に対する `mark_error` は `plan_agent_spawn_with` の
     // 中で済んでいる（契約 §40.3 / §63.5）。事前条件（二重起動ガード）と
     // `get_session` / `get_project` の Err はそこで ❌ の対象から外れている。
-    let (mut session, spec) = plan_agent_spawn(&state, &id)?;
+    let (mut session, spec) = plan_agent_spawn(&state, &id, SpawnIntent::Fresh)?;
     // AppHandle に依存する行はこの 1 行だけ（設計判断 6: spawn 成功後にのみ DB を書く）。
     // `state.pty.spawn` が Wry 固定（契約 §15）で MockRuntime に登録できないため、
     // 「spawn 成功後にのみ commit_started_session を呼ぶ」という順序はユニットテストでは
@@ -486,7 +534,24 @@ mod tests {
     }
 
     fn plan(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec)> {
-        plan_agent_spawn_with(state, id, &fake_launch_env(), fake_resolve_program)
+        plan_agent_spawn_with(
+            state,
+            id,
+            &fake_launch_env(),
+            fake_resolve_program,
+            SpawnIntent::Fresh,
+        )
+    }
+
+    /// `plan` の再開版（M2-4）。`SpawnIntent` 以外の引数は同じものを使う。
+    fn plan_resume(state: &AppState, id: &str) -> AppResult<(Session, SpawnSpec)> {
+        plan_agent_spawn_with(
+            state,
+            id,
+            &fake_launch_env(),
+            fake_resolve_program,
+            SpawnIntent::Resume,
+        )
     }
 
     // ---- plan_agent_spawn_with ----
@@ -558,6 +623,61 @@ mod tests {
 
         assert_eq!(spec.cols, 80);
         assert_eq!(spec.rows, 24);
+    }
+
+    /// 分岐表 行 1 の `claude_session_id`。`build_state_with_worktree_session` が
+    /// 使う他の値（`session/shell` など）と 1 文字も重ならない値にして、取り違えを
+    /// 素通しさせない。
+    const CLAUDE_SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// `SpawnIntent::Resume` で呼ぶと、`build_launch_command` へ渡る `ResumeMode` が
+    /// `resume_plan()` -> `resume_mode()` の決定になる（分岐表 行 1）。
+    ///
+    /// `cli_args.rs` の対応表テストは `ResumePlan` -> `ResumeMode` までしか見ておらず、
+    /// **その純関数が実際に起動経路から呼ばれていること**はここでしか観測できない。
+    /// `spec.args` を見るのはそのため（分岐表に `args` の列を持たせるためではない）。
+    #[test]
+    fn plan_agent_spawn_with_resume_intent_passes_the_mode_derived_from_the_plan() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+
+        let (_, spec) = plan_resume(&state, &session.id).expect("plan resume");
+
+        assert_eq!(
+            spec.args,
+            vec!["--resume".to_string(), CLAUDE_SESSION_ID.to_string()]
+        );
+    }
+
+    /// `start_session`（`SpawnIntent::Fresh`）は、DB に `claude_session_id` が
+    /// 載っていても会話を復元しない。M1-4 が `ResumeMode::None` 固定で持っていた
+    /// 性質を、判別子を足した後も保つ。
+    #[test]
+    fn plan_agent_spawn_with_fresh_intent_never_resumes() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+
+        let (_, spec) = plan(&state, &session.id).expect("plan spawn");
+
+        assert!(
+            spec.args.is_empty(),
+            "start_session が会話を復元している: {:?}",
+            spec.args
+        );
     }
 
     /// `program` が `login_shell()` 由来のログインシェルであること、`args` が契約
@@ -729,8 +849,14 @@ mod tests {
 
         let failing_resolve =
             |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("claude".to_string())) };
-        let err = plan_agent_spawn_with(&state, &session.id, &fake_launch_env(), failing_resolve)
-            .expect_err("must fail when the binary cannot be resolved");
+        let err = plan_agent_spawn_with(
+            &state,
+            &session.id,
+            &fake_launch_env(),
+            failing_resolve,
+            SpawnIntent::Fresh,
+        )
+        .expect_err("must fail when the binary cannot be resolved");
 
         assert!(matches!(err, AppError::CliNotFound(_)), "actual: {err:?}");
         assert!(
@@ -1363,8 +1489,14 @@ mod tests {
 
         let failing_resolve =
             |_: &str| -> AppResult<PathBuf> { Err(AppError::CliNotFound("claude".to_string())) };
-        let err = plan_agent_spawn_with(&state, &session.id, &fake_launch_env(), failing_resolve)
-            .expect_err("must fail when the binary cannot be resolved");
+        let err = plan_agent_spawn_with(
+            &state,
+            &session.id,
+            &fake_launch_env(),
+            failing_resolve,
+            SpawnIntent::Fresh,
+        )
+        .expect_err("must fail when the binary cannot be resolved");
 
         assert!(wait_for_error_state(&state, &session.id));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
