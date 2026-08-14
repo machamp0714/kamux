@@ -115,7 +115,9 @@ describe('KanbanCardResume（第1部 §4.4）', () => {
       sessions: { s1: session({ cli_kind: 'codex', claude_session_id: null }) },
     });
     render(<KanbanCardResume sessionId="s1" />);
-    expect(screen.getByRole('button', { name: 'プロセスを再起動' })).toBeInTheDocument();
+    const button = screen.getByRole('button', { name: 'プロセスを再起動' });
+    expect(button).toBeInTheDocument();
+    expect(button).toHaveAttribute('title', '会話は復元されません');
   });
 
   it('クリックはカードの onClick へバブリングしない（stopPropagation）', () => {

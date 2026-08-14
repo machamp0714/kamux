@@ -54,6 +54,43 @@ describe('resume の失敗ハンドリング', () => {
     useAppStore.setState({ resumeFailedSessionIds: [SID] });
     await useAppStore.getState().resumeSession(SID);
     expect(useAppStore.getState().resumeFailedSessionIds).toEqual([]);
+    expect(useAppStore.getState().sessions[SID]).toEqual({ id: SID, claude_session_id: null });
+  });
+
+  // running は resume_failed より必ず先に届く（Spawned → 失敗なら exited/resume_failed の順）。
+  // resumeSession の成功以外の経路（例: TerminalPane の直接起動）でも古い失敗フラグが
+  // 消えるよう、running を受けたら先に落とす。失敗すれば直後の exited/resume_failed が積み直す。
+  it('running を経由すれば resume_failed の再送でも最終的に積まれた状態になる', () => {
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'exited',
+      reason: 'resume_failed',
+    });
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'running',
+      reason: 'spawned',
+    });
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'exited',
+      reason: 'resume_failed',
+    });
+    expect(useAppStore.getState().resumeFailedSessionIds).toEqual([SID]);
+  });
+
+  it('resume_failed の後に running を受けると失敗リストから外れる', () => {
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'exited',
+      reason: 'resume_failed',
+    });
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'running',
+      reason: 'spawned',
+    });
+    expect(useAppStore.getState().resumeFailedSessionIds).toEqual([]);
   });
 
   it('retryResumeAsFresh は claude_session_id をクリアしてから再開する', async () => {

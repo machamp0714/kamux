@@ -55,6 +55,15 @@ export interface SessionSlice {
    * reason: 'resume_failed'（契約 §8 の StateReason）を受け取ったセッションの id 集合。
    * InterruptedOverlay / KanbanCardResume の「新しい会話として開始」導線と
    * retryResumeAsFresh はこの配列だけを見る（第1部 §4.4）。
+   *
+   * 出入りの規則（両方とも applyStateEvent が担う。resumeSession アクションの
+   * 成功経路だけに頼らない）:
+   * - 積む: reason === 'resume_failed' を受けたとき。
+   * - 落とす: runtime_state === 'running' を受けたとき。再開失敗の経路は
+   *   Spawned(=running) → 非ゼロ終了(=exited/resume_failed) の順に必ず流れる
+   *   （本フェーズの Ruling 19 が確定させた順序）ので、running で先に落としても、
+   *   直後の失敗イベントが積み直す。これにより resumeSession を経由しない起動
+   *   （例: TerminalPane の直接起動）でも古い失敗フラグが残り続けない。
    */
   resumeFailedSessionIds: string[];
 
@@ -217,11 +226,15 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       // 作ると、他の 3 項が同値でも参照だけが毎回変わってしまう）。
       const resumeFailedChanged =
         p.reason === 'resume_failed' && !s.resumeFailedSessionIds.includes(p.session_id);
+      // running を受けたら resumeFailedSessionIds から落とす（doc 参照）。
+      const resumeFailedRemoved =
+        p.runtime_state === 'running' && s.resumeFailedSessionIds.includes(p.session_id);
       if (
         s.runtimeStates[p.session_id] === p.runtime_state &&
         s.runtimeReasons[p.session_id] === p.reason &&
         !dropError &&
-        !resumeFailedChanged
+        !resumeFailedChanged &&
+        !resumeFailedRemoved
       ) {
         // 新しいオブジェクトを作らない = 無関係な購読者を再レンダリングさせない
         return {};
@@ -230,7 +243,9 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       if (dropError) delete runtimeErrors[p.session_id];
       const resumeFailedSessionIds = resumeFailedChanged
         ? [...new Set([...s.resumeFailedSessionIds, p.session_id])]
-        : s.resumeFailedSessionIds;
+        : resumeFailedRemoved
+          ? s.resumeFailedSessionIds.filter((id) => id !== p.session_id)
+          : s.resumeFailedSessionIds;
       return {
         runtimeStates: { ...s.runtimeStates, [p.session_id]: p.runtime_state },
         runtimeReasons: { ...s.runtimeReasons, [p.session_id]: p.reason },
@@ -244,7 +259,11 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
 
   resumeSession: async (sessionId) => {
     // 失敗時は生 stderr をストアへ残す（契約 §42.3 規約 4）。
-    // カードの kanban-card__error はこれを読む。トーストは呼び出し側が出す。
+    // kanban-card__error は resume_session の Err がバックエンドで mark_error を
+    // 呼んだ（runtime_state: 'error'）場合にだけ出る。resume_failed の経路（本関数の
+    // catch ではなく applyStateEvent 経由）は RuntimeState::Exited に落ちる
+    // （src-tauri/src/pty/sink.rs）ため kanban-card__error には出ず、失敗表示は
+    // resumeFailedSessionIds によるボタン切り替えが担う。トーストは呼び出し側が出す。
     let session: Session;
     try {
       session = await resumeSessionCmd(sessionId);

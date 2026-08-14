@@ -103,7 +103,7 @@ export function KanbanCard({ session, onEdit, onArchive, onOpen, dragActivator }
       <KanbanCardError sessionId={session.id} />
 
       <div className="kanban-card__actions">
-        <KanbanCardResume sessionId={session.id} />
+        {interactive && <KanbanCardResume sessionId={session.id} />}
         <button
           type="button"
           onPointerDown={stopDrag}
