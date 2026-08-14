@@ -1752,6 +1752,74 @@ mod tests {
             );
         }
 
+        /// M2-4 群 S: `install_app_state_with` が `HookHandler` へ渡す
+        /// `Arc<ResumeTracker>` を、**`AppState` に載るその実体と同じもの**にする配線。
+        ///
+        /// `HookHandler` は `AppHandle` を持たないので `state.resume_tracker` を
+        /// 読めず、`HookHandler::new` の引数として受け取るしかない。したがって
+        /// 「同じ `Arc` か」は**この 1 行の配線にしか現れない**。別々に `new()` すると
+        /// コンパイルは通り、`hooks_srv/handler.rs` と `pty/sink.rs` の単体テストも
+        /// 全部緑のまま、**claude の resume が成功しても非ゼロ終了しさえすれば
+        /// `ResumeFailed` になる**（`note_session_start` は handler 側のマップを、
+        /// `classify_exit` は `AppState` 側のマップを触るため）。
+        /// 実測: 第 4 引数を `Arc::new(ResumeTracker::new())` へ差し替える変異
+        /// （Task 8 の M-10）が、このテストを**単独で**赤にする。
+        ///
+        /// `bootstrap` は `fn` ポインタ（`HooksBootstrap`）でクロージャを取れないため、
+        /// 静的な受け皿へ横取りする。書き込むのは下の `capture_hook_sink` だけで、
+        /// 呼ぶのはこのテストだけである。
+        #[test]
+        fn install_app_state_gives_the_hook_handler_the_managed_resume_tracker() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "resume");
+
+            let app = mock_app();
+            super::super::install_app_state(&app, Arc::new(store), capture_hook_sink);
+            let state = app.state::<AppState>();
+            let sink = CAPTURED_HOOK_SINK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("bootstrap must have received the hook sink");
+
+            // `AppState` 側で試行を記録し、`HookHandler` 側から SessionStart を届ける。
+            // 同じ `Arc` でなければ、この 2 つは別のマップを触る。
+            state.resume_tracker.mark_resume_attempt(
+                &session.id,
+                &crate::session::cli_args::ResumePlan::ClaudeContinue,
+            );
+            sink.on_hook(crate::hooks_srv::HookEvent {
+                kamux_session_id: session.id.clone(),
+                kind: crate::hooks_srv::HookKind::SessionStart,
+                claude_session_id: None,
+                source: Some("resume".to_string()),
+            });
+
+            assert_eq!(
+                state
+                    .resume_tracker
+                    .classify_exit(&format!("{}:agent", session.id), Some(1)),
+                crate::model::StateReason::PtyExited,
+                "HookHandler と AppState が別の ResumeTracker を持っている\
+                 （SessionStart が classify_exit に届いていない）"
+            );
+        }
+
+        /// 上のテスト専用の受け皿。`HooksBootstrap` が `fn` ポインタなので、
+        /// クロージャで捕まえる代わりにここへ置く。
+        static CAPTURED_HOOK_SINK: Mutex<Option<Arc<dyn HookSink>>> = Mutex::new(None);
+
+        fn capture_hook_sink(
+            sink: Arc<dyn HookSink>,
+        ) -> (Option<HooksRuntime>, Option<HooksServer>) {
+            *CAPTURED_HOOK_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+            (None, None)
+        }
+
         /// 「この経路は状態機械の shutdown を始めたか」を、実際の遷移で確かめる。
         ///
         /// `begin_shutdown()` の効果は「以降の入力を捨てる」ことなので、

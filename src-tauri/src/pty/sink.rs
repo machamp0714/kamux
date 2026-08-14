@@ -278,11 +278,12 @@ mod tests {
 
     // --- M2-4: 終了理由の出し分け（契約 §41.3 決定 (3)）---
     //
-    // `PtyExited` と `ResumeFailed` は**どちらも `RuntimeState::Exited` へ落ちる**
-    // （§41.3 決定 (1) の表は `PtyExited` 列の逐語コピーである）。したがって
-    // `state.runtime.current(&id)` を見るテストは、実装が両方を `note_pty_exit` に
-    // 潰していても緑になる。**差が出るのは `StateReason` だけなので、observer から
-    // reason を直接読む。**
+    // `PtyExited` と `ResumeFailed` は**どちらも `RuntimeState::Exited` へ落ちる** ——
+    // `runtime_state.rs` の `next_state` に
+    // `(_, In::PtyExited) | (_, In::ResumeFailed) | (_, In::UserStopped) => Exited`
+    // という 1 本の腕があり（§41.3 決定 (1) の表は `PtyExited` 列の逐語コピー）、
+    // **`state.runtime.current(&id)` には差が出ない。差が出るのは `StateReason`
+    // だけなので、observer から reason を直接読む。**
     mod resume_failure {
         use std::sync::Mutex;
         use std::time::Duration;
