@@ -477,6 +477,39 @@ pub async fn resume_session(
         // ここに在るのは呼び出し 1 行だけである —— この関数はユニットテストから
         // 到達できないため（契約 §15 / §96.4）、条件をここに書くと外す変異が
         // 緑になる。
+        //
+        // ---- 並行 spawn に負けた `Err` について（lesser-evil。**未検証の予測**）----
+        //
+        // **この段落は測っていない。** 並行 `Err` 経路を再現するテストは無く、
+        // この関数自体が到達不能領域である（契約 §96.4）。偽にする変異を作れない
+        // 種類の記述なので、観測ではなく構造の読み取りとして残す。根拠は
+        // 10 行上の `spawn_agent_surface_with`（`:337` 以降）の逐語コメントと、
+        // `ResumeTracker` の `insert` / `remove` の意味差である。
+        //
+        // 1. **先例が隣に在る。** 同じ `Err` を受ける `spawn_agent_surface_with` の
+        //    `inspect_err` は、`PtyManager` の排他が返す
+        //    `InvalidState("surface already running")` を名指しし、**それでも
+        //    `detach_heuristics` を呼ぶ側に倒している**（押し出された登録は既に
+        //    停止済みなので、外さないほうが状態が壊れる）。隣り合う 2 つの後始末が
+        //    逆の判断を採ると、次の読み手はどちらが正典か決められない。
+        // 2. **ただし非対称がある。隠さない。** heuristics 側は「押し出された死んだ
+        //    登録」を外すので損失ゼロだが、**こちらが消すのは勝った側の生きている
+        //    試行である。** 後発 B が負けたときに B がここへ来て、勝者 A の
+        //    エントリを `remove` する —— 以後 A が非ゼロ終了しても素の `PtyExited`
+        //    になり、**「会話は復元されませんでした」が沈黙する（誤沈黙）。**
+        //    **並行経路の害は round 2 以前から在った** ——
+        //    `mark_resume_attempt` の `insert` 上書きにより、A に `SessionStart` が
+        //    届いた後で B が mark すると `session_start_seen` が `false` へ戻り、
+        //    **A の成功が誤って `ResumeFailed` になる（誤検知）。** round 2 が
+        //    加えたのは誤沈黙の側であって、害を新設したのではない。
+        // 3. **頻度が釣り合わない。** 手当ての対象（ふつうの spawn 失敗 =
+        //    バイナリ不在・worktree 異常）は日常的に起きる。並行敗北は、同一
+        //    セッションへの `resume_session` / `start_session` が並行 IPC で届き、
+        //    **UI ゲートと `plan_agent_spawn_with` の二重起動ガードの両方を抜ける**
+        //    ことを要する。消す側に倒すのはこの非対称による。
+        // 4. **コードで直すなら受け皿は `ResumeTracker` 側である**（例: 世代
+        //    トークンを取り「自分が入れたエントリだけ消す」）。**ここに `if` を
+        //    書かないこと** —— 到達不能領域なので、条件を外す変異が緑になる。
         state.resume_tracker.clear_resume_attempt(&id);
         state.runtime.sender().mark_error(&id, &err.to_string());
         return Err(err);
@@ -813,6 +846,53 @@ mod tests {
                 .any(|(k, v)| k == "LANG" && v == "ja_JP.UTF-8"),
             "resume の env から LANG が落ちている: {:?}",
             spec.env
+        );
+    }
+
+    /// `resume_session` は `resume_plan()` を 2 回引く —— 1 回目は
+    /// `plan_agent_spawn_with` の中（`ResumeMode` を導くため）、2 回目は戻り値の
+    /// `Session` に対して（`mark_resume_attempt` へ渡すため）。**この 2 つの決定が
+    /// 一致することを固定する。**
+    ///
+    /// レビュー Minor 1 の手当て: 一致の根拠（「`prepare_worktree` は `branch` /
+    /// `worktree_path` しか書き換えないので、判断材料の `cli_kind` / `mode` /
+    /// `claude_session_id` は動かない」）はコメントに書いてあるだけで、誰も
+    /// 観測していなかった。**`prepare_worktree` の周辺が将来 `claude_session_id`
+    /// や `mode` を触った瞬間に黙って破れる** —— そのとき `mark_resume_attempt`
+    /// は `plan_agent_spawn_with` が実際に使ったのとは違う決定で記録され、
+    /// `FreshStart` ガード（裁定 B）の判定が実際の起動と食い違う。
+    ///
+    /// **恒真の罠を潰す:** 決定が `FreshStart`（= 復元材料が無い側）だと、
+    /// 判断材料を落とす変異でも両辺が `FreshStart` のまま一致してしまう。
+    /// 復元材料がある `ClaudeResume` で測り、その値そのものも assert する。
+    #[test]
+    fn plan_agent_spawn_returns_a_session_that_yields_the_same_resume_decision() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+
+        let before = resume_plan(&state.store.get_session(&session.id).expect("get session"));
+        assert_eq!(
+            before,
+            crate::session::cli_args::ResumePlan::ClaudeResume {
+                claude_session_id: CLAUDE_SESSION_ID.to_string(),
+            },
+            "前提: 復元材料が在る決定で測る（FreshStart 同士の一致は恒真）"
+        );
+
+        let (planned, _spec) = plan_resume(&state, &session.id).expect("plan resume");
+
+        assert_eq!(
+            resume_plan(&planned),
+            before,
+            "plan_agent_spawn_with の戻り値が再開の決定を変えている\
+             （resume_session はこの Session に対して resume_plan を引き直す）"
         );
     }
 

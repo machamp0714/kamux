@@ -299,21 +299,37 @@ mod tests {
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
     }
 
-    /// 冪等性: 未知のセッションの破棄は no-op で、幻のエントリも作らない。
-    /// (`classify_exit` の戻り値からは観測できないので `attempts` を直接見る。
-    /// `note_session_start_does_not_create_an_entry_for_an_unknown_session` と同じ形)
+    /// 破棄は**そのセッションだけ**に効く。未知 ID では幻の行も作らない(冪等)。
+    ///
+    /// **前身の `clearing_an_unknown_session_is_a_no_op` は恒真だった**(レビュー
+    /// Minor 2) —— 未知 ID しか渡していなかったため、本体が no-op の実装と
+    /// 区別できないのに名前が「no-op であることを見た」と読めた。両方向へ
+    /// 弁別力を持たせる:
+    ///   - 本体を no-op にすると `S` が残り、`len() == 1` の assert が赤になる
+    ///   - 本体を `map.clear()`(全消し)にすると `other` まで消え、赤になる
+    ///     (Task 8 の変異 F-2 で実測。**どの assert が先に落ちるかは
+    ///     報告の F-2 の行を参照** —— ここには「測った結果」だけを書く)
     #[test]
-    fn clearing_an_unknown_session_is_a_no_op() {
+    fn clearing_one_session_removes_only_that_sessions_attempt() {
         let t = ResumeTracker::new();
-        t.clear_resume_attempt(S);
-        assert_eq!(t.lock().len(), 0);
-        // 既に破棄済みの試行をもう一度破棄しても、他のセッションを巻き込まない。
         let other = "22222222-2222-4222-8222-222222222222";
+        t.mark_resume_attempt(S, &ATTEMPTED);
         t.mark_resume_attempt(other, &ATTEMPTED);
+
+        // 未知 ID の破棄は既存の試行を 1 件も壊さず、幻の行も作らない。
+        t.clear_resume_attempt("00000000-0000-4000-8000-000000000000");
+        assert_eq!(
+            t.lock().len(),
+            2,
+            "未知 ID の破棄が既存の試行を壊した(または幻の行を作った)"
+        );
+
         t.clear_resume_attempt(S);
+        assert_eq!(t.lock().len(), 1, "S の試行が破棄されていない");
         assert_eq!(
             t.classify_exit(&format!("{other}:agent"), Some(1)),
-            StateReason::ResumeFailed
+            StateReason::ResumeFailed,
+            "他セッションの試行まで巻き込んで破棄している"
         );
     }
 
