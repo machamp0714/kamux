@@ -1536,6 +1536,49 @@ mod tests {
 
             let row = state.store.get_session(&session.id).expect("get_session");
             assert_eq!(row.claude_session_id, None, "DB でクリアが反映されていない");
+            assert_eq!(
+                updated.updated_at, row.updated_at,
+                "戻り値の updated_at が DB の最新行と一致していない: \
+                 get_session で読み直さず updated.claude_session_id を直書きすると \
+                 更新前の updated_at のまま返ってしまう"
+            );
+        }
+
+        /// M2-4 レビュー Important: `session_patch_guard_tests` はガード関数
+        /// `validate_session_patch` を**直接**呼ぶだけで、`update_session` コマンドの
+        /// 実体である `apply_session_patch` へ捏造 ID を送るテストが無かった
+        /// （`apply_session_patch` から `validate_session_patch(patch)?;` の呼び出し行を
+        /// 消しても `cargo test --workspace` が全緑で通ってしまう）。
+        #[test]
+        fn apply_session_patch_rejects_a_fabricated_claude_session_id_via_the_command_path() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Custom)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+            store
+                .set_claude_session_id(&session.id, "abc123")
+                .expect("set_claude_session_id");
+
+            let state = crate::state::test_support::app_state(store);
+            let err = super::super::apply_session_patch(
+                &state,
+                &session.id,
+                &crate::model::SessionPatch {
+                    claude_session_id: Some(Some("fabricated".to_string())),
+                    ..Default::default()
+                },
+            )
+            .expect_err("捏造 ID の設定はコマンド経路でも拒否されるべき");
+            assert!(matches!(err, AppError::InvalidState(_)), "got {err:?}");
+
+            let row = state.store.get_session(&session.id).expect("get_session");
+            assert_eq!(
+                row.claude_session_id,
+                Some("abc123".to_string()),
+                "拒否されたパッチで claude_session_id が書き換わってはいけない"
+            );
         }
 
         /// M3-3 群 S: PTY 終了でヒューリスティックの登録を外す配線と、**その極性**。
