@@ -412,6 +412,70 @@ pub async fn start_session(
     commit_started_session(&state, &mut session)
 }
 
+/// セッションの agent サーフェスを**会話を復元して**起動する（契約 §7 / §75）。
+///
+/// **`start_session` の双子である。** 独自の起動経路を持たず、同じ
+/// `plan_agent_spawn` → `spawn_agent_surface_with` → `send(Spawned)` →
+/// `commit_started_session` を通る（契約 §123.3）。違いは 2 つだけ:
+///   1. `SpawnIntent::Resume` を渡す（`ResumeMode` は `plan_agent_spawn_with` の
+///      中で `resume_plan()` → `resume_mode()` から導かれる）
+///   2. spawn の直前に `ResumeTracker::mark_resume_attempt` を呼ぶ（契約 §123.6 の 5）
+///
+/// **`mark_error` は spawn（起動フェーズ 5 段目）の `Err` に対してだけ呼ぶ。**
+/// 1〜4 段の `Err` に対しては `plan_agent_spawn_with` が自分の中で呼んでいるので、
+/// `?` で素通しする（契約 §123.6 の 6: 二重に呼ぶと `error` を 2 回書いて
+/// イベントが 2 通出る）。
+///
+/// **`send(Spawned)` は `commit_started_session` より前に置くこと**（`start_session`
+/// と同一の順序）。`commit_started_session` は `update_session` の失敗で `?` 早期
+/// return しうるので、逆順にすると「PTY は生きているのに `Spawned` が状態機械へ
+/// 一度も届かない」——カードは `Idle` のまま、契約 §34.5 の `first_started_at` も
+/// 記録されない。
+///
+/// **この関数自体はユニットテストから到達できない**（`state.pty.spawn_with_observer`
+/// が Wry 固定。契約 §15 / §96.4）。`start_session` と同じく、判別子
+/// （`SpawnIntent::Resume`）の選択と上記の処理順は目視レビューで担保する ——
+/// `SpawnIntent::Fresh` へ差し替える変異が全緑になることを実測した（Task 8 の
+/// 変異 M-2。`start_session` 側の同型は M-B が実測済み）。テストで守られているのは
+/// この関数が呼ぶ側（`plan_agent_spawn_with` の resume 経路 / `mark_resume_attempt`
+/// のガード / `sink.rs` の出し分け）である。
+#[tauri::command]
+pub async fn resume_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> AppResult<Session> {
+    let (mut session, spec) = plan_agent_spawn(&state, &id, SpawnIntent::Resume)?;
+
+    // 契約 §123.6 の 5: `mark_resume_attempt` は spawn の直前。
+    //
+    // `resume_plan()` を `plan_agent_spawn_with` の中と here の 2 回引くが、決定は
+    // 必ず一致する —— 判断材料は `cli_kind` / `mode` / `claude_session_id` の 3 つ
+    // だけで、間に挟まる `prepare_worktree` はそのどれも書き換えない（`branch` /
+    // `worktree_path` のみ）。`ResumeMode<'a>` は `ResumePlan` の中の `String` を
+    // 借りるため、決定そのものを関数の外へ持ち出す形は借用が組めない
+    // （契約 §123.6 のハザード）。
+    //
+    // 記録するかどうか（`FreshStart` を弾く）の判断は `ResumeTracker` 側にある ——
+    // ここに `if` を書くと、この関数がテストから到達できないためガードを外す変異が
+    // 全緑になる（`mark_resume_attempt` の doc を参照）。
+    let plan = resume_plan(&session);
+    state.resume_tracker.mark_resume_attempt(&id, &plan);
+
+    // 起動フェーズの 5 段目（契約 §63.4 / §63.5）。`plan_agent_spawn_with` の外に
+    // あるので `mark_error` もここで呼ぶ。M3-3 のヒューリスティック装着は
+    // `spawn_agent_surface_with` に含まれる（契約 §123.3 の理由 3。`spawn`
+    // （observer なし）へ戻すと resume 経路だけ沈黙推定が落ちる）。
+    if let Err(err) = spawn_agent_surface_with(&state, &session, spec, |spec, observer| {
+        state.pty.spawn_with_observer(&app, spec, observer)
+    }) {
+        state.runtime.sender().mark_error(&id, &err.to_string());
+        return Err(err);
+    }
+    state.runtime.sender().send(&id, StateInput::Spawned);
+    commit_started_session(&state, &mut session)
+}
+
 /// agent サーフェスを殺す。runtime_state の遷移は M2-1 が担当する（設計判断 7）。
 /// `PtyManager::kill` は冪等（契約 §15）なので、事前の `is_alive` 確認は不要。
 #[tauri::command]
@@ -675,6 +739,110 @@ mod tests {
         assert_eq!(
             spec.args,
             vec!["--resume".to_string(), CLAUDE_SESSION_ID.to_string()]
+        );
+    }
+
+    /// **§18 の PATH 解決が resume 経路でも効いていること**（契約 §123.3 の理由 1）。
+    /// `plan_agent_spawn_resolves_the_binary_via_resolve_program_for_claude` は
+    /// `SpawnIntent::Fresh` 側しか見ておらず、resume が独自の起動経路を持てば
+    /// （= `resolve_program` を通さずログインシェルや素の "claude" へ倒せば）
+    /// あちらは緑のまま素通りする。`ShellEnvGuard` で `$SHELL` を既定値と別の値へ
+    /// 差し替えるので、`login_shell()` へ倒す変異と `/fake/bin/claude` は必ず食い違う。
+    #[test]
+    fn plan_agent_spawn_with_resume_intent_resolves_the_binary_to_an_absolute_path() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ShellEnvGuard::set("/tmp/kamux-test-login-shell");
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+
+        let (_, spec) = plan_resume(&state, &session.id).expect("plan resume");
+
+        assert_eq!(spec.program, "/fake/bin/claude");
+    }
+
+    /// **§23 の env が resume 経路で落ちていないこと**（契約 §123.3 の理由 2）。
+    /// 3 つとも別々の出どころを持つ: `KAMUX_SESSION_ID` は `session.id`、
+    /// `PATH` / `LANG` は注入された `launch_env`。`/fake/bin` と `ja_JP.UTF-8` は
+    /// 実行環境の実 PATH / 実ロケールと一致しないので、`launch_env` 引数を
+    /// 実環境値へ差し替える変異が入っても vacuous にならない。
+    #[test]
+    fn plan_agent_spawn_with_resume_intent_keeps_the_session_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Claude, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+
+        let (_, spec) = plan_resume(&state, &session.id).expect("plan resume");
+
+        assert!(
+            spec.env
+                .contains(&("KAMUX_SESSION_ID".to_string(), session.id.clone())),
+            "resume の env から KAMUX_SESSION_ID が落ちている: {:?}",
+            spec.env
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "PATH" && v == "/fake/bin"),
+            "resume の env から PATH が落ちている: {:?}",
+            spec.env
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "LANG" && v == "ja_JP.UTF-8"),
+            "resume の env から LANG が落ちている: {:?}",
+            spec.env
+        );
+    }
+
+    /// 契約 §4.6 / §123.6 の 4: codex には非 `None` の `ResumeMode` が渡らない。
+    /// `resume_plan()` が codex に対して常に `FreshStart` を返すので、
+    /// `build_launch_command` の `CliKind::Claude | CliKind::Codex` の腕（両者で
+    /// 共通）に届く `ResumeMode` は `None` だけになる。
+    ///
+    /// **DB に `claude_session_id` を入れてから測る。** 入れないと、判別が
+    /// `cli_kind` ではなく「そもそも復元材料が無い」で通ってしまい、
+    /// `resume_plan()` の codex 腕を claude 側へ倒す変異を弁別できない。
+    #[test]
+    fn plan_agent_spawn_with_resume_intent_never_resumes_codex() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, state, session, _worktree_path) =
+            build_state_with_worktree_session(CliKind::Codex, None);
+        state
+            .store
+            .set_claude_session_id(&session.id, CLAUDE_SESSION_ID)
+            .expect("set claude_session_id");
+        assert_eq!(
+            state
+                .store
+                .get_session(&session.id)
+                .expect("get session")
+                .claude_session_id
+                .as_deref(),
+            Some(CLAUDE_SESSION_ID),
+            "前提: 復元材料が DB に在る状態で測る"
+        );
+
+        let (_, spec) = plan_resume(&state, &session.id).expect("plan resume");
+
+        assert!(
+            spec.args.is_empty(),
+            "codex に resume フラグが渡っている: {:?}",
+            spec.args
         );
     }
 

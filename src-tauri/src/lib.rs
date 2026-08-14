@@ -492,10 +492,17 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     // `start_session` は `State<'_, AppState>` を経由してしか `state.hooks` を読めず、
     // Tauri はマネージド状態が載るまでコマンドを解決できないため、ここで確定させれば
     // 「hooks が載る前に始まったセッション」は構造的に発生しない。
+    // 再開試行の追跡（M2-4）。**`HookHandler` と `AppState` は同じ実体を持つこと。**
+    // `HookHandler` は `AppHandle` を持たないので `state.resume_tracker` を読めず、
+    // ここで `Arc` を配るのが唯一の経路である（別々に `new()` すると、
+    // `SessionStart` hook が別のマップを更新して `classify_exit` に届かない）。
+    let resume_tracker = Arc::new(crate::session::resume_tracker::ResumeTracker::new());
+
     let hook_handler: Arc<dyn HookSink> = Arc::new(crate::hooks_srv::HookHandler::new(
         Arc::clone(&store),
         runtime.sender(),
         Arc::clone(&heuristics),
+        Arc::clone(&resume_tracker),
     ));
     let (hooks, hooks_server) = bootstrap(hook_handler);
 
@@ -504,6 +511,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         pty: pty::PtyManager::new(),
         runtime,
         heuristics,
+        resume_tracker,
         hooks,
         hooks_server: Mutex::new(hooks_server),
     });
@@ -576,6 +584,7 @@ pub fn run() {
             pty::commands::resize_pty,
             pty::commands::ack_pty,
             session::start_session,
+            session::resume_session,
             session::stop_session,
             session::suggest_branch_name,
             crate::pty::editor::spawn_editor,

@@ -104,11 +104,22 @@ impl<R: Runtime> PtySink for TauriSink<R> {
         // `try_state` が `None` を返す場合（アプリ終了処理中に起こりうる）は黙って
         // 何もしない —— `begin_shutdown()` 後の遷移を捨てる方針と一致する。
         //
-        // M2-4 Task 8 がここを `ResumeTracker::classify_exit(surface_id, exit_code)`
-        // による分岐（`note_pty_exit` / `note_resume_failed_exit`）へ置き換える
-        // （契約 §41.3 決定 (3)）。M2-1 では `ResumeTracker` がまだ無い。
+        // M2-4 / 契約 §41.3 決定 (3): 終了理由を `ResumeTracker::classify_exit` で
+        // 分類し、`note_pty_exit` / `note_resume_failed_exit` を出し分ける。
+        // **`classify_exit` は resume 試行フラグを消費するので、1 終了につき
+        // 1 回だけ呼ぶ。** `:editor` の弾きは `classify_exit` と note_* の両方が
+        // 持つ（前者は試行フラグを消費しないため、後者は状態機械の入口のため）。
+        // ここで import するのは `StateReason`（比較用）だけで、`StateInput` は
+        // import しない（M2-1 Task 7 の規約）。
         if let Some(state) = self.app.try_state::<crate::state::AppState>() {
-            state.runtime.sender().note_pty_exit(surface_id);
+            let sender = state.runtime.sender();
+            if state.resume_tracker.classify_exit(surface_id, exit_code)
+                == crate::model::StateReason::ResumeFailed
+            {
+                sender.note_resume_failed_exit(surface_id);
+            } else {
+                sender.note_pty_exit(surface_id);
+            }
             // M3-3: ヒューリスティックの登録を外す。**production で唯一の PTY 終了経路**
             // なので、ここに置かないと終了したセッションのウォッチャが残る。
             //
@@ -262,6 +273,151 @@ mod tests {
                 Err(RecvTimeoutError::Timeout) => {}
                 other => panic!("unexpected event on unrelated topic: {other:?}"),
             }
+        }
+    }
+
+    // --- M2-4: 終了理由の出し分け（契約 §41.3 決定 (3)）---
+    //
+    // `PtyExited` と `ResumeFailed` は**どちらも `RuntimeState::Exited` へ落ちる**
+    // （§41.3 決定 (1) の表は `PtyExited` 列の逐語コピーである）。したがって
+    // `state.runtime.current(&id)` を見るテストは、実装が両方を `note_pty_exit` に
+    // 潰していても緑になる。**差が出るのは `StateReason` だけなので、observer から
+    // reason を直接読む。**
+    mod resume_failure {
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::Manager;
+
+        use super::*;
+        use crate::model::{CliKind, SessionStatePayload, StateReason};
+        use crate::session::cli_args::ResumePlan;
+        use crate::session::runtime_state::{StateInput, StateObserver};
+        use crate::state::AppState;
+        use crate::store::test_support::{insert_test_session, open_temp};
+
+        #[derive(Default)]
+        struct RecordingObserver {
+            seen: Mutex<Vec<(String, StateReason)>>,
+        }
+
+        impl StateObserver for RecordingObserver {
+            fn on_state(&self, payload: &SessionStatePayload) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((payload.session_id.clone(), payload.reason));
+            }
+        }
+
+        impl RecordingObserver {
+            /// PTY 終了に由来する理由だけを残す。fixture の `Spawned`
+            /// （`StateReason::Spawned`）は memory 更新 → DB 書き込み → observer 通知の
+            /// 順で非同期に進むため、絞らないと位置指定の assert が残留レースで壊れる
+            /// （`hooks_srv/handler.rs` の `hook_reasons` と同じ手当て）。
+            fn exit_reasons(&self) -> Vec<(String, StateReason)> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(_, reason)| {
+                        matches!(reason, StateReason::PtyExited | StateReason::ResumeFailed)
+                    })
+                    .cloned()
+                    .collect()
+            }
+
+            /// consumer スレッド経由の通知が届くまで有界時間だけ待つ。
+            fn wait_for_one_exit_reason(&self) -> Vec<(String, StateReason)> {
+                for _ in 0..200 {
+                    let seen = self.exit_reasons();
+                    if !seen.is_empty() {
+                        return seen;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("no exit-originated state change observed within 2s");
+            }
+        }
+
+        /// `on_exit` が `ResumeTracker::classify_exit` の結果で
+        /// `note_resume_failed_exit` / `note_pty_exit` を出し分けていること。
+        ///
+        /// 陽性の対照は下の
+        /// `an_untracked_nonzero_exit_is_reported_as_a_plain_pty_exit` が持つ ——
+        /// **同じ `on_exit(surface, Some(1))` の呼び出しで、resume 試行の有無だけが
+        /// 違う。** 片側だけだと、分岐が効いているのか、常に片方を呼んでいるだけ
+        /// なのかを区別できない。
+        #[test]
+        fn a_nonzero_exit_of_a_tracked_resume_attempt_is_reported_as_resume_failed() {
+            let (_dir, store) = open_temp();
+            let project = store
+                .insert_project("kamux", "/tmp/kamux-test-repo", CliKind::Claude)
+                .expect("insert project");
+            let session = insert_test_session(&store, &project.id, "resume");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            let handle = app.handle().clone();
+            let state = handle.state::<AppState>();
+
+            // 陽性の対照（前提）: 遷移が通る状態から測る。`Idle` のまま測ると
+            // `Exited` への遷移そのものは起きるが、fixture が本当に生きていることを
+            // 確かめられない。
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            let observer = Arc::new(RecordingObserver::default());
+            state.runtime.register_observer(observer.clone());
+            state
+                .resume_tracker
+                .mark_resume_attempt(&session.id, &ResumePlan::ClaudeContinue);
+
+            TauriSink::new(handle.clone()).on_exit(&format!("{}:agent", session.id), Some(1));
+
+            assert_eq!(
+                observer.wait_for_one_exit_reason(),
+                vec![(session.id.clone(), StateReason::ResumeFailed)],
+                "resume 試行中の非ゼロ終了は ResumeFailed として状態機械へ届くこと"
+            );
+            state.runtime.begin_shutdown();
+        }
+
+        /// 陽性の対照。resume 試行が記録されていない終了は素の `PtyExited` のまま。
+        #[test]
+        fn an_untracked_nonzero_exit_is_reported_as_a_plain_pty_exit() {
+            let (_dir, store) = open_temp();
+            let project = store
+                .insert_project("kamux", "/tmp/kamux-test-repo", CliKind::Claude)
+                .expect("insert project");
+            let session = insert_test_session(&store, &project.id, "fresh");
+
+            let app = mock_builder()
+                .manage(crate::state::test_support::app_state(store))
+                .build(mock_context(noop_assets()))
+                .expect("build mock app");
+            let handle = app.handle().clone();
+            let state = handle.state::<AppState>();
+
+            state
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+            let observer = Arc::new(RecordingObserver::default());
+            state.runtime.register_observer(observer.clone());
+
+            TauriSink::new(handle.clone()).on_exit(&format!("{}:agent", session.id), Some(1));
+
+            assert_eq!(
+                observer.wait_for_one_exit_reason(),
+                vec![(session.id.clone(), StateReason::PtyExited)],
+                "resume を試みていない終了に ResumeFailed を付けてはならない"
+            );
+            state.runtime.begin_shutdown();
         }
     }
 

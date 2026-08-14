@@ -16,6 +16,10 @@ pub struct HookHandler {
     /// hooks 疎通の昇格先（M3-3）。`RuntimeSender` と同じく、accept スレッドから
     /// 同期的に呼べる軽いハンドルとして所有する。
     heuristics: Arc<HeuristicRegistry>,
+    /// 再開試行の追跡（M2-4）。**`AppState.resume_tracker` と同じ実体を受け取る。**
+    /// この構造体は `AppHandle` を持たないので `AppState` から読めず、
+    /// 引数で渡すのが唯一の経路である（契約 §41.3 / 計画 §4.2）。
+    resume_tracker: Arc<crate::session::resume_tracker::ResumeTracker>,
 }
 
 impl HookHandler {
@@ -23,11 +27,13 @@ impl HookHandler {
         store: Arc<Store>,
         runtime_tx: RuntimeSender,
         heuristics: Arc<HeuristicRegistry>,
+        resume_tracker: Arc<crate::session::resume_tracker::ResumeTracker>,
     ) -> Self {
         Self {
             store,
             runtime_tx,
             heuristics,
+            resume_tracker,
         }
     }
 
@@ -77,6 +83,17 @@ impl HookSink for HookHandler {
                         );
                     }
                 }
+                // M2-4 / 契約 §12.6 / 第1部 §3.1: source ("startup" / "resume") の値も
+                // 既存値との異同も見ず、無条件に「再開試行はプロセス起動まで届いた」と
+                // 記録する（保存は M2-2 が実装済み）。
+                //
+                // **内側の `match` の外に置くこと。** `Some` 腕へ入れると、payload に
+                // `session_id` が無い `SessionStart` が再開失敗として扱われる ——
+                // そのプロセスは会話を開始しており、再開の失敗ではない。
+                // 試行が記録されていないセッションでは no-op（`note_session_start` が
+                // 新規エントリを作らない）。
+                self.resume_tracker
+                    .note_session_start(&event.kamux_session_id);
                 // 状態機械には送らない。SessionStart に対応する StateInput が存在しない。
             }
             // 契約 §12.4: どちらも waiting_input へ落ちるが、遷移理由は区別する。
@@ -173,7 +190,12 @@ mod tests {
             )),
             tauri::async_runtime::handle().inner().clone(),
         );
-        let handler = HookHandler::new(Arc::clone(&store), tx.clone(), Arc::clone(&heuristics));
+        let handler = HookHandler::new(
+            Arc::clone(&store),
+            tx.clone(),
+            Arc::clone(&heuristics),
+            Arc::new(crate::session::resume_tracker::ResumeTracker::new()),
+        );
         (handler, store, tx, runtime, session.id, dir, heuristics)
     }
 
@@ -415,6 +437,63 @@ mod tests {
             "PermissionRequest must be observed as HookPermission and Notification as \
              HookNotification, in that order"
         );
+    }
+
+    /// M2-4 / 契約 §41.3: `SessionStart` を受け取ったら再開試行に「到達した」印を
+    /// 付ける。**`claude_session_id` の有無で分岐しない** —— payload に
+    /// `session_id` が無い `SessionStart` でも、そのプロセスは会話を開始して
+    /// おり、再開の失敗ではない。
+    ///
+    /// **`claude_session_id: None` で測るのが要である。** `Some(..)` で測ると、
+    /// 印を内側の `Some` 腕へ入れてしまう実装（= payload に session_id が
+    /// 無い正常な起動を `ResumeFailed` と報告する実装）でも緑になる。
+    ///
+    /// 陽性の対照は下の
+    /// `a_resume_attempt_without_session_start_is_still_classified_as_failed` が
+    /// 持つ。片側だけだと、`classify_exit` が常に `PtyExited` を返しているのか、
+    /// この配線が効いているのかを区別できない。
+    #[test]
+    fn session_start_marks_the_resume_attempt_as_reached_even_without_a_session_id() {
+        let (handler, _store, _tx, runtime, id, _dir) = handler_with_session();
+        handler
+            .resume_tracker
+            .mark_resume_attempt(&id, &crate::session::cli_args::ResumePlan::ClaudeContinue);
+
+        handler.on_hook(HookEvent {
+            kamux_session_id: id.clone(),
+            kind: HookKind::SessionStart,
+            claude_session_id: None,
+            source: Some("resume".to_string()),
+        });
+
+        assert_eq!(
+            handler
+                .resume_tracker
+                .classify_exit(&format!("{id}:agent"), Some(1)),
+            StateReason::PtyExited,
+            "SessionStart が届いた後の非ゼロ終了を ResumeFailed と分類している"
+        );
+
+        runtime.begin_shutdown();
+    }
+
+    /// 上のテストの陽性の対照。`SessionStart` が来ないまま非ゼロ終了した
+    /// resume 試行は `ResumeFailed` のままである。
+    #[test]
+    fn a_resume_attempt_without_session_start_is_still_classified_as_failed() {
+        let (handler, _store, _tx, runtime, id, _dir) = handler_with_session();
+        handler
+            .resume_tracker
+            .mark_resume_attempt(&id, &crate::session::cli_args::ResumePlan::ClaudeContinue);
+
+        assert_eq!(
+            handler
+                .resume_tracker
+                .classify_exit(&format!("{id}:agent"), Some(1)),
+            StateReason::ResumeFailed
+        );
+
+        runtime.begin_shutdown();
     }
 
     /// 契約 §12.2 のマージにより両方発火しうる。同じ状態への二重遷移は無害。

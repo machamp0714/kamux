@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::model::StateReason;
 use crate::pty::agent_session_id;
+use crate::session::cli_args::ResumePlan;
 
 /// resume 試行 1 回分の観測。
 #[derive(Debug, Clone, Copy)]
@@ -33,25 +34,31 @@ impl ResumeTracker {
     /// resume_session が PTY を spawn する直前に呼ぶ。
     /// 同一セッションの前回試行は破棄される。
     ///
-    /// **呼び出し側は、`resume_mode()` が `ResumeMode::None` を返す入力
-    /// (第1部 §3 行 4〜16。shell / custom / codex の全行、および
-    /// claude + in_place + `claude_session_id == None`)で、この試行を
-    /// 記録するかどうかを決めること。**
-    /// 記録すると、`SessionStart` hook を発火しない `cli_kind`(shell /
-    /// custom / codex)では `session_start_seen` が永久に `false` のまま
-    /// になるため、そのプロセスが非ゼロ終了しさえすれば必ず
-    /// `StateReason::ResumeFailed` になる。これは「会話復元を試みてすら
-    /// いない」プロセスに対して誤って再開失敗を報告することになる。
+    /// **`ResumePlan::FreshStart` は試行として記録しない**(Task 8 が採った形。
+    /// 前身の doc が並べていた 3 つの選択肢のうち (a) に当たる)。理由:
+    /// `SpawnIntent::Resume` は「会話復元を試みている」と同値ではない ——
+    /// shell / custom / codex の全行と claude + in_place + `claude_session_id`
+    /// 欠損では `resume_plan()` が `FreshStart` を返し、復元は試みられない。
+    /// これらの `cli_kind` は `SessionStart` hook を発火しない(発火源は
+    /// `claude_hook_args` の `--settings` で `CliKind::Claude` 限定)ので、
+    /// 無条件に記録すると `session_start_seen` が永久に `false` のままになり、
+    /// そのプロセスが非ゼロ終了しさえすれば必ず `StateReason::ResumeFailed` に
+    /// なる。「会話は復元されませんでした」が、復元を試みてすらいない
+    /// プロセスに対して出ることになる。
     ///
-    /// 未検証の予測(この呼び出し側は本 PR にはまだ無く、変異を当てる
-    /// 対象そのものが存在しない): どの手当てを採るかは Task 8 の設計
-    /// 判断であり、選択肢は少なくとも 3 つある。
-    ///   (a) `resume_mode(&plan) != ResumeMode::None` のときだけ呼ぶ
-    ///   (b) 呼ぶが、`ResumeFailed` の判定に「そもそも復元を試みた」
-    ///       条件を持たせる
-    ///   (c) 非 claude では resume ボタン自体を「再起動」として
-    ///       `ResumeFailed` 経路から外す
-    pub fn mark_resume_attempt(&self, session_id: &str) {
+    /// **ガードは呼び出し側ではなくここに置く。** `resume_session` は
+    /// `state.pty.spawn`(Wry 固定。契約 §15)を含みユニットテストから到達
+    /// できない(契約 §96.4 の到達不能領域)ので、あちらに `if` を書くと
+    /// ガードを外す変異が全緑になる。ここに置けば観測できる —— このガードを
+    /// 外して無条件に記録する変異は `a_fresh_start_plan_is_never_recorded_as_a_resume_attempt`
+    /// と `a_fresh_start_for_an_ambiguous_in_place_conversation_is_not_recorded_either`
+    /// を赤にすることを実測した(Task 8 の変異 M-1)。
+    pub fn mark_resume_attempt(&self, session_id: &str, plan: &ResumePlan) {
+        // 理由(`FreshStartReason`)では分岐しない —— `resume_mode()` が理由に
+        // よらず `ResumeMode::None` へ落とすのと同じ扱いにする。
+        if matches!(plan, ResumePlan::FreshStart { .. }) {
+            return;
+        }
         let mut map = self.lock();
         map.insert(
             session_id.to_string(),
@@ -109,10 +116,15 @@ mod tests {
     use super::*;
     use crate::model::StateReason;
 
+    use crate::session::cli_args::FreshStartReason;
+
     // mark_resume_attempt / note_session_start は session_id、
     // classify_exit は surface_id を取る(契約 §41.3 決定 (3))。
     const S: &str = "11111111-1111-4111-8111-111111111111";
     const SURF: &str = "11111111-1111-4111-8111-111111111111:agent";
+
+    /// 会話復元を実際に試みる plan。`mark_resume_attempt` が試行を記録する側。
+    const ATTEMPTED: ResumePlan = ResumePlan::ClaudeContinue;
 
     #[test]
     fn plain_start_exit_is_pty_exited() {
@@ -124,7 +136,7 @@ mod tests {
     #[test]
     fn editor_surface_exit_never_consumes_the_attempt() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         let editor = "11111111-1111-4111-8111-111111111111:editor";
         assert_eq!(t.classify_exit(editor, Some(1)), StateReason::PtyExited);
         // 試行は生きているので、agent の終了は依然 ResumeFailed になる。
@@ -135,7 +147,7 @@ mod tests {
     #[test]
     fn resume_attempt_without_session_start_and_nonzero_exit_is_resume_failed() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
     }
 
@@ -143,7 +155,7 @@ mod tests {
     #[test]
     fn session_start_received_means_resume_succeeded() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         t.note_session_start(S);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
     }
@@ -152,7 +164,7 @@ mod tests {
     #[test]
     fn zero_exit_code_is_never_resume_failed() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         assert_eq!(t.classify_exit(SURF, Some(0)), StateReason::PtyExited);
     }
 
@@ -160,7 +172,7 @@ mod tests {
     #[test]
     fn unknown_exit_code_is_never_resume_failed() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         assert_eq!(t.classify_exit(SURF, None), StateReason::PtyExited);
     }
 
@@ -168,7 +180,7 @@ mod tests {
     #[test]
     fn classify_consumes_the_attempt() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
     }
@@ -177,9 +189,9 @@ mod tests {
     #[test]
     fn a_new_attempt_resets_the_session_start_flag() {
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         t.note_session_start(S);
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
     }
 
@@ -194,12 +206,64 @@ mod tests {
         assert_eq!(t.lock().len(), 0);
     }
 
+    /// `ResumePlan::FreshStart` は「そもそも会話復元を試みない」決定なので、
+    /// 試行として記録しない。記録すると、`SessionStart` hook を発火しない
+    /// cli_kind(shell / custom / codex)のプロセスが非ゼロ終了しさえすれば
+    /// 必ず `ResumeFailed` になり、復元を試みてすらいない起動に対して
+    /// 「会話は復元されませんでした」が出る。
+    ///
+    /// 陽性の対照は上の
+    /// `resume_attempt_without_session_start_and_nonzero_exit_is_resume_failed`
+    /// が持つ ——「同じ引数で `ATTEMPTED` なら `ResumeFailed`」なので、
+    /// この assert が緑なのは分岐が効いているからであって、
+    /// `classify_exit` が常に `PtyExited` を返すからではない。
+    #[test]
+    fn a_fresh_start_plan_is_never_recorded_as_a_resume_attempt() {
+        let t = ResumeTracker::new();
+        t.mark_resume_attempt(
+            S,
+            &ResumePlan::FreshStart {
+                reason: FreshStartReason::NoConversationRestore,
+            },
+        );
+        assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
+    }
+
+    /// 同じガードを、もう一方の `FreshStartReason` でも見る。理由で分岐して
+    /// いないこと(`resume_mode()` が理由によらず `ResumeMode::None` へ落とすのと
+    /// 同じ扱い)の固定。
+    #[test]
+    fn a_fresh_start_for_an_ambiguous_in_place_conversation_is_not_recorded_either() {
+        let t = ResumeTracker::new();
+        t.mark_resume_attempt(
+            S,
+            &ResumePlan::FreshStart {
+                reason: FreshStartReason::AmbiguousInPlaceConversation,
+            },
+        );
+        assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::PtyExited);
+    }
+
+    /// `ClaudeResume`(分岐表 行 1 / 行 2)も記録される側であることを固定する。
+    /// ガードを `ClaudeContinue` だけに絞る変異を弁別する。
+    #[test]
+    fn a_claude_resume_plan_is_recorded_as_a_resume_attempt() {
+        let t = ResumeTracker::new();
+        t.mark_resume_attempt(
+            S,
+            &ResumePlan::ClaudeResume {
+                claude_session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            },
+        );
+        assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
+    }
+
     #[test]
     fn sessions_are_tracked_independently() {
         let other = "22222222-2222-4222-8222-222222222222";
         let other_surf = format!("{other}:agent");
         let t = ResumeTracker::new();
-        t.mark_resume_attempt(S);
+        t.mark_resume_attempt(S, &ATTEMPTED);
         t.note_session_start(other);
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
         assert_eq!(
