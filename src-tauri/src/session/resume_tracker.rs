@@ -32,6 +32,25 @@ impl ResumeTracker {
 
     /// resume_session が PTY を spawn する直前に呼ぶ。
     /// 同一セッションの前回試行は破棄される。
+    ///
+    /// **呼び出し側は、`resume_mode()` が `ResumeMode::None` を返す入力
+    /// (第1部 §3 行 4〜16。shell / custom / codex の全行、および
+    /// claude + in_place + `claude_session_id == None`)で、この試行を
+    /// 記録するかどうかを決めること。**
+    /// 記録すると、`SessionStart` hook を発火しない `cli_kind`(shell /
+    /// custom / codex)では `session_start_seen` が永久に `false` のまま
+    /// になるため、そのプロセスが非ゼロ終了しさえすれば必ず
+    /// `StateReason::ResumeFailed` になる。これは「会話復元を試みてすら
+    /// いない」プロセスに対して誤って再開失敗を報告することになる。
+    ///
+    /// 未検証の予測(この呼び出し側は本 PR にはまだ無く、変異を当てる
+    /// 対象そのものが存在しない): どの手当てを採るかは Task 8 の設計
+    /// 判断であり、選択肢は少なくとも 3 つある。
+    ///   (a) `resume_mode(&plan) != ResumeMode::None` のときだけ呼ぶ
+    ///   (b) 呼ぶが、`ResumeFailed` の判定に「そもそも復元を試みた」
+    ///       条件を持たせる
+    ///   (c) 非 claude では resume ボタン自体を「再起動」として
+    ///       `ResumeFailed` 経路から外す
     pub fn mark_resume_attempt(&self, session_id: &str) {
         let mut map = self.lock();
         map.insert(

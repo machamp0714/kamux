@@ -264,7 +264,7 @@ fn plan_agent_spawn(
 ) -> AppResult<(Session, SpawnSpec)> {
     // `intent` の素通し（この 1 行の `intent` の選択）はどのテストからも観測
     // されていない。取り違え（例: 引数を `SpawnIntent::Fresh` へ潰す）を打つ
-    // 変異は 750 passed のまま全緑になることを実測済み（レビュー I-2）。理由:
+    // 変異は全緑になることを実測済み（レビュー I-2 / M-A、HEAD 424d8a2）。理由:
     // `plan_agent_spawn` は `probe_login_env()` / `resolve_program`（契約 §18）
     // という実環境（`$SHELL -ilc` の実行・実 PATH 探索）に触れる seam の外側の
     // ラッパであり（契約 §60.4）、`resolve_program` へ本物の `claude` を注入
@@ -371,8 +371,8 @@ pub async fn start_session(
     // `get_session` / `get_project` の Err はそこで ❌ の対象から外れている。
     //
     // ここに書く `SpawnIntent::Fresh` の選択もどのテストからも観測されていない
-    // —— `SpawnIntent::Resume` へ差し替える変異を打っても 750 passed のまま
-    // 全緑になることを実測済み（レビュー I-2）。理由: `start_session` の
+    // —— `SpawnIntent::Resume` へ差し替える変異を打っても全緑になることを
+    // 実測済み（レビュー I-2 / M-B、HEAD 424d8a2）。理由: `start_session` の
     // `state.pty.spawn`（後段の `spawn_with_observer` 呼び出し）は Wry 固定
     // （契約 §15）で `MockRuntime` に登録できず、IPC テストからこの関数自体へ
     // 到達できない。したがって、この 1 トークンの取り違え（誤って会話を
