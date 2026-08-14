@@ -1507,6 +1507,15 @@ mod tests {
 
         /// M2-4: クリアが実際に DB へ効き、戻り値の `Session.claude_session_id` が
         /// 書き込み後の行（`get_session` で読み直した値）から取り直されていること。
+        ///
+        /// `updated.updated_at == row.updated_at` は、正しい実装では**必ず**成立する
+        /// （`apply_session_patch` 内の `get_session` とこのテストの `get_session` の
+        /// 間に DB 書き込みが無いため、フレークの余地は無い）。一方 `get_session` を
+        /// `updated.claude_session_id = None` の直書きへ差し替える変異は、`now_ms()`
+        /// がミリ秒解像度で、書き込み後の 2 回の DAO 呼び出しがほぼ同時に起きるため、
+        /// 両者が同じミリ秒に収まった回だけ見逃す（実測: 1 回あたり検知確率 約 1/5〜1/6）。
+        /// 80 回繰り返すことで見逃し確率を無視できる水準まで下げる
+        /// （production 側に手を入れず、テスト側だけで判別力を作る）。
         #[test]
         fn apply_session_patch_clears_claude_session_id_and_returns_the_updated_row() {
             let (_dir, store) = open_temp();
@@ -1514,34 +1523,41 @@ mod tests {
                 .insert_project("kamux", "/x/kamux", CliKind::Custom)
                 .expect("insert_project")
                 .id;
-            let session = insert_test_session(&store, &project_id, "live");
-            store
-                .set_claude_session_id(&session.id, "abc123")
-                .expect("set_claude_session_id");
-
             let state = crate::state::test_support::app_state(store);
-            let updated = super::super::apply_session_patch(
-                &state,
-                &session.id,
-                &crate::model::SessionPatch {
-                    claude_session_id: Some(None),
-                    ..Default::default()
-                },
-            )
-            .expect("patch");
-            assert_eq!(
-                updated.claude_session_id, None,
-                "戻り値でクリアが反映されていない"
-            );
 
-            let row = state.store.get_session(&session.id).expect("get_session");
-            assert_eq!(row.claude_session_id, None, "DB でクリアが反映されていない");
-            assert_eq!(
-                updated.updated_at, row.updated_at,
-                "戻り値の updated_at が DB の最新行と一致していない: \
-                 get_session で読み直さず updated.claude_session_id を直書きすると \
-                 更新前の updated_at のまま返ってしまう"
-            );
+            for i in 0..80 {
+                let session = insert_test_session(&state.store, &project_id, &format!("live-{i}"));
+                state
+                    .store
+                    .set_claude_session_id(&session.id, "abc123")
+                    .expect("set_claude_session_id");
+
+                let updated = super::super::apply_session_patch(
+                    &state,
+                    &session.id,
+                    &crate::model::SessionPatch {
+                        claude_session_id: Some(None),
+                        ..Default::default()
+                    },
+                )
+                .expect("patch");
+                assert_eq!(
+                    updated.claude_session_id, None,
+                    "戻り値でクリアが反映されていない（iteration {i}）"
+                );
+
+                let row = state.store.get_session(&session.id).expect("get_session");
+                assert_eq!(
+                    row.claude_session_id, None,
+                    "DB でクリアが反映されていない（iteration {i}）"
+                );
+                assert_eq!(
+                    updated.updated_at, row.updated_at,
+                    "戻り値の updated_at が DB の最新行と一致していない（iteration {i}）: \
+                     get_session で読み直さず updated.claude_session_id を直書きすると \
+                     更新前の updated_at のまま返ってしまう"
+                );
+            }
         }
 
         /// M2-4 レビュー Important: `session_patch_guard_tests` はガード関数
