@@ -33,6 +33,15 @@ pub struct AppState {
     /// `set_hooks` / `hooks()` のような専用メソッドは作らない。`state.hooks.as_ref()` が
     /// 唯一の到達経路（契約 §75 の適用）。
     pub hooks: Option<HooksRuntime>,
+    /// 再開試行の追跡（M2-4）。**`RuntimeStateManager` の中には入れない** ——
+    /// あちらは状態機械の中核で、こちらは「その終了が resume 失敗か」を
+    /// 分類して入力を選ぶ側である（`heuristics` と同じ層の関係）。
+    ///
+    /// `Arc` なのは `HookHandler` が同じ実体を持つ必要があるためである。
+    /// handler は `AppHandle` を持たないので `AppState` から読めず、
+    /// `HookHandler::new` の引数として渡すのが唯一の経路になる。
+    /// setter は作らない（`state.resume_tracker` が唯一の到達経路。契約 §75）。
+    pub resume_tracker: Arc<crate::session::resume_tracker::ResumeTracker>,
     /// Drop でソケットを unlink するため保持する。`shutdown()` が `&mut self` を要る
     /// ため `hooks` とは違い `Mutex` が必要（RunEvent::Exit のハンドラから止める）。
     pub hooks_server: Mutex<Option<HooksServer>>,
@@ -68,6 +77,7 @@ pub(crate) mod test_support {
             pty: PtyManager::new(),
             runtime,
             heuristics,
+            resume_tracker: Arc::new(crate::session::resume_tracker::ResumeTracker::new()),
             hooks: None,
             hooks_server: Mutex::new(None),
         }

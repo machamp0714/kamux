@@ -4,6 +4,7 @@ import { RuntimeBadge } from '../../components/RuntimeBadge';
 import type { Session } from '../../types/model';
 import { CLI_ICON } from './badge';
 import { KanbanCardError } from './KanbanCardError';
+import { KanbanCardResume } from './KanbanCardResume';
 
 /**
  * dnd-kit のドラッグ活性化一式。**ラッパ要素ではなくカードのルート要素に載せる。**
@@ -47,8 +48,8 @@ function stopOpen(e: MouseEvent<HTMLButtonElement>) {
  * クリック / Enter でターミナル画面の該当ペインへフォーカスする（要件5・契約 §11）。
  *
  * **`runtimeStates` / `runtimeErrors` を購読しない**（契約 §25.5 / §38.3）。
- * バッジとエラーは葉（`RuntimeBadge` / `KanbanCardError`）が自分で購読するので、
- * 実行状態が動いてもカード全体は再レンダリングされない。
+ * バッジ・エラー・再開ボタンは葉（`RuntimeBadge` / `KanbanCardError` / `KanbanCardResume`）
+ * が自分で購読するので、実行状態が動いてもカード全体は再レンダリングされない。
  */
 export function KanbanCard({ session, onEdit, onArchive, onOpen, dragActivator }: KanbanCardProps) {
   const dragListeners = dragActivator?.listeners;
@@ -102,6 +103,7 @@ export function KanbanCard({ session, onEdit, onArchive, onOpen, dragActivator }
       <KanbanCardError sessionId={session.id} />
 
       <div className="kanban-card__actions">
+        {interactive && <KanbanCardResume sessionId={session.id} />}
         <button
           type="button"
           onPointerDown={stopDrag}

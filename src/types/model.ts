@@ -78,6 +78,13 @@ export interface AppError {
 /** 契約 §5 */
 export const surfaceId = (sessionId: string, kind: SurfaceKind) => `${sessionId}:${kind}`;
 
+// 契約 §23 / 計画第1部 §2: src-tauri/src/session/cli_args.rs の ResumePlan / FreshStartReason と 1:1。
+export type FreshStartReason = 'ambiguous_in_place_conversation' | 'no_conversation_restore';
+export type ResumePlan =
+  | { kind: 'claude_resume'; claude_session_id: string }
+  | { kind: 'claude_continue' }
+  | { kind: 'fresh_start'; reason: FreshStartReason };
+
 /**
  * `focus://session/{session_id}`（契約 §8）のペイロード。
  * TS 側の置き場所の正典は src/types/model.ts（契約 §33.2。Rust 側の model.rs と 1:1）。

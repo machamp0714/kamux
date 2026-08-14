@@ -12,6 +12,7 @@ vi.mock('../ipc/commands', () => ({
   createSession: vi.fn(),
   updateSession: vi.fn(),
   moveSession: vi.fn(),
+  resumeSession: vi.fn(),
 }));
 
 import {
@@ -20,6 +21,7 @@ import {
   listProjects,
   listSessions,
   moveSession,
+  resumeSession,
   updateSession,
   type CreateSessionArgs,
 } from '../ipc/commands';
@@ -142,6 +144,10 @@ const ARGS: Record<string, unknown[]> = {
   moveCard: ['a', 'review', 0],
   editSession: ['a', { title: 'renamed' }],
   archiveSession: ['a'],
+  // 契約 §8 の StateReason::ResumeFailed 経路（M2-4 Task 10）。
+  // どちらもフォーカス 3 状態には触れない —— sessions / resumeFailedSessionIds / runtimeErrors だけを書く。
+  resumeSession: ['a'],
+  retryResumeAsFresh: ['a'],
 };
 
 function seedBaseline(): void {
@@ -196,6 +202,9 @@ beforeEach(() => {
       const target = useAppStore.getState().sessions[id];
       return target ? [{ ...target, kanban_status: toStatus }] : [];
     });
+  vi.mocked(resumeSession)
+    .mockReset()
+    .mockImplementation(async (id) => useAppStore.getState().sessions[id] ?? makeSession({ id }));
   seedBaseline();
 });
 

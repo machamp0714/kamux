@@ -141,6 +141,67 @@ describe('KanbanCard（要件5: クリック / Enter で開く）', () => {
   });
 });
 
+// KanbanCardResume は葉として自分で購読するので（契約 §25.5 / §38.3）、KanbanCard の
+// 実物を render しないと「差し込みの 1 行」の欠落を検出できない（契約 §81 群 S）。
+describe('KanbanCard と KanbanCardResume の配線（第1部 §4.4）', () => {
+  beforeEach(() => {
+    useAppStore.setState({ sessions: { s1: session('s1') }, resumeFailedSessionIds: [] });
+  });
+
+  it('runtimeStates が interrupted のとき再開ボタンが actions 内に描かれる', () => {
+    useAppStore.setState({ runtimeStates: { s1: 'interrupted' } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={session('s1')} onOpen={vi.fn()} />);
+    });
+
+    // session('s1') は cli_kind: 'shell' なので resumeAffordance のラベルは
+    // 「プロセスを再起動」（claude 以外の分岐。src/session/resumeAffordance.ts）
+    const actions = card().querySelector('.kanban-card__actions');
+    const buttons = [...(actions?.querySelectorAll('button') ?? [])].map((b) => b.textContent);
+    expect(buttons).toContain('プロセスを再起動');
+  });
+
+  it('runtimeStates が running のときは再開ボタンを描かない', () => {
+    useAppStore.setState({ runtimeStates: { s1: 'running' } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={session('s1')} onOpen={vi.fn()} />);
+    });
+
+    const actions = card().querySelector('.kanban-card__actions');
+    const buttons = [...(actions?.querySelectorAll('button') ?? [])].map((b) => b.textContent);
+    expect(buttons).not.toContain('プロセスを再起動');
+  });
+
+  // Important 2: DragOverlay のクローン（onOpen も dragActivator も渡さない。
+  // KanbanView/index.tsx:139 の形）に、破壊的操作を起こせる生きたボタンが
+  // 入ってはならない（KanbanCard.tsx:45-47 の doc の不変条件）。
+  it('クローン形状（onOpen も dragActivator も無い）では再開ボタンが存在しない', () => {
+    useAppStore.setState({ runtimeStates: { s1: 'interrupted' } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={session('s1')} />);
+    });
+
+    const actions = card().querySelector('.kanban-card__actions');
+    const buttons = [...(actions?.querySelectorAll('button') ?? [])].map((b) => b.textContent);
+    expect(buttons).not.toContain('プロセスを再起動');
+  });
+
+  it('実カード形状（onOpen を渡す）では再開ボタンが存在する', () => {
+    useAppStore.setState({ runtimeStates: { s1: 'interrupted' } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={session('s1')} onOpen={vi.fn()} />);
+    });
+
+    const actions = card().querySelector('.kanban-card__actions');
+    const buttons = [...(actions?.querySelectorAll('button') ?? [])].map((b) => b.textContent);
+    expect(buttons).toContain('プロセスを再起動');
+  });
+});
+
 // components.md「カード」節: kanban-card__head は「横並び・両端寄せ。左に CLI チップ、
 // 右にバッジ」= 2 グループである。ここに 3 要素目（title）が混ざると
 // justify-content: space-between の意味が変わり、バッジが中央に落ちる。
