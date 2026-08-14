@@ -21,21 +21,6 @@ use cli_args::{
 };
 use workspace::{apply_start_kanban_transition, prepare_worktree};
 
-/// `start_session` の `AppHandle` を必要としない部分だけを切り出した純関数（注入版）。
-///
-/// 契約 §15 が `PtyManager::spawn(&self, app: &tauri::AppHandle, ..)` を Wry 固定で
-/// 凍結しているため、`start_session` 全体は `MockRuntime` の `generate_handler!` に
-/// 登録できず IPC テストから到達不能になる（フィックス対象レビュー指摘: Task 8 fix
-/// round 1、Important 1）。`id -> get_session -> get_project -> prepare_worktree ->
-/// build_launch_command -> SpawnSpec` の組み立て自体は `AppHandle` を要求しない
-/// ので、ここへ分離すればランタイム不要の普通のユニットテストで固定できる。
-///
-/// `launch_env` / `resolve_program` を引数で注入できるのは、`probe_login_env()` /
-/// `resolve_program()`（契約 §18）が実環境（`$SHELL -ilc` の実行・実 PATH 探索）に
-/// 触れるため（契約 §60.4 の注入版 seam）。ここへ実装をベタ書きすると、この関数を
-/// 呼ぶすべてのテストが実行環境の `$SHELL` と実 `claude` の有無に依存してしまい、
-/// 契約 §14「実 `claude` は使わない」を満たせなくなる。`plan_agent_spawn`（下）が
-/// 実環境版へ委譲する薄いラッパである。
 /// 起動が「新規」か「再開」かの判別子（M2-4）。
 ///
 /// **`ResumeMode` そのものを引数にできない。** `ResumeMode<'a>` は
@@ -54,6 +39,21 @@ pub enum SpawnIntent {
     Resume,
 }
 
+/// `start_session` の `AppHandle` を必要としない部分だけを切り出した純関数（注入版）。
+///
+/// 契約 §15 が `PtyManager::spawn(&self, app: &tauri::AppHandle, ..)` を Wry 固定で
+/// 凍結しているため、`start_session` 全体は `MockRuntime` の `generate_handler!` に
+/// 登録できず IPC テストから到達不能になる（フィックス対象レビュー指摘: Task 8 fix
+/// round 1、Important 1）。`id -> get_session -> get_project -> prepare_worktree ->
+/// build_launch_command -> SpawnSpec` の組み立て自体は `AppHandle` を要求しない
+/// ので、ここへ分離すればランタイム不要の普通のユニットテストで固定できる。
+///
+/// `launch_env` / `resolve_program` を引数で注入できるのは、`probe_login_env()` /
+/// `resolve_program()`（契約 §18）が実環境（`$SHELL -ilc` の実行・実 PATH 探索）に
+/// 触れるため（契約 §60.4 の注入版 seam）。ここへ実装をベタ書きすると、この関数を
+/// 呼ぶすべてのテストが実行環境の `$SHELL` と実 `claude` の有無に依存してしまい、
+/// 契約 §14「実 `claude` は使わない」を満たせなくなる。`plan_agent_spawn`（下）が
+/// 実環境版へ委譲する薄いラッパである。
 fn plan_agent_spawn_with(
     state: &AppState,
     id: &str,
@@ -261,6 +261,16 @@ fn plan_agent_spawn(
     id: &str,
     intent: SpawnIntent,
 ) -> AppResult<(Session, SpawnSpec)> {
+    // `intent` の素通し（この 1 行の `intent` の選択）はどのテストからも観測
+    // されていない。取り違え（例: 引数を `SpawnIntent::Fresh` へ潰す）を打つ
+    // 変異は 750 passed のまま全緑になることを実測済み（レビュー I-2）。理由:
+    // `plan_agent_spawn` は `probe_login_env()` / `resolve_program`（契約 §18）
+    // という実環境（`$SHELL -ilc` の実行・実 PATH 探索）に触れる seam の外側の
+    // ラッパであり（契約 §60.4）、`resolve_program` へ本物の `claude` を注入
+    // しない限り `SpawnIntent::Resume` の分岐へテストから到達できない
+    // （契約 §14「実 `claude` は使わない」の下では構成できていない）。
+    // したがって、この 1 トークンの取り違えは `start_session`（`mod.rs` 内の
+    // 既存の M-1 コメントを参照）と同じ扱いで目視レビューにより担保する。
     plan_agent_spawn_with(state, id, probe_login_env(), resolve_program, intent)
 }
 
@@ -358,6 +368,15 @@ pub async fn start_session(
     // `build_launch_command`）の Err に対する `mark_error` は `plan_agent_spawn_with` の
     // 中で済んでいる（契約 §40.3 / §63.5）。事前条件（二重起動ガード）と
     // `get_session` / `get_project` の Err はそこで ❌ の対象から外れている。
+    //
+    // ここに書く `SpawnIntent::Fresh` の選択もどのテストからも観測されていない
+    // —— `SpawnIntent::Resume` へ差し替える変異を打っても 750 passed のまま
+    // 全緑になることを実測済み（レビュー I-2）。理由: `start_session` の
+    // `state.pty.spawn`（後段の `spawn_with_observer` 呼び出し）は Wry 固定
+    // （契約 §15）で `MockRuntime` に登録できず、IPC テストからこの関数自体へ
+    // 到達できない。したがって、この 1 トークンの取り違え（誤って会話を
+    // 復元してしまう）は、直後の 5 段目に既にある M-1 コメントの区間と同じ
+    // 扱いで目視レビューにより担保する。
     let (mut session, spec) = plan_agent_spawn(&state, &id, SpawnIntent::Fresh)?;
     // AppHandle に依存する行はこの 1 行だけ（設計判断 6: spawn 成功後にのみ DB を書く）。
     // `state.pty.spawn` が Wry 固定（契約 §15）で MockRuntime に登録できないため、
