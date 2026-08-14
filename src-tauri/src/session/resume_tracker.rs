@@ -164,6 +164,17 @@ mod tests {
         assert_eq!(t.classify_exit(SURF, Some(1)), StateReason::ResumeFailed);
     }
 
+    /// `note_session_start` は、試行が記録されていないセッションでは
+    /// `attempts` に新規エントリを作らない(不変条件。契約 §41.3)。
+    /// この不変条件は `classify_exit` の戻り値からは観測できない
+    /// (`session_start_seen == true` は常に `PtyExited` へ収束するため)。
+    #[test]
+    fn note_session_start_does_not_create_an_entry_for_an_unknown_session() {
+        let t = ResumeTracker::new();
+        t.note_session_start(S);
+        assert_eq!(t.lock().len(), 0);
+    }
+
     #[test]
     fn sessions_are_tracked_independently() {
         let other = "22222222-2222-4222-8222-222222222222";
