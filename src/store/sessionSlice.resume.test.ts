@@ -93,6 +93,32 @@ describe('resume の失敗ハンドリング', () => {
     expect(useAppStore.getState().resumeFailedSessionIds).toEqual([]);
   });
 
+  // 恒等ガードの !resumeFailedRemoved 項そのものを守る観測（修正ラウンド2）。
+  // runtimeStates/runtimeReasons が「同値のまま」running を再送する経路を
+  // そのまま踏む —— ここが同値でなければ他の項だけで早期 return を回避できてしまい、
+  // !resumeFailedRemoved の項が在っても無くても緑になる（観測にならない）。
+  // 同値であることがこのテストの本体である。
+  it('runtimeStates/runtimeReasons が同値のまま running を再送しても resumeFailedSessionIds は外れる', () => {
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'running',
+      reason: 'spawned',
+    });
+    // resumeFailedSessionIds だけを「載っている」状態へ差し替える。
+    // runtimeStates / runtimeReasons は直前の running のまま据え置く。
+    useAppStore.setState({ resumeFailedSessionIds: [SID] });
+
+    // 同値の running を再送する。state/reason は変わらないので、恒等ガードを
+    // 抜けられるかどうかは resumeFailedRemoved の項だけにかかっている。
+    useAppStore.getState().applyStateEvent({
+      session_id: SID,
+      runtime_state: 'running',
+      reason: 'spawned',
+    });
+
+    expect(useAppStore.getState().resumeFailedSessionIds).toEqual([]);
+  });
+
   it('retryResumeAsFresh は claude_session_id をクリアしてから再開する', async () => {
     await useAppStore.getState().retryResumeAsFresh(SID);
     expect(invoked).toEqual([
