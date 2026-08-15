@@ -266,6 +266,22 @@ describe('段 1→段 2 の順序（契約 §127.6・レビュー I-2）', () =>
   });
 });
 
+// レビュー「範囲外の観察」（task-1-review.md rev1 末尾）: 一度も起動していない
+// セッションの再開が失敗した場合に unmarkStarted(surface) が門を戻すことを、
+// これまでどのテストも観測していなかった（既存の失敗経路テストは resume.test.ts 側で
+// ../terminal/ptyBridge を vi.mock しており isStarted を観測できない）。
+describe('段 2 の失敗経路で門を戻す（sessionSlice.ts の unmarkStarted・修正ラウンド 2）', () => {
+  it('一度も起動していないセッションの再開が失敗したら isStarted(surfaceId(SID,agent)) が false に戻る', async () => {
+    mocks.resumeSessionCmd.mockRejectedValueOnce({ code: 'io', message: 'boom' });
+
+    expect(isStarted(SURFACE)).toBe(false);
+
+    await expect(useAppStore.getState().resumeSession(SID)).rejects.toBeDefined();
+
+    expect(isStarted(SURFACE)).toBe(false);
+  });
+});
+
 // lane-controller の追加裁定（task-1-brief-round2 相当）: retryResumeAsFresh
 // （新しい会話として開始）が resumeSession を経由することで登録を継承することを見る。
 describe('retryResumeAsFresh は resumeSession の登録を継承する', () => {
