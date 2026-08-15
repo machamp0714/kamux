@@ -16,6 +16,19 @@ vi.mock('../ipc/commands', () => ({
   }),
 }));
 
+// このファイルの主眼は resumeFailedSessionIds / runtimeErrors の遷移であり、
+// ptyBridge の実モジュール状態（起動済み登録簿）は本ファイルの検証対象ではない
+// （それは sessionSlice.resumePty.test.tsx が実物で担う）。実物を import すると
+// ptyBridge.ts → registry.ts → @xterm/xterm が読み込まれ、かつ ensurePtySubscription が
+// 実際の Tauri IPC（window.__TAURI_INTERNALS__）を呼ぼうとして例外になる
+// （契約 §127.6 の brief が明記する既知のハザード）ため、ここでは無害化する。
+vi.mock('../terminal/ptyBridge', () => ({
+  ensurePtySubscription: vi.fn(async () => undefined),
+  isStarted: vi.fn(() => false),
+  markStarted: vi.fn(),
+  unmarkStarted: vi.fn(),
+}));
+
 import { useAppStore } from './index';
 
 const SID = '11111111-1111-4111-8111-111111111111';
