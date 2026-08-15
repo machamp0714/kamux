@@ -436,8 +436,11 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 > find $R/.superpowers/sdd -name progress.md 2>/dev/null | wc -l                                        # ① 母数
 > find $R/.superpowers/sdd -name progress.md 2>/dev/null \
 >   | xargs grep -l '^## 裁定' 2>/dev/null | xargs grep -l 'ステージ完了ゲート' 2>/dev/null | wc -l        # ② 実施記録を持つ本数
+> find $R/.superpowers/sdd -name TEAM-LEAD-RULINGS.md 2>/dev/null \
+>   | xargs grep -l 'ステージ完了ゲート' 2>/dev/null | wc -l                                             # ②' 統合前フェーズの実施記録本数
 > ```
-> **🔴 ① を必ず先に出す。① が 0 なら「実施記録が無い」ではなく「そもそも測れていない」である**（ディレクトリが無い / 打った場所が違う）。**判定は ② が実施済みステージ数以上であること。**
+> **🔴 ① を必ず先に出す。① が 0 なら「実施記録が無い」ではなく「そもそも測れていない」である**（ディレクトリが無い / 打った場所が違う）。**判定は ②+②' が実施済みステージ数以上であること。**
+> **🔴 `TEAM-LEAD-RULINGS.md`から`progress.md`「## 裁定」への統合（issue #90）より前に完了したフェーズの実施記録は移行しない。②'（`TEAM-LEAD-RULINGS.md`側）に残ったまま数える。** 移行すると過去のフェーズ側で二重カウントか消失が起きる。
 > **2026-08-15 のレビューがこの観測点の初版を「ファイルごとの個別カウントが返り判定できない」「glob に guard が無い」として差し戻し、書き直した 2 版目も worktree で打つと zsh の no-match で中断した** —— **本節を書いた同じ便が群 β として昇格させた #114 を、書いた本人が 2 版続けて踏んだ**（群 U）。**3 版目で `find` に替えて閉じた。**
 
 ### 🔴 原本が在る値を手で写さない（群 λ。2026-08-15 に昇格。2 行）
@@ -517,7 +520,11 @@ model は sonnet を明示する（設計判断を伴うタスクのみ opus）�
 > **🔴【規則】恒久的な引用先は、常に `.claude/AGENT-LESSONS.md` の事象行を使う。`progress.md`（本節の「## 裁定」を含む）を恒久的な引用先にしない。**
 > **なぜ: `progress.md` は `.superpowers/sdd/<phase>/` 配下にあり、`TEAM-LEAD-RULINGS.md` と同じく git 管理外である。** `.claude/agents/*.md` / `SKILL.md` から「経緯は `progress.md` の◯◯にある」と書いても、他の worktree や clone からは実体が無い。**この節が `progress.md` を書き先に定めているのは「今動いているフェーズの中で稼働中のレーンが読む」ためであり、恒久的な参照先としての性質を持たせるためではない。**
 > **実例: `TEAM-LEAD-RULINGS.md`（本節が置き換わる前の書き先）を `SKILL.md`「事象が起きないことを検知する規則は…」が経緯の恒久的な引用先として引用してしまい、他の worktree から読めない状態を作った。** 修正後は `.claude/AGENT-LESSONS.md` 台帳 #227 を引いている。
-> **観測点: `.claude/agents/*.md` / `SKILL.md` 内で「経緯は◯◯にある」と書く行が、すべて `.claude/AGENT-LESSONS.md` の台帳番号を指していること。** `progress.md` を指す行が無いこと。
+> **観測点: `.claude/agents/*.md` / `SKILL.md` 内で「経緯」と `progress.md` を同じ行に含む箇所を列挙し、**本節（この規律を説明している段落自体）を除いて 0 件**であること。
+> ```bash
+> grep -rn '経緯' .claude/agents/*.md .claude/skills/kamux-lane/SKILL.md | grep 'progress\.md'
+> ```
+> **🔴 この `grep` は機械的に 0 件へは収束しない。** 本節自身が「経緯」と `progress.md` を両方含むため、実行するたびに本節の説明文（2〜3 行）が必ず混ざって出る。**列挙された行を目視し、本節（「裁定と実施記録は、リポジトリに残る形で渡す」の末尾）を除いた行が 0 件であることを確認する。** 正規表現で本節だけを機械的に除外しようとすると、表記揺れ（「恒久的な引用先」/「恒久的な参照先」等）のたびに壊れる —— **母数を機械的に出し、既知の自己言及分を人間が引き算する**方が頑健。
 
 ### マージ許可（契約 §32.3）—— あなたが出す
 

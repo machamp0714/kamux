@@ -279,7 +279,7 @@ task-reviewer は既定 `sonnet`。差分が大きい／並行処理や PTY 周�
 
 ### 真因 —— `Agent` は `run_in_background: false` でも非同期で返る
 
-**「`run_in_background: false` を明示すれば同期的に待てる」は誤りである。** M1-4 は明示していたのに 2 度止まった。実測（`.superpowers/sdd/M2-1-runtime-state/TEAM-LEAD-RULINGS.md` §11.6 / §14）はこうである。
+**「`run_in_background: false` を明示すれば同期的に待てる」は誤りである。** M1-4 は明示していたのに 2 度止まった。実測（`.superpowers/sdd/M2-1-runtime-state/TEAM-LEAD-RULINGS.md` §11.6 / §14。**当時の書き先であり恒久的な引用先ではない** —— 結論は直後の引用ブロックがそのまま保持する）はこうである。
 
 > **`Agent` は `false` でも非同期で返る。したがってあなたは implementer を起動した直後に必ず一度終了する。**
 > **残る起床手段は `Monitor`（完了イベント）だけになり、それが 1〜2 時間遅れて届く事象が複数回起きた。**
