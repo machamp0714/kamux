@@ -181,6 +181,8 @@ describe('resumeSession は購読の解決を待つ（契約 §127.6・S2 / 契�
     await pending;
 
     expect(mocks.resumeSessionCmd).toHaveBeenCalledWith(SID);
+    expect(mocks.onPtyData).toHaveBeenCalledWith(SURFACE, expect.any(Function));
+    expect(mocks.onPtyExit).toHaveBeenCalledWith(SURFACE, expect.any(Function));
   });
 });
 
