@@ -15,6 +15,19 @@ vi.mock('../ipc/commands', () => ({
   resumeSession: vi.fn(),
 }));
 
+// このファイルの主眼はフォーカス 3 状態の不変条件であり、ptyBridge の実モジュール
+// 状態は本ファイルの検証対象ではない（それは sessionSlice.resumePty.test.tsx が
+// 実物で担う）。実物のままだと resumeSession('a') が ensureTerminal を実行して
+// 実 xterm インスタンスを作ってしまい（起動済み登録簿は本ファイルの関心ではない）、
+// jsdom に無い Canvas API のエラーが出力される（契約 §127.6 の brief が明記する
+// 既知のハザード）。
+vi.mock('../terminal/ptyBridge', () => ({
+  ensurePtySubscription: vi.fn(async () => undefined),
+  isStarted: vi.fn(() => false),
+  markStarted: vi.fn(),
+  unmarkStarted: vi.fn(),
+}));
+
 import {
   createProject,
   createSession,

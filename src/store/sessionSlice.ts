@@ -8,6 +8,13 @@ import {
   updateSession as updateSessionCmd,
   type CreateSessionArgs,
 } from '../ipc/commands';
+import {
+  ensurePtySubscription,
+  isStarted,
+  markStarted,
+  unmarkStarted,
+} from '../terminal/ptyBridge';
+import { writeNotice } from '../terminal/registry';
 import type {
   KanbanStatus,
   RuntimeState,
@@ -16,6 +23,7 @@ import type {
   SessionStatePayload,
   StateReason,
 } from '../types/model';
+import { surfaceId } from '../types/model';
 import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
 import type { AppStore } from './index';
 import { toAppError } from './uiSlice';
@@ -258,6 +266,45 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     set((s) => ({ runtimeErrors: { ...s.runtimeErrors, [sessionId]: message } })),
 
   resumeSession: async (sessionId) => {
+    // 契約 §127.6: resume_session を invoke する経路も start_session / spawn_editor と
+    // 同じく、invoke より前にその surface を ptyBridge へ登録すること（登録は 2 段）。
+    // surface は agent surface（'terminal' ではない。SurfaceKind は 'agent' | 'editor' の
+    // 2 値）。段 1→段 2 の順序は TerminalPane.tsx:36-45 と同じ考え方だが、**同形ではない**
+    // —— TerminalPane.tsx:44 は isStarted(surface) を読んで早期 return するが、ここは
+    // alreadyStarted を読むだけで常に invoke する（裁定 A の帰結。二度押しを弾くのは
+    // バックエンドの二重起動ガードである。レビュー task-1-review.md Minor 訂正）。
+    // 🔴 この順序（ペインの .then よりこちらの .then が先に登録されるので markStarted が
+    // 先に走る）は「再開ボタンを押す時点で TerminalPane が必ず未マウントである」
+    // （App.tsx の view ゲート）に依存する。InterruptedOverlay など terminal 面へ
+    // 再開ボタンを持ち込む変更を入れる際は、先にこの競合（マイクロタスク順の逆転）を
+    // 解くこと（レビュー task-1-review.md I-3）。
+    const surface = surfaceId(sessionId, 'agent');
+
+    // 段 1: listen 登録の完了を待つ（契約 §16）。待たずに invoke すると、再開直後の
+    // 最初の出力を載せた pty://data がリスナ不在で捨てられる（Tauri はバッファしない）。
+    try {
+      await ensurePtySubscription(surface);
+    } catch (error: unknown) {
+      // markStarted はまだ実行していないのでフラグ衛生は安全（unmarkStarted は不要）。
+      // TerminalPane.tsx:79-81 と同じ文言・同じ tone で同じ失敗を扱う。
+      // setRuntimeError は呼ばない —— 契約 §42.3 規約 4 は runtimeErrors を
+      // 「mark_error が DB へ書くのと同一の文字列」と定めており、この失敗は
+      // バックエンドに到達していない。
+      writeNotice(surface, `PTY イベントの購読に失敗しました: ${String(error)}`, 'error');
+      throw error;
+    }
+
+    // 段 2 の前に読む。alreadyStarted ガード（契約 §127.6 裁定 A）:
+    // 再開ボタンは session://state が届くまで残るため二度押しがありうる。
+    // ガード無しだと、二度目の押下が reject したときの unmarkStarted が一度目の
+    // 成功で立てた門を落とし、L-1（偽の InvalidState）が再発する。
+    // 射程: 逆順（一度目が別の理由で失敗し二度目が成功する）は救わない —— そのとき
+    // 残るのは今日の L-1 と同じ状態であり、それより悪くはならない。
+    const alreadyStarted = isStarted(surface);
+    // 段 2: invoke の解決を待たずに呼ぶ（TerminalPane.tsx:44-45 と同じ意味。
+    // 「起動済み」ではなく「起動要求を投げ済み」の門である）。
+    markStarted(surface);
+
     // 失敗時は生 stderr をストアへ残す（契約 §42.3 規約 4）。
     // kanban-card__error は resume_session の Err がバックエンドで mark_error を
     // 呼んだ（runtime_state: 'error'）場合にだけ出る。resume_failed の経路（本関数の
@@ -268,6 +315,7 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     try {
       session = await resumeSessionCmd(sessionId);
     } catch (e: unknown) {
+      if (!alreadyStarted) unmarkStarted(surface);
       get().setRuntimeError(sessionId, toAppError(e).message);
       throw e;
     }
