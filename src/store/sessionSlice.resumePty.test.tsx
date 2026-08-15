@@ -8,6 +8,7 @@
 // 本当に効いているかを検証しないため（brief §6.1 の冒頭）。
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -192,6 +193,88 @@ describe('alreadyStarted ガード（契約 §127.6 裁定 A）', () => {
     expect(isStarted(SURFACE)).toBe(true);
 
     await expect(useAppStore.getState().resumeSession(SID)).rejects.toBeDefined();
+    expect(isStarted(SURFACE)).toBe(true);
+  });
+});
+
+// レビュー I-1（task-1-review.md）: 段 1（ensurePtySubscription）の失敗経路（裁定 B）を、
+// これまでどのテストも守っていなかった（S2 のテストは onPtyData/onPtyExit を最終的に
+// resolve させるので reject 側を一度も通らない）。段 1 を reject させ、レビューが挙げた
+// 5 点 (a)〜(e) を 1 本で観測する。
+describe('段 1 の失敗経路（契約 §127.6 裁定 B・レビュー I-1）', () => {
+  it('ensurePtySubscription が reject したら resume_session を invoke せず、門も立てず、error tone の notice を書き、runtimeErrors は付けずに reject する', async () => {
+    const subscribeError = new Error('listen failed');
+    mocks.onPtyData.mockRejectedValue(subscribeError);
+    mocks.onPtyExit.mockResolvedValue(vi.fn());
+
+    // (e) resumeSession の Promise が reject する
+    await expect(useAppStore.getState().resumeSession(SID)).rejects.toBe(subscribeError);
+
+    // (a) resume_session が 1 度も invoke されない
+    expect(mocks.resumeSessionCmd).not.toHaveBeenCalled();
+    // (b) isStarted(surface) が false のまま（段 2 を実行していない）
+    expect(isStarted(SURFACE)).toBe(false);
+    // (c) writeNotice が 'error' tone で呼ばれる
+    expect(mocks.writeNotice).toHaveBeenCalledWith(
+      SURFACE,
+      `PTY イベントの購読に失敗しました: ${String(subscribeError)}`,
+      'error',
+    );
+    // (d) setRuntimeError が呼ばれず runtimeErrors[SID] が付かない
+    expect(useAppStore.getState().runtimeErrors[SID]).toBeUndefined();
+  });
+});
+
+// レビュー I-2（task-1-review.md）: 段 1 と段 2 の「順序」自体が無観測だった（RM-MARK は
+// markStarted の存在しか見ていない）。購読の解決前後で isStarted(surface) の値を跨いで
+// 観測する。RM-ORDER-A（markStarted を段 1 の await より前へ）・RM-ORDER-B（markStarted を
+// invoke 解決後へ）・RM-NOSUB（段 1 を丸ごと撤去）のいずれでも赤くなる。
+describe('段 1→段 2 の順序（契約 §127.6・レビュー I-2）', () => {
+  it('markStarted は購読解決の後・invoke 解決の前に実行される', async () => {
+    let resolveData: (handle: () => void) => void = () => {};
+    let resolveExit: (handle: () => void) => void = () => {};
+    mocks.onPtyData.mockReturnValue(
+      new Promise<() => void>((resolve) => {
+        resolveData = resolve;
+      }),
+    );
+    mocks.onPtyExit.mockReturnValue(
+      new Promise<() => void>((resolve) => {
+        resolveExit = resolve;
+      }),
+    );
+    let resolveInvoke: (session: Session) => void = () => {};
+    mocks.resumeSessionCmd.mockReturnValue(
+      new Promise<Session>((resolve) => {
+        resolveInvoke = resolve;
+      }),
+    );
+
+    const pending = useAppStore.getState().resumeSession(SID);
+    await flushMicrotasks();
+    // 購読が未解決の間は markStarted も未実行（段 1 が段 2 より先）
+    expect(isStarted(SURFACE)).toBe(false);
+
+    resolveData(vi.fn());
+    resolveExit(vi.fn());
+    await waitFor(() => expect(mocks.resumeSessionCmd).toHaveBeenCalledWith(SID));
+    // invoke が pending の間も isStarted は true（段 2 は invoke 解決を待たずに実行される）
+    expect(isStarted(SURFACE)).toBe(true);
+
+    resolveInvoke(makeSession({ id: SID }));
+    await pending;
+  });
+});
+
+// lane-controller の追加裁定（task-1-brief-round2 相当）: retryResumeAsFresh
+// （新しい会話として開始）が resumeSession を経由することで登録を継承することを見る。
+describe('retryResumeAsFresh は resumeSession の登録を継承する', () => {
+  it('retryResumeAsFresh の後、agent surface の isStarted は true である', async () => {
+    mocks.updateSession.mockResolvedValue(makeSession({ id: SID, claude_session_id: null }));
+    mocks.resumeSessionCmd.mockResolvedValue(makeSession({ id: SID }));
+
+    await useAppStore.getState().retryResumeAsFresh(SID);
+
     expect(isStarted(SURFACE)).toBe(true);
   });
 });

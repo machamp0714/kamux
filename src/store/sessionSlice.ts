@@ -269,7 +269,15 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // 契約 §127.6: resume_session を invoke する経路も start_session / spawn_editor と
     // 同じく、invoke より前にその surface を ptyBridge へ登録すること（登録は 2 段）。
     // surface は agent surface（'terminal' ではない。SurfaceKind は 'agent' | 'editor' の
-    // 2 値）。TerminalPane.tsx:32-45 と同形。
+    // 2 値）。段 1→段 2 の順序は TerminalPane.tsx:36-45 と同じ考え方だが、**同形ではない**
+    // —— TerminalPane.tsx:44 は isStarted(surface) を読んで早期 return するが、ここは
+    // alreadyStarted を読むだけで常に invoke する（裁定 A の帰結。二度押しを弾くのは
+    // バックエンドの二重起動ガードである。レビュー task-1-review.md Minor 訂正）。
+    // 🔴 この順序（ペインの .then よりこちらの .then が先に登録されるので markStarted が
+    // 先に走る）は「再開ボタンを押す時点で TerminalPane が必ず未マウントである」
+    // （App.tsx の view ゲート）に依存する。InterruptedOverlay など terminal 面へ
+    // 再開ボタンを持ち込む変更を入れる際は、先にこの競合（マイクロタスク順の逆転）を
+    // 解くこと（レビュー task-1-review.md I-3）。
     const surface = surfaceId(sessionId, 'agent');
 
     // 段 1: listen 登録の完了を待つ（契約 §16）。待たずに invoke すると、再開直後の
