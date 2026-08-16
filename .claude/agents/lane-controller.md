@@ -364,7 +364,7 @@ echo "--- git status ---"; git status --short
 
 **実装完了もレビュー完了も同じ形にする。** implementer にも `task-reviewer` にも `STATUS: … (round: <トークン>)` を書かせ、**上のループの `grep` 1 本で判定する。位置は見ない**（理由は上の検算表）。**コミットは作業消失を防ぐためのもので、完了信号ではない。**
 
-**🔴 トークンを書く義務は、受け手の定義ファイル 3 本が持つ**（`rust-implementer.md` / `web-implementer.md` / `task-reviewer.md` の「完了時の報告」節）。**dispatch プロンプトへ逐語で入れるのは念押しであって、それだけでは義務にならない** —— **dispatch はタスク 1 本で消えるからである**（`kamux-promotion/SKILL.md`「6. 閾値判定表」）。
+**🔴 トークンを書く義務は、受け手の定義ファイル 3 本が持つ**（`rust-implementer.md` / `web-implementer.md` / `task-reviewer.md` の「完了時の報告」節）。**dispatch プロンプトへ逐語で入れるのは念押しであって、それだけでは義務にならない** —— **dispatch はタスク 1 本で消えるからである**（`kamux-promotion/SKILL.md`「昇格するかの判断」）。
 
 #### (2) 🔴 マーカは「エージェントが書いた」ことしか保証しない。「終わった」ことは保証しない
 
