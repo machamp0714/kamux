@@ -409,9 +409,16 @@ else:
                            capture_output=True, text=True).stdout.split()
     vacuous = []
     if _revs:
-        _base = subprocess.run(["git", "-C", ROOT, "show", f"{_revs[-1]}:{REL}"],
-                               capture_output=True, text=True).stdout
-        vacuous = [a for a in ANCHORS if a in _base]
+        # 直前の _rounds は returncode を見ているのに、ここだけ見ていなかった（非対称）。
+        # 失敗時に空文字になると全アンカーが素通りするので、揃えて FATAL にする。
+        _b = subprocess.run(["git", "-C", ROOT, "show", f"{_revs[-1]}:{REL}"],
+                            capture_output=True, text=True)
+        if _b.returncode != 0:
+            die("12", f"枝の初回コミット {_revs[-1][:7]} の {REL} を取得できない: {_b.stderr.strip()}")
+        vacuous = [a for a in ANCHORS if a in _b.stdout]
+    else:
+        # 枝が origin/main と同じなら、守る対象の履歴が存在しない。
+        die("12", "origin/main からのコミットが 0 本。--anchor= を判定する材料が無い")
     if vacuous:
         die("12", f"枝の初回コミットに既に在る逐語をアンカーに渡している（守るものが無い）: {vacuous}")
     else:
