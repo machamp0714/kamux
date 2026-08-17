@@ -34,7 +34,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--chapters=")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -160,7 +160,13 @@ for i, l in sec:
 chap = [(i + 1, l.strip()[:90]) for i, l in enumerate(lines) if re.search(r"[0-9]+ 章", l)]
 declared = next((f for f in FLAGS if f.startswith("--chapters=")), None)
 if not chap:
-    print("SKIP [5b] 「N 章」を含む行が 0 行（母数 0。合格ではない）")
+    # I-3 で閉じたのと同じ形をここで開けない。0 行が正しいなら --no-chapters を明示する。
+    if "--no-chapters" in FLAGS:
+        print("SKIP [5b] 「N 章」を含む行が 0 行（--no-chapters で明示的に外した）")
+    else:
+        die("5b", "「N 章」を含む行が 0 行。母数 0 は合格ではない。無いことが正しいなら --no-chapters を渡す")
+elif "--no-chapters" in FLAGS:
+    die("5b", f"--no-chapters を渡したが、「N 章」を含む行が {len(chap)} 行ある。外す理由が成立していない")
 elif declared is None:
     die("5b", f"「N 章」を含む行が {len(chap)} 行ある。用途は機械で裁けないので、"
               f"人が全件を裁いたうえで --chapters={len(chap)} を渡すこと")
@@ -224,19 +230,31 @@ old_cores = [norm(core(h)) for h in old_full]
 
 
 def hits_old(q):
-    """短すぎる引用は見出しの断片にたまたま当たるだけなので母数から外す。"""
+    """旧見出しを指していた引用か。部分一致だけで拾うと、「該当 0 件」のような
+    一般的な断片が見出しの中に在るせいで母数に入り、誰も指していない見出しを
+    改名しただけで NG が出る（偽陽性）。判定に使うのは下の 2 つの和だけ。"""
+    return norm(q) in old_cores
+
+
+# 対象ファイル自身の旧見出しの断片が母数に混ざると、誰も指していない見出しを
+# 改名しただけで NG が出る（偽陽性）。他ファイルにも現れる引用だけを母数にする。
+r3 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", "「", "origin/main", "--"]
+                    + [f":!{REL}", ".claude/*.md", ".claude/**/*.md"],
+                    capture_output=True, text=True)
+elsewhere = {q.strip() for line in r3.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line)}
+def loosely(q):
     qn = norm(q)
-    if qn in old_cores:
-        return True
     return len(qn) >= 4 and any(qn in c or c in qn for c in old_cores)
-
-
-resolved_before = sorted(q for q in quoted if hits_old(q))
 # 厳格な部分母数: 対象ファイル名と同じ行に書かれた引用だけを取る。こちらが本物のポインタ。
 base = os.path.basename(REL)
 r2 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", base, "origin/main", "--", ".claude/*.md", ".claude/**/*.md"],
                     capture_output=True, text=True)
-named = sorted({q for line in r2.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line) if hits_old(q)})
+named = sorted({q for line in r2.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line) if loosely(q)})
+# 判定の母数 = 旧見出しと完全一致する引用 ∪ 対象ファイル名と同じ行に書かれた引用。
+# 前者は曖昧さが無く、後者は文脈でポインタだと分かる。どちらでもない部分一致は
+# 一覧には出すが判定には使わない。
+resolved_before = sorted({q for q in quoted if hits_old(q)} | set(named))
+advisory = sorted({q for q in quoted if loosely(q) and not hits_old(q) and q not in named})
 if not resolved_before:
     die("9", "旧版で解決していた引用が 0 件。母数が壊れている")
 else:
@@ -251,6 +269,7 @@ else:
     report("9", not broken, f"向き 2: 旧版で解決していた引用 {len(resolved_before)} 件のうち新版で切れたもの {len(broken)} 件 {broken}")
     report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
     print(f"        厳格母数の内訳: {named}")
+    print(f"        判定に使わない部分一致 {len(advisory)} 件（見出しの断片にたまたま当たるだけ）: {advisory}")
     for q in resolved_before:
         # 判定は見出しへの解決だけを合格にするので、一覧の表記もそれに合わせる。
         where = ("見出し" if any(norm(q) in h or h in norm(q) for h in new_n)
