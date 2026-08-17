@@ -35,7 +35,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -189,9 +189,14 @@ else:
                   f"       python3 .claude/scripts/check-rewrite.py . {REL} "
                   f"{CASES_REL or ''} --chapters={actual}")
     else:
-        report("5b", want == actual,
+        ok5b = want == actual
+        report("5b", ok5b,
                f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 実体 {actual} / 宣言 {want}。"
                f"全件を出すので用途を人が裁くこと")
+        if not ok5b:
+            # 宣言値は人が手で書き写す。器の変更でダイジェストの材料が変わると、
+            # 過去に承認された宣言が黙って古くなる。正解を器の側から出す。
+            print(f"        下の全件を人が裁き直してから: --chapters={actual}")
     for i, l in chap:
         print(f"        :{i} {l[:90]}")
 
@@ -203,7 +208,14 @@ report("6", n <= 8, f"太字 = {n} 箇所（旧 {old_body.count('**') // 2} 箇�
 old_full = [l.lstrip("#").strip() for l in old_lines if re.match(r"^#{2,3} ", l)]
 decorated = [h for h in old_full if h != core(h)]
 if not decorated:
-    die("7", "装飾付きの旧見出しが 0 本。母数が壊れている")
+    # origin/main 側が既に書き直し済みのファイル（1 本目の再検算など）では 0 本が正しい。
+    if "--no-decorated" in FLAGS:
+        print("SKIP [7] 装飾付きの旧見出しが 0 本（--no-decorated で明示的に外した）")
+    else:
+        die("7", "装飾付きの旧見出しが 0 本。母数 0 は合格ではない。"
+                 "旧版が既に書き直し済みなら --no-decorated を渡す")
+elif "--no-decorated" in FLAGS:
+    die("7", f"--no-decorated を渡したが、装飾付きの旧見出しが {len(decorated)} 本ある。外す理由が成立していない")
 else:
     stale, own = [], 0
     for h in decorated:
@@ -229,7 +241,12 @@ else:
     new_n = [norm(h) for h in new_heads]
     lost = sorted(core(h) for h in old_full if norm(core(h)) not in new_n)
     if not lost:
-        report("8", True, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの 0 本")
+        # 改名 0 本なのに古い --renamed= が残っていると、次のファイルでも通ってしまう。
+        # 5b と同じく両方向を閉じる（片側だけ閉じるのが台帳 #243 の形）。
+        if any(f.startswith("--renamed=") for f in FLAGS):
+            die("8", "改名された旧見出しは 0 本なのに --renamed= が渡されている。外す理由が成立していない")
+        else:
+            report("8", True, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの 0 本")
     else:
         # 意図的な改名はありうる（見出しに章参照が埋まっている等）。件数だけでは
         # 「1 本直して 1 本消す」が素通りするので、5b と同じくダイジェストまで宣言させる。
