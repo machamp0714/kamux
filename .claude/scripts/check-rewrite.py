@@ -181,8 +181,11 @@ else:
     actual = f"{len(chap)}:{digest}"
     want = declared.split("=", 1)[1]
     if ":" not in want:
-        die("5b", f"--chapters は <件数>:<ダイジェスト> の形で渡す。今の実体は {actual}。"
-                  f"下の全件を人が裁いてから写すこと")
+        # 正しい呼び出し方を散文に置くと、器が変わるたびに古くなる。器の側から出す。
+        die("5b", f"--chapters は <件数>:<ダイジェスト> の形で渡す。下の全件を人が裁いてから、"
+                  f"次のコマンドを打つこと:\n"
+                  f"       python3 .claude/scripts/check-rewrite.py . {REL} "
+                  f"{CASES_REL or ''} --chapters={actual}")
     else:
         report("5b", want == actual,
                f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 実体 {actual} / 宣言 {want}。"
