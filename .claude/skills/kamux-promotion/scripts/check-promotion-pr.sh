@@ -42,9 +42,9 @@ ok() { printf 'OK  [%s] %s\n' "$1" "$2"; }
 
 # --- 検査 1: 閾値・手続きの正典が本スキル 1 ファイルだけであること -------------------
 # --exclude-dir=worktrees が要る。.claude/worktrees/ には他レーンの複製が在る。
-# 🔴 --include='*.md' が要る。本スクリプト自身が CANON_PHRASE を変数として持つため、
-# 付けないと自分自身がヒットして「二重の正典」を誤検出する（自己言及。実際に踏んだ）。
-CANON="$(grep -rl "$CANON_PHRASE" .claude --exclude-dir=worktrees --include='*.md' 2>/dev/null | sort)"
+# 本スクリプト自身が CANON_PHRASE を変数として持つので、自分だけを外す。
+# 🔴 --include='*.md' で絞ってはならない。md 以外に正典フレーズが紛れ込んでも見えなくなる。
+CANON="$(grep -rl "$CANON_PHRASE" .claude --exclude-dir=worktrees --exclude="$(basename "$0")" 2>/dev/null | sort)"
 CANON_N="$(printf '%s' "$CANON" | grep -c .)"
 if [ "$CANON_N" -eq 0 ]; then
   ng 1 "'$CANON_PHRASE' がどこにも無い。母数 0 は「違反なし」ではなく「測れていない」である。SKILL_REL か CANON_PHRASE が実物とずれた"
@@ -86,7 +86,13 @@ printf 'INFO[4] 台帳の母数=%s 未昇格=%s\n' "$LEDGER_ROWS" "$LEDGER_OPEN"
 [ "$LEDGER_ROWS" -gt 0 ] || die "台帳の事象行が 0 件。行の書式か --ledger の指定がずれている（母数 0 では検査 4 は意味を持たない）。"
 
 if [ "$NO_PROMOTION" -eq 1 ]; then
-  printf 'SKIP[4] --no-promotion 指定。昇格 0 件の便なので照合しない。\n' >&2
+  # 🔴 フラグと本文の矛盾を先に見る。宣言が在るのに --no-promotion を付けると、
+  # 実在する閉じ忘れを無条件に素通りさせて PASS を返す（レビュー r5 が実測）。
+  if printf '%s' "$BODY" | grep -q '^閉じる台帳行:'; then
+    ng 4 "--no-promotion を指定したが、PR 本文に '閉じる台帳行:' の宣言が在る。どちらかが誤り。昇格させる行があるならフラグを外し、無いなら宣言行を消すこと"
+  else
+    printf 'SKIP[4] --no-promotion 指定。宣言行も無いので照合しない。\n' >&2
+  fi
 else
   DECL="$(printf '%s' "$BODY" | sed -n 's/^閉じる台帳行: *//p' | tr ' ' '\n')"
   A="$(printf '%s' "$DECL" | grep -c .)"                 # ③a 全 token 数

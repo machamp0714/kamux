@@ -15,7 +15,7 @@ argument-hint: "<stage0 | … | stage6>"
 | | |
 |---|---|
 | 判断して実行する人 | team-lead 自身。lane-controller ではない |
-| 読む対象 | 台帳のうち `昇格` 列が `—` の行 |
+| 読む対象 | 台帳のうち `昇格` 列が `—` の行。**この列に書ける値の語彙は台帳の「## 昇格」節が持つ。ここへ写さない** |
 | 書き換える先 | `.claude/agents/*.md`、`.claude/skills/kamux-lane/SKILL.md`、このファイル |
 | 扱わないもの | 仕様・型・命名・順序・値の話。これは契約変更要求で、contract-owner が裁定する |
 
