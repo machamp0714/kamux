@@ -22,6 +22,7 @@ code fence の逐語比較は永久に空振りする。`--chapters=N` の N を
 - **規則の本文が主張していることは読まない。** 例えば「章の書き方」節の本文を
   「どこでも § でよい」へ書き換えても検査 5 は緑のままになる。散文の主張は機械で測れない。
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -171,10 +172,21 @@ elif declared is None:
     die("5b", f"「N 章」を含む行が {len(chap)} 行ある。用途は機械で裁けないので、"
               f"人が全件を裁いたうえで --chapters={len(chap)} を渡すこと")
 else:
-    want = int(declared.split("=", 1)[1])
-    report("5b", want == len(chap),
-           f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 「N 章」を含む行 = {len(chap)} 行 / 宣言 {want} 行。"
-           f"全件を出すので用途を人が裁くこと")
+    # 件数だけを宣言させると「1 箇所直して 1 箇所足す」入れ替えが素通りする。
+    # 該当行の中身のダイジェストまで宣言させる。行番号は入れないので、
+    # 無関係な編集で行がずれただけでは変わらない。
+    digest = hashlib.sha256(
+        "\n".join(sorted(l for _, l in chap)).encode("utf-8")
+    ).hexdigest()[:12]
+    actual = f"{len(chap)}:{digest}"
+    want = declared.split("=", 1)[1]
+    if ":" not in want:
+        die("5b", f"--chapters は <件数>:<ダイジェスト> の形で渡す。今の実体は {actual}。"
+                  f"下の全件を人が裁いてから写すこと")
+    else:
+        report("5b", want == actual,
+               f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 実体 {actual} / 宣言 {want}。"
+               f"全件を出すので用途を人が裁くこと")
     for i, l in chap:
         print(f"        :{i} {l}")
 
