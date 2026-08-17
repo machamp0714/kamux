@@ -35,7 +35,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -227,8 +227,23 @@ if not old_full or not new_heads:
     die("8", f"母数が壊れている（旧見出し {len(old_full)} 本 / 新見出し {len(new_heads)} 本）")
 else:
     new_n = [norm(h) for h in new_heads]
-    lost = [h for h in old_full if norm(core(h)) not in new_n]
-    report("8", not lost, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの {len(lost)} 本 {[core(h) for h in lost]}")
+    lost = sorted(core(h) for h in old_full if norm(core(h)) not in new_n)
+    if not lost:
+        report("8", True, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの 0 本")
+    else:
+        # 意図的な改名はありうる（見出しに章参照が埋まっている等）。件数だけでは
+        # 「1 本直して 1 本消す」が素通りするので、5b と同じくダイジェストまで宣言させる。
+        rd = f"{len(lost)}:{hashlib.sha256(chr(10).join(lost).encode('utf-8')).hexdigest()[:12]}"
+        decl = next((f.split("=", 1)[1] for f in FLAGS if f.startswith("--renamed=")), None)
+        if "--no-renamed" in FLAGS:
+            die("8", f"--no-renamed を渡したが、新版に無い旧見出しのコアが {len(lost)} 本ある: {lost}")
+        elif decl is None:
+            die("8", f"新版に無い旧見出しのコアが {len(lost)} 本ある。参照切れが無いことは検査 9 / 9b が見るが、"
+                     f"改名そのものが意図的かは人が裁く。下を読んでから次を渡すこと:\n"
+                     f"       --renamed={rd}\n" + "\n".join(f"       - {x}" for x in lost))
+        else:
+            report("8", decl == rd, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの {len(lost)} 本。"
+                                    f"実体 {rd} / 宣言 {decl}。全件: {lost}")
 
 # 9. 向き 2: 「旧版で解決していた引用」が新版でも解決するか。
 #    .claude/ 配下の全 .md から 「…」 を拾い、旧見出しに当たるものだけを母数にする。
@@ -336,16 +351,20 @@ else:
 
 # 12. round 2 で復元した逐語が生きているか。
 #     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
-ANCHORS = [
-    "対で読むこと",              # 旧 :42 の前方ポインタ
-    "絶対に動かさない",          # 旧 :20
-    "起動時に必ず読むもの",      # 旧 :11 の見出し
-    "§73.5",                     # 旧 :107 の識別子
-    "書き込む先の名指し",        # 用途の分界（値 vs 場所）
-    "dispatch 層が読むだけで",   # frontmatter の裁定
-]
-lostA = [a for a in ANCHORS if a not in body]
-report("12", not lostA, f"復元した逐語 {len(ANCHORS)} 件（手で列挙。機械導出ではない）のうち欠けたもの {len(lostA)} 件 {lostA}")
+# 12. レビューの修正ラウンドで復元・追加した逐語が生きているか。
+#     ファイルごとに違うので引数で受ける。手で作った列挙であることを出力に明記する。
+ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
+if not ANCHORS:
+    if "--no-anchors" in FLAGS:
+        print("SKIP [12] 守る逐語の指定が無い（--no-anchors で明示的に外した）")
+    else:
+        die("12", "守る逐語（--anchor=<逐語>）が 1 件も無い。母数 0 は合格ではない。"
+                  "修正ラウンドで復元・追加した記述が無いなら --no-anchors を渡す")
+elif "--no-anchors" in FLAGS:
+    die("12", f"--no-anchors を渡したが --anchor= が {len(ANCHORS)} 件ある。外す理由が成立していない")
+else:
+    lostA = [a for a in ANCHORS if a not in body]
+    report("12", not lostA, f"守る逐語 {len(ANCHORS)} 件（手で列挙。機械導出ではない）のうち欠けたもの {len(lostA)} 件 {lostA}")
 
 print()
 print("注意: このスクリプトは規範項目の欠落を測らない。見出しと見出しの間の散文が 1 本消えても")
