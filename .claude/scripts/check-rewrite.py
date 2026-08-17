@@ -402,8 +402,22 @@ if not ANCHORS:
 elif "--no-anchors" in FLAGS:
     die("12", f"--no-anchors を渡したが --anchor= が {len(ANCHORS)} 件ある。外す理由が成立していない")
 else:
-    lostA = [a for a in ANCHORS if a not in body]
-    report("12", not lostA, f"守る逐語 {len(ANCHORS)} 件（手で列挙。機械導出ではない）のうち欠けたもの {len(lostA)} 件 {lostA}")
+    # 母数を履歴由来にしても、アンカーの中身が操作者由来のままだと
+    # 自明に在る語を 1 つ渡すだけで満たせる（--anchor=の で全合格になった）。
+    # 守る対象は「修正ラウンドで復元・追加した逐語」なので、その性質も履歴から導く。
+    _revs = subprocess.run(["git", "-C", ROOT, "rev-list", "origin/main..HEAD"],
+                           capture_output=True, text=True).stdout.split()
+    vacuous = []
+    if _revs:
+        _base = subprocess.run(["git", "-C", ROOT, "show", f"{_revs[-1]}:{REL}"],
+                               capture_output=True, text=True).stdout
+        vacuous = [a for a in ANCHORS if a in _base]
+    if vacuous:
+        die("12", f"枝の初回コミットに既に在る逐語をアンカーに渡している（守るものが無い）: {vacuous}")
+    else:
+        lostA = [a for a in ANCHORS if a not in body]
+        report("12", not lostA, f"守る逐語 {len(ANCHORS)} 件（手で列挙。中身は枝の初回コミットに"
+                                f"無いことを確かめた）のうち欠けたもの {len(lostA)} 件 {lostA}")
 
 print()
 print("注意: このスクリプトは規範項目の欠落を測らない。見出しと見出しの間の散文が 1 本消えても")
