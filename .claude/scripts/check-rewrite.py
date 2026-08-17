@@ -35,7 +35,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -189,9 +189,14 @@ else:
                   f"       python3 .claude/scripts/check-rewrite.py . {REL} "
                   f"{CASES_REL or ''} --chapters={actual}")
     else:
-        report("5b", want == actual,
+        ok5b = want == actual
+        report("5b", ok5b,
                f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 実体 {actual} / 宣言 {want}。"
                f"全件を出すので用途を人が裁くこと")
+        if not ok5b:
+            # 宣言値は人が手で書き写す。器の変更でダイジェストの材料が変わると、
+            # 過去に承認された宣言が黙って古くなる。正解を器の側から出す。
+            print(f"        下の全件を人が裁き直してから: --chapters={actual}")
     for i, l in chap:
         print(f"        :{i} {l[:90]}")
 
@@ -203,12 +208,22 @@ report("6", n <= 8, f"太字 = {n} 箇所（旧 {old_body.count('**') // 2} 箇�
 old_full = [l.lstrip("#").strip() for l in old_lines if re.match(r"^#{2,3} ", l)]
 decorated = [h for h in old_full if h != core(h)]
 if not decorated:
-    die("7", "装飾付きの旧見出しが 0 本。母数が壊れている")
+    # origin/main 側が既に書き直し済みのファイル（1 本目の再検算など）では 0 本が正しい。
+    if "--no-decorated" in FLAGS:
+        print("SKIP [7] 装飾付きの旧見出しが 0 本（--no-decorated で明示的に外した）")
+    else:
+        die("7", "装飾付きの旧見出しが 0 本。母数 0 は合格ではない。"
+                 "旧版が既に書き直し済みなら --no-decorated を渡す")
+elif "--no-decorated" in FLAGS:
+    die("7", f"--no-decorated を渡したが、装飾付きの旧見出しが {len(decorated)} 本ある。外す理由が成立していない")
 else:
     stale, own = [], 0
     for h in decorated:
         r = subprocess.run(["grep", "-rnF", "--include=*.md", "--exclude-dir=worktrees", h, ".claude/", "CLAUDE.md"],
                            capture_output=True, text=True, cwd=ROOT)
+        # grep は「見つからない」で 1 を返す。2 以上はエラーで、失敗が「参照 0 件」と同じ出力になる。
+        if r.returncode > 1:
+            die("7", f"参照の検索に失敗した（exit {r.returncode}）: {r.stderr.strip()}")
         for line in r.stdout.strip().split("\n"):
             if not line or line.startswith(REL):
                 continue
@@ -227,8 +242,28 @@ if not old_full or not new_heads:
     die("8", f"母数が壊れている（旧見出し {len(old_full)} 本 / 新見出し {len(new_heads)} 本）")
 else:
     new_n = [norm(h) for h in new_heads]
-    lost = [h for h in old_full if norm(core(h)) not in new_n]
-    report("8", not lost, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの {len(lost)} 本 {[core(h) for h in lost]}")
+    lost = sorted(core(h) for h in old_full if norm(core(h)) not in new_n)
+    if not lost:
+        # 改名 0 本なのに古い --renamed= が残っていると、次のファイルでも通ってしまう。
+        # 5b と同じく両方向を閉じる（片側だけ閉じるのが台帳 #243 の形）。
+        if any(f.startswith("--renamed=") for f in FLAGS):
+            die("8", "改名された旧見出しは 0 本なのに --renamed= が渡されている。外す理由が成立していない")
+        else:
+            report("8", True, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの 0 本")
+    else:
+        # 意図的な改名はありうる（見出しに章参照が埋まっている等）。件数だけでは
+        # 「1 本直して 1 本消す」が素通りするので、5b と同じくダイジェストまで宣言させる。
+        rd = f"{len(lost)}:{hashlib.sha256(chr(10).join(lost).encode('utf-8')).hexdigest()[:12]}"
+        decl = next((f.split("=", 1)[1] for f in FLAGS if f.startswith("--renamed=")), None)
+        if "--no-renamed" in FLAGS:
+            die("8", f"--no-renamed を渡したが、新版に無い旧見出しのコアが {len(lost)} 本ある: {lost}")
+        elif decl is None:
+            die("8", f"新版に無い旧見出しのコアが {len(lost)} 本ある。参照切れが無いことは検査 9 / 9b が見るが、"
+                     f"改名そのものが意図的かは人が裁く。下を読んでから次を渡すこと:\n"
+                     f"       --renamed={rd}\n" + "\n".join(f"       - {x}" for x in lost))
+        else:
+            report("8", decl == rd, f"向き 1: 旧見出しのコア {len(old_full)} 本のうち新版に無いもの {len(lost)} 本。"
+                                    f"実体 {rd} / 宣言 {decl}。全件: {lost}")
 
 # 9. 向き 2: 「旧版で解決していた引用」が新版でも解決するか。
 #    .claude/ 配下の全 .md から 「…」 を拾い、旧見出しに当たるものだけを母数にする。
@@ -246,19 +281,24 @@ for line in r.stdout.split("\n"):
 old_cores = [norm(core(h)) for h in old_full]
 
 
+def strip_ellipsis(q):
+    """他ファイルは見出しを「純関数へ切り出したら…」の形で省略して指す。
+    末尾の … を落とさないと完全一致にも部分一致にも当たらず、母数から漏れる。"""
+    return re.sub(r"(…|\.\.\.)\s*$", "", q).strip()
+
+
 def hits_old(q):
     """旧見出しを指していた引用か。部分一致だけで拾うと、「該当 0 件」のような
     一般的な断片が見出しの中に在るせいで母数に入り、誰も指していない見出しを
-    改名しただけで NG が出る（偽陽性）。判定に使うのは下の 2 つの和だけ。"""
-    return norm(q) in old_cores
+    改名しただけで NG が出る（偽陽性）。判定に使うのは完全一致と、
+    末尾を省略した前方一致だけ。"""
+    qn = norm(q)
+    if qn in old_cores:
+        return True
+    e = norm(strip_ellipsis(q))
+    return e != qn and len(e) >= 4 and any(c.startswith(e) for c in old_cores)
 
 
-# 対象ファイル自身の旧見出しの断片が母数に混ざると、誰も指していない見出しを
-# 改名しただけで NG が出る（偽陽性）。他ファイルにも現れる引用だけを母数にする。
-r3 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", "「", "origin/main", "--"]
-                    + [f":!{REL}", ".claude/*.md", ".claude/**/*.md"],
-                    capture_output=True, text=True)
-elsewhere = {q.strip() for line in r3.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line)}
 def loosely(q):
     qn = norm(q)
     return len(qn) >= 4 and any(qn in c or c in qn for c in old_cores)
@@ -266,6 +306,8 @@ def loosely(q):
 base = os.path.basename(REL)
 r2 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", base, "origin/main", "--", ".claude/*.md", ".claude/**/*.md"],
                     capture_output=True, text=True)
+if r2.returncode > 1:
+    die("9b", f"origin/main から {base} を含む行を取得できない（exit {r2.returncode}）: {r2.stderr.strip()}")
 named = sorted({q for line in r2.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line) if loosely(q)})
 # 判定の母数 = 旧見出しと完全一致する引用 ∪ 対象ファイル名と同じ行に書かれた引用。
 # 前者は曖昧さが無く、後者は文脈でポインタだと分かる。どちらでもない部分一致は
@@ -280,16 +322,24 @@ else:
     # 母数は「旧版で見出しに解決していた引用」なので、新版でも見出しに解決しなければならない。
     # 本文のどこかに在るだけでは合格にしない（節名を指すポインタが散文の一部として
     # 残っただけの状態を通してしまう）。
-    broken = [q for q in resolved_before
-              if not any(norm(q) in h or h in norm(q) for h in new_n)]
+    def resolves(q):
+        qn, e = norm(q), norm(strip_ellipsis(q))
+        return any(qn in h or h in qn or h.startswith(e) for h in new_n)
+
+    broken = [q for q in resolved_before if not resolves(q)]
     broken_named = [q for q in named if q in broken]
     report("9", not broken, f"向き 2: 旧版で解決していた引用 {len(resolved_before)} 件のうち新版で切れたもの {len(broken)} 件 {broken}")
-    report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
+    if not named:
+        # 母数 0 のまま OK を出さない。9 には die が在るのに 9b だけ無かった。
+        die("9b", f"{base} と同じ行に書かれた引用が 0 件。母数 0 は合格ではない。"
+                  f"他ファイルがこのファイルを節名で指していないか、grep が失敗している")
+    else:
+        report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
     print(f"        厳格母数の内訳: {named}")
     print(f"        判定に使わない部分一致 {len(advisory)} 件（見出しの断片にたまたま当たるだけ）: {advisory}")
     for q in resolved_before:
         # 判定は見出しへの解決だけを合格にするので、一覧の表記もそれに合わせる。
-        where = ("見出し" if any(norm(q) in h or h in norm(q) for h in new_n)
+        where = ("見出し" if resolves(q)
                  else ("切れた（本文にはあるが見出しではない）" if norm(q) in body_n else "切れた"))
         print(f"        「{q}」→ {where}")
 
@@ -336,16 +386,49 @@ else:
 
 # 12. round 2 で復元した逐語が生きているか。
 #     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
-ANCHORS = [
-    "対で読むこと",              # 旧 :42 の前方ポインタ
-    "絶対に動かさない",          # 旧 :20
-    "起動時に必ず読むもの",      # 旧 :11 の見出し
-    "§73.5",                     # 旧 :107 の識別子
-    "書き込む先の名指し",        # 用途の分界（値 vs 場所）
-    "dispatch 層が読むだけで",   # frontmatter の裁定
-]
-lostA = [a for a in ANCHORS if a not in body]
-report("12", not lostA, f"復元した逐語 {len(ANCHORS)} 件（手で列挙。機械導出ではない）のうち欠けたもの {len(lostA)} 件 {lostA}")
+# 12. レビューの修正ラウンドで復元・追加した逐語が生きているか。
+#     ファイルごとに違うので引数で受ける。手で作った列挙であることを出力に明記する。
+ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
+# --no-anchors だけは母数が操作者由来（--anchor= の個数）なので、渡すだけで検査が死ぬ。
+# 母数を履歴由来にする —— 修正ラウンドが 1 度でも回っていたら、守る逐語が在るはず。
+_rounds = subprocess.run(["git", "-C", ROOT, "rev-list", "--count", "origin/main..HEAD"],
+                         capture_output=True, text=True)
+ROUNDS = int(_rounds.stdout.strip() or 0) if _rounds.returncode == 0 else 0
+if not ANCHORS:
+    if "--no-anchors" in FLAGS and ROUNDS > 1:
+        die("12", f"--no-anchors を渡したが、origin/main から {ROUNDS} コミット進んでいる。"
+                  f"修正ラウンドが回っているなら、復元・追加した逐語を --anchor= で守ること")
+    elif "--no-anchors" in FLAGS:
+        print(f"SKIP [12] 守る逐語の指定が無い（--no-anchors で明示的に外した。origin/main から {ROUNDS} コミット）")
+    else:
+        die("12", "守る逐語（--anchor=<逐語>）が 1 件も無い。母数 0 は合格ではない。"
+                  "修正ラウンドで復元・追加した記述が無いなら --no-anchors を渡す")
+elif "--no-anchors" in FLAGS:
+    die("12", f"--no-anchors を渡したが --anchor= が {len(ANCHORS)} 件ある。外す理由が成立していない")
+else:
+    # 母数を履歴由来にしても、アンカーの中身が操作者由来のままだと
+    # 自明に在る語を 1 つ渡すだけで満たせる（--anchor=の で全合格になった）。
+    # 守る対象は「修正ラウンドで復元・追加した逐語」なので、その性質も履歴から導く。
+    _revs = subprocess.run(["git", "-C", ROOT, "rev-list", "origin/main..HEAD"],
+                           capture_output=True, text=True).stdout.split()
+    vacuous = []
+    if _revs:
+        # 直前の _rounds は returncode を見ているのに、ここだけ見ていなかった（非対称）。
+        # 失敗時に空文字になると全アンカーが素通りするので、揃えて FATAL にする。
+        _b = subprocess.run(["git", "-C", ROOT, "show", f"{_revs[-1]}:{REL}"],
+                            capture_output=True, text=True)
+        if _b.returncode != 0:
+            die("12", f"枝の初回コミット {_revs[-1][:7]} の {REL} を取得できない: {_b.stderr.strip()}")
+        vacuous = [a for a in ANCHORS if a in _b.stdout]
+    else:
+        # 枝が origin/main と同じなら、守る対象の履歴が存在しない。
+        die("12", "origin/main からのコミットが 0 本。--anchor= を判定する材料が無い")
+    if vacuous:
+        die("12", f"枝の初回コミットに既に在る逐語をアンカーに渡している（守るものが無い）: {vacuous}")
+    else:
+        lostA = [a for a in ANCHORS if a not in body]
+        report("12", not lostA, f"守る逐語 {len(ANCHORS)} 件（手で列挙。中身は枝の初回コミットに"
+                                f"無いことを確かめた）のうち欠けたもの {len(lostA)} 件 {lostA}")
 
 print()
 print("注意: このスクリプトは規範項目の欠落を測らない。見出しと見出しの間の散文が 1 本消えても")
