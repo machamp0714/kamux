@@ -35,7 +35,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated", "--no-cases")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -228,7 +228,10 @@ else:
             if not line or line.startswith(REL):
                 continue
             # 他の定義ファイルが「自分の見出し」として同じ文字列を持つ行は参照ではない。
-            if line.split(":", 2)[-1].lstrip().startswith("#"):
+            # 「行頭が # か」だけで寄せると、古いポインタを見出しの形で書けば不可視になる。
+            # 見出しの本文が旧見出しと逐語一致する場合だけ除外する。
+            text = line.split(":", 2)[-1]
+            if re.match(r"^#{1,6} ", text.lstrip()) and text.lstrip().lstrip("#").strip() == h:
                 own += 1
                 continue
             stale.append(line[:120])
@@ -344,7 +347,16 @@ else:
         print(f"        「{q}」→ {where}")
 
 # 10. 退避先へのポインタが本文に 1 行あり、実体が在る
-if CASES_REL:
+#     引数を落とすと検査ごと消える形を閉じる。5b / 7 / 11 / 12 には「外す理由が成立しない」
+#     FATAL が在るのに 10 だけ無く、退避先を渡し忘れると 1 行も出力せず全合格に到達していた。
+if not CASES_REL:
+    if "--no-cases" in FLAGS:
+        print("SKIP [10] 退避先が無い（--no-cases で明示的に外した）")
+    else:
+        die("10", "退避先の引数が無い。母数 0 は合格ではない。退避先を作っていないなら --no-cases を渡す")
+elif "--no-cases" in FLAGS:
+    die("10", f"--no-cases を渡したが、退避先 {CASES_REL} が引数に在る。外す理由が成立していない")
+else:
     ptr = CASES_REL in body
     report("10", ptr and os.path.exists(os.path.join(ROOT, CASES_REL)),
            f"退避先へのポインタ {'在り' if ptr else '無し'} / 実体 {'在り' if os.path.exists(os.path.join(ROOT, CASES_REL)) else '無し'}")
@@ -391,7 +403,10 @@ else:
 ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
 # --no-anchors だけは母数が操作者由来（--anchor= の個数）なので、渡すだけで検査が死ぬ。
 # 母数を履歴由来にする —— 修正ラウンドが 1 度でも回っていたら、守る逐語が在るはず。
-_rounds = subprocess.run(["git", "-C", ROOT, "rev-list", "--count", "origin/main..HEAD"],
+# 母数は「REL を触ったコミット」に絞る。枝の全コミットを数えると、REL を触らない
+# コミット（器の導入など）だけで ROUNDS が増え、--no-anchors が成立しなくなる。
+# 逆向きも同根で、非空虚ガードの比較先が REL の旧版になり、新版のどの語でも通ってしまう。
+_rounds = subprocess.run(["git", "-C", ROOT, "rev-list", "--count", "origin/main..HEAD", "--", REL],
                          capture_output=True, text=True)
 ROUNDS = int(_rounds.stdout.strip() or 0) if _rounds.returncode == 0 else 0
 if not ANCHORS:
@@ -409,7 +424,7 @@ else:
     # 母数を履歴由来にしても、アンカーの中身が操作者由来のままだと
     # 自明に在る語を 1 つ渡すだけで満たせる（--anchor=の で全合格になった）。
     # 守る対象は「修正ラウンドで復元・追加した逐語」なので、その性質も履歴から導く。
-    _revs = subprocess.run(["git", "-C", ROOT, "rev-list", "origin/main..HEAD"],
+    _revs = subprocess.run(["git", "-C", ROOT, "rev-list", "origin/main..HEAD", "--", REL],
                            capture_output=True, text=True).stdout.split()
     vacuous = []
     if _revs:
