@@ -221,6 +221,9 @@ else:
     for h in decorated:
         r = subprocess.run(["grep", "-rnF", "--include=*.md", "--exclude-dir=worktrees", h, ".claude/", "CLAUDE.md"],
                            capture_output=True, text=True, cwd=ROOT)
+        # grep は「見つからない」で 1 を返す。2 以上はエラーで、失敗が「参照 0 件」と同じ出力になる。
+        if r.returncode > 1:
+            die("7", f"参照の検索に失敗した（exit {r.returncode}）: {r.stderr.strip()}")
         for line in r.stdout.strip().split("\n"):
             if not line or line.startswith(REL):
                 continue
@@ -296,12 +299,6 @@ def hits_old(q):
     return e != qn and len(e) >= 4 and any(c.startswith(e) for c in old_cores)
 
 
-# 対象ファイル自身の旧見出しの断片が母数に混ざると、誰も指していない見出しを
-# 改名しただけで NG が出る（偽陽性）。他ファイルにも現れる引用だけを母数にする。
-r3 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", "「", "origin/main", "--"]
-                    + [f":!{REL}", ".claude/*.md", ".claude/**/*.md"],
-                    capture_output=True, text=True)
-elsewhere = {q.strip() for line in r3.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line)}
 def loosely(q):
     qn = norm(q)
     return len(qn) >= 4 and any(qn in c or c in qn for c in old_cores)
@@ -309,6 +306,8 @@ def loosely(q):
 base = os.path.basename(REL)
 r2 = subprocess.run(["git", "-C", ROOT, "grep", "-h", "-e", base, "origin/main", "--", ".claude/*.md", ".claude/**/*.md"],
                     capture_output=True, text=True)
+if r2.returncode > 1:
+    die("9b", f"origin/main から {base} を含む行を取得できない（exit {r2.returncode}）: {r2.stderr.strip()}")
 named = sorted({q for line in r2.stdout.split("\n") for q in re.findall(r"「([^」]+)」", line) if loosely(q)})
 # 判定の母数 = 旧見出しと完全一致する引用 ∪ 対象ファイル名と同じ行に書かれた引用。
 # 前者は曖昧さが無く、後者は文脈でポインタだと分かる。どちらでもない部分一致は
@@ -330,7 +329,12 @@ else:
     broken = [q for q in resolved_before if not resolves(q)]
     broken_named = [q for q in named if q in broken]
     report("9", not broken, f"向き 2: 旧版で解決していた引用 {len(resolved_before)} 件のうち新版で切れたもの {len(broken)} 件 {broken}")
-    report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
+    if not named:
+        # 母数 0 のまま OK を出さない。9 には die が在るのに 9b だけ無かった。
+        die("9b", f"{base} と同じ行に書かれた引用が 0 件。母数 0 は合格ではない。"
+                  f"他ファイルがこのファイルを節名で指していないか、grep が失敗している")
+    else:
+        report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
     print(f"        厳格母数の内訳: {named}")
     print(f"        判定に使わない部分一致 {len(advisory)} 件（見出しの断片にたまたま当たるだけ）: {advisory}")
     for q in resolved_before:
