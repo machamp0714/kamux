@@ -229,9 +229,12 @@ else:
                 continue
             # 他の定義ファイルが「自分の見出し」として同じ文字列を持つ行は参照ではない。
             # 「行頭が # か」だけで寄せると、古いポインタを見出しの形で書けば不可視になる。
-            # 見出しの本文が旧見出しと逐語一致する場合だけ除外する。
-            text = line.split(":", 2)[-1]
-            if re.match(r"^#{1,6} ", text.lstrip()) and text.lstrip().lstrip("#").strip() == h:
+            # 除外は 3 条件すべてを満たすときだけ —— (1) 定義ファイルである
+            # (2) 見出しである (3) 見出しの本文が旧見出しと逐語一致する。
+            # 退避先や台帳は定義ファイルではないので、そこに置いた古いポインタは除外しない。
+            path, text = line.split(":", 1)[0], line.split(":", 2)[-1]
+            is_def = re.fullmatch(r"\.claude/agents/[\w.-]+\.md|\.claude/skills/.+/SKILL\.md", path)
+            if is_def and re.match(r"^#{1,6} ", text.lstrip()) and text.lstrip().lstrip("#").strip() == h:
                 own += 1
                 continue
             stale.append(line[:120])
@@ -349,9 +352,14 @@ else:
 # 10. 退避先へのポインタが本文に 1 行あり、実体が在る
 #     引数を落とすと検査ごと消える形を閉じる。5b / 7 / 11 / 12 には「外す理由が成立しない」
 #     FATAL が在るのに 10 だけ無く、退避先を渡し忘れると 1 行も出力せず全合格に到達していた。
+#     フラグは操作者の別の引数ではなく本文の実体と突き合わせる。--no-fence が旧版の fence を、
+#     --no-decorated が旧見出しを見るのと同じ形にする。パスを渡さずフラグだけ渡す逃げ道を塞ぐ。
+_ref = re.search(r"\.claude/references/[\w.-]*cases\.md", body)
 if not CASES_REL:
-    if "--no-cases" in FLAGS:
-        print("SKIP [10] 退避先が無い（--no-cases で明示的に外した）")
+    if "--no-cases" in FLAGS and _ref:
+        die("10", f"--no-cases を渡したが、本文が退避先 {_ref.group(0)} を指している。外す理由が成立していない")
+    elif "--no-cases" in FLAGS:
+        print("SKIP [10] 退避先が無い（--no-cases で明示的に外した。本文にも退避先への参照が無い）")
     else:
         die("10", "退避先の引数が無い。母数 0 は合格ではない。退避先を作っていないなら --no-cases を渡す")
 elif "--no-cases" in FLAGS:
