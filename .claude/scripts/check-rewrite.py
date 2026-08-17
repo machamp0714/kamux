@@ -278,11 +278,22 @@ for line in r.stdout.split("\n"):
 old_cores = [norm(core(h)) for h in old_full]
 
 
+def strip_ellipsis(q):
+    """他ファイルは見出しを「純関数へ切り出したら…」の形で省略して指す。
+    末尾の … を落とさないと完全一致にも部分一致にも当たらず、母数から漏れる。"""
+    return re.sub(r"(…|\.\.\.)\s*$", "", q).strip()
+
+
 def hits_old(q):
     """旧見出しを指していた引用か。部分一致だけで拾うと、「該当 0 件」のような
     一般的な断片が見出しの中に在るせいで母数に入り、誰も指していない見出しを
-    改名しただけで NG が出る（偽陽性）。判定に使うのは下の 2 つの和だけ。"""
-    return norm(q) in old_cores
+    改名しただけで NG が出る（偽陽性）。判定に使うのは完全一致と、
+    末尾を省略した前方一致だけ。"""
+    qn = norm(q)
+    if qn in old_cores:
+        return True
+    e = norm(strip_ellipsis(q))
+    return e != qn and len(e) >= 4 and any(c.startswith(e) for c in old_cores)
 
 
 # 対象ファイル自身の旧見出しの断片が母数に混ざると、誰も指していない見出しを
@@ -312,8 +323,11 @@ else:
     # 母数は「旧版で見出しに解決していた引用」なので、新版でも見出しに解決しなければならない。
     # 本文のどこかに在るだけでは合格にしない（節名を指すポインタが散文の一部として
     # 残っただけの状態を通してしまう）。
-    broken = [q for q in resolved_before
-              if not any(norm(q) in h or h in norm(q) for h in new_n)]
+    def resolves(q):
+        qn, e = norm(q), norm(strip_ellipsis(q))
+        return any(qn in h or h in qn or h.startswith(e) for h in new_n)
+
+    broken = [q for q in resolved_before if not resolves(q)]
     broken_named = [q for q in named if q in broken]
     report("9", not broken, f"向き 2: 旧版で解決していた引用 {len(resolved_before)} 件のうち新版で切れたもの {len(broken)} 件 {broken}")
     report("9b", not broken_named, f"向き 2（厳格）: {base} と同じ行に書かれた引用 {len(named)} 件のうち切れたもの {len(broken_named)} 件 {broken_named}")
@@ -321,7 +335,7 @@ else:
     print(f"        判定に使わない部分一致 {len(advisory)} 件（見出しの断片にたまたま当たるだけ）: {advisory}")
     for q in resolved_before:
         # 判定は見出しへの解決だけを合格にするので、一覧の表記もそれに合わせる。
-        where = ("見出し" if any(norm(q) in h or h in norm(q) for h in new_n)
+        where = ("見出し" if resolves(q)
                  else ("切れた（本文にはあるが見出しではない）" if norm(q) in body_n else "切れた"))
         print(f"        「{q}」→ {where}")
 
@@ -371,9 +385,17 @@ else:
 # 12. レビューの修正ラウンドで復元・追加した逐語が生きているか。
 #     ファイルごとに違うので引数で受ける。手で作った列挙であることを出力に明記する。
 ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
+# --no-anchors だけは母数が操作者由来（--anchor= の個数）なので、渡すだけで検査が死ぬ。
+# 母数を履歴由来にする —— 修正ラウンドが 1 度でも回っていたら、守る逐語が在るはず。
+_rounds = subprocess.run(["git", "-C", ROOT, "rev-list", "--count", "origin/main..HEAD"],
+                         capture_output=True, text=True)
+ROUNDS = int(_rounds.stdout.strip() or 0) if _rounds.returncode == 0 else 0
 if not ANCHORS:
-    if "--no-anchors" in FLAGS:
-        print("SKIP [12] 守る逐語の指定が無い（--no-anchors で明示的に外した）")
+    if "--no-anchors" in FLAGS and ROUNDS > 1:
+        die("12", f"--no-anchors を渡したが、origin/main から {ROUNDS} コミット進んでいる。"
+                  f"修正ラウンドが回っているなら、復元・追加した逐語を --anchor= で守ること")
+    elif "--no-anchors" in FLAGS:
+        print(f"SKIP [12] 守る逐語の指定が無い（--no-anchors で明示的に外した。origin/main から {ROUNDS} コミット）")
     else:
         die("12", "守る逐語（--anchor=<逐語>）が 1 件も無い。母数 0 は合格ではない。"
                   "修正ラウンドで復元・追加した記述が無いなら --no-anchors を渡す")
