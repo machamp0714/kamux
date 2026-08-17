@@ -158,7 +158,9 @@ for i, l in sec:
 # 5b. 逆向き。壊れたのは「素の § を書く」向きではなく、「契約へ書き込む値を N 章 で書く」向き。
 #     どちらに当たるかは用途で決まるので機械では裁けない。母数を宣言させることで、
 #     新しい N 章 が増えたことに書き手が気づく形にする。
-chap = [(i + 1, l.strip()[:90]) for i, l in enumerate(lines) if re.search(r"[0-9]+ 章", l)]
+# 切り捨てるのは表示だけ。ダイジェストの材料に切り捨て済みの値を流用すると、
+# 切った位置より後ろの違反が素通りする。
+chap = [(i + 1, l.strip()) for i, l in enumerate(lines) if re.search(r"[0-9]+ 章", l)]
 declared = next((f for f in FLAGS if f.startswith("--chapters=")), None)
 if not chap:
     # I-3 で閉じたのと同じ形をここで開けない。0 行が正しいなら --no-chapters を明示する。
@@ -191,7 +193,7 @@ else:
                f"逆向き（契約へ書き込む値を「N 章」で書いていないか）: 実体 {actual} / 宣言 {want}。"
                f"全件を出すので用途を人が裁くこと")
     for i, l in chap:
-        print(f"        :{i} {l}")
+        print(f"        :{i} {l[:90]}")
 
 # 6. 太字が見出しと表の項目名まで
 n = body.count("**") // 2
