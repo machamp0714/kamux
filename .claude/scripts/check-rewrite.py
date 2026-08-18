@@ -403,8 +403,13 @@ def fence_seq(text):
 # 中身が逐語保護の外へ出る。旧版にはこの形が実在し、本検査の射程外だった。
 _quoted = [i + 1 for i, l in enumerate(lines) if l.startswith("> ```")]
 if _quoted:
+    # die の後も実行が続くと、同じ [11] タグで FATAL と NG が 2 行出て読み手が混乱する。
+    # 逐語保護の前提が崩れている以上、その先の比較には意味が無いので即座に落とす。
     die("11", f"新版に `> ` 付きの code fence が {len(_quoted)} 本ある（行 {_quoted}）。"
               f"この形は逐語保護の外に出る。素の fence にすること")
+    print()
+    print(f"FATAL {len(fatal)} 件: {fatal} —— 測定できていない。不合格の証拠にはならない")
+    sys.exit(2)
 
 old_code, new_code = code_lines(old_body), code_lines(body)
 if not old_code:
@@ -467,6 +472,19 @@ else:
                 print(f"        増えた: {x}")
 
 # 11b. 多重集合が同じでも、並びと空行は守られていない。
+#
+#      ⚠️ 11 の順序依存ダイジェストと 11b は **素な分業**であって、どちらも冗長ではない。
+#      片方を外すと片方の族が静かに開く。実測（4 本目のレビューで両方向を切って測った）:
+#
+#        - 11b だけ無効化 + 「fence 間で行を移動」 → exit 0 / 全合格（11 は素通り）
+#        - ダイジェストを sorted(added) へ戻す + 「fence 内で added 行を入れ替え」
+#                                              → exit 0 / 全合格（11b も素通り）
+#
+#      ダイジェストは added どうしの順序だけを、11b は added 以外の順序と空行だけを守る。
+#
+#      残余（4 本目時点で未閉。5 本目の器いじりで拾う）: added 行は、他の added 行との
+#      相対順序さえ保てば fence 構造のどこへ動かしても両方を通る。11b は _drop_once で
+#      added を除くので位置を見ず、ダイジェストは added 間の順序しか記録しないため。
 #      宣言済みの増減を両側から取り除いてから、残りを順序込みで比べる。
 #      これが無いと「fence 内の 2 行を入れ替える」「空行を挟む」が差分 0 で素通りする。
 def _drop_once(seq, items):
@@ -479,7 +497,11 @@ def _drop_once(seq, items):
         out.append(l)
     return out
 
-if old_code and "--no-fence" not in FLAGS:
+if not old_code or "--no-fence" in FLAGS:
+    # 検査 11 は母数 0 のとき SKIP を印字するのに 11b だけ黙っていた。
+    # 「どの検査も母数を先に出力する」という本スクリプトの規律の外に出ない。
+    print("SKIP [11b] 旧版に code fence が無いので並び・空行の比較対象が無い")
+else:
     _o = _drop_once(fence_seq(old_body), missing)
     _n = _drop_once(fence_seq(body), added)
     _diff = next(((k, a, b) for k, (a, b) in enumerate(zip(_o, _n)) if a != b), None)
@@ -489,8 +511,6 @@ if old_code and "--no-fence" not in FLAGS:
               else f"最初の食い違いは {_diff[0] + 1} 行目 旧 {_diff[1]!r} / 新 {_diff[2]!r}"
                    if _diff else f"行数が違う（旧 {len(_o)} / 新 {len(_n)}）"))
 
-# 12. round 2 で復元した逐語が生きているか。
-#     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
 # 12. レビューの修正ラウンドで復元・追加した逐語が生きているか。
 #     ファイルごとに違うので引数で受ける。手で作った列挙であることを出力に明記する。
 ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
