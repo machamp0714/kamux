@@ -401,11 +401,14 @@ def fence_seq(text):
 
 # 新版に `> ` 付きの fence が在ると、code_lines() が fence と数えないので
 # 中身が逐語保護の外へ出る。旧版にはこの形が実在し、本検査の射程外だった。
-_quoted = [i + 1 for i, l in enumerate(lines) if l.startswith("> ```")]
+# `> ` 付きに限らない。`>````（空白なし）と字下げした fence も code_lines() の
+# `l.startswith("```")` に当たらないので、中身が逐語保護の外へ出る。3 綴りとも閉じる。
+_quoted = [i + 1 for i, l in enumerate(lines)
+           if re.match(r"^(?:\s+|\s*>+\s*)```", l)]
 if _quoted:
     # die の後も実行が続くと、同じ [11] タグで FATAL と NG が 2 行出て読み手が混乱する。
     # 逐語保護の前提が崩れている以上、その先の比較には意味が無いので即座に落とす。
-    die("11", f"新版に `> ` 付きの code fence が {len(_quoted)} 本ある（行 {_quoted}）。"
+    die("11", f"新版に行頭が素でない code fence が {len(_quoted)} 本ある（引用符付き・字下げ。行 {_quoted}）。"
               f"この形は逐語保護の外に出る。素の fence にすること")
     print()
     print(f"FATAL {len(fatal)} 件: {fatal} —— 測定できていない。不合格の証拠にはならない")
