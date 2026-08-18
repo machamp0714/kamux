@@ -35,7 +35,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated", "--no-cases")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated", "--no-cases", "--fence=", "--no-fence-change")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -400,9 +400,40 @@ else:
     co, cn = Counter(old_code), Counter(new_code)
     missing = list((co - cn).elements())
     added = list((cn - co).elements())
-    report("11", not missing and not added,
-           f"code fence の行（コメント込み）: 旧 {len(old_code)} 行 / 新 {len(new_code)} 行。"
-           f"落ちた {len(missing)} 行 {missing[:2]} / 増えた {len(added)} 行 {added[:2]}")
+    head = (f"code fence の行（コメント込み）: 旧 {len(old_code)} 行 / 新 {len(new_code)} 行。"
+            f"落ちた {len(missing)} 行 / 増えた {len(added)} 行")
+    # 逐語保存が既定である。ただし fence の中に「規範値ではない見本」が混ざることがあり
+    # （日付の見本など）、他の検査（2 の日付）と正面から衝突する。5b / 8 / 12 と同じ形で
+    # 宣言の逃げ道を 1 つ置く。件数だけでは「1 行落として 1 行足す」入れ替えが素通りするので
+    # ダイジェストまで宣言させる。--no-fence は「旧版に fence が無い」の意味なので兼用しない。
+    delta = sorted(missing) + sorted(added)
+    fdecl = next((f.split("=", 1)[1] for f in FLAGS if f.startswith("--fence=")), None)
+    if not delta:
+        if fdecl is not None:
+            die("11", "fence の差分は 0 行なのに --fence= が渡されている。外す理由が成立していない")
+        elif "--no-fence-change" in FLAGS:
+            print(f"SKIP [11] {head}（--no-fence-change。差分 0 行なので宣言は不要だった）")
+        else:
+            report("11", True, head)
+    else:
+        actual = f"{len(delta)}:{hashlib.sha256(chr(10).join(delta).encode('utf-8')).hexdigest()[:12]}"
+        if "--no-fence-change" in FLAGS:
+            die("11", f"--no-fence-change を渡したが、fence の差分が {len(delta)} 行ある。外す理由が成立していない")
+        elif fdecl is None:
+            die("11", f"{head}。**逐語保存が既定である。** 意図した変更なら、下の全件を人が裁いたうえで次を渡すこと:\n"
+                      f"       --fence={actual}\n"
+                      + "\n".join(f"       - 落ちた: {x}" for x in sorted(missing))
+                      + ("\n" if missing and added else "")
+                      + "\n".join(f"       - 増えた: {x}" for x in sorted(added)))
+        else:
+            ok11 = fdecl == actual
+            report("11", ok11, f"{head}。実体 {actual} / 宣言 {fdecl}")
+            if not ok11:
+                print(f"        下の全件を人が裁き直してから: --fence={actual}")
+            for x in sorted(missing):
+                print(f"        落ちた: {x}")
+            for x in sorted(added):
+                print(f"        増えた: {x}")
 
 # 12. round 2 で復元した逐語が生きているか。
 #     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
