@@ -23,6 +23,7 @@ code fence の逐語比較は永久に空振りする。`--chapters=N` の N を
   「どこでも § でよい」へ書き換えても検査 5 は緑のままになる。散文の主張は機械で測れない。
 """
 import hashlib
+from collections import Counter
 import os
 import re
 import subprocess
@@ -384,6 +385,27 @@ def code_lines(text):
             out.append(l)
     return out
 
+def fence_seq(text):
+    """fence の中身を空行も含めて並び順のまま返す。
+    code_lines() は多重集合の材料なので空行を捨てるが、それだと
+    「行を入れ替える」「空行を挟む」変異が差分 0 として素通りする。"""
+    out, inside = [], False
+    for l in text.split("\n"):
+        if l.startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            out.append(l)
+    return out
+
+
+# 新版に `> ` 付きの fence が在ると、code_lines() が fence と数えないので
+# 中身が逐語保護の外へ出る。旧版にはこの形が実在し、本検査の射程外だった。
+_quoted = [i + 1 for i, l in enumerate(lines) if l.startswith("> ```")]
+if _quoted:
+    die("11", f"新版に `> ` 付きの code fence が {len(_quoted)} 本ある（行 {_quoted}）。"
+              f"この形は逐語保護の外に出る。素の fence にすること")
+
 old_code, new_code = code_lines(old_body), code_lines(body)
 if not old_code:
     # 母数 0 を黙って通さない。旧版に fence が無いファイルでは --no-fence を明示的に渡す。
@@ -396,7 +418,6 @@ elif "--no-fence" in FLAGS:
     die("11", f"--no-fence を渡したが、旧版に code fence が {len(old_code)} 行ある。外す理由が成立していない")
 else:
     # 多重集合で比べる。集合で比べると同じ行を複製しても気づかない。
-    from collections import Counter
     co, cn = Counter(old_code), Counter(new_code)
     missing = list((co - cn).elements())
     added = list((cn - co).elements())
@@ -434,6 +455,29 @@ else:
                 print(f"        落ちた: {x}")
             for x in sorted(added):
                 print(f"        増えた: {x}")
+
+# 11b. 多重集合が同じでも、並びと空行は守られていない。
+#      宣言済みの増減を両側から取り除いてから、残りを順序込みで比べる。
+#      これが無いと「fence 内の 2 行を入れ替える」「空行を挟む」が差分 0 で素通りする。
+def _drop_once(seq, items):
+    c = Counter(items)
+    out = []
+    for l in seq:
+        if c[l] > 0:
+            c[l] -= 1
+            continue
+        out.append(l)
+    return out
+
+if old_code and "--no-fence" not in FLAGS:
+    _o = _drop_once(fence_seq(old_body), missing)
+    _n = _drop_once(fence_seq(body), added)
+    _diff = next(((k, a, b) for k, (a, b) in enumerate(zip(_o, _n)) if a != b), None)
+    report("11b", _o == _n,
+           f"fence の並びと空行（宣言済みの増減を除いた残り 旧 {len(_o)} 行 / 新 {len(_n)} 行）: "
+           + ("一致" if _o == _n
+              else f"最初の食い違いは {_diff[0] + 1} 行目 旧 {_diff[1]!r} / 新 {_diff[2]!r}"
+                   if _diff else f"行数が違う（旧 {len(_o)} / 新 {len(_n)}）"))
 
 # 12. round 2 で復元した逐語が生きているか。
 #     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
