@@ -427,7 +427,17 @@ else:
     # （日付の見本など）、他の検査（2 の日付）と正面から衝突する。5b / 8 / 12 と同じ形で
     # 宣言の逃げ道を 1 つ置く。件数だけでは「1 行落として 1 行足す」入れ替えが素通りするので
     # ダイジェストまで宣言させる。--no-fence は「旧版に fence が無い」の意味なので兼用しない。
-    delta = sorted(missing) + sorted(added)
+    # 増えた側は「新版に現れる順」で固定する。sorted() で並べると、
+    # 増えた行どうしの入れ替えが多重集合を変えないまま素通りする
+    # （旧版が `> ` 付きだった fence を素の fence へ移した便では、
+    #  そのブロック全体が added なので 11b でも比べられない）。
+    _cnt_added = Counter(added)
+    added_ordered = []
+    for l in new_code:
+        if _cnt_added[l] > 0:
+            _cnt_added[l] -= 1
+            added_ordered.append(l)
+    delta = sorted(missing) + added_ordered
     fdecl = next((f.split("=", 1)[1] for f in FLAGS if f.startswith("--fence=")), None)
     if not delta:
         if fdecl is not None:
