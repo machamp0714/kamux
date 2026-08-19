@@ -23,6 +23,7 @@ code fence の逐語比較は永久に空振りする。`--chapters=N` の N を
   「どこでも § でよい」へ書き換えても検査 5 は緑のままになる。散文の主張は機械で測れない。
 """
 import hashlib
+from collections import Counter
 import os
 import re
 import subprocess
@@ -35,7 +36,7 @@ argv = [x for x in sys.argv[3:] if not x.startswith("--")]
 FLAGS = {x for x in sys.argv[3:] if x.startswith("--")}
 CASES_REL = argv[0] if argv else None
 
-KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated", "--no-cases")
+KNOWN = ("--no-fence", "--no-chapters", "--chapters=", "--renamed=", "--no-renamed", "--anchor=", "--no-anchors", "--no-decorated", "--no-cases", "--fence=", "--no-fence-change")
 _bad = [f for f in FLAGS if not any(f == k or f.startswith(k) for k in KNOWN)]
 if _bad:
     # typo を黙って受理すると、外したつもりの検査が走り、付けたつもりの逃げ道が効かない。
@@ -384,6 +385,35 @@ def code_lines(text):
             out.append(l)
     return out
 
+def fence_seq(text):
+    """fence の中身を空行も含めて並び順のまま返す。
+    code_lines() は多重集合の材料なので空行を捨てるが、それだと
+    「行を入れ替える」「空行を挟む」変異が差分 0 として素通りする。"""
+    out, inside = [], False
+    for l in text.split("\n"):
+        if l.startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            out.append(l)
+    return out
+
+
+# 新版に `> ` 付きの fence が在ると、code_lines() が fence と数えないので
+# 中身が逐語保護の外へ出る。旧版にはこの形が実在し、本検査の射程外だった。
+# `> ` 付きに限らない。`>````（空白なし）と字下げした fence も code_lines() の
+# `l.startswith("```")` に当たらないので、中身が逐語保護の外へ出る。3 綴りとも閉じる。
+_quoted = [i + 1 for i, l in enumerate(lines)
+           if re.match(r"^(?:\s+|\s*>+\s*)```", l)]
+if _quoted:
+    # die の後も実行が続くと、同じ [11] タグで FATAL と NG が 2 行出て読み手が混乱する。
+    # 逐語保護の前提が崩れている以上、その先の比較には意味が無いので即座に落とす。
+    die("11", f"新版に行頭が素でない code fence が {len(_quoted)} 本ある（引用符付き・字下げ。行 {_quoted}）。"
+              f"この形は逐語保護の外に出る。素の fence にすること")
+    print()
+    print(f"FATAL {len(fatal)} 件: {fatal} —— 測定できていない。不合格の証拠にはならない")
+    sys.exit(2)
+
 old_code, new_code = code_lines(old_body), code_lines(body)
 if not old_code:
     # 母数 0 を黙って通さない。旧版に fence が無いファイルでは --no-fence を明示的に渡す。
@@ -396,16 +426,94 @@ elif "--no-fence" in FLAGS:
     die("11", f"--no-fence を渡したが、旧版に code fence が {len(old_code)} 行ある。外す理由が成立していない")
 else:
     # 多重集合で比べる。集合で比べると同じ行を複製しても気づかない。
-    from collections import Counter
     co, cn = Counter(old_code), Counter(new_code)
     missing = list((co - cn).elements())
     added = list((cn - co).elements())
-    report("11", not missing and not added,
-           f"code fence の行（コメント込み）: 旧 {len(old_code)} 行 / 新 {len(new_code)} 行。"
-           f"落ちた {len(missing)} 行 {missing[:2]} / 増えた {len(added)} 行 {added[:2]}")
+    head = (f"code fence の行（コメント込み）: 旧 {len(old_code)} 行 / 新 {len(new_code)} 行。"
+            f"落ちた {len(missing)} 行 / 増えた {len(added)} 行")
+    # 逐語保存が既定である。ただし fence の中に「規範値ではない見本」が混ざることがあり
+    # （日付の見本など）、他の検査（2 の日付）と正面から衝突する。5b / 8 / 12 と同じ形で
+    # 宣言の逃げ道を 1 つ置く。件数だけでは「1 行落として 1 行足す」入れ替えが素通りするので
+    # ダイジェストまで宣言させる。--no-fence は「旧版に fence が無い」の意味なので兼用しない。
+    # 増えた側は「新版に現れる順」で固定する。sorted() で並べると、
+    # 増えた行どうしの入れ替えが多重集合を変えないまま素通りする
+    # （旧版が `> ` 付きだった fence を素の fence へ移した便では、
+    #  そのブロック全体が added なので 11b でも比べられない）。
+    _cnt_added = Counter(added)
+    added_ordered = []
+    for l in new_code:
+        if _cnt_added[l] > 0:
+            _cnt_added[l] -= 1
+            added_ordered.append(l)
+    delta = sorted(missing) + added_ordered
+    fdecl = next((f.split("=", 1)[1] for f in FLAGS if f.startswith("--fence=")), None)
+    if not delta:
+        if fdecl is not None:
+            die("11", "fence の差分は 0 行なのに --fence= が渡されている。外す理由が成立していない")
+        elif "--no-fence-change" in FLAGS:
+            print(f"SKIP [11] {head}（--no-fence-change。差分 0 行なので宣言は不要だった）")
+        else:
+            report("11", True, head)
+    else:
+        actual = f"{len(delta)}:{hashlib.sha256(chr(10).join(delta).encode('utf-8')).hexdigest()[:12]}"
+        if "--no-fence-change" in FLAGS:
+            die("11", f"--no-fence-change を渡したが、fence の差分が {len(delta)} 行ある。外す理由が成立していない")
+        elif fdecl is None:
+            die("11", f"{head}。**逐語保存が既定である。** 意図した変更なら、下の全件を人が裁いたうえで次を渡すこと:\n"
+                      f"       --fence={actual}\n"
+                      + "\n".join(f"       - 落ちた: {x}" for x in sorted(missing))
+                      + ("\n" if missing and added else "")
+                      + "\n".join(f"       - 増えた: {x}" for x in sorted(added)))
+        else:
+            ok11 = fdecl == actual
+            report("11", ok11, f"{head}。実体 {actual} / 宣言 {fdecl}")
+            if not ok11:
+                print(f"        下の全件を人が裁き直してから: --fence={actual}")
+            for x in sorted(missing):
+                print(f"        落ちた: {x}")
+            for x in sorted(added):
+                print(f"        増えた: {x}")
 
-# 12. round 2 で復元した逐語が生きているか。
-#     これは手で作った列挙である（機械導出ではない）。母数を宣言する。
+# 11b. 多重集合が同じでも、並びと空行は守られていない。
+#
+#      ⚠️ 11 の順序依存ダイジェストと 11b は **素な分業**であって、どちらも冗長ではない。
+#      片方を外すと片方の族が静かに開く。実測（4 本目のレビューで両方向を切って測った）:
+#
+#        - 11b だけ無効化 + 「fence 間で行を移動」 → exit 0 / 全合格（11 は素通り）
+#        - ダイジェストを sorted(added) へ戻す + 「fence 内で added 行を入れ替え」
+#                                              → exit 0 / 全合格（11b も素通り）
+#
+#      ダイジェストは added どうしの順序だけを、11b は added 以外の順序と空行だけを守る。
+#
+#      残余（4 本目時点で未閉。5 本目の器いじりで拾う）: added 行は、他の added 行との
+#      相対順序さえ保てば fence 構造のどこへ動かしても両方を通る。11b は _drop_once で
+#      added を除くので位置を見ず、ダイジェストは added 間の順序しか記録しないため。
+#      宣言済みの増減を両側から取り除いてから、残りを順序込みで比べる。
+#      これが無いと「fence 内の 2 行を入れ替える」「空行を挟む」が差分 0 で素通りする。
+def _drop_once(seq, items):
+    c = Counter(items)
+    out = []
+    for l in seq:
+        if c[l] > 0:
+            c[l] -= 1
+            continue
+        out.append(l)
+    return out
+
+if not old_code or "--no-fence" in FLAGS:
+    # 検査 11 は母数 0 のとき SKIP を印字するのに 11b だけ黙っていた。
+    # 「どの検査も母数を先に出力する」という本スクリプトの規律の外に出ない。
+    print("SKIP [11b] 旧版に code fence が無いので並び・空行の比較対象が無い")
+else:
+    _o = _drop_once(fence_seq(old_body), missing)
+    _n = _drop_once(fence_seq(body), added)
+    _diff = next(((k, a, b) for k, (a, b) in enumerate(zip(_o, _n)) if a != b), None)
+    report("11b", _o == _n,
+           f"fence の並びと空行（宣言済みの増減を除いた残り 旧 {len(_o)} 行 / 新 {len(_n)} 行）: "
+           + ("一致" if _o == _n
+              else f"最初の食い違いは {_diff[0] + 1} 行目 旧 {_diff[1]!r} / 新 {_diff[2]!r}"
+                   if _diff else f"行数が違う（旧 {len(_o)} / 新 {len(_n)}）"))
+
 # 12. レビューの修正ラウンドで復元・追加した逐語が生きているか。
 #     ファイルごとに違うので引数で受ける。手で作った列挙であることを出力に明記する。
 ANCHORS = [f.split("=", 1)[1] for f in sorted(FLAGS) if f.startswith("--anchor=")]
