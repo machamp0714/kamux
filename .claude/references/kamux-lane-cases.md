@@ -93,7 +93,7 @@ stage5 で 5 回（台帳 #124 / #125 / #128 / #142 / #144）。
 ## 証拠に借りたコマンドの出力が、2 状態を区別するか
 
 - パイプ: 2026-08-15 のゲートで team-lead 自身が `cargo test --workspace 2>&1 | tail -20` を踏み、`cargo test` が 8 件しか見えなかった（実際は 783）。clippy が落ちていても緑と報告する形だった。
-- `git push -q origin main`（台帳 #180）/ `rm -rf` の glob（#114。実物は `rm -rf $TMPDIR/kamux-boot-from-*` で、zsh の no-match が先行パターンの削除ごと中断した）/ `gh pr merge --delete-branch`（#118 / #191。worktree から打つと `fatal: 'main' is already used by worktree` が出るが、リモートのマージは成功している）/ `git ls-files -s`（#169）/ `git status --porcelain`（#113）/ `--no-fail-fast` 無し（#40）/ アサーション反転とテスト本数（#28）。
+- `git push -q origin main`（台帳 #180）/ `rm -rf` の glob（#114。実物は `rm -rf $TMPDIR/kamux-boot-from-*` で、zsh の no-match が先行パターンの削除ごと中断した）/ `gh pr merge --delete-branch`（#118 / #191。worktree から打つと `fatal: 'main' is already used by worktree` が出るが、リモートのマージは成功している）/ `git ls-files -s`（#169）/ `git status --porcelain`（#113）/ `--no-fail-fast` 無し（#40。先頭 target が赤になった時点で残り 3 target が黙って飛ばされた）/ アサーション反転とテスト本数（#28）。
 - CI / ローカルの緑（#115）: `externalBin` 化の後、ローカルは worktree に残ったバイナリで全緑、CI だけが `resource path … doesn't exist` で落ちた。PR 単位レビューも変異検証つきで APPROVED を出していた。
 - 無視パターンが `src-tauri/target/` を焼き込んで死んだ件（#54）は、CI が `target/` を持たないため CI から永久に観測できない。
 
