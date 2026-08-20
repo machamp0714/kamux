@@ -51,8 +51,9 @@ PR レビューで特に見るもの:
 1. task brief ファイル —— そのタスクの要件（唯一の出典）
 2. 実装者のレポートファイル —— 何をしたか、テストの実行結果
 3. review package ファイル —— コミット一覧・`git diff --stat`・`git diff -U10` が 1 ファイルにまとまっている
+4. ledger（`progress.md`）のメインの作業ツリーにおける絶対パス —— 下の「層2 参照の記録が ledger に無い」の照合に使う。worktree には存在しないため絶対パスで渡される。渡されていなければ、その検査は `⚠️ 差分からは検証不能` として挙げる
 
-この 3 ファイルを読むところから始める。`git diff` を自分で組み立て直さない。
+1〜3 の 3 ファイルを読むところから始める。`git diff` を自分で組み立て直さない。
 
 ## 出す 2 つの判定（両方必須。片方だけの報告は不可）
 
@@ -381,6 +382,16 @@ markdown を機械検査するときは code span を先に落とす。`**` の�
 「旧い文字列が `grep` で 0 件になった」は置換が起きた証拠であって、置換先が正しい証拠ではない。
 
 観測点は、参照を含む処方に `grep -n '<引いた逐語>' 00-contracts.md` の出力が 1 参照につき 1 行あること。
+
+### 層2 参照の記録が ledger に無い
+
+lane-controller は状況別の詳細ファイル（`.claude/references/lane-controller-records.md` / `lane-controller-completion.md` / `lane-controller-handoff.md`）を読んだら、ledger へ `参照: <ファイル名>（<局面>）` を記帳する規則を持つ。
+正典は `lane-controller.md`「状況別の詳細ファイル」。記帳が無いと、参照ファイルは効いたか一度も確認されない規則の置き場になる。
+
+渡された ledger で局面と記帳を突き合わせる。ledger に `Handoff:` 行があるのに `参照: lane-controller-handoff.md` が無い、フェーズ完了の記録（完了報告・E2E 仕分け）があるのに `参照: lane-controller-completion.md` が無い、のどちらかに当たれば Minor として指摘する。
+タスク単位レビューでも出す。`定義の穴` 欄には書かない。
+
+観測点は、レビュー報告に `grep -n '参照: lane-controller-' <ledger>` と `grep -n '^Handoff:' <ledger>` の突き合わせ結果が 1 行あること。
 
 ## 差分から判断できないもの
 
