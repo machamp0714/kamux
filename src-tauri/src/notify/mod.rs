@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::model::{RuntimeState, SessionStatePayload, StateReason};
-use policy::{badge_count, decide, format_notification, DecisionInput};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+use crate::model::{FocusPayload, RuntimeState, SessionStatePayload, StateReason, SurfaceKind};
+use policy::{badge_count, decide, format_notification, DecisionInput, MAIN_WINDOW_LABEL};
 
 pub use policy::{
     NotifyDecision, NotifyKind, NotifyPermission, SessionLabel, ViewKind, VisibilityContext,
@@ -231,6 +233,49 @@ impl Notifier {
             badge,
             request_permission,
         }
+    }
+}
+
+/// 契約 §8 のトピック文字列を組み立てる唯一の場所。
+pub fn focus_event_topic(session_id: &str) -> String {
+    format!("focus://session/{session_id}")
+}
+
+/// 通知クリックからセッションフォーカスまでを実行する。
+///
+/// 前面化を先に行う。逆順だと、非表示のウィンドウに対してビュー切り替えが走り、
+/// 前面化した瞬間に描画が追いつかないため（設計判断。この順序を測る自動観測は
+/// この差分に無い）。
+pub fn focus_session_from_notification<R: Runtime>(app: &AppHandle<R>, session_id: &str) {
+    if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(e) = win.show() {
+            tracing::warn!("failed to show window: {e}");
+        }
+        if let Err(e) = win.unminimize() {
+            tracing::debug!("unminimize skipped: {e}");
+        }
+        if let Err(e) = win.set_focus() {
+            tracing::warn!("failed to focus window: {e}");
+        }
+    }
+
+    let payload = FocusPayload {
+        session_id: session_id.to_string(),
+        surface_kind: SurfaceKind::Agent,
+    };
+    if let Err(e) = app.emit(&focus_event_topic(session_id), payload) {
+        tracing::warn!("failed to emit focus event: {e}");
+    }
+}
+
+/// Dock バッジを適用する。`None` でバッジを消す。
+pub fn apply_badge<R: Runtime>(app: &AppHandle<R>, count: Option<i64>) {
+    let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        tracing::warn!("main window not found; badge not applied");
+        return;
+    };
+    if let Err(e) = win.set_badge_count(count) {
+        tracing::warn!("failed to set badge count: {e}");
     }
 }
 
@@ -641,6 +686,14 @@ mod notifier_tests {
     /// `waiting_input_title_follows_the_design_doc`（title: "fix-login" の場合）から
     /// そのままコピーする。body の区切りは U+00B7 MIDDLE DOT（`·`）であり、
     /// 中黒 U+30FB（`・`）ではない。
+    #[test]
+    fn focus_topic_matches_the_contract() {
+        assert_eq!(
+            focus_event_topic("3f2a9c1e-0000"),
+            "focus://session/3f2a9c1e-0000"
+        );
+    }
+
     #[test]
     fn notifier_keeps_the_title_in_title_and_the_body_in_body() {
         let sink = Arc::new(RecordingSink::default());
