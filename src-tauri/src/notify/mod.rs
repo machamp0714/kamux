@@ -3,6 +3,7 @@
 //! `policy` サブモジュールが判定ロジックの型と純粋関数を持つ。
 //! OS API に触れる実装は後続タスクで別サブモジュールとして追加する。
 
+pub mod mac_sink;
 pub mod policy;
 
 use std::sync::{Arc, Mutex};
