@@ -42,6 +42,15 @@ pub struct AppState {
     /// `HookHandler::new` の引数として渡すのが唯一の経路になる。
     /// setter は作らない（`state.resume_tracker` が唯一の到達経路。契約 §75）。
     pub resume_tracker: Arc<crate::session::resume_tracker::ResumeTracker>,
+    /// 通知の判定・送信と Dock バッジの数え上げ（M2-3）。**`RuntimeStateManager` の中には
+    /// 入れない** —— あちらは状態機械の中核で、こちらはその出力を購読する側である
+    /// （`heuristics` / `resume_tracker` と同じ層の関係）。
+    ///
+    /// `Arc` なのは、同じ実体を `NotifyObserver`（`RuntimeStateManager` の observer）と
+    /// 共有する必要があるためである。observer は `AppState` を読めないので、
+    /// `install_app_state_with` が両方へ同じ `Arc` を配るのが唯一の経路になる。
+    /// setter は作らない（`state.notifier` が唯一の到達経路。契約 §75）。
+    pub notifier: Arc<crate::notify::Notifier>,
     /// Drop でソケットを unlink するため保持する。`shutdown()` が `&mut self` を要る
     /// ため `hooks` とは違い `Mutex` が必要（RunEvent::Exit のハンドラから止める）。
     pub hooks_server: Mutex<Option<HooksServer>>,
@@ -78,6 +87,13 @@ pub(crate) mod test_support {
             runtime,
             heuristics,
             resume_tracker: Arc::new(crate::session::resume_tracker::ResumeTracker::new()),
+            // 契約 §0: テストでは OS へ触れない [`RecordingSink`] に差し替える。
+            // ラベルは常に None を返し、`Notifier` 側の `SessionLabel::fallback` に落とす
+            // （このヘルパを使うテストは通知文言を主題にしていない）。
+            notifier: Arc::new(crate::notify::Notifier::new(
+                Arc::new(crate::notify::RecordingSink::default()),
+                Arc::new(|_id: &str| None),
+            )),
             hooks: None,
             hooks_server: Mutex::new(None),
         }

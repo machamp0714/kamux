@@ -236,6 +236,14 @@ impl Notifier {
     }
 }
 
+/// Unix epoch ミリ秒。契約 §3 の時刻表現と同じ。
+pub fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// 契約 §8 のトピック文字列を組み立てる唯一の場所。
 pub fn focus_event_topic(session_id: &str) -> String {
     format!("focus://session/{session_id}")
@@ -265,6 +273,56 @@ pub fn focus_session_from_notification<R: Runtime>(app: &AppHandle<R>, session_i
     };
     if let Err(e) = app.emit(&focus_event_topic(session_id), payload) {
         tracing::warn!("failed to emit focus event: {e}");
+    }
+}
+
+/// 状態遷移 1 件から、通知の判定・送信・Dock バッジ更新・初回の通知許可要求までを行う。
+///
+/// M2-1 の consumer スレッドから**同期的に**呼ばれるため、ここでブロックする処理を
+/// 書いてはならない。OS 通知の実送信は [`mac_sink::MacNotificationSink`] が専用スレッドへ、
+/// 許可要求は `tauri::async_runtime::spawn` へそれぞれ逃がしている。
+///
+/// `apply_badge` の呼び出しと `request_permission` の spawn は `AppHandle` と OS API を
+/// 要求するため、**これらを測る自動観測はこの差分に無い**（契約 §0 の「OS 通知の実送信は
+/// 自動テストしない」）。この関数が observer から実際に呼ばれていることは
+/// `lib.rs` の `install_app_state_posts_a_notification_through_the_registered_observer`
+/// が `NotificationSink` の側から観測する。
+pub fn on_session_state<R: Runtime>(
+    app: &AppHandle<R>,
+    notifier: &Arc<Notifier>,
+    payload: &SessionStatePayload,
+) {
+    let outcome = notifier.on_state(payload, now_epoch_ms());
+    apply_badge(app, outcome.badge);
+
+    if outcome.request_permission {
+        let notifier = Arc::clone(notifier);
+        tauri::async_runtime::spawn(async move {
+            let p = mac_sink::request_permission().await;
+            notifier.set_permission(p);
+        });
+    }
+}
+
+/// M2-1 の [`StateObserver`](crate::session::runtime_state::StateObserver) として登録する
+/// 薄い接着剤。
+///
+/// `Notifier` 自体に `AppHandle` を持たせない（= `Runtime` に対して総称にしない）ことで、
+/// `Notifier` を Tauri 抜きで `cargo test` できる状態に保つ。
+pub struct NotifyObserver<R: Runtime> {
+    app: AppHandle<R>,
+    notifier: Arc<Notifier>,
+}
+
+impl<R: Runtime> NotifyObserver<R> {
+    pub fn new(app: AppHandle<R>, notifier: Arc<Notifier>) -> Self {
+        Self { app, notifier }
+    }
+}
+
+impl<R: Runtime> crate::session::runtime_state::StateObserver for NotifyObserver<R> {
+    fn on_state(&self, payload: &SessionStatePayload) {
+        on_session_state(&self.app, &self.notifier, payload);
     }
 }
 
@@ -692,6 +750,15 @@ mod notifier_tests {
             focus_event_topic("3f2a9c1e-0000"),
             "focus://session/3f2a9c1e-0000"
         );
+    }
+
+    #[test]
+    fn now_ms_is_monotonic_enough_for_rate_limiting() {
+        let a = now_epoch_ms();
+        let b = now_epoch_ms();
+        assert!(b >= a);
+        // 2026 年以降であることを緩く確認（epoch ミリ秒として妥当な桁）
+        assert!(a > 1_700_000_000_000);
     }
 
     #[test]
