@@ -1294,8 +1294,9 @@ mod tests {
             Arc::new(crate::notify::RecordingSink::default())
         }
 
-        /// 通知許可のテスト固定値。契約 §0 のとおり、テストから実 OS API
-        /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4）。
+        /// 通知許可のテスト固定値。`test_sink` と同じ理由で、テストから実 OS API
+        /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4。
+        /// 契約上の章番号は 00-contracts.md に本文照合が取れなかったため引用しない）。
         /// `Granted` を選ぶのは 2 つの理由から: (1) `decide()` は `Denied` のときだけ
         /// 通知を抑制するので `Unknown` でも投稿自体は起きるが、この値を選ぶと
         /// `Notifier` が実 `read_permission()`（この機体では `Unknown` を返す。
