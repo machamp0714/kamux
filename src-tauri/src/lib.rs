@@ -571,7 +571,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     //
     //   1. 起動直後は PTY が 1 つも走っておらず、真に入力待ちのセッションは存在しない。
     //      `last_runtime_state` は表示復元用のヒントであって真実ではない（設計 §5.3）。
-    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:570）が
+    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:609）が
     //      走り、`{running, waiting_input}` の行を `interrupted` へ昇格させる（契約 §2。
     //      `00-contracts.md:3455` が「`normalize_on_startup` は `{running, waiting_input}`
     //      しか触らない」と書く）。seed はその**前**に実行されるため、
@@ -1811,7 +1811,7 @@ mod tests {
         /// **`last_runtime_state` から復元する形の変異は、このテストを赤にする**
         /// （実測: task-10 修正ラウンド 1 の RX-3。`StatePersist` 経由の読み出し 1 件で
         /// 赤を再確認済み。旧版は「直前の `normalize_on_startup` が昇格させるため無改変と
-        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:570）
+        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:609）
         /// より**前**に走るため誤りだった。`install_app_state_with` の該当コメント参照）。
         ///
         /// バッジの読み出しには `forget_session` を使う。未知の `session_id` に対しては

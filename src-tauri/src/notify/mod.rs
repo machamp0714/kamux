@@ -190,9 +190,10 @@ impl Notifier {
             // この項は set_permission が permission_requested を立てるのと冗長であり、
             // 公開 API 経由では単独では到達不能なのでテストで守れない（PR 18 単位レビュー I-1）。
             // 設計 §5.6 の「権限が未知のときに 1 回だけ訊く」を式の上に残すために意図的に置いている。
-            // ⚠️ PR 19 で set_permission の呼び出し方が増える（read_permission() の結果を流す）。
-            //    その時点で「公開 API 経由では到達不能」の前提を再検証すること。
-            //    Granted → Unknown → Spawned の経路が実際に発生しうる。
+            // PR 19 で read_permission() の結果を流す set_permission が lib.rs:527 に足された。
+            // 前提は不変である —— 本項を削除する変異は緑（PR 19 単位レビュー S-6）。
+            // production の set_permission 呼び出しは lib.rs:527 と mod.rs:304 の 2 箇所のみで、
+            // Granted → Unknown は起こらない。
             && inner.permission == NotifyPermission::Unknown
             && !inner.permission_requested;
         if request_permission {
@@ -244,7 +245,8 @@ pub fn now_epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 契約 §8 のトピック文字列を組み立てる唯一の場所。
+/// Rust 側で契約 §8 のトピック文字列を組み立てる唯一の場所。
+/// TS 側は src/ipc/events.ts:33 が独立に組み立てる。
 pub fn focus_event_topic(session_id: &str) -> String {
     format!("focus://session/{session_id}")
 }
@@ -732,19 +734,6 @@ mod notifier_tests {
         assert_eq!(sink.posted()[0].title, "入力待ち: セッション 3f2a9c1e");
     }
 
-    /// 必須要件: `format_notification()` の戻り値 `(title, body)` を
-    /// `NotificationRequest` に詰める箇所で title/body を取り違えていないかを検出する。
-    ///
-    /// `recording_sink_captures_posts_in_order`（sink_tests）は `NotificationRequest` を
-    /// テスト自身が名前付きフィールドで組み立てており、`format_notification()` の戻り値を
-    /// 詰め替えるコードパスを一切通らないため、この取り違えを構造的に観測できない。
-    /// このテストは `Notifier::on_state` を実際に駆動し、`format_notification()` から
-    /// `Notifier::on_state` 内の詰め替えコードを経由して `RecordingSink` に届いた値を見る。
-    ///
-    /// 期待値は手入力ではなく policy.rs の既存テスト
-    /// `waiting_input_title_follows_the_design_doc`（title: "fix-login" の場合）から
-    /// そのままコピーする。body の区切りは U+00B7 MIDDLE DOT（`·`）であり、
-    /// 中黒 U+30FB（`・`）ではない。
     #[test]
     fn focus_topic_matches_the_contract() {
         assert_eq!(
@@ -762,6 +751,19 @@ mod notifier_tests {
         assert!(a > 1_700_000_000_000);
     }
 
+    /// 必須要件: `format_notification()` の戻り値 `(title, body)` を
+    /// `NotificationRequest` に詰める箇所で title/body を取り違えていないかを検出する。
+    ///
+    /// `recording_sink_captures_posts_in_order`（sink_tests）は `NotificationRequest` を
+    /// テスト自身が名前付きフィールドで組み立てており、`format_notification()` の戻り値を
+    /// 詰め替えるコードパスを一切通らないため、この取り違えを構造的に観測できない。
+    /// このテストは `Notifier::on_state` を実際に駆動し、`format_notification()` から
+    /// `Notifier::on_state` 内の詰め替えコードを経由して `RecordingSink` に届いた値を見る。
+    ///
+    /// 期待値は手入力ではなく policy.rs の既存テスト
+    /// `waiting_input_title_follows_the_design_doc`（title: "fix-login" の場合）から
+    /// そのままコピーする。body の区切りは U+00B7 MIDDLE DOT（`·`）であり、
+    /// 中黒 U+30FB（`・`）ではない。
     #[test]
     fn notifier_keeps_the_title_in_title_and_the_body_in_body() {
         let sink = Arc::new(RecordingSink::default());
