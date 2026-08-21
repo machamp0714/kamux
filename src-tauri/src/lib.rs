@@ -17,7 +17,8 @@ use crate::error::{AppError, AppResult};
 use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
 use crate::notify::{
-    mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, SessionLabel,
+    mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
+    SessionLabel,
 };
 use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
@@ -427,7 +428,12 @@ fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
     let sink: Arc<dyn NotificationSink> = Arc::new(mac_sink::MacNotificationSink::new(
         notification_click_handler(manager.app_handle()),
     ));
-    install_app_state_with(manager, store, persist, sink, bootstrap);
+    // I-4（task-10 レビュー修正ラウンド 1）: 通知許可の実 OS 問い合わせはここでだけ行う。
+    // `install_app_state_with` はテストの直接呼び出し口であり、そちらに
+    // `mac_sink::read_permission()` を残すと `cargo test` のたびに実 OS API
+    // （`get_notification_settings()`）が叩かれてしまう（実測: 修正前は 11 回）。
+    let permission = mac_sink::read_permission();
+    install_app_state_with(manager, store, persist, sink, permission, bootstrap);
 }
 
 /// 通知バナーがクリックされたときの処理を組み立てる。
@@ -456,7 +462,16 @@ fn notification_click_handler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> C
 /// （`Option` ではない）ので、`ok()?` で `None` に畳んで `Notifier` 側の
 /// `SessionLabel::fallback` に落とす。同期クロージャなので `MutexGuard` が
 /// `.await` を跨ぐことはない。
-fn build_notifier(store: Arc<Store>, sink: Arc<dyn NotificationSink>) -> Arc<Notifier> {
+///
+/// `permission` を引数で受けるのは `sink` と同じ理由である（task-10 レビュー I-4）。
+/// この関数の中で `mac_sink::read_permission()` を呼ぶと、`install_app_state_with`
+/// を直接呼ぶテスト全部が実 OS API（`get_notification_settings()`。ブロッキング）を
+/// 叩くことになる。実 OS から読む結線は `install_app_state` 側に 1 箇所だけ残す。
+fn build_notifier(
+    store: Arc<Store>,
+    sink: Arc<dyn NotificationSink>,
+    permission: NotifyPermission,
+) -> Arc<Notifier> {
     let labels: LabelResolver = Arc::new(move |session_id: &str| {
         let session = store.get_session(session_id).ok()?;
         let project = store.get_project(&session.project_id).ok()?;
@@ -470,7 +485,7 @@ fn build_notifier(store: Arc<Store>, sink: Arc<dyn NotificationSink>) -> Arc<Not
     });
 
     let notifier = Arc::new(Notifier::new(sink, labels));
-    notifier.set_permission(mac_sink::read_permission());
+    notifier.set_permission(permission);
     notifier
 }
 
@@ -485,14 +500,22 @@ fn build_notifier(store: Arc<Store>, sink: Arc<dyn NotificationSink>) -> Arc<Not
 /// 「`NotifyObserver` が本当に登録されているか」「通知文言が本当に `Store` から
 /// 引かれているか」を観測するには [`RecordingSink`](crate::notify::RecordingSink) を
 /// 差せる seam が要る。実 sink を差す結線は `install_app_state` 側にある。
+///
+/// `permission` を引数に出しているのも同じ理由である（task-10 レビュー I-4）。
+/// production の許可読み取り `mac_sink::read_permission()` はブロッキングな実 OS API
+/// なので、テストから固定値を注入できる seam が要る。実 OS から読む結線は
+/// `install_app_state` 側にのみ残る —— この seam を経由するテストは実 OS API を
+/// 一切叩かない。`install_app_state` を直接呼ぶテスト（3 本）は実読み取りが残る
+/// （task-10-report.md 修正ラウンド 1 の実測参照）。
 fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     store: Arc<Store>,
     persist: Arc<dyn StatePersist>,
     sink: Arc<dyn NotificationSink>,
+    permission: NotifyPermission,
     bootstrap: HooksBootstrap,
 ) {
-    let notifier = build_notifier(Arc::clone(&store), sink);
+    let notifier = build_notifier(Arc::clone(&store), sink, permission);
     let runtime = RuntimeStateManager::new(persist);
     runtime.register_observer(Arc::new(TauriEmitObserver::new(
         manager.app_handle().clone(),
@@ -509,11 +532,17 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     //
     //   1. 起動直後は PTY が 1 つも走っておらず、真に入力待ちのセッションは存在しない。
     //      `last_runtime_state` は表示復元用のヒントであって真実ではない（設計 §5.3）。
-    //   2. 直前の `normalize_on_startup` は `{running, waiting_input}` の行を
-    //      `interrupted` へ昇格させる（契約 §2。`00-contracts.md:3455` が
-    //      「`normalize_on_startup` は `{running, waiting_input}` しか触らない」と書く）。
-    //      昇格前の値を数えれば「プロセスが存在しないセッション」でバッジが非ゼロになり、
-    //      §5.2 が `exited` を却下したのと同じ失敗モードになる。
+    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:564）が
+    //      走り、`{running, waiting_input}` の行を `interrupted` へ昇格させる（契約 §2。
+    //      `00-contracts.md:3455` が「`normalize_on_startup` は `{running, waiting_input}`
+    //      しか触らない」と書く）。seed はその**前**に実行されるため、
+    //      `last_runtime_state` から復元する形にすると seed の時点ではまだ正規化前の値
+    //      （waiting_input）を読んでしまう。DB 側が後から interrupted に書き換わっても
+    //      Notifier に既に載ったバッジ数は自動的には引き戻らないので、
+    //      「プロセスが存在しないセッション」でバッジが非ゼロのまま固着する。
+    //      §5.2 が `exited` を却下したのと同じ失敗モードになる
+    //      （旧版は順序を「直前」と誤記していた。実測は task-10-report.md 修正
+    //      ラウンド 1 の RX-3 を参照。修正前の§4項目3が同じ誤りを自認していた）。
     //
     // バッジは、起動後に実際の状態遷移が来た時点で初めて増える。`seed_states` は
     // M3-3 以降で「実行中セッションの状態をまとめて流し込む」用途に残してある。
@@ -1265,6 +1294,19 @@ mod tests {
             Arc::new(crate::notify::RecordingSink::default())
         }
 
+        /// 通知許可のテスト固定値。契約 §0 のとおり、テストから実 OS API
+        /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4）。
+        /// `Granted` を選ぶのは 2 つの理由から: (1) `decide()` は `Denied` のときだけ
+        /// 通知を抑制するので `Unknown` でも投稿自体は起きるが、この値を選ぶと
+        /// `Notifier` が実 `read_permission()`（この機体では `Unknown` を返す。
+        /// task-10-review.md の P-OSCALL 実測）と区別できなくなる。(2) `Granted` なら
+        /// `on_state` の `request_permission` が常に `false` になり、`on_session_state`
+        /// の `tauri::async_runtime::spawn` 経由で実 OS の認可要求 API
+        /// （`request_auth()`）が走らない。
+        fn test_permission() -> crate::notify::NotifyPermission {
+            crate::notify::NotifyPermission::Granted
+        }
+
         /// hooks を常に無効化するテスト用ブートストラップ。
         ///
         /// 実 `bootstrap_hooks` は `$TMPDIR/kamux-hooks-<pid>.sock` に bind する
@@ -1421,6 +1463,7 @@ mod tests {
                 Arc::new(store),
                 probe.clone(),
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1454,6 +1497,7 @@ mod tests {
                 Arc::new(store),
                 probe.clone(),
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1534,6 +1578,7 @@ mod tests {
                 Arc::new(store),
                 probe.clone(),
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1583,6 +1628,7 @@ mod tests {
                 store,
                 persist,
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1645,16 +1691,24 @@ mod tests {
                 store,
                 persist,
                 sink.clone(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
             let state = app.state::<AppState>();
-            // 実機の許可状態にテストを依存させない。`read_permission()` はバンドル外では
-            // `Unknown` を返すため、ここで固定しないと `Spawned` のたびに
-            // `request_permission` の spawn が走る（判定自体は Denied 以外なら Post）。
-            state
-                .notifier
-                .set_permission(crate::notify::NotifyPermission::Granted);
+            // I-4（task-10 レビュー修正ラウンド 1）: 実機の許可状態にテストを依存させない。
+            // `permission` は `install_app_state_with` への注入経路（`test_permission()`）
+            // で固定した。ここでは注入した値が実際に `Notifier` まで届いていることを見る
+            // —— 届いていなければ（`build_notifier` が引数を無視して
+            // `mac_sink::read_permission()` を直接呼ぶ形へ後退すれば）この機体では
+            // `Unknown` になる（実測: task-10-review.md の P-OSCALL で
+            // READ-VALUE=Unknown が 11/11）。
+            assert_eq!(
+                state.notifier.permission(),
+                crate::notify::NotifyPermission::Granted,
+                "注入した NotifyPermission が Notifier まで届いていない \
+                 （build_notifier が permission 引数を無視している疑い）"
+            );
 
             let sender = state.runtime.sender();
             sender.send(&session.id, StateInput::Spawned);
@@ -1670,6 +1724,35 @@ mod tests {
             assert_eq!(posted[0].session_id, session.id);
             assert_eq!(posted[0].title, "入力待ち: fix-login");
             assert_eq!(posted[0].body, "kamux · feature/x");
+
+            // I-1 / I-2（task-10 レビュー）: observer が `Notifier` へ渡した時刻が
+            // 実時計であること、かつ `AppState.notifier` が observer と同一実体で
+            // あることを 1 本で見る。`state` は既にこのスコープに在る。
+            let running = crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::Running,
+                reason: crate::model::StateReason::Spawned,
+            };
+            let waiting = crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::WaitingInput,
+                reason: crate::model::StateReason::HookNotification,
+            };
+            state
+                .notifier
+                .on_state(&running, crate::notify::now_epoch_ms());
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(
+                        &waiting,
+                        crate::notify::now_epoch_ms()
+                            + crate::notify::policy::NOTIFY_MIN_INTERVAL_MS / 2
+                    )
+                    .decision,
+                crate::notify::NotifyDecision::SuppressRateLimited,
+                "observer が記録した通知時刻が実時計でないか、AppState.notifier が別実体である"
+            );
         }
 
         /// M2-3 Task 10: 起動時の Dock バッジは**空の状態マップから**始まる。
@@ -1681,9 +1764,11 @@ mod tests {
         /// ⚠️ このテストは `seed_states(BTreeMap::new())` の**存在**では赤にならない ——
         /// 空マップの seed は `Notifier` の初期状態と同じで no-op だからである。守るのは
         /// 「非空の値を seed する変異」であり、実測は変異 M-BADGE-SEED で取ってある。
-        /// **`last_runtime_state` から復元する形の変異は、直前の `normalize_on_startup` が
-        /// `waiting_input` の行を `interrupted` へ昇格させるため `badge_count` が `None` に
-        /// なり、無改変と同じ出力になる**（契約 §2 / `00-contracts.md:3455`）。
+        /// **`last_runtime_state` から復元する形の変異は、このテストを赤にする**
+        /// （実測: task-10 修正ラウンド 1 の RX-3。`StatePersist` 経由の読み出し 1 件で
+        /// 赤を再確認済み。旧版は「直前の `normalize_on_startup` が昇格させるため無改変と
+        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:564）
+        /// より**前**に走るため誤りだった。`install_app_state_with` の該当コメント参照）。
         ///
         /// バッジの読み出しには `forget_session` を使う。未知の `session_id` に対しては
         /// 「何も消さずに現在のバッジ数を返す」ので、観測のためだけの API を
@@ -1708,6 +1793,7 @@ mod tests {
                 store,
                 persist,
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1986,6 +2072,7 @@ mod tests {
                 store,
                 persist,
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -2051,6 +2138,7 @@ mod tests {
                 store,
                 persist,
                 test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
             let state = app.state::<AppState>();
