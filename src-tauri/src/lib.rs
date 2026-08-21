@@ -18,7 +18,7 @@ use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
 use crate::notify::{
     mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
-    SessionLabel,
+    SessionLabel, ViewKind,
 };
 use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
@@ -212,6 +212,42 @@ async fn get_hooks_diagnostics(
     state: State<'_, AppState>,
 ) -> AppResult<crate::session::heuristics::diagnostics::HooksDiagnostics> {
     Ok(crate::session::heuristics::diagnostics::diagnostics_from_state(&state))
+}
+
+// 通知（契約 §7.1、M2-3）。フロントの表示状態を Rust に push する。
+// 前面かつターミナル画面で表示中のセッションを通知抑制の判定に使う
+// （抑制ロジック本体は notify::policy::is_session_visible、契約 §21）。
+#[tauri::command]
+async fn set_visibility_context(
+    state: State<'_, AppState>,
+    view: ViewKind,
+    visible_session_ids: Vec<String>,
+) -> AppResult<()> {
+    state.notifier.set_view_context(view, visible_session_ids);
+    Ok(())
+}
+
+/// 現在の通知許可状態。拒否時の案内バナー表示に使う。
+#[tauri::command]
+async fn notification_permission(state: State<'_, AppState>) -> AppResult<NotifyPermission> {
+    Ok(state.notifier.permission())
+}
+
+/// システム設定の「通知」ペインを開く。
+///
+/// 一度 Denied になったアプリに通知許可を再度要求しても macOS はプロンプトを
+/// 再表示しないため、ユーザーを設定へ誘導するのが唯一の導線
+/// （brief task-11 の記述。この既定動作そのものへの自動観測はこの差分に無い）。
+///
+/// `.status()` は `open` プロセスの終了を待つため、この async fn の中でブロックする
+/// （実測。実害の大小は未検証）。
+#[tauri::command]
+async fn open_notification_settings() -> AppResult<()> {
+    std::process::Command::new("open")
+        .arg(crate::notify::policy::notification_settings_url())
+        .status()
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
 }
 
 /// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
@@ -718,6 +754,9 @@ pub fn run() {
             delete_project,
             move_session,
             get_hooks_diagnostics,
+            set_visibility_context,
+            notification_permission,
+            open_notification_settings,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,
@@ -2742,6 +2781,11 @@ mod tests {
                     crate::pty::commands::ack_pty,
                     crate::session::stop_session,
                     crate::session::suggest_branch_name,
+                    super::super::set_visibility_context,
+                    super::super::notification_permission,
+                    // 🔴 登録のみ。`open` が実際に macOS のシステム設定を起動するため、
+                    // このテストからは絶対に invoke しない（brief Ruling X）。
+                    super::super::open_notification_settings,
                 ])
                 .build(mock_context(noop_assets()))
                 .expect("build mock app")
@@ -3482,6 +3526,103 @@ mod tests {
             );
 
             assert_eq!(got.as_str(), Some("session/session-sess-1"), "got: {got:?}");
+        }
+
+        // Ruling X: set_visibility_context / notification_permission は Notifier に
+        // 配線されているだけでは足りず、IPC 境界（camelCase JSON）を実際に越えて
+        // 値が届くことを見る。`visible_session_ids` は IPC 上 `visibleSessionIds`。
+        // 判定結果は `Notifier::on_state`（IPC コマンドではない、Rust 内部 API）を
+        // 直接呼んで観測する。既存パターンは `lib.rs`
+        // `window_focus_events_reach_the_notifier_only_for_the_main_window` と同じ。
+        fn waiting(id: &str) -> crate::model::SessionStatePayload {
+            crate::model::SessionStatePayload {
+                session_id: id.to_string(),
+                runtime_state: crate::model::RuntimeState::WaitingInput,
+                reason: crate::model::StateReason::HookNotification,
+            }
+        }
+
+        /// `set_visibility_context` が渡した `view` と `visible_session_ids` の両方を
+        /// `Notifier` に届けていることを、`Notifier::on_state` の判定結果で観測する。
+        /// - 1 回目: view=terminal, visibleSessionIds=["s-in-list"] → 名前どおり
+        ///   リストに居るセッションだけ抑制され、居ないセッションは通知が出ること
+        /// - 2 回目: view=kanban（terminal でない）に切り替えたのに、visible の
+        ///   リストに新しく入れたセッションが抑制されず通知が出ること
+        ///   （= `view` が実際に読まれている証拠。ハードコードなら抑制されたまま）
+        #[test]
+        fn set_visibility_context_delivers_view_and_ids_to_the_notifier() {
+            use crate::notify::{NotifyDecision, NotifyKind};
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let state = app.state::<AppState>();
+            // window_focused は is_session_visible の AND 条件の 1 つ。
+            // このテストの主題ではないので直接立てる（`track_window_focus` の配線は
+            // 別テスト `window_focus_events_reach_the_notifier_only_for_the_main_window`
+            // が守る）。
+            state.notifier.set_window_focused(true);
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "terminal", "visibleSessionIds": ["s-in-list"]}),
+            );
+
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list"), 1_000)
+                    .decision,
+                NotifyDecision::SuppressVisible,
+                "visibleSessionIds に含めたセッションが抑制されていない"
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-not-in-list"), 2_000)
+                    .decision,
+                NotifyDecision::Post(NotifyKind::WaitingInput),
+                "visibleSessionIds に無いセッションまで抑制している\
+                 (visible_session_ids を空 vec で固定する変異)"
+            );
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "kanban", "visibleSessionIds": ["s-in-list-2"]}),
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list-2"), 3_000)
+                    .decision,
+                NotifyDecision::Post(NotifyKind::WaitingInput),
+                "view を kanban に切り替えたのに terminal 扱いのまま抑制している\
+                 (view を無視/固定する変異)"
+            );
+        }
+
+        /// `notification_permission` が `AppState` の実値を読んでいることを、
+        /// 既定値ではない `Denied` を明示的に設定してから観測する
+        /// （既定値 `Unknown` だけを見るテストは定数固定の変異を捕まえない）。
+        #[test]
+        fn notification_permission_reads_the_value_set_on_app_state() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let state = app.state::<AppState>();
+            state
+                .notifier
+                .set_permission(crate::notify::NotifyPermission::Denied);
+
+            let got = invoke_ok(&webview, "notification_permission", json!({}));
+
+            assert_eq!(got, json!("denied"));
         }
     }
 }
