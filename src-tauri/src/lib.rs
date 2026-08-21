@@ -239,8 +239,11 @@ async fn notification_permission(state: State<'_, AppState>) -> AppResult<Notify
 /// 再表示しないため、ユーザーを設定へ誘導するのが唯一の導線
 /// （brief task-11 の記述。この既定動作そのものへの自動観測はこの差分に無い）。
 ///
-/// `.status()` は `open` プロセスの終了を待つため、この async fn の中でブロックする
-/// （実測。実害の大小は未検証）。
+/// `.status()` は子プロセスの終了を待つ仕様（`std::process::Command::status` の doc
+/// コメント「Executes a command as a child process, waiting for it to finish and
+/// collecting its status.」）に基づき、この async fn の中で同期的にブロックする。
+/// 実害の大小はこの repo では未計測（`open_notification_settings` を invoke するテストは
+/// 意図的に書いていない）。
 #[tauri::command]
 async fn open_notification_settings() -> AppResult<()> {
     std::process::Command::new("open")
@@ -3546,9 +3549,15 @@ mod tests {
         /// `Notifier` に届けていることを、`Notifier::on_state` の判定結果で観測する。
         /// - 1 回目: view=terminal, visibleSessionIds=["s-in-list"] → 名前どおり
         ///   リストに居るセッションだけ抑制され、居ないセッションは通知が出ること
-        /// - 2 回目: view=kanban（terminal でない）に切り替えたのに、visible の
-        ///   リストに新しく入れたセッションが抑制されず通知が出ること
-        ///   （= `view` が実際に読まれている証拠。ハードコードなら抑制されたまま）
+        /// - 2 回目: view=terminal のまま visibleSessionIds を ["s-in-list-2"] に
+        ///   差し替える → 新しく入れたセッションが抑制されること
+        ///   （= 2 回目の invoke が実際に `Notifier` へ反映された証拠。1 回目の
+        ///   文脈（ids=["s-in-list"]）のまま更新が握り潰されるなら、s-in-list-2 は
+        ///   ids に含まれないため抑制されず Post になり、この assert が落ちる）
+        /// - 3 回目: view=kanban（terminal でない）に切り替える。ids は
+        ///   新しい s-in-list-3 → terminal でなくなったので抑制されないこと
+        ///   （= `view` が実際に読まれている証拠。`view` をハードコードしていれば
+        ///   s-in-list-3 が ids に含まれているぶん抑制されたままになる）
         #[test]
         fn set_visibility_context_delivers_view_and_ids_to_the_notifier() {
             use crate::notify::{NotifyDecision, NotifyKind};
@@ -3592,12 +3601,27 @@ mod tests {
             invoke_ok(
                 &webview,
                 "set_visibility_context",
-                json!({"view": "kanban", "visibleSessionIds": ["s-in-list-2"]}),
+                json!({"view": "terminal", "visibleSessionIds": ["s-in-list-2"]}),
             );
             assert_eq!(
                 state
                     .notifier
                     .on_state(&waiting("s-in-list-2"), 3_000)
+                    .decision,
+                NotifyDecision::SuppressVisible,
+                "2 回目の set_visibility_context が Notifier に反映されていない\
+                 (2 回目以降の push を握り潰す set-once 変異)"
+            );
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "kanban", "visibleSessionIds": ["s-in-list-3"]}),
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list-3"), 4_000)
                     .decision,
                 NotifyDecision::Post(NotifyKind::WaitingInput),
                 "view を kanban に切り替えたのに terminal 扱いのまま抑制している\

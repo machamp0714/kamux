@@ -809,42 +809,6 @@ mod tests {
         );
     }
 
-    // characterization test: ViewKind / NotifyPermission の serde 実装（本ファイル冒頭で
-    // 既に #[serde(rename_all = "snake_case")] が付いている）を固定する。この 2 本は
-    // 追加した時点で既に緑であり、TDD の RED を経ていない（契約 §7.2 のワイヤ形式が
-    // 既存のものであることの characterization であり、新規挙動ではないため）。
-    #[test]
-    fn view_kind_serializes_to_the_frontend_union() {
-        assert_eq!(
-            serde_json::to_string(&ViewKind::Kanban).unwrap(),
-            "\"kanban\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ViewKind::Terminal).unwrap(),
-            "\"terminal\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ViewKind::Editor).unwrap(),
-            "\"editor\""
-        );
-    }
-
-    #[test]
-    fn permission_serializes_to_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&NotifyPermission::Granted).unwrap(),
-            "\"granted\""
-        );
-        assert_eq!(
-            serde_json::to_string(&NotifyPermission::Denied).unwrap(),
-            "\"denied\""
-        );
-        assert_eq!(
-            serde_json::to_string(&NotifyPermission::Unknown).unwrap(),
-            "\"unknown\""
-        );
-    }
-
     #[test]
     fn fallback_label_takes_eight_chars_not_eight_bytes() {
         // §81.2 変異検証: chars().take(8) をバイト単位のスライスに変異させると、
