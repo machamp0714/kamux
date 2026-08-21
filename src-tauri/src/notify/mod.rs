@@ -283,8 +283,9 @@ pub fn focus_session_from_notification<R: Runtime>(app: &AppHandle<R>, session_i
 /// 許可要求は `tauri::async_runtime::spawn` へそれぞれ逃がしている。
 ///
 /// `apply_badge` の呼び出しと `request_permission` の spawn は `AppHandle` と OS API を
-/// 要求するため、**これらを測る自動観測はこの差分に無い**（契約 §0 の「OS 通知の実送信は
-/// 自動テストしない」）。この関数が observer から実際に呼ばれていることは
+/// 要求するため、**これらを測る自動観測はこの差分に無い**（`M2-3-macos-notification.md:515`
+/// の「OS 通知の実送信・実クリックは自動テストしない」）。この関数が observer から
+/// 実際に呼ばれていることは
 /// `lib.rs` の `install_app_state_posts_a_notification_through_the_registered_observer`
 /// が `NotificationSink` の側から観測する。
 pub fn on_session_state<R: Runtime>(

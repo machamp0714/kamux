@@ -87,7 +87,8 @@ pub(crate) mod test_support {
             runtime,
             heuristics,
             resume_tracker: Arc::new(crate::session::resume_tracker::ResumeTracker::new()),
-            // 契約 §0: テストでは OS へ触れない [`RecordingSink`] に差し替える。
+            // `M2-3-macos-notification.md:515`: テストでは OS 通知を実送信しない
+            // [`RecordingSink`] に差し替える。
             // ラベルは常に None を返し、`Notifier` 側の `SessionLabel::fallback` に落とす
             // （このヘルパを使うテストは通知文言を主題にしていない）。
             notifier: Arc::new(crate::notify::Notifier::new(

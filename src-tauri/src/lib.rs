@@ -504,7 +504,7 @@ fn build_notifier(
 /// `permission` を引数に出しているのも同じ理由である（task-10 レビュー I-4）。
 /// production の許可読み取り `mac_sink::read_permission()` はブロッキングな実 OS API
 /// なので、テストから固定値を注入できる seam が要る。実 OS から読む結線は
-/// `install_app_state` 側にのみ残る —— この seam を経由するテストは実 OS API を
+/// `install_app_state` 側にのみ残る —— この seam を**直接**呼ぶテスト（8 本）は
 /// 一切叩かない。`install_app_state` を直接呼ぶテスト（3 本）は実読み取りが残る
 /// （task-10-report.md 修正ラウンド 1 の実測参照）。
 fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
@@ -532,7 +532,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     //
     //   1. 起動直後は PTY が 1 つも走っておらず、真に入力待ちのセッションは存在しない。
     //      `last_runtime_state` は表示復元用のヒントであって真実ではない（設計 §5.3）。
-    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:564）が
+    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:570）が
     //      走り、`{running, waiting_input}` の行を `interrupted` へ昇格させる（契約 §2。
     //      `00-contracts.md:3455` が「`normalize_on_startup` は `{running, waiting_input}`
     //      しか触らない」と書く）。seed はその**前**に実行されるため、
@@ -1288,8 +1288,9 @@ mod tests {
         use crate::state::AppState;
         use crate::store::test_support::{insert_test_session, open_temp};
 
-        /// 通知 sink のテスト差し替え。契約 §0 のとおり、テストから OS 通知を
-        /// 実送信しない（`MacNotificationSink` は `install_app_state` 側でだけ作る）。
+        /// 通知 sink のテスト差し替え。`M2-3-macos-notification.md:515`
+        /// 「OS 通知の実送信・実クリックは自動テストしない」のとおり、テストから
+        /// OS 通知を実送信しない（`MacNotificationSink` は `install_app_state` 側でだけ作る）。
         fn test_sink() -> Arc<crate::notify::RecordingSink> {
             Arc::new(crate::notify::RecordingSink::default())
         }
@@ -1768,7 +1769,7 @@ mod tests {
         /// **`last_runtime_state` から復元する形の変異は、このテストを赤にする**
         /// （実測: task-10 修正ラウンド 1 の RX-3。`StatePersist` 経由の読み出し 1 件で
         /// 赤を再確認済み。旧版は「直前の `normalize_on_startup` が昇格させるため無改変と
-        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:564）
+        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:570）
         /// より**前**に走るため誤りだった。`install_app_state_with` の該当コメント参照）。
         ///
         /// バッジの読み出しには `forget_session` を使う。未知の `session_id` に対しては
