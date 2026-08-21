@@ -192,7 +192,7 @@ impl Notifier {
             // 設計 §5.6 の「権限が未知のときに 1 回だけ訊く」を式の上に残すために意図的に置いている。
             // PR 19 で read_permission() の結果を流す set_permission が lib.rs:527 に足された。
             // 前提は不変である —— 本項を削除する変異は緑（PR 19 単位レビュー S-6）。
-            // production の set_permission 呼び出しは lib.rs:527 と mod.rs:304 の 2 箇所のみで、
+            // production の set_permission 呼び出しは lib.rs:527 と mod.rs:305 の 2 箇所のみで、
             // Granted → Unknown は起こらない。
             && inner.permission == NotifyPermission::Unknown
             && !inner.permission_requested;
