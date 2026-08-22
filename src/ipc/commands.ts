@@ -1,8 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 
+import type { AppStore } from '../store';
 import type {
   CliKind,
   KanbanStatus,
+  NotifyPermission,
   Project,
   Session,
   SessionMode,
@@ -95,3 +97,17 @@ export interface HooksDiagnostics {
  *  `session://state` での再取得は未実装）。 */
 export const getHooksDiagnostics = (): Promise<HooksDiagnostics> =>
   invoke<HooksDiagnostics>('get_hooks_diagnostics');
+
+/** 表示中のビューとセッションを Rust に伝える（前面時の通知抑制に使う）。 */
+export const setVisibilityContext = (
+  view: AppStore['view'],
+  visibleSessionIds: string[],
+): Promise<void> => invoke('set_visibility_context', { view, visibleSessionIds });
+
+/** 現在の通知許可状態を読む（プロンプトは出さない）。 */
+export const notificationPermission = (): Promise<NotifyPermission> =>
+  invoke('notification_permission');
+
+/** macOS のシステム設定「通知」ペインを開く。 */
+export const openNotificationSettings = (): Promise<void> =>
+  invoke('open_notification_settings');
