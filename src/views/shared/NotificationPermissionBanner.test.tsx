@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const notificationPermission = vi.fn();
 const openNotificationSettings = vi.fn();
@@ -12,6 +12,8 @@ vi.mock('../../ipc/commands', () => ({
 import { NotificationPermissionBanner } from './NotificationPermissionBanner';
 
 describe('NotificationPermissionBanner', () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     notificationPermission.mockReset();
     openNotificationSettings.mockReset().mockResolvedValue(undefined);
