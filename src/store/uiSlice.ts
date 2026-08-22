@@ -1,6 +1,6 @@
 import type { StateCreator } from 'zustand';
 
-import type { AppError } from '../types/model';
+import type { AppError, ViewKind } from '../types/model';
 import type { AppStore } from './index';
 import { routeFocusReducer } from './paneLogic';
 
@@ -53,7 +53,7 @@ export function toAppError(e: unknown): AppError {
 }
 
 export interface UiSlice {
-  view: 'kanban' | 'terminal' | 'editor';
+  view: ViewKind;
   focusedSessionId: string | null;
   setView: (v: AppStore['view']) => void;
   /**

@@ -54,7 +54,13 @@ export function tauriMockScript(spec: TauriMockSpec): string {
     window.__TAURI_INTERNALS__ = window.__TAURI_INTERNALS__ || {};
     window.__TAURI_INTERNALS__.__kamuxCalls = [];
     window.__TAURI_INTERNALS__.__kamuxEventHandlers = {};
-    const handlers = { ${entries} };
+    // App.tsx がマウント時に無条件で invoke する起動時コマンドの既定値。
+    // spec.commands に同名のキーがあれば下のスプレッドで上書きされる。
+    const defaultHandlers = {
+      set_visibility_context: () => undefined,
+      notification_permission: () => 'granted',
+    };
+    const handlers = { ...defaultHandlers, ${entries} };
     // listen() が返す id は下の 'plugin:event|listen' が返す配列長（= index + 1）である。
     // 解除しても配列は詰めない（詰めると既に配布済みの id が別のハンドラを指す）。
     const removeListener = (event, eventId) => {
