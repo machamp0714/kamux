@@ -64,6 +64,7 @@ describe('useVisibilityContext', () => {
   interface RerenderCase {
     name: string;
     initial: MockState;
+    expectedInitial: [string, string[]];
     mutate: (s: MockState) => MockState;
     expectedAfter: [string, string[]];
   }
@@ -77,6 +78,7 @@ describe('useVisibilityContext', () => {
         focusedSessionId: 's1',
         paneAssignment: [null, null],
       },
+      expectedInitial: ['terminal', ['s1']],
       mutate: (s) => ({ ...s, view: 'kanban' }),
       expectedAfter: ['kanban', []],
     },
@@ -88,6 +90,7 @@ describe('useVisibilityContext', () => {
         focusedSessionId: 's1',
         paneAssignment: [null, null],
       },
+      expectedInitial: ['terminal', ['s1']],
       mutate: (s) => ({ ...s, layout: 'split2' }),
       expectedAfter: ['terminal', []],
     },
@@ -99,6 +102,7 @@ describe('useVisibilityContext', () => {
         focusedSessionId: 's1',
         paneAssignment: [null, null],
       },
+      expectedInitial: ['terminal', ['s1']],
       mutate: (s) => ({ ...s, focusedSessionId: 's2' }),
       expectedAfter: ['terminal', ['s2']],
     },
@@ -110,22 +114,31 @@ describe('useVisibilityContext', () => {
         focusedSessionId: null,
         paneAssignment: ['s1', null],
       },
+      expectedInitial: ['terminal', ['s1']],
       mutate: (s) => ({ ...s, paneAssignment: ['s1', 's2'] }),
       expectedAfter: ['terminal', ['s1', 's2']],
     },
   ];
 
   it.each(rerenderCases)(
-    '$name だけを変えて rerender すると新しい値で push し直す',
-    async ({ initial, mutate, expectedAfter }) => {
+    '$name だけを変えて rerender すると新しい値で push し直し、無関係な rerender では push しない',
+    async ({ initial, expectedInitial, mutate, expectedAfter }) => {
       state = initial;
       const { rerender } = renderHook(() => useVisibilityContext());
-      await waitFor(() => expect(setVisibilityContext).toHaveBeenCalled());
+      await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith(...expectedInitial));
+      expect(setVisibilityContext).toHaveBeenCalledTimes(1);
       setVisibilityContext.mockClear();
+
+      // 依存配列に何も変化が無い rerender。依存配列が正しく効いていれば
+      // ここでは push が起きないはず（依存配列ごと削除する退行の検知点）。
+      rerender();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(setVisibilityContext).not.toHaveBeenCalled();
 
       state = mutate(state);
       rerender();
       await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith(...expectedAfter));
+      expect(setVisibilityContext).toHaveBeenCalledTimes(1);
     },
   );
 });
