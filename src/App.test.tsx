@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 
 // 子ビュー/コンポーネントは中身を持たないスタブへ差し替える。
 // 本テストの関心は「ルートがどのフックを呼ぶか」であって描画内容ではない。
@@ -8,8 +8,9 @@ vi.mock('./components/ProjectBar', () => ({ ProjectBar: () => null }));
 vi.mock('./views/EditorView', () => ({ EditorView: () => null }));
 vi.mock('./views/KanbanView', () => ({ KanbanView: () => null }));
 vi.mock('./views/KanbanView/SessionFormModal', () => ({ SessionFormModal: () => null }));
+// バナーだけ sentinel を持たせる。マウント配線（App.tsx の JSX）を観測するため。
 vi.mock('./views/shared/NotificationPermissionBanner', () => ({
-  NotificationPermissionBanner: () => null,
+  NotificationPermissionBanner: () => <div data-testid="notification-permission-banner" />,
 }));
 vi.mock('./views/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('./hooks/useKeymap', () => ({ useKeymap: vi.fn() }));
@@ -44,5 +45,6 @@ describe('App', () => {
     render(<App />);
     expect(useFocusDeepLinkSpy).toHaveBeenCalledTimes(1);
     expect(useVisibilityContextSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('notification-permission-banner')).toBeInTheDocument();
   });
 });

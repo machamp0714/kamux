@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 
 import { notificationPermission, openNotificationSettings } from '../../ipc/commands';
+import { useAppStore } from '../../store';
+import { toAppError } from '../../store/uiSlice';
 import type { NotifyPermission } from '../../types/model';
 
 /**
@@ -11,6 +13,7 @@ import type { NotifyPermission } from '../../types/model';
  */
 export function NotificationPermissionBanner() {
   const [permission, setPermission] = useState<NotifyPermission>('unknown');
+  const setError = useAppStore((s) => s.setError);
 
   useEffect(() => {
     let alive = true;
@@ -29,7 +32,12 @@ export function NotificationPermissionBanner() {
       <span>
         通知が許可されていません。要対応セッションは Dock バッジとカードのバッジで確認できます。
       </span>
-      <button type="button" onClick={() => void openNotificationSettings()}>
+      <button
+        type="button"
+        onClick={() =>
+          void openNotificationSettings().catch((e: unknown) => setError(toAppError(e)))
+        }
+      >
         システム設定を開く
       </button>
     </div>

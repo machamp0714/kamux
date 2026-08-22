@@ -37,9 +37,9 @@ describe('useFocusDeepLink', () => {
     renderHook(() => useFocusDeepLink());
     await waitFor(() => expect(listeners.size).toBe(2));
 
-    listeners.get('s2')?.({ session_id: 's2', surface_kind: 'agent' });
+    listeners.get('s2')?.({ session_id: 's9', surface_kind: 'agent' });
 
-    expect(focusSession).toHaveBeenCalledWith('s2', 'terminal');
+    expect(focusSession).toHaveBeenCalledWith('s9', 'terminal');
   });
 
   it('surface_kind が editor のときはエディタ画面にフォーカスする（Ruling AF: routing の退行を検出する）', async () => {
