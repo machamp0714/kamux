@@ -26,21 +26,22 @@ describe('visibleSessionIds', () => {
   });
 
   it('2分割では両ペインのセッションが見えている', () => {
-    expect(
-      visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', 's2'] }),
-    ).toEqual(['s1', 's2']);
+    expect(visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', 's2'] })).toEqual([
+      's1',
+      's2',
+    ]);
   });
 
   it('2分割で片方が未割り当てなら割り当て済みだけを返す', () => {
-    expect(
-      visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', null] }),
-    ).toEqual(['s1']);
+    expect(visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', null] })).toEqual([
+      's1',
+    ]);
   });
 
   it('2分割で同じセッションが両ペインにあっても重複しない', () => {
-    expect(
-      visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', 's1'] }),
-    ).toEqual(['s1']);
+    expect(visibleSessionIds({ ...base, layout: 'split2', paneAssignment: ['s1', 's1'] })).toEqual([
+      's1',
+    ]);
   });
 
   it('縦分割(split2-v)でも両ペインのセッションが見えている', () => {
