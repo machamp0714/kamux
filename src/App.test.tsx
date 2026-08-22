@@ -8,6 +8,9 @@ vi.mock('./components/ProjectBar', () => ({ ProjectBar: () => null }));
 vi.mock('./views/EditorView', () => ({ EditorView: () => null }));
 vi.mock('./views/KanbanView', () => ({ KanbanView: () => null }));
 vi.mock('./views/KanbanView/SessionFormModal', () => ({ SessionFormModal: () => null }));
+vi.mock('./views/shared/NotificationPermissionBanner', () => ({
+  NotificationPermissionBanner: () => null,
+}));
 vi.mock('./views/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('./hooks/useKeymap', () => ({ useKeymap: vi.fn() }));
 vi.mock('./hooks/useRuntimeStateEvents', () => ({ useRuntimeStateEvents: vi.fn() }));

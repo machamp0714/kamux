@@ -12,6 +12,7 @@ import { toAppError } from './store/uiSlice';
 import { EditorView } from './views/EditorView';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
+import { NotificationPermissionBanner } from './views/shared/NotificationPermissionBanner';
 import { TerminalView } from './views/TerminalView';
 import './App.css';
 
@@ -43,6 +44,7 @@ export default function App() {
   return (
     <div className="app">
       <ProjectBar />
+      <NotificationPermissionBanner />
       {view === 'kanban' ? <KanbanView /> : null}
       {view === 'terminal' && <TerminalView />}
       {view === 'editor' && <EditorView />}
