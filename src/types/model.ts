@@ -124,3 +124,12 @@ export interface SessionStatePayload {
  * `#[tauri::command]` の返り値型なので TS 側の置き場所は常に src/types/model.ts（契約 §83.3.1）。
  */
 export type NotifyPermission = 'unknown' | 'granted' | 'denied';
+
+/**
+ * フロントの表示中ビュー（契約 §7.2 / `src-tauri/src/notify/policy.rs` の `ViewKind` と1:1）。
+ * `set_visibility_context` コマンドの引数型なので TS 側の置き場所は常に src/types/model.ts（契約 §83.3.1）。
+ * 型は実行時に消えるためテストから触れない。VIEW_KINDS を唯一の源とし、ViewKind はそこから導出する
+ * （`AppStore['view']` 側で別の union を手書きしない）。
+ */
+export const VIEW_KINDS = ['kanban', 'terminal', 'editor'] as const;
+export type ViewKind = (typeof VIEW_KINDS)[number];
