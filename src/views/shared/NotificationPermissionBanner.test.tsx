@@ -9,6 +9,7 @@ vi.mock('../../ipc/commands', () => ({
   openNotificationSettings: () => openNotificationSettings(),
 }));
 
+import { useAppStore } from '../../store';
 import { NotificationPermissionBanner } from './NotificationPermissionBanner';
 
 describe('NotificationPermissionBanner', () => {
@@ -17,6 +18,7 @@ describe('NotificationPermissionBanner', () => {
   beforeEach(() => {
     notificationPermission.mockReset();
     openNotificationSettings.mockReset().mockResolvedValue(undefined);
+    useAppStore.setState({ lastError: null });
   });
 
   it('許可されているときは何も表示しない', async () => {
@@ -49,5 +51,18 @@ describe('NotificationPermissionBanner', () => {
     render(<NotificationPermissionBanner />);
     fireEvent.click(await screen.findByRole('button', { name: 'システム設定を開く' }));
     await waitFor(() => expect(openNotificationSettings).toHaveBeenCalledTimes(1));
+  });
+
+  it('設定を開けなかったときは握り潰さず setError でストアへ伝える', async () => {
+    notificationPermission.mockResolvedValue('denied');
+    openNotificationSettings.mockReset().mockRejectedValue(new Error('open failed'));
+    render(<NotificationPermissionBanner />);
+    fireEvent.click(await screen.findByRole('button', { name: 'システム設定を開く' }));
+    await waitFor(() =>
+      expect(useAppStore.getState().lastError).toEqual({
+        code: 'io',
+        message: 'Error: open failed',
+      }),
+    );
   });
 });
