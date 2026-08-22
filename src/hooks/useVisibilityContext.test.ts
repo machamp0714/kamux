@@ -60,4 +60,20 @@ describe('useVisibilityContext', () => {
       expect(setVisibilityContext).toHaveBeenCalledWith('terminal', ['s1', 's2']),
     );
   });
+
+  it('view が変わるたびに push し直す（依存配列が全フィールドを含むことを守る）', async () => {
+    state = {
+      view: 'terminal',
+      layout: 'single',
+      focusedSessionId: 's1',
+      paneAssignment: [null, null],
+    };
+    const { rerender } = renderHook(() => useVisibilityContext());
+    await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith('terminal', ['s1']));
+
+    state = { ...state, view: 'kanban' };
+    rerender();
+    await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith('kanban', []));
+    expect(setVisibilityContext).toHaveBeenCalledTimes(2);
+  });
 });

@@ -12,9 +12,9 @@ vi.mock('../ipc/events', () => ({
 }));
 
 const focusSession = vi.fn();
+let sessions: Record<string, { id: string }> = { s1: { id: 's1' }, s2: { id: 's2' } };
 vi.mock('../store', () => ({
-  useAppStore: (selector: (s: unknown) => unknown) =>
-    selector({ sessions: { s1: { id: 's1' }, s2: { id: 's2' } }, focusSession }),
+  useAppStore: (selector: (s: unknown) => unknown) => selector({ sessions, focusSession }),
 }));
 
 import { useFocusDeepLink } from './useFocusDeepLink';
@@ -24,6 +24,7 @@ describe('useFocusDeepLink', () => {
     listeners.clear();
     focusSession.mockClear();
     unlisten.mockClear();
+    sessions = { s1: { id: 's1' }, s2: { id: 's2' } };
   });
 
   it('ストア上の全セッションを購読する', async () => {
@@ -55,5 +56,16 @@ describe('useFocusDeepLink', () => {
     await waitFor(() => expect(listeners.size).toBe(2));
     unmount();
     await waitFor(() => expect(unlisten).toHaveBeenCalledTimes(2));
+  });
+
+  it('セッションが増えたら新しい ID を追加購読する（依存配列が sessionIdsKey を含むことを守る）', async () => {
+    sessions = { s1: { id: 's1' } };
+    const { rerender } = renderHook(() => useFocusDeepLink());
+    await waitFor(() => expect(listeners.size).toBe(1));
+
+    sessions = { s1: { id: 's1' }, s2: { id: 's2' } };
+    rerender();
+    await waitFor(() => expect(listeners.size).toBe(2));
+    expect([...listeners.keys()].sort()).toEqual(['s1', 's2']);
   });
 });
