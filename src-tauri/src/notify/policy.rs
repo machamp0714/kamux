@@ -689,7 +689,20 @@ mod tests {
             (ViewKind::Terminal, "terminal"),
             (ViewKind::Editor, "editor"),
         ];
-        for (value, expected) in cases {
+        // `ViewKind` の全バリアントを型で固定する: ワイルドカードを持たない網羅
+        // match なので、バリアントが増えると上の `cases`（3件固定）を直さない限り
+        // コンパイルが通らなくなる。`_ => ...` を足さないこと（それを足すと
+        // このガードは何も検出しなくなる）。
+        for (index, (value, expected)) in cases.into_iter().enumerate() {
+            let ordinal = match value {
+                ViewKind::Kanban => 0,
+                ViewKind::Terminal => 1,
+                ViewKind::Editor => 2,
+            };
+            assert_eq!(
+                ordinal, index,
+                "cases 配列の並びが ViewKind のバリアント順と食い違う: {value:?}"
+            );
             let json = serde_json::to_string(&value).expect("serialize");
             assert_eq!(
                 json,
