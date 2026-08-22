@@ -61,19 +61,71 @@ describe('useVisibilityContext', () => {
     );
   });
 
-  it('view が変わるたびに push し直す（依存配列が全フィールドを含むことを守る）', async () => {
-    state = {
-      view: 'terminal',
-      layout: 'single',
-      focusedSessionId: 's1',
-      paneAssignment: [null, null],
-    };
-    const { rerender } = renderHook(() => useVisibilityContext());
-    await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith('terminal', ['s1']));
+  interface RerenderCase {
+    name: string;
+    initial: MockState;
+    mutate: (s: MockState) => MockState;
+    expectedAfter: [string, string[]];
+  }
 
-    state = { ...state, view: 'kanban' };
-    rerender();
-    await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith('kanban', []));
-    expect(setVisibilityContext).toHaveBeenCalledTimes(2);
-  });
+  const rerenderCases: RerenderCase[] = [
+    {
+      name: 'view',
+      initial: {
+        view: 'terminal',
+        layout: 'single',
+        focusedSessionId: 's1',
+        paneAssignment: [null, null],
+      },
+      mutate: (s) => ({ ...s, view: 'kanban' }),
+      expectedAfter: ['kanban', []],
+    },
+    {
+      name: 'layout',
+      initial: {
+        view: 'terminal',
+        layout: 'single',
+        focusedSessionId: 's1',
+        paneAssignment: [null, null],
+      },
+      mutate: (s) => ({ ...s, layout: 'split2' }),
+      expectedAfter: ['terminal', []],
+    },
+    {
+      name: 'focusedSessionId',
+      initial: {
+        view: 'terminal',
+        layout: 'single',
+        focusedSessionId: 's1',
+        paneAssignment: [null, null],
+      },
+      mutate: (s) => ({ ...s, focusedSessionId: 's2' }),
+      expectedAfter: ['terminal', ['s2']],
+    },
+    {
+      name: 'paneAssignment',
+      initial: {
+        view: 'terminal',
+        layout: 'split2',
+        focusedSessionId: null,
+        paneAssignment: ['s1', null],
+      },
+      mutate: (s) => ({ ...s, paneAssignment: ['s1', 's2'] }),
+      expectedAfter: ['terminal', ['s1', 's2']],
+    },
+  ];
+
+  it.each(rerenderCases)(
+    '$name だけを変えて rerender すると新しい値で push し直す',
+    async ({ initial, mutate, expectedAfter }) => {
+      state = initial;
+      const { rerender } = renderHook(() => useVisibilityContext());
+      await waitFor(() => expect(setVisibilityContext).toHaveBeenCalled());
+      setVisibilityContext.mockClear();
+
+      state = mutate(state);
+      rerender();
+      await waitFor(() => expect(setVisibilityContext).toHaveBeenCalledWith(...expectedAfter));
+    },
+  );
 });
