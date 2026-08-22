@@ -10,8 +10,13 @@ import { tauriMockScript } from './support/tauriMock';
  * である。この spec は、その上書きが実際に効くことを、アプリの画面（バナー等）を経由
  * せず、ハーネス自身（`window.__TAURI_INTERNALS__.invoke` の戻り値）で直接確かめる。
  *
- * `set_visibility_context` は既定・上書きのどちらも `undefined` を返すため、戻り値
- * では 2 状態を区別できない。この観測対象には含めない。
+ * `set_visibility_context` はこの観測対象に含めない。理由は推測ではなく試作で確かめた:
+ * spec 側で `set_visibility_context: () => undefined` を明示宣言した場合も、宣言しない
+ * （defaultHandlers の既定のみが効く）場合も、`invoke('set_visibility_context')` の戻り値は
+ * 共に `undefined` だった（`AppResult<()>` に対応する仕様なので当然ではあるが、実測して
+ * から確認した）。戻り値だけでは 2 状態を区別できないため、この形の観測は足さない。
+ * `defaultHandlers` の全メンバ数は 2（`set_visibility_context` / `notification_permission`）
+ * で、戻り値だけで上書きを観測できるのはこのうち `notification_permission` の 1 件のみ。
  */
 
 function mockScript(): string {
