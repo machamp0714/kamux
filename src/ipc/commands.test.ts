@@ -188,12 +188,12 @@ describe('ipc/commands', () => {
   });
 
   it('notificationPermission が引数なしで invoke し、戻り値をそのまま返す', async () => {
-    invoke.mockResolvedValue('granted');
+    invoke.mockResolvedValue('denied');
 
     const got = await notificationPermission();
 
     expect(invoke).toHaveBeenCalledWith('notification_permission');
-    expect(got).toBe('granted');
+    expect(got).toBe('denied');
   });
 
   it('openNotificationSettings が引数なしで invoke する', async () => {

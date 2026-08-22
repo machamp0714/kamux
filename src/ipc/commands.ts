@@ -109,5 +109,4 @@ export const notificationPermission = (): Promise<NotifyPermission> =>
   invoke('notification_permission');
 
 /** macOS のシステム設定「通知」ペインを開く。 */
-export const openNotificationSettings = (): Promise<void> =>
-  invoke('open_notification_settings');
+export const openNotificationSettings = (): Promise<void> => invoke('open_notification_settings');
