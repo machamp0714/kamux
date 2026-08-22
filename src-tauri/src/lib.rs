@@ -16,6 +16,10 @@ use tauri::{Manager, State, WindowEvent};
 use crate::error::{AppError, AppResult};
 use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
 use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
+use crate::notify::{
+    mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
+    SessionLabel, ViewKind,
+};
 use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
@@ -210,6 +214,45 @@ async fn get_hooks_diagnostics(
     Ok(crate::session::heuristics::diagnostics::diagnostics_from_state(&state))
 }
 
+// 通知（契約 §7.1、M2-3）。フロントの表示状態を Rust に push する。
+// 前面かつターミナル画面で表示中のセッションを通知抑制の判定に使う
+// （抑制ロジック本体は notify::policy::is_session_visible、契約 §21）。
+#[tauri::command]
+async fn set_visibility_context(
+    state: State<'_, AppState>,
+    view: ViewKind,
+    visible_session_ids: Vec<String>,
+) -> AppResult<()> {
+    state.notifier.set_view_context(view, visible_session_ids);
+    Ok(())
+}
+
+/// 現在の通知許可状態。拒否時の案内バナー表示に使う。
+#[tauri::command]
+async fn notification_permission(state: State<'_, AppState>) -> AppResult<NotifyPermission> {
+    Ok(state.notifier.permission())
+}
+
+/// システム設定の「通知」ペインを開く。
+///
+/// 一度 Denied になったアプリに通知許可を再度要求しても macOS はプロンプトを
+/// 再表示しないため、ユーザーを設定へ誘導するのが唯一の導線
+/// （brief task-11 の記述。この既定動作そのものへの自動観測はこの差分に無い）。
+///
+/// `.status()` は子プロセスの終了を待つ仕様（`std::process::Command::status` の doc
+/// コメント「Executes a command as a child process, waiting for it to finish and
+/// collecting its status.」）に基づき、この async fn の中で同期的にブロックする。
+/// 実害の大小はこの repo では未計測（`open_notification_settings` を invoke するテストは
+/// 意図的に書いていない）。
+#[tauri::command]
+async fn open_notification_settings() -> AppResult<()> {
+    std::process::Command::new("open")
+        .arg(crate::notify::policy::notification_settings_url())
+        .status()
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
 /// 終了時の後始末のうち、**順序を型で強制する 2 手**だけをここに閉じる。
 ///
 /// 効いているのはモジュールの private ではなく **`ShutdownBegun` のフィールドの
@@ -341,6 +384,25 @@ fn kill_on_window_destroyed<R: tauri::Runtime>(window: &tauri::Window<R>, event:
     }
 }
 
+/// メインウィンドウの前面/背面を `Notifier` へ伝える（M2-3）。
+///
+/// 前面のウィンドウで見えているセッションには通知を出さない（設計 §5.5）。その判定材料は
+/// このイベントでしか取れない。`Manager::state::<AppState>()` は未登録時に panic するので
+/// `try_state` で受ける（契約 §0。`kill_on_window_destroyed` と同じ形）。
+///
+/// `Builder::on_window_event` は**追加**である（`app.rs:2064` の
+/// `self.window_event_listeners.push(..)` を実測）ため、`kill_on_window_destroyed` の
+/// 隣に並べて登録する。片方を置き換えてはならない。
+fn track_window_focus<R: tauri::Runtime>(window: &tauri::Window<R>, event: &WindowEvent) {
+    if let WindowEvent::Focused(focused) = event {
+        if window.label() == crate::notify::policy::MAIN_WINDOW_LABEL {
+            if let Some(state) = window.try_state::<AppState>() {
+                state.notifier.set_window_focused(*focused);
+            }
+        }
+    }
+}
+
 /// `RunEvent::Exit` でも `kill_on_window_destroyed` と同じ一括 kill を撃つ。
 ///
 /// Cmd+Q はこの経路を通る。PR 単位レビューが依存クレートのソースを追跡して
@@ -402,7 +464,68 @@ fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
     bootstrap: HooksBootstrap,
 ) {
     let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-    install_app_state_with(manager, store, persist, bootstrap);
+    let sink: Arc<dyn NotificationSink> = Arc::new(mac_sink::MacNotificationSink::new(
+        notification_click_handler(manager.app_handle()),
+    ));
+    // I-4（task-10 レビュー修正ラウンド 1）: 通知許可の実 OS 問い合わせはここでだけ行う。
+    // `install_app_state_with` はテストの直接呼び出し口であり、そちらに
+    // `mac_sink::read_permission()` を残すと `cargo test` のたびに実 OS API
+    // （`get_notification_settings()`）が叩かれてしまう（実測: 修正前は 11 回）。
+    let permission = mac_sink::read_permission();
+    install_app_state_with(manager, store, persist, sink, permission, bootstrap);
+}
+
+/// 通知バナーがクリックされたときの処理を組み立てる。
+///
+/// ウィンドウ操作はメインスレッドでしか行えないので `run_on_main_thread` へ渡す。
+/// クリックの実配送は実機でしか起きない（契約 §21 の検証項目 2 は手動スモークが持つ）ため、
+/// **この関数を測る自動観測はこの差分に無い**。中身の順序は
+/// [`notify::focus_session_from_notification`] 側に閉じてある。
+fn notification_click_handler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> ClickHandler {
+    let handle = app.clone();
+    Arc::new(move |session_id: &str| {
+        let session_id = session_id.to_string();
+        let target = handle.clone();
+        if let Err(e) = handle.run_on_main_thread(move || {
+            crate::notify::focus_session_from_notification(&target, &session_id);
+        }) {
+            tracing::warn!("failed to dispatch notification click: {e}");
+        }
+    })
+}
+
+/// 通知の判定器を組み立てる。`store` は `AppState` に入るのと同じハンドルを渡すこと。
+///
+/// 通知文言の材料を `Store` から引く経路（契約 §17）をここに閉じ込める。
+/// `get_session` / `get_project` は見つからなければ `AppError::NotFound` を返す
+/// （`Option` ではない）ので、`ok()?` で `None` に畳んで `Notifier` 側の
+/// `SessionLabel::fallback` に落とす。同期クロージャなので `MutexGuard` が
+/// `.await` を跨ぐことはない。
+///
+/// `permission` を引数で受けるのは `sink` と同じ理由である（task-10 レビュー I-4）。
+/// この関数の中で `mac_sink::read_permission()` を呼ぶと、`install_app_state_with`
+/// を直接呼ぶテスト全部が実 OS API（`get_notification_settings()`。ブロッキング）を
+/// 叩くことになる。実 OS から読む結線は `install_app_state` 側に 1 箇所だけ残す。
+fn build_notifier(
+    store: Arc<Store>,
+    sink: Arc<dyn NotificationSink>,
+    permission: NotifyPermission,
+) -> Arc<Notifier> {
+    let labels: LabelResolver = Arc::new(move |session_id: &str| {
+        let session = store.get_session(session_id).ok()?;
+        let project = store.get_project(&session.project_id).ok()?;
+        Some(SessionLabel {
+            title: session.title,
+            project_name: project.name,
+            location: session
+                .branch
+                .unwrap_or_else(|| crate::notify::policy::LOCATION_IN_PLACE.to_string()),
+        })
+    });
+
+    let notifier = Arc::new(Notifier::new(sink, labels));
+    notifier.set_permission(permission);
+    notifier
 }
 
 /// `install_app_state` の注入版（`session::plan_agent_spawn_with` と同じ seam）。
@@ -410,16 +533,65 @@ fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
 /// `persist` を引数に出しているのは、起動時正規化の**呼ばれ方**（回数・順序・失敗時の
 /// 扱い）をフェイクで観測するため。実 `Store` を差す結線そのものは `install_app_state`
 /// 側にあり、そちらは DB を読み直すテストで固定する。
+///
+/// `sink` を引数に出しているのも同じ理由である（M2-3 Task 10）。production の
+/// `MacNotificationSink` は OS 通知を実送信するので、テストから
+/// 「`NotifyObserver` が本当に登録されているか」「通知文言が本当に `Store` から
+/// 引かれているか」を観測するには [`RecordingSink`](crate::notify::RecordingSink) を
+/// 差せる seam が要る。実 sink を差す結線は `install_app_state` 側にある。
+///
+/// `permission` を引数に出しているのも同じ理由である（task-10 レビュー I-4）。
+/// production の許可読み取り `mac_sink::read_permission()` はブロッキングな実 OS API
+/// なので、テストから固定値を注入できる seam が要る。実 OS から読む結線は
+/// `install_app_state` 側にのみ残る —— この seam を**直接**呼ぶテスト（8 本）は
+/// 一切叩かない。`install_app_state` を直接呼ぶテスト（3 本）は実読み取りが残る
+/// （task-10-report.md 修正ラウンド 1 の実測参照）。
 fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     store: Arc<Store>,
     persist: Arc<dyn StatePersist>,
+    sink: Arc<dyn NotificationSink>,
+    permission: NotifyPermission,
     bootstrap: HooksBootstrap,
 ) {
+    let notifier = build_notifier(Arc::clone(&store), sink, permission);
     let runtime = RuntimeStateManager::new(persist);
     runtime.register_observer(Arc::new(TauriEmitObserver::new(
         manager.app_handle().clone(),
     )));
+    // M2-3: 状態遷移 → 通知 / Dock バッジ。M2-1 側のファイルには 1 行も足さない ——
+    // `register_observer` が公開された seam である。
+    runtime.register_observer(Arc::new(crate::notify::NotifyObserver::new(
+        manager.app_handle().clone(),
+        Arc::clone(&notifier),
+    )));
+
+    // 起動時の Dock バッジは必ず空から始める。**DB の `last_runtime_state` から
+    // 復元してはならない。** 理由は 2 つ:
+    //
+    //   1. 起動直後は PTY が 1 つも走っておらず、真に入力待ちのセッションは存在しない。
+    //      `last_runtime_state` は表示復元用のヒントであって真実ではない（設計 §5.3）。
+    //   2. seed_states/apply_badge の**直後**に `normalize_on_startup()`（lib.rs:609）が
+    //      走り、`{running, waiting_input}` の行を `interrupted` へ昇格させる（契約 §2。
+    //      `00-contracts.md:3455` が「`normalize_on_startup` は `{running, waiting_input}`
+    //      しか触らない」と書く）。seed はその**前**に実行されるため、
+    //      `last_runtime_state` から復元する形にすると seed の時点ではまだ正規化前の値
+    //      （waiting_input）を読んでしまう。DB 側が後から interrupted に書き換わっても
+    //      Notifier に既に載ったバッジ数は自動的には引き戻らないので、
+    //      「プロセスが存在しないセッション」でバッジが非ゼロのまま固着する。
+    //      §5.2 が `exited` を却下したのと同じ失敗モードになる
+    //      （旧版は順序を「直前」と誤記していた。実測は task-10-report.md 修正
+    //      ラウンド 1 の RX-3 を参照。修正前の§4項目3が同じ誤りを自認していた）。
+    //
+    // バッジは、起動後に実際の状態遷移が来た時点で初めて増える。`seed_states` は
+    // M3-3 以降で「実行中セッションの状態をまとめて流し込む」用途に残してある。
+    //
+    // ⚠️ 空マップの seed は `Notifier` の初期状態と同じなので、**この 2 行を消しても
+    // 赤くならない**（実測: 変異 M-BADGE-SEED は非空マップを seed する形で打った）。
+    // `install_app_state_starts_the_badge_from_an_empty_state_map` が守るのは
+    // 「非空の値を seed する変異」であって、この行の存在ではない。
+    let seeded = notifier.seed_states(std::collections::BTreeMap::new());
+    crate::notify::apply_badge(manager.app_handle(), seeded);
 
     // 前回 running / waiting_input のまま終了した行を interrupted へ正規化する。
     //
@@ -512,6 +684,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         runtime,
         heuristics,
         resume_tracker,
+        notifier,
         hooks,
         hooks_server: Mutex::new(hooks_server),
     });
@@ -570,6 +743,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
+        // 🔴 `on_window_event` は**追加**（tauri 2.11.5 `app.rs:2064` の
+        // `window_event_listeners.push(..)`）。上の行を置き換えると PTY の一括 kill が
+        // 丸ごと消える。`setup` の側は逆に**上書き**（`app.rs:1777` の `self.setup = ..`）
+        // なので、2 つ目を足してはならない。
+        .on_window_event(track_window_focus)
         .invoke_handler(tauri::generate_handler![
             create_project,
             list_projects,
@@ -579,6 +757,9 @@ pub fn run() {
             delete_project,
             move_session,
             get_hooks_diagnostics,
+            set_visibility_context,
+            notification_permission,
+            open_notification_settings,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,
@@ -1024,6 +1205,109 @@ mod tests {
         );
     }
 
+    /// `track_window_focus` が `Notifier` のフォーカス状態を実際に動かすこと（M2-3 Task 10）。
+    ///
+    /// `WindowEvent::Focused(bool)` はフィールド公開のタプルバリアントなので、
+    /// enum 全体の `#[non_exhaustive]` があってもこのクレートから構築できる
+    /// （`kill_on_window_destroyed` の doc コメントと同じ根拠）。したがって関数は
+    /// 直接呼んで固定できる。**`run()` の `.on_window_event(track_window_focus)` という
+    /// 登録行そのものは、どのテストも通らない**（契約 §96.4。`kill_on_window_destroyed`
+    /// と同じ制約で、実配送の確認は実機の手動スモークが持つ）。
+    ///
+    /// 観測は `Notifier::on_state` の判定に出す —— `Notifier` はフォーカス状態の
+    /// getter を持たず、フォーカスは「表示中セッションの通知を抑止するか」にしか効かない。
+    /// 3 つの腕がそれぞれ別の変異で赤くなる:
+    /// 1. 陽性の対照。フォーカスが無ければ、表示中のセッションでも通知は出る
+    /// 2. `*focused` を反転する変異
+    /// 3. `window.label() == MAIN_WINDOW_LABEL` のガードを外す変異
+    #[test]
+    fn window_focus_events_reach_the_notifier_only_for_the_main_window() {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
+
+        use crate::model::{RuntimeState, SessionStatePayload, StateReason};
+        use crate::notify::{NotifyDecision, NotifyKind, ViewKind};
+        use crate::store::test_support::open_temp;
+
+        fn waiting(id: &str) -> SessionStatePayload {
+            SessionStatePayload {
+                session_id: id.to_string(),
+                runtime_state: RuntimeState::WaitingInput,
+                reason: StateReason::HookNotification,
+            }
+        }
+
+        let (_dir, store) = open_temp();
+        let app = mock_builder()
+            .manage(crate::state::test_support::app_state(store))
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+        for label in ["main", "settings"] {
+            WebviewWindowBuilder::new(&app, label, Default::default())
+                .build()
+                .expect("build webview");
+        }
+        let main = app.get_window("main").expect("main window registered");
+        let settings = app
+            .get_window("settings")
+            .expect("settings window registered");
+
+        let state = app.state::<AppState>();
+        state.notifier.set_view_context(
+            ViewKind::Terminal,
+            vec!["s1".into(), "s2".into(), "s3".into()],
+        );
+
+        // (1) 陽性の対照: フォーカス無しなら、表示中のセッションでも通知は出る
+        assert_eq!(
+            state.notifier.on_state(&waiting("s1"), 1_000).decision,
+            NotifyDecision::Post(NotifyKind::WaitingInput),
+            "陽性の対照: ウィンドウが前面でなければ表示中でも抑止しない"
+        );
+
+        // (2) main の Focused(true) が届いている
+        super::track_window_focus(&main, &WindowEvent::Focused(true));
+        assert_eq!(
+            state.notifier.on_state(&waiting("s2"), 2_000).decision,
+            NotifyDecision::SuppressVisible,
+            "main の Focused(true) が Notifier に届いていない"
+        );
+
+        // (3) main 以外のウィンドウのイベントは無視する
+        super::track_window_focus(&settings, &WindowEvent::Focused(false));
+        assert_eq!(
+            state.notifier.on_state(&waiting("s3"), 3_000).decision,
+            NotifyDecision::SuppressVisible,
+            "main 以外のウィンドウの Focused がフォーカス状態を書き換えている"
+        );
+    }
+
+    /// `AppState` が載る前にフォーカスイベントが来ても panic しない（契約 §0）。
+    ///
+    /// `Manager::state::<AppState>()` は未登録時に panic するため、`try_state` で
+    /// 受けている（`kill_on_window_destroyed` と同じ形）。ウィンドウは `setup` の前に
+    /// 生成されるので、この順序は実機で起こりうる。
+    #[test]
+    fn window_focus_events_are_ignored_before_app_state_is_managed() {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+        use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
+
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+        WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("build webview");
+        let window = app.get_window("main").expect("window registered");
+
+        super::track_window_focus(&window, &WindowEvent::Focused(true));
+
+        assert!(
+            app.try_state::<AppState>().is_none(),
+            "前提が崩れている: このテストは AppState 未登録の経路を見ている"
+        );
+    }
+
     // --- M2-1 Task 6: runtime_state の Tauri 配線 ---
     //
     // ここから下の 7 本は「状態機械をアプリの寿命に結線した」ことを固定する。
@@ -1045,6 +1329,27 @@ mod tests {
         use crate::session::runtime_state::{StateInput, StatePersist};
         use crate::state::AppState;
         use crate::store::test_support::{insert_test_session, open_temp};
+
+        /// 通知 sink のテスト差し替え。`M2-3-macos-notification.md:515`
+        /// 「OS 通知の実送信・実クリックは自動テストしない」のとおり、テストから
+        /// OS 通知を実送信しない（`MacNotificationSink` は `install_app_state` 側でだけ作る）。
+        fn test_sink() -> Arc<crate::notify::RecordingSink> {
+            Arc::new(crate::notify::RecordingSink::default())
+        }
+
+        /// 通知許可のテスト固定値。`test_sink` と同じ理由で、テストから実 OS API
+        /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4。
+        /// 契約上の章番号は 00-contracts.md に本文照合が取れなかったため引用しない）。
+        /// `Granted` を選ぶのは 2 つの理由から: (1) `decide()` は `Denied` のときだけ
+        /// 通知を抑制するので `Unknown` でも投稿自体は起きるが、この値を選ぶと
+        /// `Notifier` が実 `read_permission()`（この機体では `Unknown` を返す。
+        /// task-10-review.md の P-OSCALL 実測）と区別できなくなる。(2) `Granted` なら
+        /// `on_state` の `request_permission` が常に `false` になり、`on_session_state`
+        /// の `tauri::async_runtime::spawn` 経由で実 OS の認可要求 API
+        /// （`request_auth()`）が走らない。
+        fn test_permission() -> crate::notify::NotifyPermission {
+            crate::notify::NotifyPermission::Granted
+        }
 
         /// hooks を常に無効化するテスト用ブートストラップ。
         ///
@@ -1201,6 +1506,8 @@ mod tests {
                 &app,
                 Arc::new(store),
                 probe.clone(),
+                test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1233,6 +1540,8 @@ mod tests {
                 &app,
                 Arc::new(store),
                 probe.clone(),
+                test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1312,6 +1621,8 @@ mod tests {
                 &app,
                 Arc::new(store),
                 probe.clone(),
+                test_sink(),
+                test_permission(),
                 test_bootstrap_hooks,
             );
 
@@ -1356,7 +1667,14 @@ mod tests {
 
             let store = Arc::new(store);
             let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
 
             app.state::<AppState>()
                 .runtime
@@ -1370,6 +1688,166 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
             assert_eq!(payload["session_id"], serde_json::json!(session.id));
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// M2-3 Task 10: `install_app_state_with` が `NotifyObserver` を
+        /// **`register_observer` で実際に登録している**こと。
+        ///
+        /// `notify::notifier_tests` は `Notifier` を**直接構築**して駆動するので、
+        /// この配線 1 行を消しても全部緑のまま通る（実測: 変異 M-OBS）。ここでは
+        /// observer も `Notifier` も 1 つも作らず、**`sender()` に入力を積んで
+        /// `NotificationSink` に通知が届くか**だけを見る。
+        ///
+        /// 同時に、通知文言が `build_notifier` の `LabelResolver` 経由で
+        /// **DB の行から**来ていることも見る（実測: 変異 M-LABEL）。title / project_name /
+        /// location に別々の値を置いてあるので、`SessionLabel` の詰め替えを取り違える変異は
+        /// 期待値と食い違う。`SessionLabel::fallback` に落ちた場合の title は
+        /// 「セッション <先頭 8 文字>」なので、`Store` を引かない変異とも区別できる。
+        ///
+        /// 消えたときの症状は重い —— 状態が遷移しても通知が 1 度も出ず、Dock バッジも
+        /// 更新されない（M2-3 の機能が丸ごと無反応になる）。
+        #[test]
+        fn install_app_state_posts_a_notification_through_the_registered_observer() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = crate::model::Session::new_backlog(
+                &project_id,
+                "fix-login",
+                "",
+                crate::model::SessionMode::Worktree,
+                Some("feature/x".to_string()),
+                CliKind::Claude,
+                None,
+                1.0,
+                crate::store::now_ms(),
+            );
+            let session = store.insert_session(&session).expect("insert_session");
+
+            let app = mock_app();
+            let sink = test_sink();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                sink.clone(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
+
+            let state = app.state::<AppState>();
+            // I-4（task-10 レビュー修正ラウンド 1）: 実機の許可状態にテストを依存させない。
+            // `permission` は `install_app_state_with` への注入経路（`test_permission()`）
+            // で固定した。ここでは注入した値が実際に `Notifier` まで届いていることを見る
+            // —— 届いていなければ（`build_notifier` が引数を無視して
+            // `mac_sink::read_permission()` を直接呼ぶ形へ後退すれば）この機体では
+            // `Unknown` になる（実測: task-10-review.md の P-OSCALL で
+            // READ-VALUE=Unknown が 11/11）。
+            assert_eq!(
+                state.notifier.permission(),
+                crate::notify::NotifyPermission::Granted,
+                "注入した NotifyPermission が Notifier まで届いていない \
+                 （build_notifier が permission 引数を無視している疑い）"
+            );
+
+            let sender = state.runtime.sender();
+            sender.send(&session.id, StateInput::Spawned);
+            sender.send(&session.id, StateInput::HookNotification);
+
+            assert!(
+                wait_until(|| !sink.posted().is_empty()),
+                "通知が 1 件も届かない: install_app_state_with が NotifyObserver を \
+                 register_observer していない"
+            );
+            let posted = sink.posted();
+            assert_eq!(posted.len(), 1);
+            assert_eq!(posted[0].session_id, session.id);
+            assert_eq!(posted[0].title, "入力待ち: fix-login");
+            assert_eq!(posted[0].body, "kamux · feature/x");
+
+            // I-1 / I-2（task-10 レビュー）: observer が `Notifier` へ渡した時刻が
+            // 実時計であること、かつ `AppState.notifier` が observer と同一実体で
+            // あることを 1 本で見る。`state` は既にこのスコープに在る。
+            let running = crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::Running,
+                reason: crate::model::StateReason::Spawned,
+            };
+            let waiting = crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::WaitingInput,
+                reason: crate::model::StateReason::HookNotification,
+            };
+            state
+                .notifier
+                .on_state(&running, crate::notify::now_epoch_ms());
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(
+                        &waiting,
+                        crate::notify::now_epoch_ms()
+                            + crate::notify::policy::NOTIFY_MIN_INTERVAL_MS / 2
+                    )
+                    .decision,
+                crate::notify::NotifyDecision::SuppressRateLimited,
+                "observer が記録した通知時刻が実時計でないか、AppState.notifier が別実体である"
+            );
+        }
+
+        /// M2-3 Task 10: 起動時の Dock バッジは**空の状態マップから**始まる。
+        ///
+        /// DB に `waiting_input` の行があってもバッジは付かない。起動直後は PTY が
+        /// 1 つも走っておらず、真に入力待ちのセッションは存在しないためである
+        /// （`install_app_state_with` の該当コメント参照）。
+        ///
+        /// ⚠️ このテストは `seed_states(BTreeMap::new())` の**存在**では赤にならない ——
+        /// 空マップの seed は `Notifier` の初期状態と同じで no-op だからである。守るのは
+        /// 「非空の値を seed する変異」であり、実測は変異 M-BADGE-SEED で取ってある。
+        /// **`last_runtime_state` から復元する形の変異は、このテストを赤にする**
+        /// （実測: task-10 修正ラウンド 1 の RX-3。`StatePersist` 経由の読み出し 1 件で
+        /// 赤を再確認済み。旧版は「直前の `normalize_on_startup` が昇格させるため無改変と
+        /// 同じ出力になる」と書いていたが、seed は `normalize_on_startup`（lib.rs:609）
+        /// より**前**に走るため誤りだった。`install_app_state_with` の該当コメント参照）。
+        ///
+        /// バッジの読み出しには `forget_session` を使う。未知の `session_id` に対しては
+        /// 「何も消さずに現在のバッジ数を返す」ので、観測のためだけの API を
+        /// production に足さずに済む。
+        #[test]
+        fn install_app_state_starts_the_badge_from_an_empty_state_map() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "waiting");
+            store
+                .set_last_runtime_state(&session.id, RuntimeState::WaitingInput)
+                .expect("set_last_runtime_state");
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
+
+            assert_eq!(
+                app.state::<AppState>()
+                    .notifier
+                    .forget_session("no-such-id"),
+                None,
+                "起動時のバッジは空から始まる（DB の last_runtime_state から復元しない）"
+            );
         }
 
         /// M3-3: `update_session` の設定変更が**実行中のセッションへ即座に届く**こと。
@@ -1633,7 +2111,14 @@ mod tests {
             let app = mock_app();
             let store = Arc::new(store);
             let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
 
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
@@ -1692,7 +2177,14 @@ mod tests {
             let app = mock_app();
             let store = Arc::new(store);
             let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
-            super::super::install_app_state_with(&app, store, persist, test_bootstrap_hooks);
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
             let state = app.state::<AppState>();
 
             state
@@ -2292,6 +2784,11 @@ mod tests {
                     crate::pty::commands::ack_pty,
                     crate::session::stop_session,
                     crate::session::suggest_branch_name,
+                    super::super::set_visibility_context,
+                    super::super::notification_permission,
+                    // 🔴 登録のみ。`open` が実際に macOS のシステム設定を起動するため、
+                    // このテストからは絶対に invoke しない（brief Ruling X）。
+                    super::super::open_notification_settings,
                 ])
                 .build(mock_context(noop_assets()))
                 .expect("build mock app")
@@ -3032,6 +3529,124 @@ mod tests {
             );
 
             assert_eq!(got.as_str(), Some("session/session-sess-1"), "got: {got:?}");
+        }
+
+        // Ruling X: set_visibility_context / notification_permission は Notifier に
+        // 配線されているだけでは足りず、IPC 境界（camelCase JSON）を実際に越えて
+        // 値が届くことを見る。`visible_session_ids` は IPC 上 `visibleSessionIds`。
+        // 判定結果は `Notifier::on_state`（IPC コマンドではない、Rust 内部 API）を
+        // 直接呼んで観測する。既存パターンは `lib.rs`
+        // `window_focus_events_reach_the_notifier_only_for_the_main_window` と同じ。
+        fn waiting(id: &str) -> crate::model::SessionStatePayload {
+            crate::model::SessionStatePayload {
+                session_id: id.to_string(),
+                runtime_state: crate::model::RuntimeState::WaitingInput,
+                reason: crate::model::StateReason::HookNotification,
+            }
+        }
+
+        /// `set_visibility_context` が渡した `view` と `visible_session_ids` の両方を
+        /// `Notifier` に届けていることを、`Notifier::on_state` の判定結果で観測する。
+        /// - 1 回目: view=terminal, visibleSessionIds=["s-in-list"] → 名前どおり
+        ///   リストに居るセッションだけ抑制され、居ないセッションは通知が出ること
+        /// - 2 回目: view=terminal のまま visibleSessionIds を ["s-in-list-2"] に
+        ///   差し替える → 新しく入れたセッションが抑制されること
+        ///   （= 2 回目の invoke が実際に `Notifier` へ反映された証拠。1 回目の
+        ///   文脈（ids=["s-in-list"]）のまま更新が握り潰されるなら、s-in-list-2 は
+        ///   ids に含まれないため抑制されず Post になり、この assert が落ちる）
+        /// - 3 回目: view=kanban（terminal でない）に切り替える。ids は
+        ///   新しい s-in-list-3 → terminal でなくなったので抑制されないこと
+        ///   （= `view` が実際に読まれている証拠。`view` をハードコードしていれば
+        ///   s-in-list-3 が ids に含まれているぶん抑制されたままになる）
+        #[test]
+        fn set_visibility_context_delivers_view_and_ids_to_the_notifier() {
+            use crate::notify::{NotifyDecision, NotifyKind};
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let state = app.state::<AppState>();
+            // window_focused は is_session_visible の AND 条件の 1 つ。
+            // このテストの主題ではないので直接立てる（`track_window_focus` の配線は
+            // 別テスト `window_focus_events_reach_the_notifier_only_for_the_main_window`
+            // が守る）。
+            state.notifier.set_window_focused(true);
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "terminal", "visibleSessionIds": ["s-in-list"]}),
+            );
+
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list"), 1_000)
+                    .decision,
+                NotifyDecision::SuppressVisible,
+                "visibleSessionIds に含めたセッションが抑制されていない"
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-not-in-list"), 2_000)
+                    .decision,
+                NotifyDecision::Post(NotifyKind::WaitingInput),
+                "visibleSessionIds に無いセッションまで抑制している\
+                 (visible_session_ids を空 vec で固定する変異)"
+            );
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "terminal", "visibleSessionIds": ["s-in-list-2"]}),
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list-2"), 3_000)
+                    .decision,
+                NotifyDecision::SuppressVisible,
+                "2 回目の set_visibility_context が Notifier に反映されていない\
+                 (2 回目以降の push を握り潰す set-once 変異)"
+            );
+
+            invoke_ok(
+                &webview,
+                "set_visibility_context",
+                json!({"view": "kanban", "visibleSessionIds": ["s-in-list-3"]}),
+            );
+            assert_eq!(
+                state
+                    .notifier
+                    .on_state(&waiting("s-in-list-3"), 4_000)
+                    .decision,
+                NotifyDecision::Post(NotifyKind::WaitingInput),
+                "view を kanban に切り替えたのに terminal 扱いのまま抑制している\
+                 (view を無視/固定する変異)"
+            );
+        }
+
+        /// `notification_permission` が `AppState` の実値を読んでいることを、
+        /// 既定値ではない `Denied` を明示的に設定してから観測する
+        /// （既定値 `Unknown` だけを見るテストは定数固定の変異を捕まえない）。
+        #[test]
+        fn notification_permission_reads_the_value_set_on_app_state() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let state = app.state::<AppState>();
+            state
+                .notifier
+                .set_permission(crate::notify::NotifyPermission::Denied);
+
+            let got = invoke_ok(&webview, "notification_permission", json!({}));
+
+            assert_eq!(got, json!("denied"));
         }
     }
 }

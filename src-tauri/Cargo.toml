@@ -2,7 +2,7 @@
 name = "kamux"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 
 [lib]
 name = "kamux"
@@ -24,6 +24,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 memchr = "2"
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+mac-usernotifications = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

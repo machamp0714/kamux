@@ -3,14 +3,17 @@
 //! `policy` サブモジュールが判定ロジックの型と純粋関数を持つ。
 //! OS API に触れる実装は後続タスクで別サブモジュールとして追加する。
 
+pub mod mac_sink;
 pub mod policy;
 
 use std::sync::{Arc, Mutex};
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::model::{RuntimeState, SessionStatePayload, StateReason};
-use policy::{badge_count, decide, format_notification, DecisionInput};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
+
+use crate::model::{FocusPayload, RuntimeState, SessionStatePayload, StateReason, SurfaceKind};
+use policy::{badge_count, decide, format_notification, DecisionInput, MAIN_WINDOW_LABEL};
 
 pub use policy::{
     NotifyDecision, NotifyKind, NotifyPermission, SessionLabel, ViewKind, VisibilityContext,
@@ -187,9 +190,10 @@ impl Notifier {
             // この項は set_permission が permission_requested を立てるのと冗長であり、
             // 公開 API 経由では単独では到達不能なのでテストで守れない（PR 18 単位レビュー I-1）。
             // 設計 §5.6 の「権限が未知のときに 1 回だけ訊く」を式の上に残すために意図的に置いている。
-            // ⚠️ PR 19 で set_permission の呼び出し方が増える（read_permission() の結果を流す）。
-            //    その時点で「公開 API 経由では到達不能」の前提を再検証すること。
-            //    Granted → Unknown → Spawned の経路が実際に発生しうる。
+            // PR 19 で read_permission() の結果を流す set_permission が lib.rs:527 に足された。
+            // 前提は不変である —— 本項を削除する変異は緑（PR 19 単位レビュー S-6）。
+            // production の set_permission 呼び出しは lib.rs:527 と mod.rs:305 の 2 箇所のみで、
+            // Granted → Unknown は起こらない。
             && inner.permission == NotifyPermission::Unknown
             && !inner.permission_requested;
         if request_permission {
@@ -230,6 +234,109 @@ impl Notifier {
             badge,
             request_permission,
         }
+    }
+}
+
+/// Unix epoch ミリ秒。契約 §3 の時刻表現と同じ。
+pub fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Rust 側で契約 §8 のトピック文字列を組み立てる唯一の場所。
+/// TS 側は src/ipc/events.ts:33 が独立に組み立てる。
+pub fn focus_event_topic(session_id: &str) -> String {
+    format!("focus://session/{session_id}")
+}
+
+/// 通知クリックからセッションフォーカスまでを実行する。
+///
+/// 前面化を先に行う。逆順だと、非表示のウィンドウに対してビュー切り替えが走り、
+/// 前面化した瞬間に描画が追いつかないため（設計判断。この順序を測る自動観測は
+/// この差分に無い）。
+pub fn focus_session_from_notification<R: Runtime>(app: &AppHandle<R>, session_id: &str) {
+    if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(e) = win.show() {
+            tracing::warn!("failed to show window: {e}");
+        }
+        if let Err(e) = win.unminimize() {
+            tracing::debug!("unminimize skipped: {e}");
+        }
+        if let Err(e) = win.set_focus() {
+            tracing::warn!("failed to focus window: {e}");
+        }
+    }
+
+    let payload = FocusPayload {
+        session_id: session_id.to_string(),
+        surface_kind: SurfaceKind::Agent,
+    };
+    if let Err(e) = app.emit(&focus_event_topic(session_id), payload) {
+        tracing::warn!("failed to emit focus event: {e}");
+    }
+}
+
+/// 状態遷移 1 件から、通知の判定・送信・Dock バッジ更新・初回の通知許可要求までを行う。
+///
+/// M2-1 の consumer スレッドから**同期的に**呼ばれるため、ここでブロックする処理を
+/// 書いてはならない。OS 通知の実送信は [`mac_sink::MacNotificationSink`] が専用スレッドへ、
+/// 許可要求は `tauri::async_runtime::spawn` へそれぞれ逃がしている。
+///
+/// `apply_badge` の呼び出しと `request_permission` の spawn は `AppHandle` と OS API を
+/// 要求するため、**これらを測る自動観測はこの差分に無い**（`M2-3-macos-notification.md:515`
+/// の「OS 通知の実送信・実クリックは自動テストしない」）。この関数が observer から
+/// 実際に呼ばれていることは
+/// `lib.rs` の `install_app_state_posts_a_notification_through_the_registered_observer`
+/// が `NotificationSink` の側から観測する。
+pub fn on_session_state<R: Runtime>(
+    app: &AppHandle<R>,
+    notifier: &Arc<Notifier>,
+    payload: &SessionStatePayload,
+) {
+    let outcome = notifier.on_state(payload, now_epoch_ms());
+    apply_badge(app, outcome.badge);
+
+    if outcome.request_permission {
+        let notifier = Arc::clone(notifier);
+        tauri::async_runtime::spawn(async move {
+            let p = mac_sink::request_permission().await;
+            notifier.set_permission(p);
+        });
+    }
+}
+
+/// M2-1 の [`StateObserver`](crate::session::runtime_state::StateObserver) として登録する
+/// 薄い接着剤。
+///
+/// `Notifier` 自体に `AppHandle` を持たせない（= `Runtime` に対して総称にしない）ことで、
+/// `Notifier` を Tauri 抜きで `cargo test` できる状態に保つ。
+pub struct NotifyObserver<R: Runtime> {
+    app: AppHandle<R>,
+    notifier: Arc<Notifier>,
+}
+
+impl<R: Runtime> NotifyObserver<R> {
+    pub fn new(app: AppHandle<R>, notifier: Arc<Notifier>) -> Self {
+        Self { app, notifier }
+    }
+}
+
+impl<R: Runtime> crate::session::runtime_state::StateObserver for NotifyObserver<R> {
+    fn on_state(&self, payload: &SessionStatePayload) {
+        on_session_state(&self.app, &self.notifier, payload);
+    }
+}
+
+/// Dock バッジを適用する。`None` でバッジを消す。
+pub fn apply_badge<R: Runtime>(app: &AppHandle<R>, count: Option<i64>) {
+    let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        tracing::warn!("main window not found; badge not applied");
+        return;
+    };
+    if let Err(e) = win.set_badge_count(count) {
+        tracing::warn!("failed to set badge count: {e}");
     }
 }
 
@@ -625,6 +732,23 @@ mod notifier_tests {
         );
 
         assert_eq!(sink.posted()[0].title, "入力待ち: セッション 3f2a9c1e");
+    }
+
+    #[test]
+    fn focus_topic_matches_the_contract() {
+        assert_eq!(
+            focus_event_topic("3f2a9c1e-0000"),
+            "focus://session/3f2a9c1e-0000"
+        );
+    }
+
+    #[test]
+    fn now_ms_is_monotonic_enough_for_rate_limiting() {
+        let a = now_epoch_ms();
+        let b = now_epoch_ms();
+        assert!(b >= a);
+        // 2026 年以降であることを緩く確認（epoch ミリ秒として妥当な桁）
+        assert!(a > 1_700_000_000_000);
     }
 
     /// 必須要件: `format_notification()` の戻り値 `(title, body)` を

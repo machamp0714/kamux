@@ -4,7 +4,7 @@ members = ["src-tauri", "crates/kamux-relay"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.90"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

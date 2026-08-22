@@ -86,6 +86,13 @@ pub struct SessionStatePayload {
     pub reason: StateReason,
 }
 
+/// 通知クリックからセッションへフォーカスを戻すためのペイロード（契約 §8）。
+#[derive(Serialize, Clone)]
+pub struct FocusPayload {
+    pub session_id: String,
+    pub surface_kind: SurfaceKind,
+}
+
 /// 契約 §4
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
