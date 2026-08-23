@@ -15,12 +15,17 @@ const TERMINAL_GENERATED_REPORTS: [&str; 2] = ["\x1b[I", "\x1b[O"];
 /// 完全一致するかどうかを判定する（契約 §139.2 / §139.4）。人間が発した入力ではないので、
 /// `write_pty` はこれを `UserInput` として通知しない。
 ///
-/// **前方一致・部分一致・正規表現の走査は使わない。** 人間が `Esc` `[` `I` と順に打つと、
-/// xterm は 1 打鍵ごとに `triggerDataEvent` を呼ぶので `onData` へは 3 チャンクに分かれて
-/// 届く（`@xterm/xterm/src/browser/Terminal.ts:1072` / `:1155`。いずれも `_keyDown` /
-/// `_keyPress` の中で打鍵 1 回につき 1 回呼ばれる）。走査型はこの 3 打鍵目
-/// （`"I"` だけの chunk）を `"\x1b[I"` の部分一致として拾ってしまい、🟡 が消えなくなる。
-/// payload 全体の完全一致だけがこの事故を避けられる。
+/// **前方一致・部分一致・正規表現の走査は使わない。走査型は向きによって壊れ方が違う：**
+/// - `data.contains(r)`（payload が報告を含む向き）は `"\x1b[Iy"` / `"y\x1b[I"` のような
+///   payload を報告と誤判定し、**人間の入力を握り潰す**
+/// - `r.contains(data)`（報告が payload を含む向き）は、人間が `Esc` `[` `I` と順に打った
+///   ときの 1 打鍵チャンク（`"\x1b"` / `"["` / `"I"`。xterm は 1 打鍵ごとに
+///   `triggerDataEvent` を呼ぶので `onData` へは 3 チャンクに分かれて届く。
+///   `@xterm/xterm/src/browser/Terminal.ts:1072` / `:1155`。いずれも `_keyDown` /
+///   `_keyPress` の中で打鍵 1 回につき 1 回呼ばれる）を報告と誤判定し、
+///   **3 打鍵目を落として 🟡 が消えなくなる**
+///
+/// payload 全体の完全一致だけがどちらの事故も避けられる。
 fn is_terminal_generated_report(data: &str) -> bool {
     TERMINAL_GENERATED_REPORTS.contains(&data)
 }
@@ -98,8 +103,10 @@ mod tests {
     #[test]
     fn is_terminal_generated_report_false_for_each_chunk_of_a_human_typing_esc_bracket_i() {
         // 人間が Esc [ I と順に打つと、xterm は 1 打鍵ごとに triggerDataEvent を呼ぶので
-        // onData へは 3 チャンクに分かれて届く（契約 §139.4）。走査型ならここが緑になって
-        // しまうが、この 3 本は「集合の要素そのものを増やす誤り」を殺すためにある。
+        // onData へは 3 チャンクに分かれて届く（契約 §139.4）。走査型のうち
+        // data.contains(r)（前方一致の向き）ではこのテストは緑のままだが、
+        // r.contains(data)（報告が payload を含む向き）ではここが赤になる。
+        // この 3 本は「集合の要素そのものを増やす誤り」を殺すためにもある。
         assert!(!is_terminal_generated_report("\x1b"));
         assert!(!is_terminal_generated_report("["));
         assert!(!is_terminal_generated_report("I"));

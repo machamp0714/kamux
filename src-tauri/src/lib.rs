@@ -3402,6 +3402,17 @@ mod tests {
                 "陽性コントロール: フォーカス報告の前は 🟡 のはず"
             );
 
+            let err = invoke_err(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": "nope:agent", "data": "\u{1b}[I"}),
+            );
+            assert_eq!(
+                err["code"],
+                json!("not_found"),
+                "契約 §139.2: 報告バイト列も PTY へは必ず書く（書かれなければ not_found が返らない）"
+            );
+
             invoke_ok(
                 &webview,
                 "write_pty",
