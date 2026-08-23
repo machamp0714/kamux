@@ -38,7 +38,12 @@ git status --short
 git log --oneline -5
 
 # 4. 起動・再開するフェーズの PR の終端状態と ledger の現在地を突き合わせる
-gh pr list --search "<フェーズ ID>" --state all --json number,state,mergedAt
+#    ⚠️ --search "<フェーズ ID>" を使わない。GitHub の全文検索はハイフンを分解し body も走査するため、
+#       無関係な PR が MERGED として返る（M3-4 で 8 本、うち M3-4 の PR は 0 本の実測）。title で絞る:
+P=<フェーズ ID>
+gh pr list --state all --limit 300 --json number,state,mergedAt,title \
+  -q "[.[] | select(.title | test(\"(^|[^0-9A-Za-z])${P}([^0-9]|$)\"))] | \"件数=\(length)\", (.[] | \"\(.number)\t\(.state)\t\(.title)\")"
+# 不合格の形: 件数=0、または返った title にフェーズ ID が含まれないこと
 ```
 
 4 は再開のときほど効く。ledger は書き手が落ちると古いまま止まるが、PR の状態は GitHub 側に残る終端事実である。
@@ -442,7 +447,7 @@ grep -n '「[^」]*」' .claude/AGENT-LESSONS.md   # 棚卸し表の所在列か
 【規則 0】判定（レビュー・承認・裁定）を依頼したら、判定が返るまで**その対象を凍結する**。対象はコミット済みブランチに限らず、未コミットの成果物・検算スクリプト・手順書・器も含む。判定区間に対象を動かす必要が生じたら、動かす前に依頼を取り下げる便を出す。
 
 - 依頼の便に対象の同定（sha / ファイルと mtime）を書き、判定を受領した便で同じ値を再掲して一致を確かめる。一致しないなら判定は動いた対象を見ていない
-- この規則は依頼を出す側（team-lead / lane-controller）に掛かる。implementer は dispatch されない限り書かず、task-reviewer は成果物を修正しない定義を既に持つので、置き先はこの 2 者である
+- この規則は依頼を出す側（team-lead / lane-controller）に掛かる。implementer は dispatch されない限り書かない。**task-reviewer は変異検証で production を一時改変する**（`task-reviewer.md` の 4 段手順）—— 判定区間の凍結は依頼側の義務だが、**同じ作業ツリーで測る第三者（ゲートのビルド等）が居るときは、依頼側が隔離 worktree を切ってから依頼を出す**（変異込みのバイナリを掴んだ実測がある）
 - 観測点: 判定受領の便に、依頼時と同じ sha / mtime の再掲があること
 
 【規則 1】マージ許可を出す前に `git diff --no-ext-diff --stat <承認 sha>..HEAD` を測り、非空ならレビューへ戻す。
