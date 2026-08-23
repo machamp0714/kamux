@@ -6,21 +6,21 @@ use tauri::State;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// 端末エミュレータが自分で生成して PTY へ書き返す報告（フォーカス報告）の payload と
+/// 端末が自分で生成する報告の閉じた集合（契約 §139.4）。**この配列 1 箇所だけに置く。**
+/// 増やすときは、一次資料（xterm の `triggerDataEvent` 呼び出し位置）と、実際にその CLI が
+/// 出したことの実測を、1 バイト列につき 1 組ずつ揃えてから 1 行足す（契約 §139.4.1）。
+const TERMINAL_GENERATED_REPORTS: [&str; 2] = ["\x1b[I", "\x1b[O"];
+
+/// `data` が端末エミュレータ自身の生成した報告（フォーカス報告）と payload 全体で
 /// 完全一致するかどうかを判定する（契約 §139.2 / §139.4）。人間が発した入力ではないので、
 /// `write_pty` はこれを `UserInput` として通知しない。
 ///
 /// **前方一致・部分一致・正規表現の走査は使わない。** 人間が `Esc` `[` `I` と順に打つと、
 /// xterm は 1 打鍵ごとに `triggerDataEvent` を呼ぶので `onData` へは 3 チャンクに分かれて
-/// 届く（`@xterm/xterm/src/browser/Terminal.ts:1072` / `:1155`）。走査型はこの 3 打鍵目
+/// 届く（`@xterm/xterm/src/browser/Terminal.ts:1072` / `:1155`。いずれも `_keyDown` /
+/// `_keyPress` の中で打鍵 1 回につき 1 回呼ばれる）。走査型はこの 3 打鍵目
 /// （`"I"` だけの chunk）を `"\x1b[I"` の部分一致として拾ってしまい、🟡 が消えなくなる。
 /// payload 全体の完全一致だけがこの事故を避けられる。
-///
-/// 集合はこの配列 1 箇所に置く。増やすときは、一次資料（xterm の `triggerDataEvent` 呼び
-/// 出し位置）と、実際にその CLI が出したことの実測を、1 バイト列につき 1 組ずつ揃えてから
-/// 1 行足す（契約 §139.4.1）。
-const TERMINAL_GENERATED_REPORTS: [&str; 2] = ["\x1b[I", "\x1b[O"];
-
 fn is_terminal_generated_report(data: &str) -> bool {
     TERMINAL_GENERATED_REPORTS.contains(&data)
 }
