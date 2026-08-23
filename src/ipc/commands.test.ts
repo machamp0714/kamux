@@ -11,7 +11,10 @@ import {
   listProjects,
   listSessions,
   moveSession,
+  notificationPermission,
+  openNotificationSettings,
   resizePty,
+  setVisibilityContext,
   spawnEditor,
   startSession,
   stopSession,
@@ -174,5 +177,27 @@ describe('ipc/commands', () => {
 
     expect(invoke).toHaveBeenCalledWith('get_hooks_diagnostics');
     expect(got).toEqual(diagnostics);
+  });
+
+  it('setVisibilityContext が view と visibleSessionIds を camelCase で渡す', async () => {
+    await setVisibilityContext('kanban', ['s1', 's2']);
+    expect(invoke).toHaveBeenCalledWith('set_visibility_context', {
+      view: 'kanban',
+      visibleSessionIds: ['s1', 's2'],
+    });
+  });
+
+  it('notificationPermission が引数なしで invoke し、戻り値をそのまま返す', async () => {
+    invoke.mockResolvedValue('denied');
+
+    const got = await notificationPermission();
+
+    expect(invoke).toHaveBeenCalledWith('notification_permission');
+    expect(got).toBe('denied');
+  });
+
+  it('openNotificationSettings が引数なしで invoke する', async () => {
+    await openNotificationSettings();
+    expect(invoke).toHaveBeenCalledWith('open_notification_settings');
   });
 });

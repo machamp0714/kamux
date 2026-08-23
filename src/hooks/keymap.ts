@@ -1,4 +1,5 @@
 import type { PaneIndex } from '../store/paneLogic';
+import type { ViewKind } from '../types/model';
 
 /**
  * 契約 §11 のキーマップ。M1-2 が実装したのは Cmd+1 / Cmd+N と、モーダルを閉じる Escape。
@@ -11,7 +12,7 @@ import type { PaneIndex } from '../store/paneLogic';
  * 切り出さず、このユニオンと resolveKeymap 本体に足す。
  */
 export type KeymapAction =
-  | { type: 'set_view'; view: 'kanban' | 'terminal' | 'editor' }
+  | { type: 'set_view'; view: ViewKind }
   | { type: 'open_create_session' }
   | { type: 'close_modal' }
   | { type: 'cycle_session'; dir: 1 | -1 }
@@ -30,7 +31,7 @@ export interface KeymapEvent {
 export interface KeymapContext {
   modalOpen: boolean;
   /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] は terminal 画面でのみ有効（契約 §11.4.2） */
-  view: 'kanban' | 'terminal' | 'editor';
+  view: ViewKind;
 }
 
 /**
