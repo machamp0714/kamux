@@ -3370,6 +3370,63 @@ mod tests {
             state.pty.kill(&agent_surface_id).expect("cleanup");
         }
 
+        /// 契約 §139.2: 端末が自分で生成したフォーカス報告（`\x1b[I`）は `UserInput` では
+        /// ない。🟡 のセッションへ `write_pty` でこの payload を送っても `waiting_input` の
+        /// ままであること。
+        ///
+        /// 否定の判定には `wait_until` の有界の待ちを使う（`invoke_ok` の直後に素の
+        /// `assert_eq!` を打つと、状態機械が処理する前に通って絶対に赤くならない）。
+        /// 末尾に陽性の対照（実際の打鍵で 🟢 になること）を入れて、「何も動いていないから
+        /// 緑」を殺す。
+        #[test]
+        fn write_pty_does_not_note_user_input_for_a_terminal_generated_focus_report() {
+            use crate::model::{RuntimeState, SurfaceKind};
+            use crate::pty::surface_id;
+            use crate::session::runtime_state::StateInput;
+
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+            let session_id = create_session_over_ipc(&webview);
+            let agent_surface_id = surface_id(&session_id, SurfaceKind::Agent);
+
+            let state = app.state::<AppState>();
+            spawn_agent_surface(&state, &agent_surface_id);
+            let sender = state.runtime.sender();
+            sender.send(&session_id, StateInput::Spawned);
+            sender.send(&session_id, StateInput::HookNotification);
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::WaitingInput),
+                "陽性コントロール: フォーカス報告の前は 🟡 のはず"
+            );
+
+            invoke_ok(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": agent_surface_id, "data": "\u{1b}[I"}),
+            );
+
+            assert!(
+                !wait_until(|| state.runtime.current(&session_id) == RuntimeState::Running),
+                "端末が自分で生成したフォーカス報告で 🟡 が解除されてはいけない"
+            );
+
+            invoke_ok(
+                &webview,
+                "write_pty",
+                json!({"surfaceId": agent_surface_id, "data": "y"}),
+            );
+
+            assert!(
+                wait_until(|| state.runtime.current(&session_id) == RuntimeState::Running),
+                "陽性対照: 実際の打鍵では 🟡 が解除されるはず"
+            );
+
+            state.pty.kill(&agent_surface_id).expect("cleanup");
+        }
+
         /// 必達 6: `stop_session` は kill のあと `UserStopped` を送り、⛔ を確定させる。
         ///
         /// 2 回目の停止は `PtyManager::kill` の冪等性（契約 §15）により `Ok` が返り、
