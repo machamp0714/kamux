@@ -23,7 +23,8 @@ RAW_PIPE = re.compile(r"(?<!\\)\|")
 
 def check(path: str) -> int:
     try:
-        lines = open(path, encoding="utf-8").read().split("\n")
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().split("\n")
     except OSError as e:
         print(f"FATAL: {path}: {e}")
         return 2
