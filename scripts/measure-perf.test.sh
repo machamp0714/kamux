@@ -231,7 +231,9 @@ contains "起動時間の FAIL で exit_code=1" "$out" "exit_code=1"
 # 裁定 112: rust_setup_ms が無い場合も FAIL（? を出して素通りさせない）
 out="$(startup_case '[kamux-perf] frontend_ready_ms=842
 ' yes 2>&1)"
-contains "rust_setup_ms 欠落で FAIL" "$out" "rust_setup_ms"
+# 「rust_setup_ms」だけを見ると INFO 行の `rust_setup_ms=?` で満たされてしまう。
+# FAIL の本文を逐語で見る。
+contains "rust_setup_ms 欠落で FAIL" "$out" "FAIL  起動時間          perf.log に rust_setup_ms がありません"
 lacks "rust_setup_ms 欠落で PASS を出さない" "$out" "PASS"
 contains "rust_setup_ms 欠落で exit_code=1" "$out" "exit_code=1"
 
