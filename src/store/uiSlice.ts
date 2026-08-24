@@ -157,7 +157,14 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
     }),
 
   modal: null,
-  openModal: (m) => set({ modal: m, view: 'kanban' }),
+  openModal: (m) =>
+    set({
+      modal: m,
+      view: 'kanban',
+      cleanupDialog: null,
+      projectSwitcherOpen: false,
+      deleteProjectDialog: null,
+    }),
   closeModal: () => set({ modal: null }),
 
   projectSwitcherOpen: false,
@@ -183,7 +190,12 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
   cleanupDialog: null,
 
   openCleanupDialog: async (sessionId) => {
-    set({ cleanupDialog: { sessionId, status: null, error: null, busy: false } });
+    set({
+      cleanupDialog: { sessionId, status: null, error: null, busy: false },
+      modal: null,
+      projectSwitcherOpen: false,
+      deleteProjectDialog: null,
+    });
     try {
       const status = await worktreeStatus(sessionId);
       set((st) =>
