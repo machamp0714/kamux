@@ -87,7 +87,12 @@ describe('ipc/commands', () => {
     await updateSession('s1', { kanban_status: 'done' });
 
     const [, args] = invoke.mock.calls[0] as [string, { patch: Record<string, unknown> }];
-    expect(Object.prototype.hasOwnProperty.call(args.patch, 'archived_at')).toBe(false);
+    // hasOwnProperty を archived_at だけに限らず、patch のキー集合そのものを固定する。
+    // こうしないと archived_at 以外のフィールド（title / description / sort_order /
+    // heuristics_enabled / silence_timeout_secs / claude_session_id）が無条件に
+    // undefined で注入されても検出できない（toHaveBeenCalledWith は undefined 値の
+    // プロパティを無視するため）。
+    expect(Object.keys(args.patch)).toEqual(['kanban_status']);
   });
 
   it('listSessions が projectId と includeArchived を渡す', async () => {
