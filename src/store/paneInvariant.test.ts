@@ -161,6 +161,13 @@ const ARGS: Record<string, unknown[]> = {
   // どちらもフォーカス 3 状態には触れない —— sessions / resumeFailedSessionIds / runtimeErrors だけを書く。
   resumeSession: ['a'],
   retryResumeAsFresh: ['a'],
+  // M3-4 Task 8: worktree 掃除ダイアログ。どれも cleanupDialog だけを書き、フォーカス 3 状態には触れない。
+  // このファイルは ../ipc/commands を丸ごとモックしており worktreeStatus/cleanupWorktree は
+  // 提供されない（undefined 呼び出し）ため、openCleanupDialog/confirmCleanup は catch 経路で
+  // 完結する。cleanupDialog は seedBaseline で null のままなので confirmCleanup は早期 return する。
+  openCleanupDialog: ['s1'],
+  closeCleanupDialog: [],
+  confirmCleanup: [false],
 };
 
 function seedBaseline(): void {

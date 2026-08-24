@@ -1,6 +1,8 @@
 import type { StateCreator } from 'zustand';
 
+import { cleanupWorktree, worktreeStatus } from '../ipc/commands';
 import type { AppError, ViewKind } from '../types/model';
+import type { CleanupDialogState } from './cleanup';
 import type { AppStore } from './index';
 import { routeFocusReducer } from './paneLogic';
 
@@ -70,9 +72,16 @@ export interface UiSlice {
   setError: (e: AppError | null) => void;
   editorSurfaces: Record<string, EditorSurfaceStatus>;
   setEditorSurface: (sessionId: string, status: EditorSurfaceStatus | null) => void;
+  /** worktree 掃除ダイアログの状態。null = 閉じている。 */
+  cleanupDialog: CleanupDialogState | null;
+  /** worktree_status を取りに行きつつダイアログを開く（契約 §7.2）。 */
+  openCleanupDialog: (sessionId: string) => Promise<void>;
+  closeCleanupDialog: () => void;
+  /** cleanup_worktree を確定する。成功したらダイアログを閉じてセッション一覧を取り直す。 */
+  confirmCleanup: (force: boolean) => Promise<void>;
 }
 
-export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set) => ({
+export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get) => ({
   view: 'kanban',
   focusedSessionId: null,
 
@@ -102,4 +111,45 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set) => (
   editorSurfaces: {},
   setEditorSurface: (sessionId, status) =>
     set((s) => ({ editorSurfaces: reduceEditorSurfaces(s.editorSurfaces, sessionId, status) })),
+
+  cleanupDialog: null,
+
+  openCleanupDialog: async (sessionId) => {
+    set({ cleanupDialog: { sessionId, status: null, error: null, busy: false } });
+    try {
+      const status = await worktreeStatus(sessionId);
+      set((st) =>
+        st.cleanupDialog?.sessionId === sessionId
+          ? { cleanupDialog: { ...st.cleanupDialog, status } }
+          : {},
+      );
+    } catch (e) {
+      set((st) =>
+        st.cleanupDialog?.sessionId === sessionId
+          ? { cleanupDialog: { ...st.cleanupDialog, error: toAppError(e).message } }
+          : {},
+      );
+    }
+  },
+
+  closeCleanupDialog: () => set({ cleanupDialog: null }),
+
+  confirmCleanup: async (force) => {
+    const dialog = get().cleanupDialog;
+    if (!dialog) return;
+    set({ cleanupDialog: { ...dialog, busy: true, error: null } });
+    try {
+      await cleanupWorktree(dialog.sessionId, force);
+      set({ cleanupDialog: null });
+      // cleanup_worktree は AppResult<()> なので更新後の Session を返さない。取り直す
+      const projectId = get().activeProjectId;
+      if (projectId !== null) await get().loadSessions(projectId);
+    } catch (e) {
+      set((st) =>
+        st.cleanupDialog
+          ? { cleanupDialog: { ...st.cleanupDialog, busy: false, error: toAppError(e).message } }
+          : {},
+      );
+    }
+  },
 });
