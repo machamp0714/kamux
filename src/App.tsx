@@ -12,6 +12,7 @@ import { toAppError } from './store/uiSlice';
 import { EditorView } from './views/EditorView';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
+import { ProjectSwitcherContainer } from './views/ProjectSwitcher/ProjectSwitcherContainer';
 import { NotificationPermissionBanner } from './views/shared/NotificationPermissionBanner';
 import { TerminalView } from './views/TerminalView';
 import './App.css';
@@ -48,6 +49,9 @@ export default function App() {
       {view === 'kanban' ? <KanbanView /> : null}
       {view === 'terminal' && <TerminalView />}
       {view === 'editor' && <EditorView />}
+      {/* 同じ --z-scrim を使う 2 枚。tree order が前後を決めるので順序を動かさない
+          （src/App.projectSwitcher.test.tsx が固定している）。 */}
+      <ProjectSwitcherContainer />
       <SessionFormModal />
       <ErrorToast />
     </div>

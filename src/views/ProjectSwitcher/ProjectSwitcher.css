@@ -1,0 +1,113 @@
+/* ---- プロジェクトスイッチャー（Cmd+P） ----
+   契約 §54.1: 新規コンポーネントのクラス名は `.tsx` のファイル名を kebab-case にした
+   ものをブロック名とする（`project-switcher`）。§54.2 の登録条件（2 つ以上のフェーズが
+   同じクラス名を使うとき）は満たさないので §25.3 へは登録しない。
+   寸法は components.md「モーダル・ダイアログ」節（パネル幅 500〜600px / スクリム）、
+   入力欄は「入力欄」節（高さ 36px / --border-input）、一覧は「パネル・表」節、
+   0 件時の案内は「空状態」節に従う。重なりは既存トークン --z-scrim を使う。 */
+
+.project-switcher__scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: var(--space-10);
+  background: var(--scrim);
+}
+
+.project-switcher {
+  display: flex;
+  flex-direction: column;
+  /* components.md「モーダル・ダイアログ」節のパネル幅 500〜600px に合わせた部品固有の寸法 */
+  width: 560px;
+  max-width: 100%;
+  max-height: 70vh;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-modal);
+  box-shadow: var(--shadow-modal);
+  font-family: var(--font-ui);
+  color: var(--text-primary);
+}
+
+/* components.md「入力欄」節。境界は --border ではなく --border-input（WCAG 1.4.11 の 3:1） */
+.project-switcher__input {
+  /* components.md「入力欄」節が px で指定している部品固有の寸法 */
+  height: 36px;
+  padding: 0 var(--space-9);
+  border: none;
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border-bottom: 1px solid var(--border-input);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+}
+
+.project-switcher__input:focus {
+  outline: none;
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border-bottom: 2px solid var(--accent);
+}
+
+.project-switcher__input::placeholder {
+  color: var(--text-muted);
+}
+
+.project-switcher__list {
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+/* components.md「パネル・表」節の行（padding / 区切り線） */
+.project-switcher__item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-6);
+  padding: var(--space-5) var(--space-7);
+  /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.project-switcher__item:last-child {
+  border-bottom: none;
+}
+
+.project-switcher__item[aria-selected='true'] {
+  background: var(--bg-hover);
+}
+
+.project-switcher__item[data-active='true'] .project-switcher__name {
+  color: var(--accent);
+}
+
+.project-switcher__name {
+  font-size: var(--text-md);
+  font-weight: 600;
+}
+
+.project-switcher__path {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* components.md「空状態」節 */
+.project-switcher__empty {
+  margin: 0;
+  padding: var(--space-9);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  text-align: center;
+}

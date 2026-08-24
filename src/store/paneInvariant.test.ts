@@ -172,6 +172,9 @@ const ARGS: Record<string, unknown[]> = {
   // （restoreSession は sessions / sessionOrder だけを書く。§144.6）。
   restoreSession: ['a'],
   setShowArchived: [true],
+  // M3-4 Task 12: Cmd+P のプロジェクトスイッチャー。projectSwitcherOpen / modal /
+  // cleanupDialog だけを書き、フォーカス 3 状態には触れない。
+  setProjectSwitcherOpen: [true],
 };
 
 function seedBaseline(): void {

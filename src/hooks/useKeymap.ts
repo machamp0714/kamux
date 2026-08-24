@@ -51,6 +51,9 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
     case 'toggle_layout':
       store.setLayout(nextLayout(store.layout));
       break;
+    case 'toggle_project_switcher':
+      store.setProjectSwitcherOpen(!store.projectSwitcherOpen);
+      break;
   }
 }
 

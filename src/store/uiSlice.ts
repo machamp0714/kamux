@@ -6,7 +6,10 @@ import type { CleanupDialogState } from './cleanup';
 import type { AppStore } from './index';
 import { routeFocusReducer } from './paneLogic';
 
-/** 開いているモーダルの種類。M3-4 の Cmd+P で variant を追加する。 */
+/**
+ * 開いているモーダルの種類。Cmd+P のプロジェクトスイッチャーはこのユニオンではなく
+ * 独立した projectSwitcherOpen で持つ（M3-4 Task 12）。
+ */
 export type ModalState = { kind: 'create_session' } | { kind: 'edit_session'; sessionId: string };
 
 /** nvim エディタサーフェスの状態（M3-1）。EditorView が spawn/live/exited/error を判別するために使う。 */
@@ -70,6 +73,15 @@ export interface UiSlice {
   modal: ModalState | null;
   /** 副作用: setView('kanban')。Cmd+N はターミナル画面からも効く（契約 §11）。 */
   openModal: (m: ModalState) => void;
+  /** Cmd+P のプロジェクトスイッチャーの開閉（M3-4 Task 12）。 */
+  projectSwitcherOpen: boolean;
+  /**
+   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog）を閉じる
+   * —— 契約 §11.4.2 の Cmd+P 行が「発火する（開いているモーダルを置き換える）」だから。
+   * modal と cleanupDialog は独立フィールドなので、立てるだけだと 2 枚同時に開く。
+   * 閉じるときは projectSwitcherOpen だけを倒す（他のオーバーレイには触れない）。
+   */
+  setProjectSwitcherOpen: (open: boolean) => void;
   closeModal: () => void;
   lastError: AppError | null;
   setError: (e: AppError | null) => void;
@@ -111,6 +123,15 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
   modal: null,
   openModal: (m) => set({ modal: m, view: 'kanban' }),
   closeModal: () => set({ modal: null }),
+
+  projectSwitcherOpen: false,
+  setProjectSwitcherOpen: (open) =>
+    set(
+      open
+        ? { projectSwitcherOpen: true, modal: null, cleanupDialog: null }
+        : { projectSwitcherOpen: false },
+    ),
+
   lastError: null,
   setError: (e) => set({ lastError: e }),
 

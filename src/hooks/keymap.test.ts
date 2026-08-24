@@ -91,9 +91,43 @@ describe('resolveKeymap', () => {
     expect(resolveKeymap(ev({ key: 'n', metaKey: false }), closed)).toBeNull();
   });
 
-  it('M3-4 の未実装キー（Cmd+P）は null を返す', () => {
-    // 契約 §11 のうち M3-4 の担当外。後続フェーズがこのユニオンに variant を足す
-    expect(resolveKeymap(ev({ key: 'p', metaKey: true }), closed)).toBeNull();
+  it('Cmd+P でプロジェクトスイッチャーを開閉する（契約 §11.4.2 の Cmd+P 行）', () => {
+    expect(resolveKeymap(ev({ key: 'p', metaKey: true }), closed)).toEqual({
+      type: 'toggle_project_switcher',
+    });
+  });
+
+  // 契約 §11.4.2 の Cmd+P 行の view 条件は「無し」。3 画面すべてで同じアクションを返す。
+  it('Cmd+P は kanban / terminal / editor のどの画面でも発火する（契約 §11.4.2: view 条件は無し）', () => {
+    for (const ctx of [closed, terminalView, editorView]) {
+      expect(resolveKeymap(ev({ key: 'p', metaKey: true }), ctx)).toEqual({
+        type: 'toggle_project_switcher',
+      });
+    }
+  });
+
+  it('モーダル表示中でも Cmd+P は発火する（契約 §11.4.1 規則 M / §11.4.2 の「開いているモーダルを置き換える」）', () => {
+    expect(resolveKeymap(ev({ key: 'p', metaKey: true }), open)).toEqual({
+      type: 'toggle_project_switcher',
+    });
+  });
+
+  it('Shift 併用で大文字になった P も受理する（契約 §97.2 規則 S）', () => {
+    expect(resolveKeymap(ev({ key: 'P', metaKey: true }), closed)).toEqual({
+      type: 'toggle_project_switcher',
+    });
+  });
+
+  // 契約 §97.2 規則 C の 7 キー（Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] / Cmd+T / Cmd+W）に
+  // Cmd+P は入っていない。§97.2 の表の `Cmd+N` / `Cmd+P` 行は Ctrl 併用「発火する」。
+  it('Ctrl 併用の Cmd+P も発火する（契約 §97.2 規則 C の 7 キー集合に Cmd+P は入っていない）', () => {
+    expect(resolveKeymap(ev({ key: 'p', metaKey: true, ctrlKey: true }), closed)).toEqual({
+      type: 'toggle_project_switcher',
+    });
+  });
+
+  it('Cmd なしの p は何もしない（ターミナル入力を奪わない）', () => {
+    expect(resolveKeymap(ev({ key: 'p', metaKey: false }), closed)).toBeNull();
   });
 
   it('Cmd+3 で editor 画面へ切り替える（契約 §11 / §11.4.2: view 条件なし・モーダル表示中も発火）', () => {
