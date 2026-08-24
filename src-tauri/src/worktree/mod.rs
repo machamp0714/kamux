@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{AppError, AppResult};
+use crate::model::{Project, Session, SessionMode, WorktreeStatus};
 
 pub mod exclude;
 pub mod slug;
@@ -62,10 +63,144 @@ pub fn create_worktree(repo_path: &Path, slug: &str, branch: &str) -> AppResult<
     Ok(path)
 }
 
+/// worktree に未コミットの変更（untracked を含む）があるかを調べる読み取り専用の操作。
+/// 破壊操作は一切行わない（契約 §7.2）。
+pub fn worktree_status(worktree_path: &Path) -> AppResult<WorktreeStatus> {
+    let out = run_git(
+        worktree_path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+
+    let entries: Vec<String> = out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    Ok(WorktreeStatus {
+        dirty: !entries.is_empty(),
+        entries,
+    })
+}
+
+/// worktree を削除する。契約 §13 に従い **ブランチは決して削除しない**。
+/// `force == false` のとき、未コミット変更があれば git 自身が拒否し、その stderr が
+/// そのまま `AppError::Git` に入る（契約 §6）。`run_git` 経由で実行するため、
+/// 対話プロンプトでハングしない防御（`GIT_TERMINAL_PROMPT=0`）を共有する。
+pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> AppResult<()> {
+    let path_str = worktree_path.to_str().ok_or_else(|| {
+        AppError::Git(format!(
+            "worktree path is not valid UTF-8: {worktree_path:?}"
+        ))
+    })?;
+
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path_str);
+
+    run_git(repo_path, &args)?;
+
+    Ok(())
+}
+
+/// worktree 掃除に必要なパスの組。DB や Tauri State に触れない純粋な計算（M3-4 Task 3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupPlan {
+    pub repo_path: PathBuf,
+    pub worktree_path: PathBuf,
+}
+
+/// セッションが掃除可能かを判定し、必要なパスを組み立てる。
+/// `in_place` セッションと、すでに掃除済み（`worktree_path == None`）のセッションは
+/// 拒否する（契約 §13「削除時の規則」）。
+pub fn plan_cleanup(session: &Session, project: &Project) -> AppResult<CleanupPlan> {
+    if session.mode == SessionMode::InPlace {
+        return Err(AppError::InvalidState(
+            "in_place セッションには worktree がありません".to_string(),
+        ));
+    }
+    let worktree_path = session.worktree_path.as_ref().ok_or_else(|| {
+        AppError::InvalidState("この worktree はすでに削除されています".to_string())
+    })?;
+    Ok(CleanupPlan {
+        repo_path: PathBuf::from(&project.repo_path),
+        worktree_path: PathBuf::from(worktree_path),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CliKind;
     use crate::worktree::test_support::TestRepo;
+
+    fn dummy_project(repo_path: &str) -> Project {
+        Project {
+            id: "p1".into(),
+            name: "test".into(),
+            repo_path: repo_path.into(),
+            default_cli: CliKind::Claude,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 裁定 Ruling 12: 直値の 20 フィールドリテラルではなく `Session::new_backlog`
+    /// を通す。フィールドが増減しても呼び出し側は追従できる。
+    fn dummy_session(mode: SessionMode, worktree_path: Option<&str>) -> Session {
+        let mut session = Session::new_backlog(
+            "p1",
+            "fix login",
+            "",
+            mode,
+            Some("session/fix-login".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            0,
+        );
+        session.worktree_path = worktree_path.map(|s| s.to_string());
+        session
+    }
+
+    #[test]
+    fn plan_cleanup_returns_paths_for_worktree_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(
+            SessionMode::Worktree,
+            Some("/repo/a/.worktrees/session-fix-login"),
+        );
+
+        let plan = plan_cleanup(&session, &project).expect("plan_cleanup が失敗");
+
+        assert_eq!(plan.repo_path, PathBuf::from("/repo/a"));
+        assert_eq!(
+            plan.worktree_path,
+            PathBuf::from("/repo/a/.worktrees/session-fix-login")
+        );
+    }
+
+    #[test]
+    fn plan_cleanup_rejects_in_place_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(SessionMode::InPlace, None);
+
+        let err = plan_cleanup(&session, &project).expect_err("in_place が受理された");
+
+        assert!(matches!(err, AppError::InvalidState(_)), "想定外: {err:?}");
+    }
+
+    #[test]
+    fn plan_cleanup_rejects_already_cleaned_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(SessionMode::Worktree, None);
+
+        let err = plan_cleanup(&session, &project).expect_err("掃除済みが受理された");
+
+        assert!(matches!(err, AppError::InvalidState(_)), "想定外: {err:?}");
+    }
 
     #[test]
     fn run_git_returns_stdout_on_success() {
@@ -258,6 +393,238 @@ mod tests {
                 assert!(
                     msg.contains("failed to execute git"),
                     "spawn failure message should be wrapped with context, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worktree_status_clean_worktree_is_not_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/clean");
+        // add_worktree の doc コメントの断定（canonicalize 済み）を観測するアサーション。
+        // レビュー Important 2: 断定だけで検算が無いと次のリファクタで消えるため。
+        assert_eq!(
+            wt,
+            std::fs::canonicalize(&wt).expect("canonicalize actual"),
+            "add_worktree の戻り値は canonicalize 済みであること"
+        );
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            !st.dirty,
+            "変更のない worktree が dirty 判定された: {:?}",
+            st.entries
+        );
+        assert!(
+            st.entries.is_empty(),
+            "entries が空でない: {:?}",
+            st.entries
+        );
+    }
+
+    #[test]
+    fn worktree_status_untracked_file_only_is_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/untracked");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            st.dirty,
+            "untracked ファイルだけの worktree が clean 判定された"
+        );
+        assert_eq!(st.entries, vec!["?? new.txt".to_string()]);
+    }
+
+    #[test]
+    fn worktree_status_modified_tracked_file_is_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/modified");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            st.dirty,
+            "追跡ファイルを変更した worktree が clean 判定された"
+        );
+        assert_eq!(st.entries, vec![" M README.md".to_string()]);
+    }
+
+    #[test]
+    fn worktree_status_missing_path_is_git_error() {
+        let repo = TestRepo::new();
+
+        let err = worktree_status(&repo.path().join(".worktrees/does-not-exist"))
+            .expect_err("存在しないパスでエラーにならなかった");
+
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn remove_worktree_clean_succeeds_and_keeps_branch() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/clean-remove");
+
+        remove_worktree(repo.path(), &wt, false).expect("clean な worktree の削除に失敗");
+
+        assert!(
+            !wt.exists(),
+            "worktree ディレクトリが残っている: {}",
+            wt.display()
+        );
+        assert!(
+            branch_exists(repo.path(), "session/clean-remove"),
+            "ブランチが削除された。契約 §13: ブランチは残さなければならない"
+        );
+    }
+
+    /// 判定の一致テスト: アプリの dirty 判定と git の拒否は同じ条件でなければならない。
+    /// untracked ファイル 1 個だけのケースで両方を同時に検証する。
+    #[test]
+    fn remove_worktree_untracked_only_is_refused_without_force() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/untracked-remove");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+        assert!(st.dirty, "アプリ側は clean と判定した");
+
+        let err = remove_worktree(repo.path(), &wt, false)
+            .expect_err("untracked ファイルがあるのに非 force 削除が成功した");
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+    }
+
+    #[test]
+    fn remove_worktree_modified_is_refused_without_force() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/modified-remove");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+
+        let err = remove_worktree(repo.path(), &wt, false)
+            .expect_err("未コミット変更があるのに非 force 削除が成功した");
+
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+    }
+
+    #[test]
+    fn remove_worktree_dirty_with_force_succeeds_and_keeps_branch() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/force-remove");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        remove_worktree(repo.path(), &wt, true).expect("force 削除に失敗");
+
+        assert!(!wt.exists(), "worktree ディレクトリが残っている");
+        assert!(
+            branch_exists(repo.path(), "session/force-remove"),
+            "force 削除でブランチまで消えた。契約 §13 違反"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_error_message_contains_raw_git_stderr() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/stderr-check");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let err = remove_worktree(repo.path(), &wt, false).expect_err("削除が成功してしまった");
+
+        match err {
+            AppError::Git(msg) => {
+                // 契約 §6: 加工していない stderr がそのまま入る。
+                // `contains("--force")` だけでは trim や prefix 付与を弁別できない
+                // （レビュー Important 1）ため、行頭・行末も生の stderr と一致することを見る。
+                // 実際の git stderr: "fatal: '<path>' contains modified or untracked
+                // files, use --force to delete it\n"
+                assert!(
+                    msg.contains("--force"),
+                    "git の stderr が加工されている可能性がある: {msg}"
+                );
+                assert!(
+                    msg.starts_with("fatal:"),
+                    "先頭に prefix が付与されている可能性がある: {msg:?}"
+                );
+                assert!(
+                    msg.ends_with('\n'),
+                    "末尾が trim されている可能性がある: {msg:?}"
+                );
+            }
+            other => panic!("想定外のエラー種別: {other:?}"),
+        }
+    }
+
+    /// `run_git` の第 1 引数（cwd）に渡すのは `repo_path` でなければならない。
+    /// `worktree_path` と取り違えても、どちらも「パス」に見えて名前だけでは
+    /// 判別できない（契約 §81.2 カテゴリ 3。レビュー Important 2）ため、
+    /// 2 つの独立したリポジトリを用意して cwd の取り違えを弁別する。
+    /// 正しい実装: repo_b を cwd にして repo_a の worktree を渡すと、git は
+    /// 「is not a working tree」で拒否する（実測済み）。
+    /// 取り違えた実装（cwd=worktree_path）: git は repo_a 自身の中で走るので、
+    /// 対象の worktree はその配下の正当な worktree として削除に成功してしまう。
+    #[test]
+    fn remove_worktree_runs_git_in_repo_path_not_worktree_path() {
+        let repo_a = TestRepo::new();
+        let repo_b = TestRepo::new();
+        let wt_a = repo_a.add_worktree("session/repo-a-wt");
+
+        let err = remove_worktree(repo_b.path(), &wt_a, false)
+            .expect_err("別リポジトリを cwd にしたのに削除が成功した（第 1 引数の取り違えの疑い）");
+
+        match &err {
+            AppError::Git(msg) => {
+                // レビュー Important 3: matches!(err, AppError::Git(_)) だけでは
+                // 「別の理由で無条件に Err を返す」ように実装が変わっても偽陽性で
+                // 緑を維持してしまう（向きが逆のテスト）。期待している失敗理由
+                // そのもの（実測済み: "fatal: '<path>' is not a working tree\n"）
+                // を見て弁別する。
+                assert!(
+                    msg.contains("is not a working tree"),
+                    "期待した失敗理由（cwd 取り違え）ではない可能性がある: {msg:?}"
+                );
+            }
+            other => panic!("想定外のエラー種別: {other:?}"),
+        }
+        assert!(
+            wt_a.exists(),
+            "取り違えにより repo_a の worktree が削除された"
+        );
+    }
+
+    #[test]
+    fn worktree_status_non_git_directory_is_git_error() {
+        // レビュー Important 1: 契約 §6 の主経路（git は起動したが非ゼロ終了 -> 生 stderr）を
+        // worktree_status_missing_path_is_git_error（spawn 失敗経路のみ）は通っていなかった。
+        // TestRepo を使わず、git init していないただの一時ディレクトリを渡す。
+        let dir = tempfile::TempDir::new().expect("tempdir 作成に失敗");
+
+        let err = worktree_status(dir.path())
+            .expect_err("git リポジトリでないディレクトリでエラーにならなかった");
+
+        match err {
+            AppError::Git(msg) => {
+                assert!(
+                    msg.contains("not a git repository"),
+                    "非ゼロ終了時の生 stderr がそのまま入っていない: {msg}"
                 );
             }
             other => panic!("expected AppError::Git, got {other:?}"),

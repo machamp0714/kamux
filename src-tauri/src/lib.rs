@@ -15,7 +15,9 @@ use tauri::{Manager, State, WindowEvent};
 
 use crate::error::{AppError, AppResult};
 use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
-use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
+use crate::model::{
+    CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch, WorktreeStatus,
+};
 use crate::notify::{
     mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
     SessionLabel, ViewKind,
@@ -250,6 +252,53 @@ async fn open_notification_settings() -> AppResult<()> {
         .arg(crate::notify::policy::notification_settings_url())
         .status()
         .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn worktree_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<WorktreeStatus> {
+    worktree_status_from_state(&state, &session_id)
+}
+
+/// `worktree_status` の本体。`State` を剥がしてあるのでそのままユニットテストできる
+/// （`apply_session_patch` / `diagnostics_from_state` と同じ形。M3-4 Task 3 Ruling 16）。
+///
+/// `State<'_, AppState>` はユニットテストから構築できないため、本体をコマンドの中に
+/// 書くと `plan_cleanup` が返す `repo_path` / `worktree_path` の取り違え変異
+/// （契約 §81.2 カテゴリ 3）を弁別できなくなる。
+fn worktree_status_from_state(state: &AppState, session_id: &str) -> AppResult<WorktreeStatus> {
+    let session = state.store.get_session(session_id)?;
+    let project = state.store.get_project(&session.project_id)?;
+    let plan = crate::worktree::plan_cleanup(&session, &project)?;
+    crate::worktree::worktree_status(&plan.worktree_path)
+}
+
+#[tauri::command]
+async fn cleanup_worktree(
+    state: State<'_, AppState>,
+    session_id: String,
+    force: bool,
+) -> AppResult<()> {
+    cleanup_worktree_from_state(&state, &session_id, force)
+}
+
+/// `cleanup_worktree` の本体。`State` を剥がしてあるのでそのままユニットテストできる
+/// （M3-4 Task 3 Ruling 16）。
+///
+/// 契約 §13「削除時の規則」: 削除に成功したときだけ `worktree_path` を NULL に更新し、
+/// `branch` はそのまま残す。`remove_worktree` が失敗したら DB は一切書き換えない。
+fn cleanup_worktree_from_state(state: &AppState, session_id: &str, force: bool) -> AppResult<()> {
+    let session = state.store.get_session(session_id)?;
+    let project = state.store.get_project(&session.project_id)?;
+    let plan = crate::worktree::plan_cleanup(&session, &project)?;
+
+    crate::worktree::remove_worktree(&plan.repo_path, &plan.worktree_path, force)?;
+
+    // 削除できたときだけ DB を更新する。branch はそのまま残す（契約 §13）。
+    state.store.set_worktree_path(session_id, None)?;
     Ok(())
 }
 
@@ -760,6 +809,8 @@ pub fn run() {
             set_visibility_context,
             notification_permission,
             open_notification_settings,
+            worktree_status,
+            cleanup_worktree,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,
@@ -1305,6 +1356,175 @@ mod tests {
         assert!(
             app.try_state::<AppState>().is_none(),
             "前提が崩れている: このテストは AppState 未登録の経路を見ている"
+        );
+    }
+
+    /// `worktree_status` コマンドの本体（Ruling 16）。dirty 判定が
+    /// `plan_cleanup` -> `worktree::worktree_status` まで実際に届くことを見る。
+    #[test]
+    fn worktree_status_from_state_reports_dirty_after_writing_a_file() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/status-check");
+        // `TestRepo::add_worktree` は production の `create_worktree` と違い
+        // `.git/info/exclude` への登録を行わないため、`.worktrees/` は main tree
+        // からは untracked に見える。除外しないと「main tree 側の混入」で
+        // 取り違え変異が副次的に赤くなり、この doc の断定（dirty 判定が
+        // `worktree_path` まで実際に届くこと）を測れない（レビュー Minor 1）。
+        crate::worktree::ensure_worktrees_excluded(repo.path())
+            .expect("worktrees を exclude 登録できなかった");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/status-check".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        session.worktree_path = Some(wt.to_str().expect("utf8").to_string());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        let clean = super::worktree_status_from_state(&state, &session.id).expect("clean status");
+        assert!(!clean.dirty, "変更前なのに dirty 判定された");
+
+        std::fs::write(wt.join("new.txt"), "x\n").expect("write");
+
+        let dirty = super::worktree_status_from_state(&state, &session.id).expect("dirty status");
+        assert!(
+            dirty.dirty,
+            "untracked ファイルがあるのに dirty 判定されない"
+        );
+    }
+
+    /// `cleanup_worktree` コマンドの本体（Ruling 16）。
+    ///
+    /// 削除成功後に worktree ディレクトリが消え、branch は残り、DB の
+    /// worktree_path が NULL に更新されることを 1 本で確認する（契約 §13）。
+    /// `remove_worktree(&plan.repo_path, &plan.worktree_path, force)` の
+    /// 第 1・第 2 引数を取り違える変異はこのテストで赤くなる —— 取り違えると
+    /// cwd が worktree 側になり、main working tree（repo_path）を
+    /// `git worktree remove` しようとして git 自身が拒否するため Err になる。
+    #[test]
+    fn cleanup_worktree_from_state_removes_worktree_keeps_branch_and_clears_db_path() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/cleanup-remove");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/cleanup-remove".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        session.worktree_path = Some(wt.to_str().expect("utf8").to_string());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        super::cleanup_worktree_from_state(&state, &session.id, false).expect("cleanup");
+
+        assert!(
+            !wt.exists(),
+            "worktree ディレクトリが残っている: {}",
+            wt.display()
+        );
+        assert!(
+            crate::worktree::branch_exists(repo.path(), "session/cleanup-remove"),
+            "ブランチが削除された。契約 §13 違反"
+        );
+
+        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        assert_eq!(
+            reloaded.worktree_path, None,
+            "worktree_path が NULL に更新されていない"
+        );
+        assert_eq!(
+            reloaded.branch.as_deref(),
+            Some("session/cleanup-remove"),
+            "branch まで書き換わった。契約 §13 違反"
+        );
+    }
+
+    /// 自己設計変異（候補 1: doc の断定を assert が測っていない形）。
+    ///
+    /// `cleanup_worktree_from_state` の doc コメントは「`remove_worktree` が失敗したら
+    /// DB は一切書き換えない」と断定しているが、上の成功系テストだけではこの断定を
+    /// 測れない。`remove_worktree` の戻り値を握りつぶして常に DB を更新する変異を
+    /// 打つと、成功系テストは緑のまま残ることを実測で確認した（穴があった）。
+    /// このテストはその穴を塞ぐ: 未コミット変更がある worktree に対して非 force で
+    /// 呼び、削除が拒否されたのに `worktree_path` が書き換わっていないことを見る。
+    #[test]
+    fn cleanup_worktree_from_state_leaves_db_untouched_when_remove_worktree_fails() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/cleanup-fails");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("write");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/cleanup-fails".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        let worktree_path_str = wt.to_str().expect("utf8").to_string();
+        session.worktree_path = Some(worktree_path_str.clone());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        let err = super::cleanup_worktree_from_state(&state, &session.id, false)
+            .expect_err("未コミット変更があるのに非 force 削除が成功した");
+        assert!(matches!(err, AppError::Git(_)), "想定外: {err:?}");
+
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        assert_eq!(
+            reloaded.worktree_path,
+            Some(worktree_path_str),
+            "削除に失敗したのに worktree_path が書き換わった。契約 §13 違反"
         );
     }
 
@@ -2991,6 +3211,100 @@ mod tests {
 
             assert_eq!(session_1["sort_order"], json!(1.0));
             assert_eq!(session_2["sort_order"], json!(2.0));
+        }
+
+        // Task 5: update_session コマンド境界で archived_at の double-option 3 分岐
+        // （不在 / 明示 null / 値あり）が Store::update_session まで正しく届くことを固定する。
+        // 分岐 2（不在）が無いと「archived_at を常に上書きする」実装、
+        // 分岐 3 の list_sessions 確認が無いと「戻り値だけ null にしてDBへ書かない」実装が
+        // どちらも通ってしまう。
+        #[test]
+        fn update_session_restores_archived_session_via_explicit_null_over_the_command_boundary() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let session = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "original",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let session_id = session["id"].as_str().expect("session id").to_owned();
+
+            // 分岐 1: 値あり -> アーカイブされる。
+            let archived = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"archived_at": 1_700_000_000_000_i64}}),
+            );
+            assert_eq!(
+                archived["archived_at"],
+                json!(1_700_000_000_000_i64),
+                "値ありの patch はアーカイブとして書き込まれなければならない"
+            );
+            let archived_list = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": false}),
+            );
+            assert_eq!(
+                archived_list.as_array().expect("array").len(),
+                0,
+                "アーカイブ直後は includeArchived: false で 0 件でなければならない"
+            );
+
+            // 分岐 2: 不在（archived_at キーを含めない）-> 変更しない。
+            let renamed = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"title": "renamed"}}),
+            );
+            assert_eq!(
+                renamed["archived_at"],
+                json!(1_700_000_000_000_i64),
+                "archived_at キーを含めない patch はアーカイブ状態を変更してはならない"
+            );
+            assert_eq!(renamed["title"], json!("renamed"));
+
+            // 分岐 3: 明示 null -> クリア（復元）。戻り値だけでなく list_sessions でも確認する。
+            let restored = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"archived_at": null}}),
+            );
+            assert_eq!(
+                restored["archived_at"],
+                json!(null),
+                "明示 null の patch は archived_at を JSON null にクリアしなければならない"
+            );
+            let restored_list = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": false}),
+            );
+            assert_eq!(
+                restored_list.as_array().expect("array").len(),
+                1,
+                "復元は戻り値だけでなく DB にも届いていなければならない \
+                 （includeArchived: false で 1 件返ることが独立な観測）"
+            );
         }
 
         // 変異 4: move_session の toStatus / toIndex が正しくバインドされているか。

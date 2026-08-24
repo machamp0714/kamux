@@ -67,6 +67,13 @@ export interface SessionPatch {
   claude_session_id?: null;
 }
 
+/** worktree の作業ツリー状態（契約 §7.2）。`worktree_status` コマンドの戻り値。 */
+export interface WorktreeStatus {
+  dirty: boolean;
+  /** `git status --porcelain` の行そのまま（例: '?? new.txt', ' M src/a.rs'） */
+  entries: string[];
+}
+
 export type AppErrorCode =
   'db' | 'not_found' | 'pty_spawn' | 'git' | 'cli_not_found' | 'invalid_state' | 'io';
 

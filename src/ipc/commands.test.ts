@@ -5,6 +5,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(
 
 import {
   ackPty,
+  cleanupWorktree,
   createProject,
   createSession,
   getHooksDiagnostics,
@@ -20,6 +21,7 @@ import {
   stopSession,
   suggestBranchName,
   updateSession,
+  worktreeStatus,
   writePty,
   writePtyBytes,
 } from './commands';
@@ -81,11 +83,31 @@ describe('ipc/commands', () => {
     });
   });
 
+  it('updateSession の未指定フィールドはキーごと落ちる（変更しない経路）', async () => {
+    await updateSession('s1', { kanban_status: 'done' });
+
+    const [, args] = invoke.mock.calls[0] as [string, { patch: Record<string, unknown> }];
+    // hasOwnProperty を archived_at だけに限らず、patch のキー集合そのものを固定する。
+    // こうしないと archived_at 以外のフィールド（title / description / sort_order /
+    // heuristics_enabled / silence_timeout_secs / claude_session_id）が無条件に
+    // undefined で注入されても検出できない（toHaveBeenCalledWith は undefined 値の
+    // プロパティを無視するため）。
+    expect(Object.keys(args.patch)).toEqual(['kanban_status']);
+  });
+
   it('listSessions が projectId と includeArchived を渡す', async () => {
     await listSessions('p1', false);
     expect(invoke).toHaveBeenCalledWith('list_sessions', {
       projectId: 'p1',
       includeArchived: false,
+    });
+  });
+
+  it('listSessions は includeArchived が true のときもそのまま渡す（ハードコード禁止）', async () => {
+    await listSessions('p1', true);
+    expect(invoke).toHaveBeenCalledWith('list_sessions', {
+      projectId: 'p1',
+      includeArchived: true,
     });
   });
 
@@ -199,5 +221,24 @@ describe('ipc/commands', () => {
   it('openNotificationSettings が引数なしで invoke する', async () => {
     await openNotificationSettings();
     expect(invoke).toHaveBeenCalledWith('open_notification_settings');
+  });
+
+  it('worktreeStatus が sessionId を camelCase で渡し、戻り値をそのまま返す', async () => {
+    invoke.mockResolvedValue({ dirty: true, entries: ['?? new.txt'] });
+
+    const got = await worktreeStatus('s1');
+
+    expect(invoke).toHaveBeenCalledWith('worktree_status', { sessionId: 's1' });
+    expect(got).toEqual({ dirty: true, entries: ['?? new.txt'] });
+  });
+
+  it('cleanupWorktree が sessionId と force を camelCase で渡す', async () => {
+    await cleanupWorktree('s1', true);
+    expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: true });
+  });
+
+  it('cleanupWorktree は force が false のときもそのまま渡す（ハードコード禁止）', async () => {
+    await cleanupWorktree('s1', false);
+    expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: false });
   });
 });
