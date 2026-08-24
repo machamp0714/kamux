@@ -9,6 +9,7 @@ import type {
   Session,
   SessionMode,
   SessionPatch,
+  WorktreeStatus,
 } from '../types/model';
 
 // invoke を呼んでよいのはこのファイルだけ。コンポーネントもストアもここを経由する。
@@ -110,3 +111,11 @@ export const notificationPermission = (): Promise<NotifyPermission> =>
 
 /** macOS のシステム設定「通知」ペインを開く。 */
 export const openNotificationSettings = (): Promise<void> => invoke('open_notification_settings');
+
+/** worktree の作業ツリー状態を読む（契約 §7.2）。 */
+export const worktreeStatus = (sessionId: string): Promise<WorktreeStatus> =>
+  invoke<WorktreeStatus>('worktree_status', { sessionId });
+
+/** worktree を破棄する。dirty な場合は force が要る。 */
+export const cleanupWorktree = (sessionId: string, force: boolean): Promise<void> =>
+  invoke('cleanup_worktree', { sessionId, force });

@@ -5,6 +5,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: (...args: unknown[]) => invoke(
 
 import {
   ackPty,
+  cleanupWorktree,
   createProject,
   createSession,
   getHooksDiagnostics,
@@ -20,6 +21,7 @@ import {
   stopSession,
   suggestBranchName,
   updateSession,
+  worktreeStatus,
   writePty,
   writePtyBytes,
 } from './commands';
@@ -199,5 +201,19 @@ describe('ipc/commands', () => {
   it('openNotificationSettings が引数なしで invoke する', async () => {
     await openNotificationSettings();
     expect(invoke).toHaveBeenCalledWith('open_notification_settings');
+  });
+
+  it('worktreeStatus が sessionId を camelCase で渡し、戻り値をそのまま返す', async () => {
+    invoke.mockResolvedValue({ dirty: true, entries: ['?? new.txt'] });
+
+    const got = await worktreeStatus('s1');
+
+    expect(invoke).toHaveBeenCalledWith('worktree_status', { sessionId: 's1' });
+    expect(got).toEqual({ dirty: true, entries: ['?? new.txt'] });
+  });
+
+  it('cleanupWorktree が sessionId と force を camelCase で渡す', async () => {
+    await cleanupWorktree('s1', true);
+    expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: true });
   });
 });
