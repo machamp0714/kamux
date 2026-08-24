@@ -15,7 +15,7 @@ fail=0
 asserts=0
 # テスト自身が assert の実数を守る。source した先で set -u に当たってブロックが
 # 丸ごと走らなかった場合、fail=0 のまま exit 0 になるのを防ぐ。
-EXPECTED_ASSERTS=54
+EXPECTED_ASSERTS=69
 
 ok() { asserts=$((asserts + 1)); printf 'ok   %s\n' "$1"; }
 ng() { asserts=$((asserts + 1)); printf 'NG   %s\n' "$1"; fail=1; }
@@ -85,6 +85,27 @@ table_tree="$(
   printf '101 100 00:09:00 5000 /bin/zsh\n'
   printf '102 101 00:08:00 90000 /usr/local/bin/claude\n'
   printf '103 100 00:09:00 2000 /usr/libexec/something\n'
+)"
+
+# テーブル 6: PTY 子孫を持つ kamux ツリー + WebKit ヘルパ 3 本。
+# table_foreign は descendants(1000) = non_pty_pids(1000) = [1000] に縮退していて、
+# 参考値 1 と 参考値 2 が同じ値を印字する。取り違えても出力が 1 文字も変わらないので、
+# 参考値の配線はそのテーブルの上では観測できない。ここでは
+#   参考値 1 = 1000,1004,1005,1006 = 197.3 MB
+#   参考値 2 = 1000,1006           = 104.5 MB
+#   参考値 3 = 統制対象 ∪ 全子孫    = 282.2 MB
+#   K        = 1000               = 102.5 MB
+#   統制値   = 1000,1001,1002,1003 = 187.5 MB
+# の 5 つがすべて別の値になる。
+table_full="$(
+  printf '1000 1 1-00:00:00 105000 /Applications/kamux.app/Contents/MacOS/kamux\n'
+  webkit_row 1001 23:59:51 46000 WebContent
+  webkit_row 1002 23:59:51 27000 GPU
+  webkit_row 1003 23:59:51 14000 Networking
+  printf '1004 1000 23:59:00 5000 /bin/zsh\n'
+  printf '1005 1004 23:58:00 90000 /usr/local/bin/claude\n'
+  printf '1006 1000 23:59:00 2000 /usr/libexec/something\n'
+  webkit_row 2001 1-00:00:09 9000 WebContent
 )"
 
 # ---------------------------------------------------------------- descendants（実プロセス）
@@ -281,6 +302,21 @@ contains "メモリは参考値も併記する" "$out" "参考"
 # 2 回打つと etime が秒単位でずれ、対応づけが静かに崩れる。
 eq "cmd_memory は ps を 1 回だけ打つ" "$(wc -l <"$ps_call_log" | tr -d ' ')" "1"
 
+# 参考値 1 / 2 / 3 と K は、ラベルと値をまたぐ 1 本の部分文字列で見る。
+# 値だけを見ると、参考値 1 と 参考値 2 の集合を取り違えても両方の数が出力に残るので
+# 緑のままになる（§104.2 の参考値はラベルと値が対応していて初めて意味を持つ）。
+out="$(memory_case "$table_full" 2>&1)"
+contains "参考値 1 は kamux ツリー全体（PTY 込み）" "$out" \
+  "参考値 1: kamux ツリー（PTY 込み。WebKit ヘルパは ppid=1 のため含まない） 197.3 MB"
+contains "参考値 2 は PTY 子孫を落とした値" "$out" \
+  "参考値 2: kamux ツリー − PTY 子孫（同上） 104.5 MB"
+# §104.2「ただし子孫を含めた合計値も参考値として必ず併記する」
+contains "参考値 3 は子孫を含めた合計値" "$out" \
+  "参考値 3: 統制対象 4 プロセス + 全子孫（§104.2「子孫を含めた合計値」） 282.2 MB"
+contains "kamux 本体単体の RSS を内訳として出す" "$out" "内訳 kamux 本体単体: 102.5 MB"
+contains "PTY 子孫があっても統制値は 4 プロセスの総和のまま" "$out" "187.5MB (上限 300MB)"
+contains "PTY 子孫を持つツリーでもメモリは PASS" "$out" "exit_code=0"
+
 out="$(memory_case "$table_missing" 2>&1)"
 contains "ヘルパ不足なら メモリは FAIL" "$out" "FAIL"
 lacks "ヘルパ不足なら メモリの PASS を出さない" "$out" "PASS"
@@ -303,6 +339,75 @@ contains "ヘルパ不足なら アイドル CPU は FAIL" "$out" "FAIL"
 eq "ヘルパ不足なら top を走らせない" "$(cat "$top_marker")" ""
 contains "ヘルパ不足なら アイドル CPU で exit_code=1" "$out" "exit_code=1"
 rm -f "$top_marker"
+
+# ---------------------------------------------------------------- cmd_idle_cpu（成功経路）
+# top をシェル関数で差し替えて成功経路を丸ごと通す（関数探索は PATH に優先する）。
+# 偽 top は -l の値を無視して常に 3 ブロック出すので、平均・最大は
+# 「1 ブロック目を捨てているか」だけで決まる。捨てなければ 1 ブロック目の
+# 400.00 が混ざって mean=133.67 / peak=400.00 になる。
+# idle_block <1000 の %CPU> <1001> <1002> <1003>
+idle_block() {
+  printf 'Processes: 512 total, 3 running, 509 sleeping, 2400 threads\n'
+  printf '2026/08/25 06:00:00\n'
+  printf 'Load Avg: 1.50, 1.60, 1.70\n'
+  printf 'CPU usage: 2.10%% user, 3.20%% sys, 94.70%% idle\n'
+  printf 'PhysMem: 16G used (2000M wired), 1000M unused.\n'
+  printf '\n'
+  printf 'PID    %%CPU\n'
+  printf '1000   %s\n' "$1"
+  printf '1001   %s\n' "$2"
+  printf '1002   %s\n' "$3"
+  printf '1003   %s\n' "$4"
+}
+idle_top_args="$(mktemp)"
+# idle_case <block2 の 4 値> <block3 の 4 値>（各引数は空白区切りの 4 個）
+idle_case() {
+  local b2="$1" b3="$2"
+  : >"$idle_top_args"
+  (
+    ps_snapshot() { printf '%s\n' "$table_foreign"; }
+    app_pid() { printf '1000\n'; }
+    top() {
+      # 呼び出しごとに 1 行追記する。2 回走ったら行数が増えて eq が落ちる。
+      printf '%s\n' "$*" >>"$idle_top_args"
+      idle_block 100.00 100.00 100.00 100.00
+      # shellcheck disable=SC2086
+      idle_block $b2
+      # shellcheck disable=SC2086
+      idle_block $b3
+    }
+    cmd_idle_cpu
+    printf 'exit_code=%s\n' "$exit_code"
+  ) 2>&1
+}
+
+# ケース A: block2 = 0.25 / block3 = 0.75 → mean 0.50 / peak 0.75。両方 PASS。
+out="$(idle_case "0.10 0.05 0.05 0.05" "0.30 0.20 0.15 0.10")"
+contains "アイドル CPU 平均は 1 ブロック目を捨てて平均する" "$out" "PASS  アイドルCPU平均 0.50% (上限 1.0%)"
+contains "アイドル CPU 最大は 2 ブロック目以降の最大" "$out" "PASS  アイドルCPU最大 0.75% (上限 5.0%)"
+contains "アイドル CPU が両方上限未満なら exit_code=0" "$out" "exit_code=0"
+# §104.3「top -l 61 -s 1 -stats pid,cpu -pid … を 1 回だけ走らせ」。
+# -pid は統制対象 4 本ぶん渡ること（§104.2 理由 2「2 本しか挙げない手順は数え漏らす」）。
+eq "top は §104.3 の逐語の引数で 1 回だけ走る" "$(cat "$idle_top_args")" \
+  "-l 61 -s 1 -stats pid,cpu -pid 1000 -pid 1001 -pid 1002 -pid 1003"
+# §104.3 の前提。Task 15 の実施者に「操作しない」だけでは足りないことを伝える
+contains "アイドル CPU は §104.3 の 30 秒前提を出す" "$out" "出力が止まって 30 秒以上経過した状態で"
+
+# ケース B: block2 = 2.50 / block3 = 3.50 → mean 3.00 / peak 3.50。
+# 平均は上限 1.0 を超えて FAIL、最大は上限 5.0 未満で PASS。
+# 平均の判定に PEAK_MAX(5.0) を渡すと 3.00% が偽 PASS になる（§104.3 は平均 < 1.0%）。
+out="$(idle_case "1.00 0.60 0.50 0.40" "1.50 1.00 0.60 0.40")"
+contains "平均の上限は 1.0% であり 3.00% は FAIL" "$out" "FAIL  アイドルCPU平均 3.00% (上限 1.0%)"
+contains "最大の上限は 5.0% であり 3.50% は PASS" "$out" "PASS  アイドルCPU最大 3.50% (上限 5.0%)"
+contains "アイドル CPU 平均の超過で exit_code=1" "$out" "exit_code=1"
+rm -f "$idle_top_args"
+
+# ---------------------------------------------------------------- 前提プロトコル
+# Task 15 の実施者はスクリプトのヘッダしか読まない。§104.3 の前提
+# 「出力が止まって 30 秒以上経過した状態で」がそこに無いと、実施者は
+# 「操作しない」だけを満たして測ってしまう。
+eq "前提プロトコルに §104.3 の 30 秒前提が在る" \
+  "$(grep -c 'idle-cpu は出力が止まって 30 秒以上経過した状態で実行する' "$script_dir/measure-perf.sh")" "1"
 
 # ---------------------------------------------------------------- assert 件数の検算
 if [ "$asserts" -ne "$EXPECTED_ASSERTS" ]; then

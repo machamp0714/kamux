@@ -6,6 +6,8 @@
 #   2. startup は kamux を一度終了してから実行する（このスクリプトが自動で終了させる）
 #   3. 他の WebKit ベースのアプリを終了しておくことは必須ではない（§104.6 の 2）。
 #      統制対象の対応づけは起動時刻で行うので、他アプリのヘルパとは区別できる。
+#   4. idle-cpu は出力が止まって 30 秒以上経過した状態で実行する（§104.3 の前提）。
+#      「操作しない」だけでは足りない。claude が出力し続けている最中は測らないこと。
 #
 # 統制値は §104.2 の 4 プロセス（kamux 本体 + com.apple.WebKit.WebContent / .GPU /
 # .Networking）の RSS の総和である。判定はこの 4 プロセスだけで下し、子孫を含めた
@@ -273,6 +275,14 @@ cmd_memory() {
   printf 'INFO  参考値 1: kamux ツリー（PTY 込み。WebKit ヘルパは ppid=1 のため含まない） %s MB\n' "$(rss_mb_in "$table" $tree_all)"
   # shellcheck disable=SC2086
   printf 'INFO  参考値 2: kamux ツリー − PTY 子孫（同上） %s MB\n' "$(rss_mb_in "$table" $non_pty)"
+  # §104.2「ただし子孫を含めた合計値も参考値として必ず併記する」。§104.1 実測 5 が
+  # 「子孫込みの合計値」= プロセスツリー + WebKit ヘルパ（PTY 子孫を引かないもの）と
+  # 定めている。参考値 1 はヘルパ 3 本を落としているのでこの量ではない。
+  # 重複する root は rss_mb_in の want[] が集合なので二重計上しない（sort_pids は dedupe しない）。
+  # shellcheck disable=SC2086
+  printf 'INFO  参考値 3: 統制対象 4 プロセス + 全子孫（§104.2「子孫を含めた合計値」） %s MB\n' "$(rss_mb_in "$table" $measured $tree_all)"
+  # 参考値 1〜3 と統制値の内訳を読み手が導けるように、kamux 本体単体も出す
+  printf 'INFO  内訳 kamux 本体単体: %s MB\n' "$(rss_mb_in "$table" "$root")"
   printf 'INFO  統制対象 PID（§104.2 の 4 プロセス）: %s\n' "$measured"
   # shellcheck disable=SC2086
   verdict "メモリ" "$(rss_mb_in "$table" $measured)" "$MEM_BUDGET_MB" "MB" || exit_code=1
@@ -294,6 +304,9 @@ cmd_idle_cpu() {
     exit_code=1
     return
   fi
+  # §104.3 の前提。「操作しない」だけでは足りない —— claude が出力し続けている
+  # 最中でも操作はしていないので、前提を逐語で出さないと実施者が測ってしまう。
+  printf 'INFO  §104.3 の前提: 出力が止まって 30 秒以上経過した状態で測ること\n'
   printf 'INFO  %s 秒間サンプリングします。この間アプリを操作しないでください\n' "$IDLE_SAMPLES"
 
   local args="" p
