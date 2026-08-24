@@ -115,7 +115,9 @@ describe('ProjectSwitcher', () => {
   });
 
   // 末尾で ArrowDown を押しても最後の候補に留まる（下端のクランプ）。
-  // Math.min(c + 1, matches.length - 1) を Math.min(c + 1, matches.length) にする変異の観測点。
+  // 描画時にも index を clamp しているので、この 1 本だけでは onKeyDown 側の
+  // Math.min(c + 1, matches.length - 1) を緩める変異が緑になる（実測）。次の 1 本が
+  // その分を測る。
   it('末尾で ArrowDown を押しても範囲外にならない', () => {
     const onSelect = vi.fn();
     render(
@@ -132,6 +134,27 @@ describe('ProjectSwitcher', () => {
     fireEvent.keyDown(input, { key: 'ArrowDown' });
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(onSelect).toHaveBeenCalledWith('1'); // alpha, beta, kamux の末尾 = kamux
+  });
+
+  // 末尾より下へ押し込んだ分がカーソルに溜まると、ArrowUp 1 回で戻る先がずれる。
+  // onKeyDown 側のクランプ（Math.min(c + 1, matches.length - 1)）の観測点。
+  it('末尾より下へ押し込んでも余分が溜まらない（ArrowUp 1 回で直前の候補へ戻る）', () => {
+    const onSelect = vi.fn();
+    render(
+      <ProjectSwitcher
+        projects={projects}
+        activeProjectId="1"
+        onSelect={onSelect}
+        onClose={vi.fn()}
+      />,
+    );
+    const input = screen.getByRole('combobox');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    fireEvent.keyDown(input, { key: 'ArrowDown' }); // 末尾（kamux）で頭打ち
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onSelect).toHaveBeenCalledWith('2'); // alpha, beta, kamux の 2 番目 = beta
   });
 
   it('Escape で onClose が呼ばれる', () => {
