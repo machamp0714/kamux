@@ -164,6 +164,24 @@ describe('CleanupWorktreeDialog', () => {
     expect(screen.getByText(/use --force to delete it/)).toBeTruthy();
   });
 
+  // `uiSlice.openCleanupDialog` の catch 節は `{ ...st.cleanupDialog, error: … }` を返し
+  // status を null のままにするので、worktree_status の失敗時のストア状態はまさにこれになる
+  // （git のロック競合・worktree の実体消失で起きる）。取得は終わっているので
+  // 「変更を確認しています…」を出し続けてはならない。
+  it('取得に失敗（status は null のまま error だけ入る）なら取得中の文言を出さず、エラー本文を出し、削除ボタンを無効にする', () => {
+    render(
+      <CleanupWorktreeDialog
+        {...base}
+        status={null}
+        error={"fatal: not a git repository: '/repo/a/.worktrees/session-fix-login/.git'"}
+      />,
+    );
+
+    expect(screen.queryByText('変更を確認しています…')).toBeNull();
+    expect(screen.getByText(/fatal: not a git repository/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: '削除する' })).toHaveProperty('disabled', true);
+  });
+
   it('キャンセルで onCancel が呼ばれる', () => {
     const onCancel = vi.fn();
     render(
