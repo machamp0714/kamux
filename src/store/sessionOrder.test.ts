@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Session } from '../types/model';
-import { buildSessionOrder, KANBAN_STATUSES } from './sessionOrder';
+import { buildSessionOrder, compareSessionOrder, KANBAN_STATUSES } from './sessionOrder';
 
 const s = (over: Partial<Session> & { id: string }): Session => ({
   project_id: 'p1',
@@ -70,5 +70,29 @@ describe('buildSessionOrder', () => {
       'p1',
     );
     expect(order).toEqual({ backlog: ['a'], in_progress: ['b'], review: ['c'], done: ['d'] });
+  });
+
+  // 契約 §144.7 / 裁定 72: (sort_order, id) の全順序。Array.prototype.sort は安定なので
+  // 入力を id 昇順で渡すとタイブレークが無くても緑になる。id 降順で渡して検出する。
+  it('sort_order が同値なら id の昇順でタイブレークする', () => {
+    const order = buildSessionOrder(
+      [s({ id: 'b', sort_order: 1 }), s({ id: 'a', sort_order: 1 })],
+      'p1',
+    );
+    expect(order.backlog).toEqual(['a', 'b']);
+  });
+});
+
+describe('compareSessionOrder', () => {
+  it('sort_order の昇順を返す', () => {
+    expect(
+      compareSessionOrder(s({ id: 'a', sort_order: 1 }), s({ id: 'b', sort_order: 2 })),
+    ).toBeLessThan(0);
+  });
+
+  it('sort_order が同値なら id の昇順でタイブレークする', () => {
+    expect(
+      compareSessionOrder(s({ id: 'b', sort_order: 1 }), s({ id: 'a', sort_order: 1 })),
+    ).toBeGreaterThan(0);
   });
 });

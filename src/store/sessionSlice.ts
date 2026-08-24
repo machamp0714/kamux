@@ -25,7 +25,7 @@ import type {
 } from '../types/model';
 import { surfaceId } from '../types/model';
 import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
-import { buildSessionOrder as buildProjectSessionOrder } from './sessionOrder';
+import { buildSessionOrder as buildProjectSessionOrder, compareSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
 import { toAppError } from './uiSlice';
 
@@ -81,6 +81,12 @@ export interface SessionSlice {
   moveCard: (sessionId: string, to: KanbanStatus, index: number) => Promise<void>;
   editSession: (id: string, patch: SessionPatch) => Promise<Session>;
   archiveSession: (id: string) => Promise<void>;
+  /**
+   * アーカイブ解除。契約 §144.2: 復元位置は update_session が sort_order を変えない
+   * ことで定まる（新コマンドを足さない）。契約 §144.5: 局所挿入（buildSessionOrder
+   * による全列再構築は使わない。他カードの並びは 1 つも変えない）。
+   */
+  restoreSession: (id: string) => Promise<void>;
   applyStateEvent: (p: SessionStatePayload) => void;
   /**
    * last_runtime_state から初期値を埋める。
@@ -258,6 +264,52 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     } catch (e) {
       // 切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で上書きしない。
       // throw はガードと無関係に行う（呼び出し側がエラーを表示する契約は変えない）
+      if (isStillActive()) {
+        set({ sessions: snapshot, sessionOrder: prevOrder });
+      }
+      throw e;
+    }
+  },
+
+  restoreSession: async (id) => {
+    const isStillActive = isStillActiveProject(get);
+    const snapshot = get().sessions;
+    const prevOrder = get().sessionOrder;
+    const target = snapshot[id];
+    if (target === undefined) return;
+
+    // 楽観更新: 局所挿入（archiveSession の局所除去の鏡像。契約 §144.5）。
+    // buildSessionOrder による全列再構築は使わない（moveCard の in-flight 中と
+    // 重なると、他のカードが古い sort_order の位置へ吸着して見えるおそれがある）。
+    const restoredTarget: Session = { ...target, archived_at: null };
+    const column = prevOrder[target.kanban_status];
+    let optimisticOrder = prevOrder;
+    // 冪等性ガード（契約 §144.5 / 裁定 70）: 既に列に居れば挿入しない。
+    // paneInvariant.test.ts の baseline は archived_at: null のセッションに
+    // restoreSession を呼ぶため、ガードが無いと同じ id が列に 2 つ入る。
+    if (!column.includes(id)) {
+      // 挿入位置は (sort_order, id) の全順序で決める（契約 §144.7 / 裁定 72）。
+      // 土台 column の並び自体は 1 つも変えない —— 「column の中で restoredTarget
+      // より全順序上前に来るべき要素の個数」を数えるだけなので、column の並び順が
+      // sort_order 昇順とずれていても（moveCard の楽観更新の in-flight 中に実在する
+      // 状態）、挿入位置は土台の作られ方に依存しない。
+      const insertAt = column.filter(
+        (cid) => compareSessionOrder(snapshot[cid], restoredTarget) < 0,
+      ).length;
+      const nextColumn = [...column];
+      nextColumn.splice(insertAt, 0, id);
+      optimisticOrder = { ...prevOrder, [target.kanban_status]: nextColumn };
+    }
+    set({ sessions: { ...snapshot, [id]: restoredTarget }, sessionOrder: optimisticOrder });
+
+    try {
+      const saved = await updateSessionCmd(id, { archived_at: null });
+      if (isStillActive()) {
+        set({ sessions: { ...get().sessions, [saved.id]: saved } });
+      }
+    } catch (e) {
+      // 切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で上書きしない。
+      // throw はガードと無関係に行う（archiveSession と同じ形）
       if (isStillActive()) {
         set({ sessions: snapshot, sessionOrder: prevOrder });
       }

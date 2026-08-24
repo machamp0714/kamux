@@ -168,6 +168,10 @@ const ARGS: Record<string, unknown[]> = {
   openCleanupDialog: ['s1'],
   closeCleanupDialog: [],
   confirmCleanup: [false],
+  // M3-4 Task 10: アーカイブ / 復元。どちらもフォーカス 3 状態には触れない
+  // （restoreSession は sessions / sessionOrder だけを書く。§144.6）。
+  restoreSession: ['a'],
+  setShowArchived: [true],
 };
 
 function seedBaseline(): void {

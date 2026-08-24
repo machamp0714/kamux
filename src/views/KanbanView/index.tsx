@@ -15,6 +15,7 @@ import { useAppStore } from '../../store';
 import { toAppError } from '../../store/uiSlice';
 import { HooksStatusPanel } from '../../components/HooksStatusPanel';
 import { KANBAN_STATUSES, type Session } from '../../types/model';
+import { ArchivedDrawer } from './ArchivedDrawer';
 import { CleanupWorktreeDialogContainer } from './CleanupWorktreeDialogContainer';
 import { KanbanCard } from './KanbanCard';
 import { KanbanColumn } from './KanbanColumn';
@@ -38,9 +39,15 @@ export function KanbanView() {
   const moveCard = useAppStore((s) => s.moveCard);
   const openModal = useAppStore((s) => s.openModal);
   const setError = useAppStore((s) => s.setError);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  // アーカイブ済みドロワー（M3-4 Task 10）。網羅検査（paneInvariant.test.ts:235）の
+  // 対象にするため uiSlice に置く。hooks 疎通ステータスのドロワー（hooksOpen）は
+  // その検査と無関係なのでローカル state のままにする。
+  const showArchived = useAppStore((s) => s.showArchived);
+  const setShowArchived = useAppStore((s) => s.setShowArchived);
+  const restoreSession = useAppStore((s) => s.restoreSession);
+  const openCleanupDialog = useAppStore((s) => s.openCleanupDialog);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  // ドロワーの開閉はこのビューのローカル state に置く（uiSlice には足さない。
-  // M3-4 の ArchivedDrawer が同じファイルへ showArchived を足す予定のため）。
   const [hooksOpen, setHooksOpen] = useState(false);
 
   const sensors = useSensors(
@@ -75,6 +82,13 @@ export function KanbanView() {
         <div className="kanban-view__actions">
           <button type="button" className="kanban-view__hooks" onClick={() => setHooksOpen(true)}>
             hooks 疎通ステータス
+          </button>
+          <button
+            type="button"
+            className="kanban-view__hooks"
+            onClick={() => setShowArchived(true)}
+          >
+            アーカイブ済み
           </button>
           <button
             type="button"
@@ -143,6 +157,17 @@ export function KanbanView() {
 
       {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。 */}
       <CleanupWorktreeDialogContainer />
+
+      {/* open が false の間は自分で null を返す（M3-4 Task 10）。 */}
+      <ArchivedDrawer
+        open={showArchived}
+        sessions={Object.values(sessions).filter((s) => s.project_id === activeProjectId)}
+        onRestore={(id) => {
+          restoreSession(id).catch((e: unknown) => setError(toAppError(e)));
+        }}
+        onCleanup={(id) => void openCleanupDialog(id)}
+        onClose={() => setShowArchived(false)}
+      />
     </div>
   );
 }

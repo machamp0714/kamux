@@ -34,6 +34,17 @@ describe('uiSlice', () => {
     expect(useAppStore.getState().view).toBe('editor');
   });
 
+  it('showArchived の既定は false', () => {
+    expect(useAppStore.getState().showArchived).toBe(false);
+  });
+
+  it('setShowArchived が showArchived を切り替える', () => {
+    useAppStore.getState().setShowArchived(true);
+    expect(useAppStore.getState().showArchived).toBe(true);
+    useAppStore.getState().setShowArchived(false);
+    expect(useAppStore.getState().showArchived).toBe(false);
+  });
+
   // 始点を 'kanban' と 'editor' の 2 通り検証する。1 つの始点だけだと
   // 「view を無視して固定値にすり替える」変異体を、その固定値と始点が一致した
   // 場合に見逃す。2 通りあれば、変異体が書ける固定値は 1 つしかないため、

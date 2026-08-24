@@ -58,6 +58,9 @@ export interface UiSlice {
   view: ViewKind;
   focusedSessionId: string | null;
   setView: (v: AppStore['view']) => void;
+  /** アーカイブ済みドロワーの開閉（M3-4 Task 10）。 */
+  showArchived: boolean;
+  setShowArchived: (v: boolean) => void;
   /**
    * カードクリック / Enter / 通知クリック（M2-3）の共通の着地点（設計判断 10・要件5）。
    * アクティブペインへ該当セッションを割り当ててから画面を切り替える。
@@ -86,6 +89,9 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
   focusedSessionId: null,
 
   setView: (view) => set({ view }),
+
+  showArchived: false,
+  setShowArchived: (v) => set({ showArchived: v }),
 
   // routeFocusReducer（paneLogic.ts）へ委譲する。もう一方のペインに既に出ている
   // 場合は割当を動かさず activePane だけ移し、それ以外は assignPaneReducer 経由で

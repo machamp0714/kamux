@@ -199,3 +199,34 @@ describe('KanbanView が worktree 掃除ダイアログをマウントする（M
     expect(screen.queryByRole('dialog', { name: 'worktree を掃除' })).toBeNull();
   });
 });
+
+// マウントの 1 行（<ArchivedDrawer />）と開閉ボタンの配線が落ちても、ArchivedDrawer
+// 単体のテストは単体 render なので全緑のまま通る（裁定 69）。呼び出し側をここで見る。
+describe('KanbanView がアーカイブ済みドロワーをマウントする（M3-4 Task 10）', () => {
+  it('showArchived が true ならドロワーの中身が現れる', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ archived_at: 1754006400000 }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByRole('button', { name: '復元' })).toBeInTheDocument();
+  });
+
+  it('「アーカイブ済み」ボタンを押すと showArchived が立つ', () => {
+    useAppStore.setState({
+      sessions: { s1: session({}) },
+      sessionOrder: { backlog: ['s1'], in_progress: [], review: [], done: [] },
+      showArchived: false,
+    });
+
+    render(<KanbanView />);
+    fireEvent.click(screen.getByRole('button', { name: 'アーカイブ済み' }));
+
+    expect(useAppStore.getState().showArchived).toBe(true);
+  });
+});
