@@ -235,7 +235,7 @@ describe('CleanupWorktreeDialog のスクリム（SessionFormModal と同じ形�
     expect(onCancel).not.toHaveBeenCalled();
   });
 
-  it('aria-modal を宣言しない（外側を無効化していないため。KanbanView/index.tsx:92-103 と同じ判断）', () => {
+  it('aria-modal を宣言しない（外側を無効化していないため。kanban-view__drawer と同じ判断）', () => {
     render(<CleanupWorktreeDialog {...base} status={{ dirty: false, entries: [] }} />);
     expect(screen.getByRole('dialog', { name: 'worktree を掃除' })).not.toHaveAttribute(
       'aria-modal',
