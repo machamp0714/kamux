@@ -158,7 +158,8 @@ describe('アーカイブと復元', () => {
 
     // レビュー Important-1: catch 内の isStillActiveProject ガードは、成功経路の鏡像
     // （上のテスト）しか測られていなかった。archiveSession の失敗側の鏡像
-    // （sessionActions.test.ts:201）と同じ形をここに置く。
+    // （sessionActions.test.ts の「失敗し、かつ応答までに切り替わっていたら、B の盤面へ
+    // ロールバックしない。ただし throw はする」テスト）と同じ形をここに置く。
     it('失敗し、かつ応答までに切り替わっていたら、B の盤面へロールバックしない。ただし throw はする', async () => {
       useAppStore.setState({
         sessions: { a: s({ id: 'a', archived_at: 1754006400000 }) },
@@ -209,7 +210,9 @@ describe('アーカイブと復元', () => {
         a: s({ id: 'a', kanban_status: 'done', sort_order: 2, archived_at: 1754006400000 }),
       },
       // sort_order 昇順なら ['y', 'x'] のはずが、意図的にずらしてある
-      // （moveCard の楽観更新が in-flight 中に残す実在の状態。sessionActions.test.ts:227 と同型）。
+      // （moveCard の楽観更新が in-flight 中に残す実在の状態。sessionActions.test.ts の
+      // describe('局所更新であることの判別テスト（buildSessionOrder による全列再構築との区別）')
+      // の doc コメントと同型）。
       sessionOrder: { backlog: [], in_progress: [], review: [], done: ['x', 'y'] },
     });
     updateSession.mockResolvedValue(

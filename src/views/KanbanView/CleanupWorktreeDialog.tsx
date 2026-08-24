@@ -30,7 +30,8 @@ export interface CleanupWorktreeDialogProps {
  * **`aria-modal` は宣言しない。** `KanbanView/index.tsx` の `kanban-view__drawer` と同じ判断である ——
  * `aria-modal` は「外側は無効化されている」と宣言するが、本実装は外側を無効化していない
  * （focus trap も `inert` も無い）。加えて `cleanupDialog` は `uiSlice` の `modal` とは
- * 別フィールドなので `useKeymap.ts:31` の `modalOpen` 判定に乗らず、Escape で閉じる手段も無い。
+ * 別フィールドなので `handleKeymapKeyDown`（`useKeymap.ts`）が組み立てる `modalOpen` 判定に
+ * 乗らず、Escape で閉じる手段も無い。
  * 宣言と実態が食い違うと、支援技術の利用者は外側の内容を隠されたまま慣習的な閉じ方も持たない。
  * 閉じる手段はキャンセルボタンとスクリムの 2 つである。
  */

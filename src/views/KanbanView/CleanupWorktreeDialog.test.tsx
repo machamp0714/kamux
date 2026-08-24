@@ -218,8 +218,10 @@ describe('CleanupWorktreeDialog', () => {
 });
 
 // 裁定 46 で aria-modal を外した結果、閉じる手段はキャンセルボタンとスクリムだけになる
-// （Escape は cleanupDialog が uiSlice の modal とは別フィールドなので keymap.ts:78 に乗らない）。
-// SessionFormModal.tsx:119 と同じ形（backdrop の onMouseDown で閉じ、パネル側で止める）を固定する。
+// （Escape は cleanupDialog が uiSlice の modal とは別フィールドなので resolveKeymap の
+// Escape 分岐（ctx.modalOpen 判定）に乗らない）。
+// SessionFormModal の session-form-modal__backdrop と同じ形
+// （backdrop の onMouseDown で閉じ、パネル側で止める）を固定する。
 describe('CleanupWorktreeDialog のスクリム（SessionFormModal と同じ形）', () => {
   it('スクリムの mouseDown で onCancel が呼ばれる', () => {
     const onCancel = vi.fn();

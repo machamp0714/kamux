@@ -40,7 +40,8 @@ export function KanbanView() {
   const openModal = useAppStore((s) => s.openModal);
   const setError = useAppStore((s) => s.setError);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
-  // アーカイブ済みドロワー（M3-4 Task 10）。網羅検査（paneInvariant.test.ts:235）の
+  // アーカイブ済みドロワー（M3-4 Task 10）。網羅検査（paneInvariant.test.ts の
+  // 「引数表 ARGS が母数（組み立て済みストアの関数型メンバ全体）を覆っている」テスト）の
   // 対象にするため uiSlice に置く。hooks 疎通ステータスのドロワー（hooksOpen）は
   // その検査と無関係なのでローカル state のままにする。
   const showArchived = useAppStore((s) => s.showArchived);
@@ -155,9 +156,6 @@ export function KanbanView() {
         </DragOverlay>
       </DndContext>
 
-      {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。 */}
-      <CleanupWorktreeDialogContainer />
-
       {/* open が false の間は自分で null を返す（M3-4 Task 10）。 */}
       <ArchivedDrawer
         open={showArchived}
@@ -168,6 +166,20 @@ export function KanbanView() {
         onCleanup={(id) => void openCleanupDialog(id)}
         onClose={() => setShowArchived(false)}
       />
+
+      {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。
+          KanbanView 内の他のオーバーレイ（hooks ドロワーのスクリム / ArchivedDrawer）は
+          いずれも .cleanup-worktree-dialog__backdrop と同じ --z-scrim を使うため、同一
+          スタッキングレベルでは tree order が重なり順を決める（CSS 仕様）。ここを最後に
+          マウントすることで、確認ダイアログが KanbanView 内の他のオーバーレイより常に
+          前面へ来るようにする（PR #106 全体レビュー I-1。tokens.css は編集しない —— 契約
+          §53.2 が実装者によるトークンの追加・変更を禁じている）。
+          KanbanView の外にある SessionFormModal（src/App.tsx）との重なりはこの並び順では
+          閉じない。App.tsx 側で KanbanView より後にマウントされているため、今は
+          tree order で SessionFormModal が前に来て問題は起きないが、これは
+          KanbanView の外の並びに依存しており、この並び順の変更だけでは保証されない
+          （直さない。lane-controller が team-lead へ上げる）。 */}
+      <CleanupWorktreeDialogContainer />
     </div>
   );
 }

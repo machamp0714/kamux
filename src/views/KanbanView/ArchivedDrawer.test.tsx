@@ -56,19 +56,21 @@ describe('ArchivedDrawer', () => {
     expect(screen.queryByText('task b')).toBeNull();
   });
 
+  // レビュー I-2: セッション id をフィクスチャで頻用される 'a' と別の値にし、実装が
+  // 渡された id をそのまま転送していることを主張する（定数 'a' 固定でも通る形にしない）。
   it('復元ボタンで onRestore が id 付きで呼ばれる', () => {
     const onRestore = vi.fn();
     render(
       <ArchivedDrawer
         open
-        sessions={[s('a', 1754006400000)]}
+        sessions={[s('restore-drawer-9', 1754006400000)]}
         onRestore={onRestore}
         onCleanup={vi.fn()}
         onClose={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: '復元' }));
-    expect(onRestore).toHaveBeenCalledWith('a');
+    expect(onRestore).toHaveBeenCalledWith('restore-drawer-9');
   });
 
   // 裁定 62: KanbanCardCleanup.tsx と同じ aria-label を持たせ、同じ操作の 2 つの
