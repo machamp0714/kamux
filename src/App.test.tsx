@@ -1,6 +1,20 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
 
+// このプロジェクトに @types/node は入っていない（フロントはブラウザ向け、tsconfig の
+// lib も DOM 系のみ）。vitest 自体は Node 上で動くので `process` は実行時には存在する
+// —— unhandled rejection を検出するテストのためだけに、使う分だけ最小限の型を宣言する。
+declare const process: {
+  on(
+    event: 'unhandledRejection',
+    listener: (reason: unknown, promise: Promise<unknown>) => void,
+  ): void;
+  off(
+    event: 'unhandledRejection',
+    listener: (reason: unknown, promise: Promise<unknown>) => void,
+  ): void;
+};
+
 // 子ビュー/コンポーネントは中身を持たないスタブへ差し替える。
 // 本テストの関心は「ルートがどのフックを呼ぶか」であって描画内容ではない。
 vi.mock('./components/ErrorToast', () => ({ ErrorToast: () => null }));
