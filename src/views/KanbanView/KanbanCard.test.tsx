@@ -205,6 +205,13 @@ describe('KanbanCard と KanbanCardResume の配線（第1部 §4.4）', () => {
 // KanbanCardCleanup も葉として自分で購読する（契約 §25.5 / §38.3）。差し込みの 1 行が
 // 落ちても葉のテストは緑のままなので、KanbanCard の実物を render して呼び出し側を見る。
 describe('KanbanCard と KanbanCardCleanup の配線（M3-4 Task 9）', () => {
+  // KanbanCardResume の describe と同じ流儀で、この describe 用のストアを毎回組み直す。
+  // zustand の setState はファイル内で永続するため、置きっぱなしにすると後続の
+  // describe が掃除ボタンのモックを持ったまま走る。
+  beforeEach(() => {
+    useAppStore.setState({ sessions: {}, openCleanupDialog: vi.fn(async () => undefined) });
+  });
+
   function cleanupTarget(id: string): Session {
     return {
       ...session(id),
