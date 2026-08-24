@@ -29,8 +29,11 @@
 }
 
 /* components.md「ボタン」節の「副」（--bg-hover / --text-primary / 1px solid var(--border)）。
-   画面の主操作は「新規セッション」1 つだけなので、こちらは一段落とす。 */
-.kanban-view__hooks {
+   画面の主操作は「新規セッション」1 つだけなので、こちらは一段落とす。
+   kanban-view__archived（M3-4 Task 10 のアーカイブ済みドロワー開閉ボタン）も
+   同じ副ボタンの扱いなので宣言を共有する。 */
+.kanban-view__hooks,
+.kanban-view__archived {
   padding: var(--space-4) var(--space-7);
   border-radius: var(--radius-md);
   /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */

@@ -85,7 +85,7 @@ export function KanbanView() {
           </button>
           <button
             type="button"
-            className="kanban-view__hooks"
+            className="kanban-view__archived"
             onClick={() => setShowArchived(true)}
           >
             アーカイブ済み
