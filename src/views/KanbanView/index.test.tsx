@@ -250,7 +250,9 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
   // レビュー Important-2: sessions は project_id === activeProjectId で絞る唯一の
   // 防波堤。restoreSession は target.project_id を見ないので、ここが外れると他
   // プロジェクトのアーカイブ済みが挿入可能な状態でドロワーへ混入する。
-  it('ドロワーへ渡す sessions はアクティブプロジェクト（p1）だけに絞る', () => {
+  // 修正ラウンド 2 F-1: activeProjectId を beforeEach の既定 'p1' から動かし、
+  // 実装が activeProjectId の値を読んでいることを主張する（'p1' 固定でも通る形にしない）。
+  it('ドロワーへ渡す sessions はアクティブプロジェクト（p2）だけに絞る', () => {
     useAppStore.setState({
       sessions: {
         s1: session({ id: 's1', title: 'p1 task', project_id: 'p1', archived_at: 1754006400000 }),
@@ -258,12 +260,13 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
       },
       sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
       showArchived: true,
+      activeProjectId: 'p2',
     });
 
     render(<KanbanView />);
 
-    expect(screen.getByText('p1 task')).toBeInTheDocument();
-    expect(screen.queryByText('p2 task')).toBeNull();
+    expect(screen.getByText('p2 task')).toBeInTheDocument();
+    expect(screen.queryByText('p1 task')).toBeNull();
   });
 
   // レビュー Important-3: 閉じる・掃除の配線 4 経路のうち、container 側の 2 経路
@@ -281,11 +284,15 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     expect(useAppStore.getState().showArchived).toBe(false);
   });
 
+  // 修正ラウンド 2 F-2: セッション id をフィクスチャ既定（'s1'）と別の値にし、
+  // 実装が渡された id をそのまま転送していることを主張する（定数 's1' 固定でも
+  // 通る形にしない）。
   it('掃除ボタンを押すと openCleanupDialog がそのセッション ID で呼ばれる', () => {
     const openCleanupDialog = vi.fn(async () => undefined);
     useAppStore.setState({
       sessions: {
-        s1: session({
+        'sess-cleanup-9': session({
+          id: 'sess-cleanup-9',
           mode: 'worktree',
           worktree_path: '/repo/a/.worktrees/session-x',
           archived_at: 1754006400000,
@@ -299,6 +306,6 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     render(<KanbanView />);
     fireEvent.click(screen.getByRole('button', { name: 'worktree を掃除' }));
 
-    expect(openCleanupDialog).toHaveBeenCalledWith('s1');
+    expect(openCleanupDialog).toHaveBeenCalledWith('sess-cleanup-9');
   });
 });
