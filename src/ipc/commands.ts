@@ -127,3 +127,7 @@ export const worktreeStatus = (sessionId: string): Promise<WorktreeStatus> =>
 /** worktree を破棄する。dirty な場合は force が要る。 */
 export const cleanupWorktree = (sessionId: string, force: boolean): Promise<void> =>
   invoke('cleanup_worktree', { sessionId, force });
+
+/** フロントの初回ペイント完了を Rust へ通知する（契約 §0 の起動時間計測点。M3-4 Task 13）。
+ *  `src/App.tsx` が初回ペイント後に 1 回だけ呼ぶ。 */
+export const reportFrontendReady = (): Promise<void> => invoke('report_frontend_ready');

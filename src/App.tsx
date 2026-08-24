@@ -6,6 +6,7 @@ import { useFocusDeepLink } from './hooks/useFocusDeepLink';
 import { useKeymap } from './hooks/useKeymap';
 import { useRuntimeStateEvents } from './hooks/useRuntimeStateEvents';
 import { useVisibilityContext } from './hooks/useVisibilityContext';
+import { reportFrontendReady } from './ipc/commands';
 import { bootstrap, useAppStore } from './store';
 import { selectSessionIdsKey } from './store/sessionSlice';
 import { toAppError } from './store/uiSlice';
@@ -41,6 +42,13 @@ export default function App() {
   useEffect(() => {
     bootstrap().catch((e: unknown) => setError(toAppError(e)));
   }, [setError]);
+
+  useEffect(() => {
+    // requestAnimationFrame で最初のペイントが済んでから記録する（契約 §0 の起動時間
+    // 測定点、M3-4 Task 13）。依存配列は [] —— 再レンダリングのたびに呼ばないこと。
+    const id = requestAnimationFrame(() => void reportFrontendReady());
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   return (
     <div className="app">

@@ -15,6 +15,7 @@ import {
   moveSession,
   notificationPermission,
   openNotificationSettings,
+  reportFrontendReady,
   resizePty,
   setVisibilityContext,
   spawnEditor,
@@ -247,5 +248,14 @@ describe('ipc/commands', () => {
   it('cleanupWorktree は force が false のときもそのまま渡す（ハードコード禁止）', async () => {
     await cleanupWorktree('s1', false);
     expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: false });
+  });
+
+  // 契約 §7.1 が `report_frontend_ready() -> AppResult<()>` を逐語で確定させている
+  // （コメントは「契約 §0 の『起動 1 秒未満』の測定に必須」と動機を添える）。
+  // scripts/measure-perf.sh（Task 14）の grep 対象はこの文字列に依存するため、
+  // 引数なしで正確な名前を渡していることをここで固定する。
+  it('reportFrontendReady が引数なしで report_frontend_ready を invoke する', async () => {
+    await reportFrontendReady();
+    expect(invoke).toHaveBeenCalledWith('report_frontend_ready');
   });
 });
