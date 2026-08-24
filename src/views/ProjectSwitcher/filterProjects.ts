@@ -5,7 +5,7 @@ const PATH_PENALTY = 1000;
 
 /**
  * 大文字小文字を無視したサブシーケンス一致。**小さいほど良い**スコアを返す。
- * スコア = 最初にマッチした位置 + マッチ区間内のギャップ合計。
+ * スコア = 最後にマッチした位置 - (needle の長さ - 1)。
  * マッチしなければ null。
  */
 export function fuzzyScore(haystack: string, needle: string): number | null {
@@ -13,17 +13,14 @@ export function fuzzyScore(haystack: string, needle: string): number | null {
   const h = haystack.toLowerCase();
   const n = needle.toLowerCase();
   let cursor = 0;
-  let first = -1;
   let last = -1;
   for (let i = 0; i < n.length; i += 1) {
     const found = h.indexOf(n[i], cursor);
     if (found === -1) return null;
-    if (first === -1) first = found;
     last = found;
     cursor = found + 1;
   }
-  const gaps = last - first - (n.length - 1);
-  return first + gaps;
+  return last - (n.length - 1);
 }
 
 /** クエリにマッチするプロジェクトを、決定的な順序で返す */
