@@ -289,6 +289,13 @@ mod tests {
     fn worktree_status_clean_worktree_is_not_dirty() {
         let repo = TestRepo::new();
         let wt = repo.add_worktree("session/clean");
+        // add_worktree の doc コメントの断定（canonicalize 済み）を観測するアサーション。
+        // レビュー Important 2: 断定だけで検算が無いと次のリファクタで消えるため。
+        assert_eq!(
+            wt,
+            std::fs::canonicalize(&wt).expect("canonicalize actual"),
+            "add_worktree の戻り値は canonicalize 済みであること"
+        );
 
         let st = worktree_status(&wt).expect("worktree_status が失敗");
 
@@ -346,5 +353,26 @@ mod tests {
             "想定外のエラー種別: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn worktree_status_non_git_directory_is_git_error() {
+        // レビュー Important 1: 契約 §6 の主経路（git は起動したが非ゼロ終了 -> 生 stderr）を
+        // worktree_status_missing_path_is_git_error（spawn 失敗経路のみ）は通っていなかった。
+        // TestRepo を使わず、git init していないただの一時ディレクトリを渡す。
+        let dir = tempfile::TempDir::new().expect("tempdir 作成に失敗");
+
+        let err = worktree_status(dir.path())
+            .expect_err("git リポジトリでないディレクトリでエラーにならなかった");
+
+        match err {
+            AppError::Git(msg) => {
+                assert!(
+                    msg.contains("not a git repository"),
+                    "非ゼロ終了時の生 stderr がそのまま入っていない: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Git, got {other:?}"),
+        }
     }
 }
