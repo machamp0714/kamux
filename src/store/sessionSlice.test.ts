@@ -298,6 +298,33 @@ describe('loadSessions', () => {
     expect(useAppStore.getState().runtimeStates.a1).toBe('waiting_input');
     expect(useAppStore.getState().runtimeStates.b1).toBe('running');
   });
+
+  // 上のテストは runtimeStates しか守っていない。退避・復元ロジックは runtimeStates /
+  // runtimeReasons / runtimeErrors の 3 つの並行フィールドを同じ形で扱っており、
+  // 取り違え（例: runtimeErrors への代入に runtimeReasons のデータを使う）が起きても
+  // runtimeStates 用の assertion だけでは検出できない。runtimeReasons / runtimeErrors も
+  // 具体値で検証する。
+  it('別プロジェクトへ切り替えても、既に読み込んだプロジェクトの runtimeReasons/runtimeErrors は消さない', async () => {
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    await useAppStore.getState().loadSessions('p1');
+    useAppStore.getState().applyStateEvent({
+      session_id: 'a1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_notification',
+    });
+    useAppStore.getState().setRuntimeError('a1', 'boom');
+
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().runtimeReasons.a1).toBe('hook_notification');
+    expect(useAppStore.getState().runtimeErrors.a1).toBe('boom');
+  });
 });
 
 describe('addSession', () => {
