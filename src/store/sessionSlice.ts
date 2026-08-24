@@ -136,8 +136,38 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
         sessionOrder: buildProjectSessionOrder(Object.values(sessions), projectId),
       };
     });
-    // 起動時正規化済みの last_runtime_state から ⏸ を復元する
+    // 起動時正規化済みの last_runtime_state から ⏸ を復元する。
+    // seedRuntimeStates(list, true) の reset は「list に無い id を全部消す」仕様
+    // （契約 §34.6「作り直し」。sessionSlice.test.ts の 'project switch' テストが
+    // その仕様自体を固定している ので、ここでは書き換えない）。
+    // M3-4: setActiveProject は stop_session を呼ばず PTY を維持する（Task 7）ため、
+    // 背景プロジェクトのセッションは動き続け、そのイベントは applyStateEvent 経由で
+    // runtimeStates に届き続ける。reset をそのまま呼ぶと、プロジェクトを切り替える
+    // たびに「今回の list（=切替先プロジェクトの分だけ）」に無い背景プロジェクトの
+    // エントリが消えてしまう。list に無い id のエントリだけ退避 → reset 後に戻す。
+    const before = get();
+    const listIds = new Set(list.map((x) => x.id));
+    const otherProjectStates: [string, RuntimeState][] = Object.entries(
+      before.runtimeStates,
+    ).filter(([id]) => !listIds.has(id));
+    const otherProjectReasons: [string, StateReason][] = Object.entries(
+      before.runtimeReasons,
+    ).filter(([id]) => !listIds.has(id));
+    const otherProjectErrors: [string, string][] = Object.entries(before.runtimeErrors).filter(
+      ([id]) => !listIds.has(id),
+    );
     get().seedRuntimeStates(list, true);
+    if (
+      otherProjectStates.length > 0 ||
+      otherProjectReasons.length > 0 ||
+      otherProjectErrors.length > 0
+    ) {
+      set((st) => ({
+        runtimeStates: { ...Object.fromEntries(otherProjectStates), ...st.runtimeStates },
+        runtimeReasons: { ...Object.fromEntries(otherProjectReasons), ...st.runtimeReasons },
+        runtimeErrors: { ...Object.fromEntries(otherProjectErrors), ...st.runtimeErrors },
+      }));
+    }
   },
 
   addSession: async (args) => {

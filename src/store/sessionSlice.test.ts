@@ -272,6 +272,32 @@ describe('loadSessions', () => {
 
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['existing', 'fresh']);
   });
+
+  // M3-4 PR31 Task 7: PTY を殺さない設計（stop_session を呼ばない）の裏返しとして、
+  // 背景プロジェクトのセッションはバックグラウンドで動き続け、そのイベントは
+  // applyStateEvent 経由で runtimeStates に届き続ける。seedRuntimeStates(list, true)
+  // は list に無い id を全部消す仕様（契約 §34.6「作り直し」）なので、対策なしだと
+  // プロジェクトを切り替えるたびに背景プロジェクトの runtimeStates が消える。
+  it('別プロジェクトへ切り替えても、既に読み込んだプロジェクトの runtimeStates は消さない', async () => {
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    await useAppStore.getState().loadSessions('p1');
+    useAppStore.getState().applyStateEvent({
+      session_id: 'a1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_notification',
+    });
+
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().runtimeStates.a1).toBe('waiting_input');
+    expect(useAppStore.getState().runtimeStates.b1).toBe('running');
+  });
 });
 
 describe('addSession', () => {

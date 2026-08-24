@@ -1,6 +1,6 @@
 import type { StateCreator } from 'zustand';
 import type { AppStore } from './index';
-import type { KanbanStatus, Layout } from '../types/model';
+import type { KanbanStatus, Layout, TerminalWorkspace } from '../types/model';
 import {
   assignPaneReducer,
   cycleSessionReducer,
@@ -28,6 +28,8 @@ export interface TerminalSlice {
   layout: Layout;
   paneAssignment: PaneAssignment;
   activePane: PaneIndex;
+  /** プロジェクトごとに退避したターミナルワークスペース（契約 §28.6。M3-4 projectSlice が読み書きする）。 */
+  workspaceByProject: Record<string, TerminalWorkspace>;
   setLayout: (l: Layout) => void;
   assignPane: (pane: PaneIndex, sessionId: string) => void;
   setActivePane: (pane: PaneIndex) => void;
@@ -51,7 +53,7 @@ const INITIAL: PaneState = {
  * 呼び出し側は get() すなわち AppStore 全体を渡すため、spread にすると
  * ストア全体が set() に流れ込み、他スライスの状態を巻き戻す事故になる。
  */
-const withFocus = (p: PaneState) => ({
+export const withFocus = (p: PaneState) => ({
   layout: p.layout,
   paneAssignment: p.paneAssignment,
   activePane: p.activePane,
@@ -60,6 +62,7 @@ const withFocus = (p: PaneState) => ({
 
 export const createTerminalSlice: StateCreator<AppStore, [], [], TerminalSlice> = (set, get) => ({
   ...INITIAL,
+  workspaceByProject: {},
 
   setLayout: (l) => set(withFocus(setLayoutReducer(get(), l))),
 
