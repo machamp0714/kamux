@@ -76,7 +76,7 @@ export function ProjectBar() {
               type="button"
               className="project-bar__delete"
               aria-label={`${p.name} を削除`}
-              onClick={() => openDeleteProjectDialog(p.id)}
+              onClick={() => void openDeleteProjectDialog(p.id)}
             >
               ×
             </button>

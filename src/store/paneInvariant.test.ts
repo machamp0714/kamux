@@ -188,7 +188,8 @@ const ARGS: Record<string, unknown[]> = {
   closeDeleteProjectDialog: [],
   // M3-4 Task 12: 削除本体。baseline は activeProjectId='p1' / projects=[] なので
   // 「残り 0 件 → 未選択」の経路（契約 §130.5 の 3 ケース目）に入り、盤面を空にする。
-  removeProject: ['p1'],
+  // 第 2 引数は止める対象のセッション id（確認ダイアログが list_sessions で取ったもの）。
+  removeProject: ['p1', []],
 };
 
 function seedBaseline(): void {

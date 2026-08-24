@@ -23,8 +23,13 @@ export interface ProjectSlice {
   /**
    * プロジェクトを削除する（契約 §130.4 / §130.5）。確認ダイアログを通した後に呼ぶこと
    * （契約 §7.1。押した瞬間には呼ばない）。
+   *
+   * `sessionIds` は止める対象で、呼び出し側（確認ダイアログ）が `list_sessions` で
+   * 取ったものを渡す。🔴 ここで `get().sessions` から引き直さないこと —— `loadSessions`
+   * は「置換ではなくマージ」なので、一度も開いていないプロジェクトのセッションは
+   * ストアに 1 件も載っておらず、無差別に回すはずの `stop_session` が 0 件になる。
    */
-  removeProject: (id: string) => Promise<void>;
+  removeProject: (id: string, sessionIds: string[]) => Promise<void>;
 }
 
 export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = (set, get) => ({
@@ -86,7 +91,7 @@ export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = 
     return created;
   },
 
-  removeProject: async (id) => {
+  removeProject: async (id, sessionIds) => {
     // 1. 契約 §130.4: sessions は §3 の ON DELETE CASCADE で消える。行だけが消えて
     //    PTY が生き残ると、どのカードからも辿れない孤児になる。
     //    🔴 稼働中かどうかで分岐しない。stop_session は冪等（契約 §15 / session/mod.rs の
@@ -94,8 +99,8 @@ export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = 
     //    契約 §147.2: runtimeStates の購読を停止処理の分岐に使わないこと ——
     //    使うと「稼働中でないから止めない」という分岐が生まれ、冪等性が担保している
     //    安全性を捨てることになる。
-    const targets = Object.values(get().sessions).filter((s) => s.project_id === id);
-    await Promise.all(targets.map((s) => stopSession(s.id)));
+    //    対象は呼び出し側が list_sessions で取った sessionIds である（doc 参照）。
+    await Promise.all(sessionIds.map((sid) => stopSession(sid)));
 
     // 2. worktree は消さない（契約 §130.4）。§13 が「git branch -D は決して実行しない」と
     //    定めているのと同じ性格の判断で、消す導線は 🧹 = plan_cleanup が既に持つ。

@@ -23,24 +23,24 @@ function isLive(state: RuntimeState | undefined): boolean {
  * 購読しない。両方が購読すると許可リストの行が 2 つ要り、それは移設ではなく追加になる
  * （契約 §147.4）。射程は表示だけで、`stop_session` の分岐には使わない（契約 §147.2）。
  *
+ * 🔴 母数は `deleteProjectDialog.sessions`（opener が `list_sessions` で取ったもの）であって
+ * `st.sessions` ではない。`st.sessions` は開いたことのあるプロジェクトの分しか持たないので、
+ * そこから引くと未訪問プロジェクトの削除で常に「0 件」と出る（契約 §130.4 / §7.1）。
+ *
  * 件数のためにセッション辞書全体を select しないこと —— 無関係なセッションが 1 つ更新
  * されるたびにダイアログが再レンダリングされる。セレクタはプリミティブを返す形にする。
+ * 消える id の一覧は確定時にしか要らないので購読せず、`getState()` で読む。
  */
 export function DeleteProjectDialogContainer(): JSX.Element | null {
   const projectId = useAppStore((s) => s.deleteProjectDialog?.projectId ?? null);
   const projectName = useAppStore((s) => s.projects.find((p) => p.id === projectId)?.name ?? null);
-  const sessionCount = useAppStore((s) =>
-    projectId === null
-      ? 0
-      : Object.values(s.sessions).filter((x) => x.project_id === projectId).length,
-  );
-  const liveCount = useAppStore((s) =>
-    projectId === null
-      ? 0
-      : Object.values(s.sessions).filter(
-          (x) => x.project_id === projectId && isLive(s.runtimeStates[x.id]),
-        ).length,
-  );
+  const sessionCount = useAppStore((s) => s.deleteProjectDialog?.sessions?.length ?? null);
+  const liveCount = useAppStore((s) => {
+    const sessions = s.deleteProjectDialog?.sessions;
+    if (sessions === undefined || sessions === null) return null;
+    return sessions.filter((x) => isLive(s.runtimeStates[x.id])).length;
+  });
+  const error = useAppStore((s) => s.deleteProjectDialog?.error ?? null);
   const closeDeleteProjectDialog = useAppStore((s) => s.closeDeleteProjectDialog);
   const removeProject = useAppStore((s) => s.removeProject);
   const setError = useAppStore((s) => s.setError);
@@ -52,10 +52,15 @@ export function DeleteProjectDialogContainer(): JSX.Element | null {
       projectName={projectName}
       sessionCount={sessionCount}
       liveCount={liveCount}
+      error={error}
       onConfirm={() => {
+        // 止める対象は数えたのと同じリストである（契約 §130.4 の「全セッションへ回す」）。
+        const sessions = useAppStore.getState().deleteProjectDialog?.sessions;
+        if (sessions === undefined || sessions === null) return;
+        const sessionIds = sessions.map((x) => x.id);
         closeDeleteProjectDialog();
         // 失敗は契約 §6 の AppError のままトーストへ流す（§130.6 の日本語ラベルが付く）。
-        removeProject(projectId).catch((e: unknown) => setError(toAppError(e)));
+        removeProject(projectId, sessionIds).catch((e: unknown) => setError(toAppError(e)));
       }}
       onCancel={closeDeleteProjectDialog}
     />

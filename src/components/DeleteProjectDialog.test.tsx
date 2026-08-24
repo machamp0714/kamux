@@ -9,6 +9,7 @@ const props = () => ({
   projectName: 'kamux',
   sessionCount: 3,
   liveCount: 1,
+  error: null,
   onConfirm: vi.fn(),
   onCancel: vi.fn(),
 });
@@ -37,6 +38,52 @@ describe('DeleteProjectDialog', () => {
     // 「出ない」だけを見ると、画面が丸ごと描かれていなくても通る。他が描かれていることを添える。
     expect(screen.getByText('セッション 3 件が一緒に消えます')).toBeTruthy();
     expect(screen.queryByText(/うち稼働中/)).toBeNull();
+  });
+
+  // 契約 §38.3 論点 2 と同じ規律: 知らないときに断定しない。
+  // 「取得中」を 0 件と書くと、破壊操作の確認ダイアログが安心側に嘘をつく。
+  it('件数が取れるまでは件数を主張しない（0 件と書かない。契約 §130.4）', () => {
+    render(<DeleteProjectDialog {...props()} sessionCount={null} liveCount={null} />);
+
+    expect(screen.queryByText(/件が一緒に消えます/)).toBeNull();
+    expect(screen.queryByText(/うち稼働中/)).toBeNull();
+    // 「出ない」だけを見ると画面が丸ごと描かれていなくても通る。代わりに何が出るかを添える。
+    expect(screen.getByText('セッションを数えています…')).toBeTruthy();
+    expect(screen.getByRole('dialog', { name: 'プロジェクトを削除' })).toBeTruthy();
+  });
+
+  it('件数が取れるまでは、チェックを入れても削除を確定できない（契約 §130.4）', () => {
+    const p = props();
+    const { rerender } = render(
+      <DeleteProjectDialog {...p} sessionCount={null} liveCount={null} />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox'));
+    const button = screen.getByRole('button', { name: '削除する' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(p.onConfirm).not.toHaveBeenCalled();
+
+    // 「常に押せない」ではないことを添える。件数が届けば押せる。
+    rerender(<DeleteProjectDialog {...p} sessionCount={0} liveCount={0} />);
+    fireEvent.click(screen.getByRole('button', { name: '削除する' }));
+    expect(p.onConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  // 契約 §6: IPC の生メッセージを加工せず原文で出す（CleanupWorktreeDialog と同じ）。
+  it('件数の取得に失敗したら生メッセージを出し、数えている最中だとは言わない（契約 §6）', () => {
+    render(
+      <DeleteProjectDialog
+        {...props()}
+        sessionCount={null}
+        liveCount={null}
+        error="db is locked"
+      />,
+    );
+
+    expect(screen.getByText('db is locked')).toBeTruthy();
+    expect(screen.queryByText('セッションを数えています…')).toBeNull();
+    expect(screen.queryByText(/件が一緒に消えます/)).toBeNull();
   });
 
   // components.md「モーダル・ダイアログ」節:

@@ -8,6 +8,7 @@ import {
   cleanupWorktree,
   createProject,
   createSession,
+  deleteProject,
   getHooksDiagnostics,
   listProjects,
   listSessions,
@@ -44,6 +45,12 @@ describe('ipc/commands', () => {
   it('listProjects が引数なしで invoke する', async () => {
     await listProjects();
     expect(invoke).toHaveBeenCalledWith('list_projects');
+  });
+
+  // 契約 §7.1 が逐語で `delete_project` を指定している。コマンド名を固定する。
+  it('deleteProject が契約どおりのコマンド名と id 引数で invoke する', async () => {
+    await deleteProject('p1');
+    expect(invoke).toHaveBeenCalledWith('delete_project', { id: 'p1' });
   });
 
   it('createSession が 7 引数すべてを camelCase で渡す', async () => {

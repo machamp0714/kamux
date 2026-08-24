@@ -5,14 +5,21 @@ import './DeleteProjectDialog.css';
 export interface DeleteProjectDialogProps {
   /** 消す対象のプロジェクト名（契約 §130.4）。 */
   projectName: string;
-  /** 一緒に消えるセッション数。`sessions` は契約 §3 の ON DELETE CASCADE で消える。 */
-  sessionCount: number;
+  /**
+   * 一緒に消えるセッション数。`sessions` は契約 §3 の ON DELETE CASCADE で消える。
+   * **null = まだ数えられていない**（`list_sessions` の往復中 or 失敗）。
+   * このとき件数を主張しないこと —— 0 と書くと、破壊操作の確認ダイアログが安心側に嘘をつく。
+   */
+  sessionCount: number | null;
   /**
    * そのうち現在稼働中の件数。数えるのは `DeleteProjectDialogContainer` で、
    * 判定は `CleanupWorktreeDialog.tsx` の `live` と同じ 2 値に揃えてある。
    * `undefined`（実行状態が未知）は数えない —— 知らないときに「動いています」とは言わない。
+   * null = `sessionCount` と同じく、まだ数えられていない。
    */
-  liveCount: number;
+  liveCount: number | null;
+  /** 件数の取得が失敗したときの生メッセージ。加工しない（契約 §6）。 */
+  error: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -33,12 +40,17 @@ export function DeleteProjectDialog({
   projectName,
   sessionCount,
   liveCount,
+  error,
   onConfirm,
   onCancel,
 }: DeleteProjectDialogProps) {
   // components.md「モーダル・ダイアログ」: 不可逆操作は明示的なチェックボックスを通す。
   // プロジェクト行とセッション行は削除すると復元できない（worktree とブランチは残る）。
   const [confirmed, setConfirmed] = useState(false);
+
+  // 何が消えるのか分からないまま確定させない（`CleanupWorktreeDialog` の
+  // `canDelete = status !== null && …` と同じ形）。取得に失敗したままなら確定できない。
+  const canDelete = sessionCount !== null && confirmed;
 
   return (
     <div className="delete-project-dialog__backdrop" onMouseDown={onCancel}>
@@ -62,12 +74,20 @@ export function DeleteProjectDialog({
           {/* components.md「破壊的な確認ダイアログ」: 危険の内訳は --bg-app + 1px solid
               --state-error のブロックへ入れる。本文は赤くしない */}
           <div className="delete-project-dialog__impact">
-            <p className="delete-project-dialog__count">
-              セッション {sessionCount} 件が一緒に消えます
-            </p>
-            {liveCount > 0 && (
+            {/* 知らないときに断定しない（契約 §38.3 論点 2 と同じ規律）。0 件とは書かない */}
+            {sessionCount === null && error === null && (
+              <p className="delete-project-dialog__loading">セッションを数えています…</p>
+            )}
+            {sessionCount !== null && (
+              <p className="delete-project-dialog__count">
+                セッション {sessionCount} 件が一緒に消えます
+              </p>
+            )}
+            {liveCount !== null && liveCount > 0 && (
               <p className="delete-project-dialog__live">うち稼働中 {liveCount} 件</p>
             )}
+            {/* 契約 §6: IPC の生メッセージを加工せず原文で出す */}
+            {error !== null && <pre className="delete-project-dialog__error">{error}</pre>}
           </div>
 
           {/* 契約 §130.4: worktree は消さない。§13 が「git branch -D は決して実行しない」と
@@ -98,7 +118,7 @@ export function DeleteProjectDialog({
           <button
             type="button"
             className="delete-project-dialog__button delete-project-dialog__button--danger"
-            disabled={!confirmed}
+            disabled={!canDelete}
             onClick={onConfirm}
           >
             削除する
