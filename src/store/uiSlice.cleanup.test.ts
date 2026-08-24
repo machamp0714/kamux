@@ -104,4 +104,29 @@ describe('掃除ダイアログ', () => {
       busy: false,
     });
   });
+
+  it('先に開いた s1 の遅延エラーが、後から開いた s2 のダイアログを汚さない', async () => {
+    let rejectS1: (e: { code: string; message: string }) => void = () => {};
+    const s1Response = new Promise<{ dirty: boolean; entries: string[] }>((_resolve, reject) => {
+      rejectS1 = reject;
+    });
+    worktreeStatus.mockImplementation((sessionId: unknown) =>
+      sessionId === 's1' ? s1Response : Promise.resolve({ dirty: false, entries: [] }),
+    );
+
+    const p1 = useAppStore.getState().openCleanupDialog('s1');
+    const p2 = useAppStore.getState().openCleanupDialog('s2');
+    await p2;
+
+    // s2 が先に解決した後で、s1 の遅れたエラーが届く。
+    rejectS1({ code: 'git', message: 'stale error' });
+    await p1;
+
+    expect(useAppStore.getState().cleanupDialog).toEqual({
+      sessionId: 's2',
+      status: { dirty: false, entries: [] },
+      error: null,
+      busy: false,
+    });
+  });
 });
