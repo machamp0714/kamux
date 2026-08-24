@@ -459,14 +459,54 @@ mod tests {
 
         match err {
             AppError::Git(msg) => {
-                // 契約 §6: 加工していない stderr がそのまま入る
+                // 契約 §6: 加工していない stderr がそのまま入る。
+                // `contains("--force")` だけでは trim や prefix 付与を弁別できない
+                // （レビュー Important 1）ため、行頭・行末も生の stderr と一致することを見る。
+                // 実際の git stderr: "fatal: '<path>' contains modified or untracked
+                // files, use --force to delete it\n"
                 assert!(
                     msg.contains("--force"),
                     "git の stderr が加工されている可能性がある: {msg}"
                 );
+                assert!(
+                    msg.starts_with("fatal:"),
+                    "先頭に prefix が付与されている可能性がある: {msg:?}"
+                );
+                assert!(
+                    msg.ends_with('\n'),
+                    "末尾が trim されている可能性がある: {msg:?}"
+                );
             }
             other => panic!("想定外のエラー種別: {other:?}"),
         }
+    }
+
+    /// `run_git` の第 1 引数（cwd）に渡すのは `repo_path` でなければならない。
+    /// `worktree_path` と取り違えても、どちらも「パス」に見えて名前だけでは
+    /// 判別できない（契約 §81.2 カテゴリ 3。レビュー Important 2）ため、
+    /// 2 つの独立したリポジトリを用意して cwd の取り違えを弁別する。
+    /// 正しい実装: repo_b を cwd にして repo_a の worktree を渡すと、git は
+    /// 「is not a working tree」で拒否する（実測済み）。
+    /// 取り違えた実装（cwd=worktree_path）: git は repo_a 自身の中で走るので、
+    /// 対象の worktree はその配下の正当な worktree として削除に成功してしまう。
+    #[test]
+    fn remove_worktree_runs_git_in_repo_path_not_worktree_path() {
+        let repo_a = TestRepo::new();
+        let repo_b = TestRepo::new();
+        let wt_a = repo_a.add_worktree("session/repo-a-wt");
+
+        let err = remove_worktree(repo_b.path(), &wt_a, false)
+            .expect_err("別リポジトリを cwd にしたのに削除が成功した（第 1 引数の取り違えの疑い）");
+
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+        assert!(
+            wt_a.exists(),
+            "取り違えにより repo_a の worktree が削除された"
+        );
     }
 
     #[test]
