@@ -649,4 +649,27 @@ test('.kanban-card__error が実ブラウザで描かれ、生 stderr が原文�
   // margin: 1em 0 が復活していないこと。jsdom は外部 CSS を解決しないため
   // KanbanCardError.test.tsx では原理的に検出できない（このテストの本題）。
   expect(await errorBox.evaluate((el) => getComputedStyle(el).margin)).toBe('0px');
+
+  // 契約 §76.5（M3-4 Task 9）: ❌ のカードは枠が赤くなる。実装は
+  // `.kanban-card:has(.kanban-card__error)` であり、修飾子クラスを持たないので
+  // DOM からは観測できない。:has() の解決も computed style でしか見えないため、
+  // jsdom（KanbanCard.test.tsx）では原理的に検出できずここが唯一の観測点になる。
+  const borderColor = await page
+    .locator('[data-session-id="s1"].kanban-card')
+    .evaluate((el) => getComputedStyle(el).borderTopColor);
+
+  // 上のバッジ spec と同じ probe。var(--state-error) が未解決だと継承チェーンへ
+  // フォールバックして「一見もっともらしい rgb()」を返すため、色値をハードコードせず
+  // 同じトークンを直接参照した probe の解決結果と突き合わせる。
+  const expectedBorderColor = await page.evaluate(() => {
+    const probe = document.createElement('div');
+    probe.style.color = 'var(--state-error)';
+    document.body.appendChild(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  });
+
+  expect(borderColor).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
+  expect(borderColor).toBe(expectedBorderColor);
 });

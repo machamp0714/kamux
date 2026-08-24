@@ -248,6 +248,16 @@
   word-break: break-all;
 }
 
+/* 契約 §76.5: ❌ のカードは枠を赤くする。`.kanban-card--error` の修飾子クラスは作らない
+   —— 付けるには KanbanCard が runtimeStates を購読することになり §25.5 が壊れる。
+   :has() は購読を増やさずに済む唯一の経路である（§76.5）。
+   :has() が解決しない環境では枠が既定のまま残るだけで、エラー本文は
+   .kanban-card__error で従来どおり出る（機能は失われない）。
+   .kanban-card:hover（上）と詳細度が同値なので、順序で勝つよう後ろに置く。 */
+.kanban-card:has(.kanban-card__error) {
+  border-color: var(--state-error);
+}
+
 /* components.md「カード」節: kanban-card__actions は「ホバーで出す」。
    display: none ではなく opacity + pointer-events で隠す —— display: none だと
    ボタンがタブ順から外れ、キーボードで :focus-within に到達する経路自体が無くなる。 */
