@@ -55,9 +55,9 @@ describe('掃除ダイアログ', () => {
     expect(listSessions).toHaveBeenCalledWith('p1', true);
   });
 
-  it('削除に失敗したらダイアログは開いたまま error を出す', async () => {
+  it('削除に失敗したらダイアログは開いたまま error を出す。再試行の開始時点で前回の error を消す', async () => {
     worktreeStatus.mockResolvedValue({ dirty: true, entries: ['?? new.txt'] });
-    cleanupWorktree.mockRejectedValue({
+    cleanupWorktree.mockRejectedValueOnce({
       code: 'git',
       message: "fatal: '/x' contains modified or untracked files, use --force to delete it\n",
     });
@@ -69,6 +69,22 @@ describe('掃除ダイアログ', () => {
     expect(d).not.toBeNull();
     expect(d?.error).toContain('--force');
     expect(d?.busy).toBe(false);
+
+    // 再試行（--force 付き）。cleanupWorktree の解決を手元で止め、開始直後（await 前）の
+    // 状態を覗いて、前回の error が再試行開始と同時に消えていることを確認する。
+    let resolveRetry: () => void = () => {};
+    const retryResponse = new Promise<void>((resolve) => {
+      resolveRetry = resolve;
+    });
+    cleanupWorktree.mockImplementationOnce(() => retryResponse);
+
+    const retryPromise = useAppStore.getState().confirmCleanup(true);
+    expect(useAppStore.getState().cleanupDialog?.busy).toBe(true);
+    expect(useAppStore.getState().cleanupDialog?.error).toBeNull();
+
+    resolveRetry();
+    await retryPromise;
+    expect(useAppStore.getState().cleanupDialog).toBeNull();
   });
 
   it('閉じると状態が消える', async () => {

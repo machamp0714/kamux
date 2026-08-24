@@ -45,6 +45,10 @@ describe('isCleanupSuggested', () => {
     expect(isCleanupSuggested(s({ mode: 'in_place', worktree_path: null }))).toBe(false);
   });
 
+  it('in_place セッションでは worktree_path が非null でも提案しない', () => {
+    expect(isCleanupSuggested(s({ mode: 'in_place', worktree_path: '/repo/x' }))).toBe(false);
+  });
+
   it('掃除済み（worktree_path が null）なら提案しない', () => {
     expect(isCleanupSuggested(s({ worktree_path: null }))).toBe(false);
   });
