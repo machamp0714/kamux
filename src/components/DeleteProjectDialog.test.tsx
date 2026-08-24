@@ -84,6 +84,11 @@ describe('DeleteProjectDialog', () => {
     expect(screen.getByText('db is locked')).toBeTruthy();
     expect(screen.queryByText('セッションを数えています…')).toBeNull();
     expect(screen.queryByText(/件が一緒に消えます/)).toBeNull();
+    // 失敗したままでも確定できない ——「エラーのときだけ通す」逃げ道を作らない。
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect((screen.getByRole('button', { name: '削除する' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
   });
 
   // components.md「モーダル・ダイアログ」節:
