@@ -41,6 +41,8 @@ describe('ProjectSwitcherContainer', () => {
     useAppStore.setState({ projectSwitcherOpen: true });
     render(<ProjectSwitcherContainer />);
     expect(screen.getAllByRole('option')).toHaveLength(2);
+    // 名前順で beta, kamux。activeProjectId='p1'（kamux）が Container から渡っている観測点。
+    expect(screen.getAllByRole('option')[1]).toHaveAttribute('data-active', 'true');
   });
 
   it('候補を選ぶとスイッチャーを閉じ、そのプロジェクトをアクティブにする', async () => {

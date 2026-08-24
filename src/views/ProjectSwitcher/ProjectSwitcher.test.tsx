@@ -33,6 +33,8 @@ describe('ProjectSwitcher', () => {
     const items = screen.getAllByRole('option').map((el) => el.textContent);
     expect(items[0]).toContain('alpha');
     expect(items[2]).toContain('kamux');
+    expect(screen.getAllByRole('option')[2]).toHaveAttribute('data-active', 'true');
+    expect(screen.getAllByRole('option')[0]).toHaveAttribute('data-active', 'false');
   });
 
   it('入力ごとにインクリメンタルに絞り込む', () => {
@@ -44,6 +46,7 @@ describe('ProjectSwitcher', () => {
         onClose={vi.fn()}
       />,
     );
+    expect(screen.getByRole('combobox')).toHaveFocus();
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'kmx' } });
     expect(screen.getAllByRole('option')).toHaveLength(1);
     expect(screen.getByRole('option').textContent).toContain('kamux');
@@ -94,6 +97,8 @@ describe('ProjectSwitcher', () => {
     );
     const input = screen.getByRole('combobox');
     fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(screen.getAllByRole('option')[1]).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getAllByRole('option')[0]).toHaveAttribute('aria-selected', 'false');
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(onSelect).toHaveBeenCalledWith('2'); // alpha -> beta
   });
@@ -155,6 +160,36 @@ describe('ProjectSwitcher', () => {
     fireEvent.keyDown(input, { key: 'ArrowUp' });
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(onSelect).toHaveBeenCalledWith('2'); // alpha, beta, kamux の 2 番目 = beta
+  });
+
+  // 描画時の index クランプ（Math.min(cursor, ...)）の観測点。cursor と index が乖離するのは
+  // projects prop が外から縮んだときだけなので、rerender で縮めて測る。
+  it('候補が外から減るとカーソルが新しい末尾へクランプされる', () => {
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <ProjectSwitcher
+        projects={projects}
+        activeProjectId="1"
+        onSelect={onSelect}
+        onClose={vi.fn()}
+      />,
+    );
+    const input = screen.getByRole('combobox');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    fireEvent.keyDown(input, { key: 'ArrowDown' }); // cursor = 2（alpha, beta, kamux の末尾）
+    rerender(
+      <ProjectSwitcher
+        projects={[projects[1], projects[2]]}
+        activeProjectId="1"
+        onSelect={onSelect}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' });
+    // 残り 2 件は名前順で alpha, beta。cursor=2 は末尾の index=1（beta）へクランプされる。
+    // 上の ArrowDown 2 行を落とすと index=0 の alpha（'3'）になるので、カーソル位置が
+    // この観測に効いている（変異で実測した）。
+    expect(onSelect).toHaveBeenCalledWith('2');
   });
 
   it('Escape で onClose が呼ばれる', () => {
