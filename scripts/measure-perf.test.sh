@@ -280,18 +280,22 @@ lacks "ヘルパ不足なら メモリの PASS を出さない" "$out" "PASS"
 contains "ヘルパ不足なら メモリで exit_code=1" "$out" "exit_code=1"
 
 # ---------------------------------------------------------------- cmd_idle_cpu
+# 偽 top の出力は本番のパイプ（top … | awk）に飲まれて標準出力へ出ない。
+# 「呼ばれたか」はファイルへ記録して観測する。
+top_marker="$(mktemp)"
 out="$(
   (
     ps_snapshot() { printf '%s\n' "$table_missing"; }
     app_pid() { printf '1000\n'; }
-    top() { printf 'TOP-CALLED\n'; }
+    top() { printf 'TOP-CALLED\n' >>"$top_marker"; }
     cmd_idle_cpu
     printf 'exit_code=%s\n' "$exit_code"
   ) 2>&1
 )"
 contains "ヘルパ不足なら アイドル CPU は FAIL" "$out" "FAIL"
-lacks "ヘルパ不足なら top を走らせない" "$out" "TOP-CALLED"
+eq "ヘルパ不足なら top を走らせない" "$(cat "$top_marker")" ""
 contains "ヘルパ不足なら アイドル CPU で exit_code=1" "$out" "exit_code=1"
+rm -f "$top_marker"
 
 # ---------------------------------------------------------------- assert 件数の検算
 if [ "$asserts" -ne "$EXPECTED_ASSERTS" ]; then
