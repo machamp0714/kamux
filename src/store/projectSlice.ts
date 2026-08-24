@@ -97,8 +97,8 @@ export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = 
     const targets = Object.values(get().sessions).filter((s) => s.project_id === id);
     await Promise.all(targets.map((s) => stopSession(s.id)));
 
-    // 2. worktree は消さない（契約 §130.4。§13 の「ブランチは決して削除しない」と
-    //    同じ性格。消す導線は 🧹 = plan_cleanup が既に持つ）。
+    // 2. worktree は消さない（契約 §130.4）。§13 が「git branch -D は決して実行しない」と
+    //    定めているのと同じ性格の判断で、消す導線は 🧹 = plan_cleanup が既に持つ。
     await deleteProject(id);
 
     const remaining = get().projects.filter((p) => p.id !== id);

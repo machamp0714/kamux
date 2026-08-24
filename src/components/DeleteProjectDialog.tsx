@@ -70,8 +70,8 @@ export function DeleteProjectDialog({
             )}
           </div>
 
-          {/* 契約 §130.4: worktree は消さない（§13 の「ブランチは決して削除しない」と
-              同じ性格）。消す導線は 🧹（plan_cleanup）が既に持つ。
+          {/* 契約 §130.4: worktree は消さない。§13 が「git branch -D は決して実行しない」と
+              定めているのと同じ性格の判断で、消す導線は 🧹（plan_cleanup）が既に持つ。
               「安心情報」を緑で出さない —— --text-muted の通常テキストで足りる */}
           <p className="delete-project-dialog__note">
             作業ツリーは残ります。消すにはカードの 🧹 を使ってください。
