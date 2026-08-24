@@ -270,9 +270,9 @@ cmd_memory() {
   tree_all="$(descendants "$root" "$table")"
   non_pty="$(non_pty_pids "$root" "$table")"
   # shellcheck disable=SC2086
-  printf 'INFO  参考値 1: 子孫すべて（PTY 込み） %s MB\n' "$(rss_mb_in "$table" $tree_all)"
+  printf 'INFO  参考値 1: kamux ツリー（PTY 込み。WebKit ヘルパは ppid=1 のため含まない） %s MB\n' "$(rss_mb_in "$table" $tree_all)"
   # shellcheck disable=SC2086
-  printf 'INFO  参考値 2: 子孫 − PTY 子孫        %s MB\n' "$(rss_mb_in "$table" $non_pty)"
+  printf 'INFO  参考値 2: kamux ツリー − PTY 子孫（同上） %s MB\n' "$(rss_mb_in "$table" $non_pty)"
   printf 'INFO  統制対象 PID（§104.2 の 4 プロセス）: %s\n' "$measured"
   # shellcheck disable=SC2086
   verdict "メモリ" "$(rss_mb_in "$table" $measured)" "$MEM_BUDGET_MB" "MB" || exit_code=1
