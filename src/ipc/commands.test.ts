@@ -216,4 +216,9 @@ describe('ipc/commands', () => {
     await cleanupWorktree('s1', true);
     expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: true });
   });
+
+  it('cleanupWorktree は force が false のときもそのまま渡す（ハードコード禁止）', async () => {
+    await cleanupWorktree('s1', false);
+    expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: false });
+  });
 });
