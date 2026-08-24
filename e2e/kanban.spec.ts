@@ -487,8 +487,10 @@ test('起動時復元: activeProjectId の選択・sort_order 順の描画・不
 
   await page.goto('/');
 
-  // localStorage の kamux.activeProjectId が指す 2 件目 (p2) が選択状態
-  await expect(page.getByRole('button', { name: 'proj-2' })).toHaveClass(
+  // localStorage の kamux.activeProjectId が指す 2 件目 (p2) が選択状態。
+  // exact: true が要るのは、M3-4 Task 12 が同じ行へ足した削除ボタンの
+  // aria-label（`proj-2 を削除`）が既定の部分一致にも掛かるためである。
+  await expect(page.getByRole('button', { name: 'proj-2', exact: true })).toHaveClass(
     /project-bar__item--active/,
   );
 
@@ -505,7 +507,8 @@ test('起動時復元: activeProjectId の選択・sort_order 順の描画・不
   await page.reload();
 
   // 先頭のプロジェクト (p1) に落ちて選択状態になり、盤面が描かれる
-  await expect(page.getByRole('button', { name: 'proj-1' })).toHaveClass(
+  // （exact: true の理由は上の proj-2 と同じ）
+  await expect(page.getByRole('button', { name: 'proj-1', exact: true })).toHaveClass(
     /project-bar__item--active/,
   );
   await expect(page.locator('.kanban-view')).toBeVisible();

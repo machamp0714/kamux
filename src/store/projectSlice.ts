@@ -1,8 +1,9 @@
 import type { StateCreator } from 'zustand';
 
-import { createProject, listProjects } from '../ipc/commands';
+import { createProject, deleteProject, listProjects, stopSession } from '../ipc/commands';
 import type { CliKind, Layout, Project } from '../types/model';
 import type { AppStore } from './index';
+import { emptySessionOrder } from './kanbanOrder';
 import { withFocus } from './terminalSlice';
 import { isLayout } from './paneLogic';
 
@@ -19,6 +20,11 @@ export interface ProjectSlice {
   loadProjects: () => Promise<void>;
   setActiveProject: (id: string) => Promise<void>;
   addProject: (name: string, repoPath: string, defaultCli: CliKind) => Promise<Project>;
+  /**
+   * プロジェクトを削除する（契約 §130.4 / §130.5）。確認ダイアログを通した後に呼ぶこと
+   * （契約 §7.1。押した瞬間には呼ばない）。
+   */
+  removeProject: (id: string) => Promise<void>;
 }
 
 export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = (set, get) => ({
@@ -78,5 +84,42 @@ export const createProjectSlice: StateCreator<AppStore, [], [], ProjectSlice> = 
     const created = await createProject(name, repoPath, defaultCli);
     set({ projects: [...get().projects, created] });
     return created;
+  },
+
+  removeProject: async (id) => {
+    // 1. 契約 §130.4: sessions は §3 の ON DELETE CASCADE で消える。行だけが消えて
+    //    PTY が生き残ると、どのカードからも辿れない孤児になる。
+    //    🔴 稼働中かどうかで分岐しない。stop_session は冪等（契約 §15 / session/mod.rs の
+    //    stop_agent_surface）なので、対象プロジェクトの全セッションへ無差別に回す。
+    //    契約 §147.2: runtimeStates の購読を停止処理の分岐に使わないこと ——
+    //    使うと「稼働中でないから止めない」という分岐が生まれ、冪等性が担保している
+    //    安全性を捨てることになる。
+    const targets = Object.values(get().sessions).filter((s) => s.project_id === id);
+    await Promise.all(targets.map((s) => stopSession(s.id)));
+
+    // 2. worktree は消さない（契約 §130.4。§13 の「ブランチは決して削除しない」と
+    //    同じ性格。消す導線は 🧹 = plan_cleanup が既に持つ）。
+    await deleteProject(id);
+
+    const remaining = get().projects.filter((p) => p.id !== id);
+    set({ projects: remaining });
+
+    // 3. 契約 §130.5 の 3 ケース。非アクティブなら activeProjectId は動かさない。
+    if (get().activeProjectId !== id) return;
+
+    if (remaining.length === 0) {
+      // 落とし先が無いので setActiveProject を通せない唯一の経路。盤面を空にする
+      // （§85.1 の focusedSessionId === paneAssignment[activePane] は withFocus が守る）。
+      set({
+        ...withFocus({ layout: 'single', paneAssignment: [null, null], activePane: 0 }),
+        activeProjectId: null,
+        sessionOrder: emptySessionOrder(),
+      });
+      return;
+    }
+
+    // 残りの先頭へ。set({ activeProjectId }) だけで済ませないのは、ワークスペースの退避・
+    // loadSessions・ペイン復元・§85.1 の維持を setActiveProject が持っているためである。
+    await get().setActiveProject(remaining[0].id);
   },
 });

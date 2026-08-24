@@ -76,9 +76,9 @@ export interface UiSlice {
   /** Cmd+P のプロジェクトスイッチャーの開閉（M3-4 Task 12）。 */
   projectSwitcherOpen: boolean;
   /**
-   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog）を閉じる
+   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog / deleteProjectDialog）を閉じる
    * —— 契約 §11.4.2 の Cmd+P 行が「発火する（開いているモーダルを置き換える）」だから。
-   * modal と cleanupDialog は独立フィールドなので、立てるだけだと 2 枚同時に開く。
+   * これらは独立フィールドなので、立てるだけだと 2 枚同時に開く。
    * 閉じるときは projectSwitcherOpen だけを倒す（他のオーバーレイには触れない）。
    */
   setProjectSwitcherOpen: (open: boolean) => void;
@@ -94,6 +94,20 @@ export interface UiSlice {
   closeCleanupDialog: () => void;
   /** cleanup_worktree を確定する。成功したらダイアログを閉じてセッション一覧を取り直す。 */
   confirmCleanup: (force: boolean) => Promise<void>;
+  /**
+   * プロジェクト削除の確認ダイアログの状態（契約 §7.1 / §130.4）。null = 閉じている。
+   * どのプロジェクトを消すのかを持つ。ローカル `useState` ではなくここに置くのは、
+   * §146.3 が「§11.4.2 の『モーダル』は画面を占有する overlay 一般を指す」と定めており、
+   * ストア外に置くと開く側から落とせない overlay（§146.6 の `hooksOpen` と同じ形）を
+   * 増やすことになるため。
+   */
+  deleteProjectDialog: { projectId: string } | null;
+  /**
+   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog / projectSwitcherOpen）を
+   * 閉じる —— 契約 §11.4.2 の「開いているモーダルを置き換える」を §146.3 の読みで満たす。
+   */
+  openDeleteProjectDialog: (projectId: string) => void;
+  closeDeleteProjectDialog: () => void;
 }
 
 export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get) => ({
@@ -128,7 +142,12 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
   setProjectSwitcherOpen: (open) =>
     set(
       open
-        ? { projectSwitcherOpen: true, modal: null, cleanupDialog: null }
+        ? {
+            projectSwitcherOpen: true,
+            modal: null,
+            cleanupDialog: null,
+            deleteProjectDialog: null,
+          }
         : { projectSwitcherOpen: false },
     ),
 
@@ -179,4 +198,16 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
       );
     }
   },
+
+  deleteProjectDialog: null,
+
+  openDeleteProjectDialog: (projectId) =>
+    set({
+      deleteProjectDialog: { projectId },
+      modal: null,
+      cleanupDialog: null,
+      projectSwitcherOpen: false,
+    }),
+
+  closeDeleteProjectDialog: () => set({ deleteProjectDialog: null }),
 });

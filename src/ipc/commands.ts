@@ -22,6 +22,14 @@ export const createProject = (
 
 export const listProjects = (): Promise<Project[]> => invoke('list_projects');
 
+/**
+ * プロジェクトを削除する（契約 §44.2 / §130.4）。`sessions` は §3 の ON DELETE CASCADE で
+ * 一緒に消えるので、呼ぶ前に対象プロジェクトの全セッションへ `stop_session` を回すこと
+ * （行だけが消えて PTY が生き残ると、どのカードからも辿れない孤児になる）。
+ * worktree は消さない —— 消す導線は 🧹（`cleanup_worktree`）が持つ。
+ */
+export const deleteProject = (id: string): Promise<void> => invoke('delete_project', { id });
+
 export interface CreateSessionArgs {
   projectId: string;
   title: string;
