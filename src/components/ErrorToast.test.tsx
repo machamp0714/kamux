@@ -46,6 +46,14 @@ describe('ErrorToast', () => {
     const { container } = render(<ErrorToast />);
     expect(container.querySelector('.error-toast__code')?.textContent).toBe('db');
     expect(container.querySelector('.error-toast__message')?.textContent).toBe('forced');
+    // brief §1(b): .error-toast__label は .error-toast__code と .error-toast__message の
+    // 間に置く（.error-toast__code の直後の兄弟）。
+    expect(container.querySelector('.error-toast__code')?.nextElementSibling).toHaveClass(
+      'error-toast__label',
+    );
+    expect(container.querySelector('.error-toast__label')?.nextElementSibling).toHaveClass(
+      'error-toast__message',
+    );
   });
 
   it('対応表に無い code のときは .error-toast__label を 1 つも描かない', () => {
@@ -53,6 +61,9 @@ describe('ErrorToast', () => {
       lastError: { code: 'unknown_code' as AppErrorCode, message: 'forced' },
     });
     const { container } = render(<ErrorToast />);
+    // トースト自体は描かれていることを先に固定する（さもないと次の assert は
+    // 「label が無い」と「トーストごと無い」を区別できず恒真に近くなる）。
+    expect(container.querySelector('.error-toast__code')?.textContent).toBe('unknown_code');
     expect(container.querySelector('.error-toast__label')).toBeNull();
   });
 });
