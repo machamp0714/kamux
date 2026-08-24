@@ -13,7 +13,7 @@ vi.mock('../../ipc/commands', () => ({
   getHooksDiagnostics: vi.fn(),
 }));
 
-import { getHooksDiagnostics } from '../../ipc/commands';
+import { getHooksDiagnostics, updateSession } from '../../ipc/commands';
 import { useAppStore } from '../../store';
 import type { Session } from '../../types/model';
 import { KanbanView } from './index';
@@ -228,5 +228,22 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     fireEvent.click(screen.getByRole('button', { name: 'アーカイブ済み' }));
 
     expect(useAppStore.getState().showArchived).toBe(true);
+  });
+
+  // onRestore の中身（restoreSession への配線）は ArchivedDrawer.test.tsx では
+  // 見えない（あちらは onRestore を vi.fn() で受けている）。ここでしか測れない。
+  it('復元ボタンを押すと restoreSession（updateSession の呼び出し）に配線されている', async () => {
+    const archived = session({ archived_at: 1754006400000 });
+    useAppStore.setState({
+      sessions: { s1: archived },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+    vi.mocked(updateSession).mockResolvedValue({ ...archived, archived_at: null });
+
+    render(<KanbanView />);
+    fireEvent.click(screen.getByRole('button', { name: '復元' }));
+
+    await waitFor(() => expect(updateSession).toHaveBeenCalledWith('s1', { archived_at: null }));
   });
 });

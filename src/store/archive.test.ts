@@ -196,4 +196,29 @@ describe('アーカイブと復元', () => {
     // より前 → 前に来るべき要素は y の 1 個だけなので index 1 に挿入する。
     expect(useAppStore.getState().sessionOrder.done).toEqual(['x', 'a', 'y']);
   });
+
+  // 挿入探索は compareSessionOrder（sort_order, id の全順序）を使う。sort_order だけの
+  // 比較（タイブレーク無し）に差し替えると、同値同士は常に「0 < 0 = false」となり
+  // insertAt が変わらないケースが多いため、id がタイブレークで前後にまたがる（列の中に
+  // 復元カードより id が小さい要素と大きい要素の両方がある）土台を選んで区別する。
+  it('挿入位置の探索は sort_order 同値のとき id でタイブレークする', async () => {
+    useAppStore.setState({
+      sessions: {
+        a: s({ id: 'a', kanban_status: 'done', sort_order: 2 }),
+        z: s({ id: 'z', kanban_status: 'done', sort_order: 2 }),
+        m: s({ id: 'm', kanban_status: 'done', sort_order: 2, archived_at: 1754006400000 }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: ['a', 'z'] },
+    });
+    updateSession.mockResolvedValue(
+      s({ id: 'm', kanban_status: 'done', sort_order: 2, archived_at: null }),
+    );
+
+    await useAppStore.getState().restoreSession('m');
+
+    // タイブレーク有り: a('a'<'m') は m より前、z('z'>'m') は m より後 → index 1 に挿入。
+    // タイブレーク無し（sort_order だけ）なら diff は常に 0 で「前に来るべき要素」が
+    // 0 件と判定され、index 0 に挿入されてしまう（['m','a','z']）。
+    expect(useAppStore.getState().sessionOrder.done).toEqual(['a', 'm', 'z']);
+  });
 });
