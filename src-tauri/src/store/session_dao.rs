@@ -206,6 +206,20 @@ impl Store {
         Ok(())
     }
 
+    /// worktree 掃除後に `worktree_path` を更新する（M3-4）。`branch` には一切触れない
+    /// （契約 §13「削除時の規則」: 削除成功時は worktree_path を NULL にし、branch は変更しない）。
+    pub fn set_worktree_path(&self, id: &str, path: Option<&str>) -> AppResult<()> {
+        let conn = self.conn()?;
+        let affected = conn.execute(
+            "UPDATE sessions SET worktree_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path, now_ms(), id],
+        )?;
+        if affected == 0 {
+            return Err(AppError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+
     /// SessionStart hook で捕捉した ID を保存（M2-2）。--continue 経路では上書きになる。
     pub fn set_claude_session_id(&self, id: &str, claude_session_id: &str) -> AppResult<()> {
         let conn = self.conn()?;
@@ -1451,6 +1465,49 @@ mod tests {
             fetched.updated_at > 1,
             "updated_at が動いていない（センチネル値 1 のまま）"
         );
+    }
+
+    #[test]
+    fn set_worktree_path_to_null_keeps_branch() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let s = session_with_sentinel_updated_at(&pid, "sid-worktree-path");
+        store.insert_session(&s).expect("insert");
+        store
+            .set_worktree(
+                &s.id,
+                "session/fix-login",
+                "/repo/a/.worktrees/session-fix-login",
+            )
+            .expect("set_worktree");
+
+        store
+            .set_worktree_path(&s.id, None)
+            .expect("worktree_path のクリアに失敗");
+
+        let reloaded = store.get_session(&s.id).expect("再取得に失敗");
+        assert_eq!(
+            reloaded.worktree_path, None,
+            "worktree_path がクリアされていない"
+        );
+        assert_eq!(
+            reloaded.branch.as_deref(),
+            Some("session/fix-login"),
+            "branch まで消えた。契約 §13 違反"
+        );
+    }
+
+    /// Ruling 15: brief 添付テストは 1 本のみで `changed == 0` のガード（4 番目の
+    /// 変異対象）を通らない。存在しない id を渡す経路を独立に固定する。
+    #[test]
+    fn set_worktree_path_rejects_an_unknown_session_id() {
+        let (_dir, store) = open_temp();
+
+        let err = store
+            .set_worktree_path("no-such-session", None)
+            .expect_err("存在しない id が受理された");
+
+        assert!(matches!(err, AppError::NotFound(_)), "想定外: {err:?}");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{AppError, AppResult};
-use crate::model::WorktreeStatus;
+use crate::model::{Project, Session, SessionMode, WorktreeStatus};
 
 pub mod exclude;
 pub mod slug;
@@ -105,10 +105,102 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> A
     Ok(())
 }
 
+/// worktree 掃除に必要なパスの組。DB や Tauri State に触れない純粋な計算（M3-4 Task 3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupPlan {
+    pub repo_path: PathBuf,
+    pub worktree_path: PathBuf,
+}
+
+/// セッションが掃除可能かを判定し、必要なパスを組み立てる。
+/// `in_place` セッションと、すでに掃除済み（`worktree_path == None`）のセッションは
+/// 拒否する（契約 §13「削除時の規則」）。
+pub fn plan_cleanup(session: &Session, project: &Project) -> AppResult<CleanupPlan> {
+    if session.mode == SessionMode::InPlace {
+        return Err(AppError::InvalidState(
+            "in_place セッションには worktree がありません".to_string(),
+        ));
+    }
+    let worktree_path = session.worktree_path.as_ref().ok_or_else(|| {
+        AppError::InvalidState("この worktree はすでに削除されています".to_string())
+    })?;
+    Ok(CleanupPlan {
+        repo_path: PathBuf::from(&project.repo_path),
+        worktree_path: PathBuf::from(worktree_path),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CliKind;
     use crate::worktree::test_support::TestRepo;
+
+    fn dummy_project(repo_path: &str) -> Project {
+        Project {
+            id: "p1".into(),
+            name: "test".into(),
+            repo_path: repo_path.into(),
+            default_cli: CliKind::Claude,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// 裁定 Ruling 12: 直値の 20 フィールドリテラルではなく `Session::new_backlog`
+    /// を通す。フィールドが増減しても呼び出し側は追従できる。
+    fn dummy_session(mode: SessionMode, worktree_path: Option<&str>) -> Session {
+        let mut session = Session::new_backlog(
+            "p1",
+            "fix login",
+            "",
+            mode,
+            Some("session/fix-login".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            0,
+        );
+        session.worktree_path = worktree_path.map(|s| s.to_string());
+        session
+    }
+
+    #[test]
+    fn plan_cleanup_returns_paths_for_worktree_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(
+            SessionMode::Worktree,
+            Some("/repo/a/.worktrees/session-fix-login"),
+        );
+
+        let plan = plan_cleanup(&session, &project).expect("plan_cleanup が失敗");
+
+        assert_eq!(plan.repo_path, PathBuf::from("/repo/a"));
+        assert_eq!(
+            plan.worktree_path,
+            PathBuf::from("/repo/a/.worktrees/session-fix-login")
+        );
+    }
+
+    #[test]
+    fn plan_cleanup_rejects_in_place_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(SessionMode::InPlace, None);
+
+        let err = plan_cleanup(&session, &project).expect_err("in_place が受理された");
+
+        assert!(matches!(err, AppError::InvalidState(_)), "想定外: {err:?}");
+    }
+
+    #[test]
+    fn plan_cleanup_rejects_already_cleaned_session() {
+        let project = dummy_project("/repo/a");
+        let session = dummy_session(SessionMode::Worktree, None);
+
+        let err = plan_cleanup(&session, &project).expect_err("掃除済みが受理された");
+
+        assert!(matches!(err, AppError::InvalidState(_)), "想定外: {err:?}");
+    }
 
     #[test]
     fn run_git_returns_stdout_on_success() {

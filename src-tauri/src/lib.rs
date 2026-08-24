@@ -15,7 +15,9 @@ use tauri::{Manager, State, WindowEvent};
 
 use crate::error::{AppError, AppResult};
 use crate::hooks_srv::{HookSink, HooksRuntime, HooksServer};
-use crate::model::{CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch};
+use crate::model::{
+    CliKind, KanbanStatus, Project, Session, SessionMode, SessionPatch, WorktreeStatus,
+};
 use crate::notify::{
     mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
     SessionLabel, ViewKind,
@@ -250,6 +252,53 @@ async fn open_notification_settings() -> AppResult<()> {
         .arg(crate::notify::policy::notification_settings_url())
         .status()
         .map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn worktree_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<WorktreeStatus> {
+    worktree_status_from_state(&state, &session_id)
+}
+
+/// `worktree_status` の本体。`State` を剥がしてあるのでそのままユニットテストできる
+/// （`apply_session_patch` / `diagnostics_from_state` と同じ形。M3-4 Task 3 Ruling 16）。
+///
+/// `State<'_, AppState>` はユニットテストから構築できないため、本体をコマンドの中に
+/// 書くと `plan_cleanup` が返す `repo_path` / `worktree_path` の取り違え変異
+/// （契約 §81.2 カテゴリ 3）を弁別できなくなる。
+fn worktree_status_from_state(state: &AppState, session_id: &str) -> AppResult<WorktreeStatus> {
+    let session = state.store.get_session(session_id)?;
+    let project = state.store.get_project(&session.project_id)?;
+    let plan = crate::worktree::plan_cleanup(&session, &project)?;
+    crate::worktree::worktree_status(&plan.worktree_path)
+}
+
+#[tauri::command]
+async fn cleanup_worktree(
+    state: State<'_, AppState>,
+    session_id: String,
+    force: bool,
+) -> AppResult<()> {
+    cleanup_worktree_from_state(&state, &session_id, force)
+}
+
+/// `cleanup_worktree` の本体。`State` を剥がしてあるのでそのままユニットテストできる
+/// （M3-4 Task 3 Ruling 16）。
+///
+/// 契約 §13「削除時の規則」: 削除に成功したときだけ `worktree_path` を NULL に更新し、
+/// `branch` はそのまま残す。`remove_worktree` が失敗したら DB は一切書き換えない。
+fn cleanup_worktree_from_state(state: &AppState, session_id: &str, force: bool) -> AppResult<()> {
+    let session = state.store.get_session(session_id)?;
+    let project = state.store.get_project(&session.project_id)?;
+    let plan = crate::worktree::plan_cleanup(&session, &project)?;
+
+    crate::worktree::remove_worktree(&plan.repo_path, &plan.worktree_path, force)?;
+
+    // 削除できたときだけ DB を更新する。branch はそのまま残す（契約 §13）。
+    state.store.set_worktree_path(session_id, None)?;
     Ok(())
 }
 
@@ -760,6 +809,8 @@ pub fn run() {
             set_visibility_context,
             notification_permission,
             open_notification_settings,
+            worktree_status,
+            cleanup_worktree,
             pty::commands::write_pty,
             pty::commands::write_pty_bytes,
             pty::commands::resize_pty,
@@ -1305,6 +1356,114 @@ mod tests {
         assert!(
             app.try_state::<AppState>().is_none(),
             "前提が崩れている: このテストは AppState 未登録の経路を見ている"
+        );
+    }
+
+    /// `worktree_status` コマンドの本体（Ruling 16）。dirty 判定が
+    /// `plan_cleanup` -> `worktree::worktree_status` まで実際に届くことを見る。
+    #[test]
+    fn worktree_status_from_state_reports_dirty_after_writing_a_file() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/status-check");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/status-check".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        session.worktree_path = Some(wt.to_str().expect("utf8").to_string());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        let clean = super::worktree_status_from_state(&state, &session.id).expect("clean status");
+        assert!(!clean.dirty, "変更前なのに dirty 判定された");
+
+        std::fs::write(wt.join("new.txt"), "x\n").expect("write");
+
+        let dirty = super::worktree_status_from_state(&state, &session.id).expect("dirty status");
+        assert!(
+            dirty.dirty,
+            "untracked ファイルがあるのに dirty 判定されない"
+        );
+    }
+
+    /// `cleanup_worktree` コマンドの本体（Ruling 16）。
+    ///
+    /// 削除成功後に worktree ディレクトリが消え、branch は残り、DB の
+    /// worktree_path が NULL に更新されることを 1 本で確認する（契約 §13）。
+    /// `remove_worktree(&plan.repo_path, &plan.worktree_path, force)` の
+    /// 第 1・第 2 引数を取り違える変異はこのテストで赤くなる —— 取り違えると
+    /// cwd が worktree 側になり、main working tree（repo_path）を
+    /// `git worktree remove` しようとして git 自身が拒否するため Err になる。
+    #[test]
+    fn cleanup_worktree_from_state_removes_worktree_keeps_branch_and_clears_db_path() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/cleanup-remove");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/cleanup-remove".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        session.worktree_path = Some(wt.to_str().expect("utf8").to_string());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        super::cleanup_worktree_from_state(&state, &session.id, false).expect("cleanup");
+
+        assert!(
+            !wt.exists(),
+            "worktree ディレクトリが残っている: {}",
+            wt.display()
+        );
+        assert!(
+            crate::worktree::branch_exists(repo.path(), "session/cleanup-remove"),
+            "ブランチが削除された。契約 §13 違反"
+        );
+
+        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        assert_eq!(
+            reloaded.worktree_path, None,
+            "worktree_path が NULL に更新されていない"
+        );
+        assert_eq!(
+            reloaded.branch.as_deref(),
+            Some("session/cleanup-remove"),
+            "branch まで書き換わった。契約 §13 違反"
         );
     }
 
