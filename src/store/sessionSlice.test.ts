@@ -316,14 +316,36 @@ describe('loadSessions', () => {
     });
     useAppStore.getState().setRuntimeError('a1', 'boom');
 
+    // 切替先プロジェクト自身（b1）にも、切替前の時点で PTY イベントが届いているケースを
+    // 再現する。b1 はまだ一度も loadSessions で読み込まれていないが、applyStateEvent は
+    // sessionId さえあれば動く（バックグラウンドで起動済みの PTY からイベントが先に届く経路）。
+    useAppStore.getState().applyStateEvent({
+      session_id: 'b1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_permission',
+    });
+
     listSessions.mockResolvedValueOnce([
-      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running', first_started_at: 1 }),
+      session({
+        id: 'b1',
+        project_id: 'p2',
+        last_runtime_state: 'running',
+        last_runtime_error: 'b1-error',
+        first_started_at: 1,
+      }),
     ]);
     useAppStore.setState({ activeProjectId: 'p2' });
     await useAppStore.getState().loadSessions('p2');
 
     expect(useAppStore.getState().runtimeReasons.a1).toBe('hook_notification');
     expect(useAppStore.getState().runtimeErrors.a1).toBe('boom');
+    // 切替先プロジェクト自身（b1）側: runtimeErrors は seedRuntimeStates(list, true) が
+    // b1 の last_runtime_error からその場で作り直す値なので、具体値で検証できる。
+    expect(useAppStore.getState().runtimeErrors.b1).toBe('b1-error');
+    // runtimeReasons は reset のたびに必ず空へ作り直される仕様（reason は Session の
+    // フィールドではなく PTY イベント由来のため、seedRuntimeStates は復元しない）。
+    // 切替前に積んだ古い reason（'hook_permission'）が残っていないことを確認する。
+    expect(useAppStore.getState().runtimeReasons.b1).toBeUndefined();
   });
 });
 
