@@ -498,11 +498,20 @@ mod tests {
         let err = remove_worktree(repo_b.path(), &wt_a, false)
             .expect_err("別リポジトリを cwd にしたのに削除が成功した（第 1 引数の取り違えの疑い）");
 
-        assert!(
-            matches!(err, AppError::Git(_)),
-            "想定外のエラー種別: {:?}",
-            err
-        );
+        match &err {
+            AppError::Git(msg) => {
+                // レビュー Important 3: matches!(err, AppError::Git(_)) だけでは
+                // 「別の理由で無条件に Err を返す」ように実装が変わっても偽陽性で
+                // 緑を維持してしまう（向きが逆のテスト）。期待している失敗理由
+                // そのもの（実測済み: "fatal: '<path>' is not a working tree\n"）
+                // を見て弁別する。
+                assert!(
+                    msg.contains("is not a working tree"),
+                    "期待した失敗理由（cwd 取り違え）ではない可能性がある: {msg:?}"
+                );
+            }
+            other => panic!("想定外のエラー種別: {other:?}"),
+        }
         assert!(
             wt_a.exists(),
             "取り違えにより repo_a の worktree が削除された"
