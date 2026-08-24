@@ -8,12 +8,14 @@ import {
   cleanupWorktree,
   createProject,
   createSession,
+  deleteProject,
   getHooksDiagnostics,
   listProjects,
   listSessions,
   moveSession,
   notificationPermission,
   openNotificationSettings,
+  reportFrontendReady,
   resizePty,
   setVisibilityContext,
   spawnEditor,
@@ -44,6 +46,12 @@ describe('ipc/commands', () => {
   it('listProjects が引数なしで invoke する', async () => {
     await listProjects();
     expect(invoke).toHaveBeenCalledWith('list_projects');
+  });
+
+  // 契約 §7.1 が逐語で `delete_project` を指定している。コマンド名を固定する。
+  it('deleteProject が契約どおりのコマンド名と id 引数で invoke する', async () => {
+    await deleteProject('p1');
+    expect(invoke).toHaveBeenCalledWith('delete_project', { id: 'p1' });
   });
 
   it('createSession が 7 引数すべてを camelCase で渡す', async () => {
@@ -240,5 +248,14 @@ describe('ipc/commands', () => {
   it('cleanupWorktree は force が false のときもそのまま渡す（ハードコード禁止）', async () => {
     await cleanupWorktree('s1', false);
     expect(invoke).toHaveBeenCalledWith('cleanup_worktree', { sessionId: 's1', force: false });
+  });
+
+  // 契約 §7.1 が `report_frontend_ready() -> AppResult<()>` を逐語で確定させている
+  // （コメントは「契約 §0 の『起動 1 秒未満』の測定に必須」と動機を添える）。
+  // scripts/measure-perf.sh（Task 14）の grep 対象はこの文字列に依存するため、
+  // 引数なしで正確な名前を渡していることをここで固定する。
+  it('reportFrontendReady が引数なしで report_frontend_ready を invoke する', async () => {
+    await reportFrontendReady();
+    expect(invoke).toHaveBeenCalledWith('report_frontend_ready');
   });
 });

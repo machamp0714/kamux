@@ -5,7 +5,7 @@ import type { ViewKind } from '../types/model';
  * 契約 §11 のキーマップ。M1-2 が実装したのは Cmd+1 / Cmd+N と、モーダルを閉じる Escape。
  * M1-3 は Cmd+2 と Cmd+J / Cmd+K を追加した。M3-1 は Cmd+3 を追加した。
  * M3-2 が Cmd+D / Cmd+[ / Cmd+]（と WKWebView 奪取時のフォールバック Cmd+Alt+←/→）を追加する。
- * Cmd+P（M3-4）は後続フェーズでこのユニオンに variant を足す形で追加する。
+ * Cmd+P（M3-4）はこのユニオンの toggle_project_switcher で追加した。
  *
  * 契約 §11.3-4「キー → アクションの対応表の正典は §11 であり、その実装は同時に
  * 1 つだけ存在してよい」により、terminal 画面固有のキーも独立した解決関数へ
@@ -17,7 +17,8 @@ export type KeymapAction =
   | { type: 'close_modal' }
   | { type: 'cycle_session'; dir: 1 | -1 }
   | { type: 'set_active_pane'; pane: PaneIndex }
-  | { type: 'toggle_layout' };
+  | { type: 'toggle_layout' }
+  | { type: 'toggle_project_switcher' };
 
 export interface KeymapEvent {
   key: string;
@@ -67,6 +68,10 @@ export function resolveKeymap(e: KeymapEvent, ctx: KeymapContext): KeymapAction 
     if (e.key === '2') return { type: 'set_view', view: 'terminal' };
     if (e.key === '3') return { type: 'set_view', view: 'editor' };
     if (e.key === 'n' || e.key === 'N') return { type: 'open_create_session' };
+    // 契約 §11.4.2 の Cmd+P 行: view 条件は無し（3 画面で発火）。モーダル表示中も発火する。
+    // 契約 §97.2: 規則 C の 7 キー集合に Cmd+P は入らないので ctrlKey で落とさない。
+    // 規則 S により Shift 併用（key = 'P'）も同じアクションを返す。
+    if (e.key === 'p' || e.key === 'P') return { type: 'toggle_project_switcher' };
     if (e.key === 'j' || e.key === 'J') {
       return ctx.view === 'terminal' && !e.ctrlKey ? { type: 'cycle_session', dir: 1 } : null;
     }

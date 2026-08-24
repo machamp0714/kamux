@@ -1,13 +1,38 @@
 import type { StateCreator } from 'zustand';
 
-import { cleanupWorktree, worktreeStatus } from '../ipc/commands';
-import type { AppError, ViewKind } from '../types/model';
+import { cleanupWorktree, listSessions, worktreeStatus } from '../ipc/commands';
+import type { AppError, Session, ViewKind } from '../types/model';
 import type { CleanupDialogState } from './cleanup';
 import type { AppStore } from './index';
 import { routeFocusReducer } from './paneLogic';
 
-/** 開いているモーダルの種類。M3-4 の Cmd+P で variant を追加する。 */
+/**
+ * 開いているモーダルの種類。Cmd+P のプロジェクトスイッチャーはこのユニオンではなく
+ * 独立した projectSwitcherOpen で持つ（M3-4 Task 12）。
+ */
 export type ModalState = { kind: 'create_session' } | { kind: 'edit_session'; sessionId: string };
+
+/**
+ * プロジェクト削除の確認ダイアログの状態（契約 §130.4）。
+ *
+ * 🔴 消えるセッションを `sessions` として自前で持つ。ストアの `st.sessions` からは引けない
+ * —— `loadSessions` は「置換ではなくマージ」で、呼ばれるのはプロジェクトを開いたときだけ
+ * なので、一度もアクティブにしていないプロジェクトのセッションは 1 件も載っていない。
+ * `st.sessions` を母数にすると、未訪問プロジェクトの削除では DB が `ON DELETE CASCADE`
+ * で N 行消すのに「セッション 0 件が一緒に消えます」と出る —— §7.1 の「確認ダイアログ必須」
+ * が抑止したい破壊に対して、ダイアログが安心側に嘘をつく形になる。
+ */
+export interface DeleteProjectDialogState {
+  projectId: string;
+  /**
+   * 消えるセッション（`list_sessions(projectId, true)` の結果）。
+   * null = 取得中 or 取得失敗。**このとき件数を主張しないこと**（0 件と書かない）——
+   * 知らないときに断定しないのは契約 §38.3 論点 2 と同じ規律である。
+   */
+  sessions: Session[] | null;
+  /** IPC の生メッセージ。加工しない（契約 §6） */
+  error: string | null;
+}
 
 /** nvim エディタサーフェスの状態（M3-1）。EditorView が spawn/live/exited/error を判別するために使う。 */
 export type EditorSurfaceStatus =
@@ -70,6 +95,15 @@ export interface UiSlice {
   modal: ModalState | null;
   /** 副作用: setView('kanban')。Cmd+N はターミナル画面からも効く（契約 §11）。 */
   openModal: (m: ModalState) => void;
+  /** Cmd+P のプロジェクトスイッチャーの開閉（M3-4 Task 12）。 */
+  projectSwitcherOpen: boolean;
+  /**
+   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog / deleteProjectDialog）を閉じる
+   * —— 契約 §11.4.2 の Cmd+P 行が「発火する（開いているモーダルを置き換える）」だから。
+   * これらは独立フィールドなので、立てるだけだと 2 枚同時に開く。
+   * 閉じるときは projectSwitcherOpen だけを倒す（他のオーバーレイには触れない）。
+   */
+  setProjectSwitcherOpen: (open: boolean) => void;
   closeModal: () => void;
   lastError: AppError | null;
   setError: (e: AppError | null) => void;
@@ -82,6 +116,20 @@ export interface UiSlice {
   closeCleanupDialog: () => void;
   /** cleanup_worktree を確定する。成功したらダイアログを閉じてセッション一覧を取り直す。 */
   confirmCleanup: (force: boolean) => Promise<void>;
+  /**
+   * プロジェクト削除の確認ダイアログの状態（契約 §7.1 / §130.4）。null = 閉じている。
+   * ローカル `useState` ではなくここに置くのは、§146.3 が「§11.4.2 の『モーダル』は
+   * 画面を占有する overlay 一般を指す」と定めており、ストア外に置くと開く側から
+   * 落とせない overlay（§146.6 の `hooksOpen` と同じ形）を増やすことになるため。
+   */
+  deleteProjectDialog: DeleteProjectDialogState | null;
+  /**
+   * `list_sessions` を取りに行きつつダイアログを開く（契約 §7.1 / §130.4）。
+   * 開くときは開いている他のオーバーレイ（modal / cleanupDialog / projectSwitcherOpen）を
+   * 閉じる —— 契約 §11.4.2 の「開いているモーダルを置き換える」を §146.3 の読みで満たす。
+   */
+  openDeleteProjectDialog: (projectId: string) => Promise<void>;
+  closeDeleteProjectDialog: () => void;
 }
 
 export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get) => ({
@@ -109,8 +157,29 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
     }),
 
   modal: null,
-  openModal: (m) => set({ modal: m, view: 'kanban' }),
+  openModal: (m) =>
+    set({
+      modal: m,
+      view: 'kanban',
+      cleanupDialog: null,
+      projectSwitcherOpen: false,
+      deleteProjectDialog: null,
+    }),
   closeModal: () => set({ modal: null }),
+
+  projectSwitcherOpen: false,
+  setProjectSwitcherOpen: (open) =>
+    set(
+      open
+        ? {
+            projectSwitcherOpen: true,
+            modal: null,
+            cleanupDialog: null,
+            deleteProjectDialog: null,
+          }
+        : { projectSwitcherOpen: false },
+    ),
+
   lastError: null,
   setError: (e) => set({ lastError: e }),
 
@@ -121,7 +190,12 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
   cleanupDialog: null,
 
   openCleanupDialog: async (sessionId) => {
-    set({ cleanupDialog: { sessionId, status: null, error: null, busy: false } });
+    set({
+      cleanupDialog: { sessionId, status: null, error: null, busy: false },
+      modal: null,
+      projectSwitcherOpen: false,
+      deleteProjectDialog: null,
+    });
     try {
       const status = await worktreeStatus(sessionId);
       set((st) =>
@@ -158,4 +232,33 @@ export const createUiSlice: StateCreator<AppStore, [], [], UiSlice> = (set, get)
       );
     }
   },
+
+  deleteProjectDialog: null,
+
+  openDeleteProjectDialog: async (projectId) => {
+    set({
+      deleteProjectDialog: { projectId, sessions: null, error: null },
+      modal: null,
+      cleanupDialog: null,
+      projectSwitcherOpen: false,
+    });
+    // 契約 §3 の ON DELETE CASCADE はアーカイブ済みの行も消すので、includeArchived は true。
+    // 消えるものを数えるなら母数に入れる（ボードに出るかどうかとは別の問い）。
+    try {
+      const sessions = await listSessions(projectId, true);
+      set((st) =>
+        st.deleteProjectDialog?.projectId === projectId
+          ? { deleteProjectDialog: { ...st.deleteProjectDialog, sessions } }
+          : {},
+      );
+    } catch (e) {
+      set((st) =>
+        st.deleteProjectDialog?.projectId === projectId
+          ? { deleteProjectDialog: { ...st.deleteProjectDialog, error: toAppError(e).message } }
+          : {},
+      );
+    }
+  },
+
+  closeDeleteProjectDialog: () => set({ deleteProjectDialog: null }),
 });

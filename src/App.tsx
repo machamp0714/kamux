@@ -6,12 +6,14 @@ import { useFocusDeepLink } from './hooks/useFocusDeepLink';
 import { useKeymap } from './hooks/useKeymap';
 import { useRuntimeStateEvents } from './hooks/useRuntimeStateEvents';
 import { useVisibilityContext } from './hooks/useVisibilityContext';
+import { reportFrontendReady } from './ipc/commands';
 import { bootstrap, useAppStore } from './store';
 import { selectSessionIdsKey } from './store/sessionSlice';
 import { toAppError } from './store/uiSlice';
 import { EditorView } from './views/EditorView';
 import { KanbanView } from './views/KanbanView';
 import { SessionFormModal } from './views/KanbanView/SessionFormModal';
+import { ProjectSwitcherContainer } from './views/ProjectSwitcher/ProjectSwitcherContainer';
 import { NotificationPermissionBanner } from './views/shared/NotificationPermissionBanner';
 import { TerminalView } from './views/TerminalView';
 import './App.css';
@@ -41,6 +43,18 @@ export default function App() {
     bootstrap().catch((e: unknown) => setError(toAppError(e)));
   }, [setError]);
 
+  useEffect(() => {
+    // requestAnimationFrame で最初のペイントが済んでから記録する（契約 §0 の起動時間
+    // 測定点、M3-4 Task 13）。依存配列は [] —— 再レンダリングのたびに呼ばないこと。
+    // `src-tauri/src/perf.rs` の「失敗しても計測のためだけの機能なのでアプリは止めない」
+    // という設計思想をフロント側にも適用する（修正ラウンド1）。`.catch()` を外すと、
+    // 拒否が unhandled rejection として漏れる（IPC 未初期化時などに実機でも起こりうる）。
+    const id = requestAnimationFrame(() => {
+      reportFrontendReady().catch(() => {});
+    });
+    return () => cancelAnimationFrame(id);
+  }, []);
+
   return (
     <div className="app">
       <ProjectBar />
@@ -48,6 +62,9 @@ export default function App() {
       {view === 'kanban' ? <KanbanView /> : null}
       {view === 'terminal' && <TerminalView />}
       {view === 'editor' && <EditorView />}
+      {/* 同じ --z-scrim を使う 2 枚。tree order が前後を決めるので順序を動かさない
+          （src/App.projectSwitcher.test.tsx が固定している）。 */}
+      <ProjectSwitcherContainer />
       <SessionFormModal />
       <ErrorToast />
     </div>

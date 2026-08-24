@@ -3,6 +3,7 @@ pub mod error;
 pub mod hooks_srv;
 pub mod model;
 pub mod notify;
+pub mod perf;
 pub mod pty;
 pub mod session;
 pub mod state;
@@ -299,6 +300,14 @@ fn cleanup_worktree_from_state(state: &AppState, session_id: &str, force: bool) 
 
     // 削除できたときだけ DB を更新する。branch はそのまま残す（契約 §13）。
     state.store.set_worktree_path(session_id, None)?;
+    Ok(())
+}
+
+/// フロントの初回ペイント完了を記録する。起動時間の正式値はこの計測点
+/// （契約 §0 の「起動 1 秒未満」の測定に必須。契約 §7）。
+#[tauri::command]
+async fn report_frontend_ready() -> AppResult<()> {
+    crate::perf::record("frontend_ready_ms");
     Ok(())
 }
 
@@ -783,12 +792,14 @@ fn init_tracing_subscriber() {
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
+    crate::perf::mark_process_start();
     let app = tauri::Builder::default()
         .setup(|app| {
             init_tracing_subscriber();
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
             let store = Arc::new(Store::open(&db_path()?)?);
             install_app_state(app, store, crate::hooks_srv::bootstrap_hooks);
+            crate::perf::record("rust_setup_ms");
             Ok(())
         })
         .on_window_event(kill_on_window_destroyed)
@@ -820,6 +831,7 @@ pub fn run() {
             session::stop_session,
             session::suggest_branch_name,
             crate::pty::editor::spawn_editor,
+            report_frontend_ready,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build kamux");

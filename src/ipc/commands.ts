@@ -22,6 +22,14 @@ export const createProject = (
 
 export const listProjects = (): Promise<Project[]> => invoke('list_projects');
 
+/**
+ * プロジェクトを削除する（契約 §44.2 / §130.4）。`sessions` は §3 の ON DELETE CASCADE で
+ * 一緒に消えるので、呼ぶ前に対象プロジェクトの全セッションへ `stop_session` を回すこと
+ * （行だけが消えて PTY が生き残ると、どのカードからも辿れない孤児になる）。
+ * worktree は消さない —— 消す導線は 🧹（`cleanup_worktree`）が持つ。
+ */
+export const deleteProject = (id: string): Promise<void> => invoke('delete_project', { id });
+
 export interface CreateSessionArgs {
   projectId: string;
   title: string;
@@ -119,3 +127,7 @@ export const worktreeStatus = (sessionId: string): Promise<WorktreeStatus> =>
 /** worktree を破棄する。dirty な場合は force が要る。 */
 export const cleanupWorktree = (sessionId: string, force: boolean): Promise<void> =>
   invoke('cleanup_worktree', { sessionId, force });
+
+/** フロントの初回ペイント完了を Rust へ通知する（契約 §0 の起動時間計測点。M3-4 Task 13）。
+ *  `src/App.tsx` が初回ペイント後に 1 回だけ呼ぶ。 */
+export const reportFrontendReady = (): Promise<void> => invoke('report_frontend_ready');

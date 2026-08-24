@@ -7,7 +7,7 @@ use serde::Serialize;
 pub enum AppError {
     #[error("db error: {0}")]
     Db(String),
-    #[error("session not found: {0}")]
+    #[error("not found: {0}")]
     NotFound(String),
     #[error("pty spawn failed: {0}")]
     PtySpawn(String),

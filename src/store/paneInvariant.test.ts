@@ -8,11 +8,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../ipc/commands', () => ({
   listProjects: vi.fn(),
   createProject: vi.fn(),
+  deleteProject: vi.fn(),
   listSessions: vi.fn(),
   createSession: vi.fn(),
   updateSession: vi.fn(),
   moveSession: vi.fn(),
   resumeSession: vi.fn(),
+  stopSession: vi.fn(),
 }));
 
 // このファイルの主眼はフォーカス 3 状態の不変条件であり、ptyBridge の実モジュール
@@ -31,10 +33,12 @@ vi.mock('../terminal/ptyBridge', () => ({
 import {
   createProject,
   createSession,
+  deleteProject,
   listProjects,
   listSessions,
   moveSession,
   resumeSession,
+  stopSession,
   updateSession,
   type CreateSessionArgs,
 } from '../ipc/commands';
@@ -106,6 +110,9 @@ const FOCUS_TOUCHING_ACTIONS = new Set([
   'setActivePane',
   'cycleSession',
   'resetTerminalLayout',
+  // M3-4 Task 12: 最後の 1 つを削除して未選択になる経路（契約 §130.5）は盤面を空にするため、
+  // フォーカス 3 状態を実際に書く。baseline は projects: [] なので ARGS はその経路へ入る。
+  'removeProject',
 ]);
 
 const CREATE_SESSION_ARGS: CreateSessionArgs = {
@@ -172,6 +179,19 @@ const ARGS: Record<string, unknown[]> = {
   // （restoreSession は sessions / sessionOrder だけを書く。§144.6）。
   restoreSession: ['a'],
   setShowArchived: [true],
+  // M3-4 Task 12: Cmd+P のプロジェクトスイッチャー。projectSwitcherOpen / modal /
+  // cleanupDialog / deleteProjectDialog だけを書き、フォーカス 3 状態には触れない
+  // （12-B(iii) で deleteProjectDialog も対象に加わった。`uiSlice.ts` の
+  // `setProjectSwitcherOpen` の `set({...})` を実際に読んで確認した）。
+  setProjectSwitcherOpen: [true],
+  // M3-4 Task 12: プロジェクト削除の確認ダイアログ。deleteProjectDialog / modal /
+  // cleanupDialog / projectSwitcherOpen だけを書き、フォーカス 3 状態には触れない。
+  openDeleteProjectDialog: ['p1'],
+  closeDeleteProjectDialog: [],
+  // M3-4 Task 12: 削除本体。baseline は activeProjectId='p1' / projects=[] なので
+  // 「残り 0 件 → 未選択」の経路（契約 §130.5 の 3 ケース目）に入り、盤面を空にする。
+  // 第 2 引数は止める対象のセッション id（確認ダイアログが list_sessions で取ったもの）。
+  removeProject: ['p1', []],
 };
 
 function seedBaseline(): void {
@@ -229,6 +249,10 @@ beforeEach(() => {
   vi.mocked(resumeSession)
     .mockReset()
     .mockImplementation(async (id) => useAppStore.getState().sessions[id] ?? makeSession({ id }));
+  vi.mocked(stopSession)
+    .mockReset()
+    .mockImplementation(async (id) => makeSession({ id }));
+  vi.mocked(deleteProject).mockReset().mockResolvedValue(undefined);
   seedBaseline();
 });
 

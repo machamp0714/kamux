@@ -3,14 +3,18 @@ import { useState } from 'react';
 import { useAppStore } from '../store';
 import { toAppError } from '../store/uiSlice';
 import type { CliKind } from '../types/model';
+import { DeleteProjectDialogContainer } from './DeleteProjectDialogContainer';
 import './ProjectBar.css';
 
 const CLI_KINDS: CliKind[] = ['claude', 'codex', 'shell', 'custom'];
 
 /**
- * 契約 §49.7: 責務は `setActiveProject` による選択と `addProject` による作成の
- * 2 つだけ。M1-1 Task 18 が `App.tsx` にインラインで置いた暫定 UI を移したもので、
- * 新機能ではない。削除の導線はここに足さない（M3-4 Task 12 の担当）。
+ * 契約 §49.7 / §130.3: 責務は `setActiveProject` による選択・`addProject` による作成・
+ * `removeProject` による削除の 3 つ。選択と作成は M1-1 Task 18 が `App.tsx` にインラインで
+ * 置いた暫定 UI を移したもので、新機能ではない。削除の導線は M3-4 Task 12 でここに着地した
+ * —— 契約 §130.3 が「速度のための面（`ProjectSwitcher`）に破壊操作を混ぜない。既に作成
+ * フォームと選択を持つ管理面である `ProjectBar` の隣に並べる」と定めたためである。
+ * 押した瞬間には消さず、確認ダイアログ（`DeleteProjectDialogContainer`）を挟む（契約 §7.1）。
  */
 export function canSubmitProjectForm(values: { name: string; repoPath: string }): boolean {
   return values.name.trim() !== '' && values.repoPath.trim() !== '';
@@ -22,6 +26,9 @@ export function ProjectBar() {
   const setActiveProject = useAppStore((s) => s.setActiveProject);
   const addProject = useAppStore((s) => s.addProject);
   const setError = useAppStore((s) => s.setError);
+  // runtimeStates はここでは購読しない（購読者は DeleteProjectDialogContainer だけ。
+  // 契約 §38.3 の許可リスト / §147.4）。
+  const openDeleteProjectDialog = useAppStore((s) => s.openDeleteProjectDialog);
 
   const [name, setName] = useState('');
   const [repoPath, setRepoPath] = useState('');
@@ -64,6 +71,15 @@ export function ProjectBar() {
             >
               {p.name}
             </button>
+            {/* 契約 §7.1: 押した瞬間には消さない。確認ダイアログを開くだけ。 */}
+            <button
+              type="button"
+              className="project-bar__delete"
+              aria-label={`${p.name} を削除`}
+              onClick={() => void openDeleteProjectDialog(p.id)}
+            >
+              ×
+            </button>
           </li>
         ))}
       </ul>
@@ -102,6 +118,11 @@ export function ProjectBar() {
           Add project
         </button>
       </form>
+
+      {/* 削除ダイアログは ProjectBar の中にマウントする（契約 §130.3）。App.tsx の
+          --z-scrim の層に並ぶ 2 枚（ProjectSwitcherContainer / SessionFormModal）の
+          tree order は動かさない（src/App.projectSwitcher.test.tsx が固定している）。 */}
+      <DeleteProjectDialogContainer />
     </div>
   );
 }

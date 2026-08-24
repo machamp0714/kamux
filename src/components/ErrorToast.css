@@ -28,6 +28,12 @@
   white-space: nowrap;
 }
 
+.error-toast__label {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
 .error-toast__message {
   margin: 0;
   white-space: pre-wrap;

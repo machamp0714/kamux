@@ -20,6 +20,11 @@
   list-style: none;
 }
 
+.project-bar__list li {
+  display: flex;
+  align-items: center;
+}
+
 .project-bar__item {
   padding: var(--space-3) var(--space-5);
   border-radius: var(--radius-md);
@@ -32,6 +37,24 @@
 .project-bar__item--active {
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+/* 破壊的操作は専用色を新設せず --state-error を使う（色の系統は 2 つだけ）。
+   常時赤いと帯がうるさいので、既定は --text-muted でホバー時に --state-error にする。 */
+.project-bar__delete {
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+  cursor: pointer;
+}
+
+.project-bar__delete:hover {
+  background: var(--bg-hover);
+  color: var(--state-error);
 }
 
 .project-bar__form {
