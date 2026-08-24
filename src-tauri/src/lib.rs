@@ -1467,6 +1467,60 @@ mod tests {
         );
     }
 
+    /// 自己設計変異（候補 1: doc の断定を assert が測っていない形）。
+    ///
+    /// `cleanup_worktree_from_state` の doc コメントは「`remove_worktree` が失敗したら
+    /// DB は一切書き換えない」と断定しているが、上の成功系テストだけではこの断定を
+    /// 測れない。`remove_worktree` の戻り値を握りつぶして常に DB を更新する変異を
+    /// 打つと、成功系テストは緑のまま残ることを実測で確認した（穴があった）。
+    /// このテストはその穴を塞ぐ: 未コミット変更がある worktree に対して非 force で
+    /// 呼び、削除が拒否されたのに `worktree_path` が書き換わっていないことを見る。
+    #[test]
+    fn cleanup_worktree_from_state_leaves_db_untouched_when_remove_worktree_fails() {
+        use crate::worktree::test_support::TestRepo;
+
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/cleanup-fails");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("write");
+
+        let (_dir, store) = open_temp();
+        let project = store
+            .insert_project(
+                "kamux",
+                repo.path().to_str().expect("utf8"),
+                CliKind::Claude,
+            )
+            .expect("insert_project");
+        let mut session = Session::new_backlog(
+            &project.id,
+            "fix login",
+            "",
+            SessionMode::Worktree,
+            Some("session/cleanup-fails".to_string()),
+            CliKind::Claude,
+            None,
+            1.0,
+            now_ms(),
+        );
+        let worktree_path_str = wt.to_str().expect("utf8").to_string();
+        session.worktree_path = Some(worktree_path_str.clone());
+        let session = store.insert_session(&session).expect("insert_session");
+
+        let state = crate::state::test_support::app_state(store);
+
+        let err = super::cleanup_worktree_from_state(&state, &session.id, false)
+            .expect_err("未コミット変更があるのに非 force 削除が成功した");
+        assert!(matches!(err, AppError::Git(_)), "想定外: {err:?}");
+
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+        let reloaded = state.store.get_session(&session.id).expect("get_session");
+        assert_eq!(
+            reloaded.worktree_path,
+            Some(worktree_path_str),
+            "削除に失敗したのに worktree_path が書き換わった。契約 §13 違反"
+        );
+    }
+
     // --- M2-1 Task 6: runtime_state の Tauri 配線 ---
     //
     // ここから下の 7 本は「状態機械をアプリの寿命に結線した」ことを固定する。
