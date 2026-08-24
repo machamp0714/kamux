@@ -3,6 +3,7 @@ import type { KeyboardEvent, MouseEvent, PointerEvent } from 'react';
 import { RuntimeBadge } from '../../components/RuntimeBadge';
 import type { Session } from '../../types/model';
 import { CLI_ICON } from './badge';
+import { KanbanCardCleanup } from './KanbanCardCleanup';
 import { KanbanCardError } from './KanbanCardError';
 import { KanbanCardResume } from './KanbanCardResume';
 
@@ -104,6 +105,7 @@ export function KanbanCard({ session, onEdit, onArchive, onOpen, dragActivator }
 
       <div className="kanban-card__actions">
         {interactive && <KanbanCardResume sessionId={session.id} />}
+        {interactive && <KanbanCardCleanup sessionId={session.id} />}
         <button
           type="button"
           onPointerDown={stopDrag}

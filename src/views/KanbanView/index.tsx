@@ -15,6 +15,7 @@ import { useAppStore } from '../../store';
 import { toAppError } from '../../store/uiSlice';
 import { HooksStatusPanel } from '../../components/HooksStatusPanel';
 import { KANBAN_STATUSES, type Session } from '../../types/model';
+import { CleanupWorktreeDialogContainer } from './CleanupWorktreeDialogContainer';
 import { KanbanCard } from './KanbanCard';
 import { KanbanColumn } from './KanbanColumn';
 import { resolveDragEnd } from './dragEnd';
@@ -139,6 +140,9 @@ export function KanbanView() {
           {dragging === undefined ? null : <KanbanCard session={dragging} />}
         </DragOverlay>
       </DndContext>
+
+      {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。 */}
+      <CleanupWorktreeDialogContainer />
     </div>
   );
 }

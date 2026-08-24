@@ -202,6 +202,80 @@ describe('KanbanCard と KanbanCardResume の配線（第1部 §4.4）', () => {
   });
 });
 
+// KanbanCardCleanup も葉として自分で購読する（契約 §25.5 / §38.3）。差し込みの 1 行が
+// 落ちても葉のテストは緑のままなので、KanbanCard の実物を render して呼び出し側を見る。
+describe('KanbanCard と KanbanCardCleanup の配線（M3-4 Task 9）', () => {
+  function cleanupTarget(id: string): Session {
+    return {
+      ...session(id),
+      mode: 'worktree',
+      branch: 'session/fix-login',
+      worktree_path: '/repo/a/.worktrees/session-fix-login',
+      kanban_status: 'done',
+    };
+  }
+
+  function actionLabels(): (string | null)[] {
+    const actions = card().querySelector('.kanban-card__actions');
+    return [...(actions?.querySelectorAll('button') ?? [])].map((b) =>
+      b.getAttribute('aria-label'),
+    );
+  }
+
+  it('掃除を提案すべきセッションでは掃除ボタンが actions 内に描かれる', () => {
+    const s = cleanupTarget('s1');
+    useAppStore.setState({ sessions: { s1: s } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={s} onOpen={vi.fn()} />);
+    });
+
+    expect(actionLabels()).toContain('worktree を掃除');
+  });
+
+  it('掃除を提案しないセッション（in_place）では掃除ボタンを描かない', () => {
+    const s = session('s1');
+    useAppStore.setState({ sessions: { s1: s } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={s} onOpen={vi.fn()} />);
+    });
+
+    expect(actionLabels()).not.toContain('worktree を掃除');
+  });
+
+  // KanbanCardResume と同じ理由: DragOverlay のクローンに破壊的操作を起こせる
+  // 生きたボタンが入ってはならない（KanbanCard.tsx の doc の不変条件）。
+  it('クローン形状（onOpen も dragActivator も無い）では掃除ボタンが存在しない', () => {
+    const s = cleanupTarget('s1');
+    useAppStore.setState({ sessions: { s1: s } });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={s} />);
+    });
+
+    expect(actionLabels()).not.toContain('worktree を掃除');
+  });
+
+  it('掃除ボタンを押すとそのカードのセッション ID で openCleanupDialog が呼ばれる', () => {
+    const openCleanupDialog = vi.fn(async () => undefined);
+    const s = cleanupTarget('s2');
+    useAppStore.setState({ sessions: { s2: s }, openCleanupDialog });
+    act(() => {
+      root = createRoot(container);
+      root.render(<KanbanCard session={s} onOpen={vi.fn()} />);
+    });
+
+    const button = card().querySelector<HTMLButtonElement>('[aria-label="worktree を掃除"]');
+    if (button === null) throw new Error('掃除ボタンが描かれていない');
+    act(() => {
+      button.click();
+    });
+
+    expect(openCleanupDialog).toHaveBeenCalledWith('s2');
+  });
+});
+
 // components.md「カード」節: kanban-card__head は「横並び・両端寄せ。左に CLI チップ、
 // 右にバッジ」= 2 グループである。ここに 3 要素目（title）が混ざると
 // justify-content: space-between の意味が変わり、バッジが中央に落ちる。
