@@ -1481,6 +1481,17 @@ mod tests {
             )
             .expect("set_worktree");
 
+        // `set_worktree` の時点でセンチネル値 1 は既に now_ms() に置き換わっている
+        // （契約 §38.2: set_worktree はユーザー操作由来なので updated_at を動かす）。
+        // `set_worktree_path` 自身が updated_at を動かすかどうかを固定するには、
+        // このあと取得した値を基準にしないと恒真になる（レビュー Important 1）。
+        let before = store.get_session(&s.id).expect("set_worktree 後の取得");
+
+        // now_ms() はミリ秒精度なので、同一ミリ秒内の 2 呼び出しは
+        // `>` 比較を偽陰性にしうる（`update_session_bumps_updated_at_but_not_created_at`
+        // と同じ手当て）。
+        std::thread::sleep(std::time::Duration::from_millis(3));
+
         store
             .set_worktree_path(&s.id, None)
             .expect("worktree_path のクリアに失敗");
@@ -1494,6 +1505,10 @@ mod tests {
             reloaded.branch.as_deref(),
             Some("session/fix-login"),
             "branch まで消えた。契約 §13 違反"
+        );
+        assert!(
+            reloaded.updated_at > before.updated_at,
+            "set_worktree_path が updated_at を動かしていない（契約 §38.2）"
         );
     }
 

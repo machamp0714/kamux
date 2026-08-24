@@ -1367,6 +1367,13 @@ mod tests {
 
         let repo = TestRepo::new();
         let wt = repo.add_worktree("session/status-check");
+        // `TestRepo::add_worktree` は production の `create_worktree` と違い
+        // `.git/info/exclude` への登録を行わないため、`.worktrees/` は main tree
+        // からは untracked に見える。除外しないと「main tree 側の混入」で
+        // 取り違え変異が副次的に赤くなり、この doc の断定（dirty 判定が
+        // `worktree_path` まで実際に届くこと）を測れない（レビュー Minor 1）。
+        crate::worktree::ensure_worktrees_excluded(repo.path())
+            .expect("worktrees を exclude 登録できなかった");
 
         let (_dir, store) = open_temp();
         let project = store
