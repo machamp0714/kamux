@@ -15,7 +15,7 @@ fail=0
 asserts=0
 # テスト自身が assert の実数を守る。source した先で set -u に当たってブロックが
 # 丸ごと走らなかった場合、fail=0 のまま exit 0 になるのを防ぐ。
-EXPECTED_ASSERTS=53
+EXPECTED_ASSERTS=54
 
 ok() { asserts=$((asserts + 1)); printf 'ok   %s\n' "$1"; }
 ng() { asserts=$((asserts + 1)); printf 'NG   %s\n' "$1"; fail=1; }
@@ -258,12 +258,14 @@ contains "追記されたログの最後の内訳を出す" "$out" "rust_setup_m
 
 # ---------------------------------------------------------------- cmd_memory
 # memory_case <table>
+ps_call_log="$(mktemp)"
 memory_case() {
   # cmd_memory 側の `local table` と名前が衝突すると bash の動的スコープで
   # 未割り当ての変数を掴む。テスト側は別名にする。
   local snapshot_table="$1"
+  : >"$ps_call_log"
   (
-    ps_snapshot() { printf '%s\n' "$snapshot_table"; }
+    ps_snapshot() { printf 'call\n' >>"$ps_call_log"; printf '%s\n' "$snapshot_table"; }
     app_pid() { printf '1000\n'; }
     cmd_memory
     printf 'exit_code=%s\n' "$exit_code"
@@ -275,6 +277,9 @@ contains "メモリの統制値は 4 プロセスの総和" "$out" "187.5"
 contains "メモリが上限未満なら PASS" "$out" "PASS"
 contains "メモリの PASS で exit_code=0" "$out" "exit_code=0"
 contains "メモリは参考値も併記する" "$out" "参考"
+# 「ps を 1 回だけ打って 1 つのスナップショットから全部導出する」を観測する。
+# 2 回打つと etime が秒単位でずれ、対応づけが静かに崩れる。
+eq "cmd_memory は ps を 1 回だけ打つ" "$(wc -l <"$ps_call_log" | tr -d ' ')" "1"
 
 out="$(memory_case "$table_missing" 2>&1)"
 contains "ヘルパ不足なら メモリは FAIL" "$out" "FAIL"
