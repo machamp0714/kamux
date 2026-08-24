@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 
 // 子ビュー/コンポーネントは中身を持たないスタブへ差し替える。
 // 本テストの関心は「ルートがどのフックを呼ぶか」であって描画内容ではない。
@@ -17,8 +17,20 @@ vi.mock('./hooks/useKeymap', () => ({ useKeymap: vi.fn() }));
 vi.mock('./hooks/useRuntimeStateEvents', () => ({ useRuntimeStateEvents: vi.fn() }));
 
 const reportFrontendReadySpy = vi.fn().mockResolvedValue(undefined);
+// tinyspy（vi.fn の内部実装、node_modules/tinyspy/dist/index.js）は
+// スパイが返す Promise に呼び出し直後 `p.then(...)` を無条件で付けて resolves を記録する。
+// そのため reportFrontendReadySpy() の返り値をそのまま App.tsx へ渡すと、reject させても
+// tinyspy 側の内部ハンドラが既に付いており、Node の unhandled rejection 検出が発火しない
+// （「モックが実際に reject していること」を測れなくなる）。呼び出し回数の記録はスパイに
+// 任せつつ、App.tsx へ渡す Promise はスパイの外側で作った素の Promise にする。
+let reportFrontendReadyRejects = false;
 vi.mock('./ipc/commands', () => ({
-  reportFrontendReady: () => reportFrontendReadySpy(),
+  reportFrontendReady: () => {
+    reportFrontendReadySpy();
+    return reportFrontendReadyRejects
+      ? Promise.reject(new Error('report_frontend_ready failed'))
+      : Promise.resolve(undefined);
+  },
 }));
 
 /**
@@ -71,6 +83,21 @@ describe('App', () => {
     useVisibilityContextSpy.mockClear();
   });
 
+  // このファイルは `vite.config.ts` の `test.globals`（未設定 = false）を前提に
+  // `describe`/`it` などを明示 import している。そのため
+  // `@testing-library/react` の自動 cleanup（globalThis.afterEach の検出に依存する）
+  // は効かない —— 他ファイル（例: `src/components/ErrorToast.test.tsx`）と同じく
+  // 明示的に `afterEach(cleanup)` を置く必要がある。
+  //
+  // これを怠ると、先行する `it('ルートで...')` がマウントした App のうち
+  // rAF をスタブしていないもの（実 `requestAnimationFrame`、jsdom 内部実装は
+  // `setTimeout` ベース）が、後続の非同期テスト（下の reject テストの
+  // `await new Promise((resolve) => setTimeout(resolve, 0))`）の間に発火し、
+  // `reportFrontendReadySpy` の呼び出し回数を予期せず増やしてフレークする
+  // （修正ラウンド1で実測）。unmount すれば effect の cleanup（`cancelAnimationFrame`）
+  // が効き、この経路を断てる。
+  afterEach(cleanup);
+
   it('ルートで useFocusDeepLink と useVisibilityContext を呼ぶ（Ruling AE/AG の呼び出し側配線を守る）', () => {
     render(<App />);
     expect(useFocusDeepLinkSpy).toHaveBeenCalledTimes(1);
@@ -83,6 +110,7 @@ describe('App', () => {
 
     beforeEach(() => {
       reportFrontendReadySpy.mockClear();
+      reportFrontendReadyRejects = false;
       raf = fakeRaf();
       vi.stubGlobal('requestAnimationFrame', raf.raf);
       vi.stubGlobal('cancelAnimationFrame', raf.caf);
@@ -113,6 +141,25 @@ describe('App', () => {
       unmount();
       raf.tick();
       expect(reportFrontendReadySpy).not.toHaveBeenCalled();
+    });
+
+    it('reportFrontendReady が reject しても呼び出し側から拒否が漏れない（修正ラウンド1、CI フレークの再現）', async () => {
+      // 実アプリでは Tauri IPC 未初期化時などに reject しうる（App.projectSwitcher.test.tsx
+      // が `./ipc/commands` をモックしていないために起きた unhandled rejection のフレークを
+      // ここで直接再現する）。
+      reportFrontendReadyRejects = true;
+      const onUnhandledRejection = vi.fn();
+      process.on('unhandledRejection', onUnhandledRejection);
+      try {
+        render(<App />);
+        raf.tick();
+        // reject の伝播はマイクロタスクを跨ぐため、マクロタスク境界まで進めてから検査する。
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(reportFrontendReadySpy).toHaveBeenCalledTimes(1);
+        expect(onUnhandledRejection).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
     });
   });
 });

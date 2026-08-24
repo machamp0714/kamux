@@ -46,7 +46,12 @@ export default function App() {
   useEffect(() => {
     // requestAnimationFrame で最初のペイントが済んでから記録する（契約 §0 の起動時間
     // 測定点、M3-4 Task 13）。依存配列は [] —— 再レンダリングのたびに呼ばないこと。
-    const id = requestAnimationFrame(() => void reportFrontendReady());
+    // `src-tauri/src/perf.rs` の「失敗しても計測のためだけの機能なのでアプリは止めない」
+    // という設計思想をフロント側にも適用する（修正ラウンド1）。`.catch()` を外すと、
+    // 拒否が unhandled rejection として漏れる（IPC 未初期化時などに実機でも起こりうる）。
+    const id = requestAnimationFrame(() => {
+      reportFrontendReady().catch(() => {});
+    });
     return () => cancelAnimationFrame(id);
   }, []);
 
