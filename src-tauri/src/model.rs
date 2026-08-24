@@ -182,6 +182,15 @@ impl Session {
     }
 }
 
+/// worktree の作業ツリー状態（契約 §7.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeStatus {
+    /// git が `worktree remove` を拒否する状態か（untracked を含む）
+    pub dirty: bool,
+    /// `git status --porcelain` の行をそのまま（例: " M src/a.rs", "?? new.txt"）
+    pub entries: Vec<String>,
+}
+
 /// フィールドが「不在」なのか「null が明示された」のかを区別するためのデシリアライザ。
 /// 不在   -> #[serde(default)] により None
 /// null   -> Some(None)

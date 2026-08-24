@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{AppError, AppResult};
+use crate::model::WorktreeStatus;
 
 pub mod exclude;
 pub mod slug;
@@ -60,6 +61,26 @@ pub fn create_worktree(repo_path: &Path, slug: &str, branch: &str) -> AppResult<
     run_git(repo_path, &["worktree", "add", path_str, "-b", branch])?;
 
     Ok(path)
+}
+
+/// worktree に未コミットの変更（untracked を含む）があるかを調べる読み取り専用の操作。
+/// 破壊操作は一切行わない（契約 §7.2）。
+pub fn worktree_status(worktree_path: &Path) -> AppResult<WorktreeStatus> {
+    let out = run_git(
+        worktree_path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+
+    let entries: Vec<String> = out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    Ok(WorktreeStatus {
+        dirty: !entries.is_empty(),
+        entries,
+    })
 }
 
 #[cfg(test)]
@@ -262,5 +283,68 @@ mod tests {
             }
             other => panic!("expected AppError::Git, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn worktree_status_clean_worktree_is_not_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/clean");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            !st.dirty,
+            "変更のない worktree が dirty 判定された: {:?}",
+            st.entries
+        );
+        assert!(
+            st.entries.is_empty(),
+            "entries が空でない: {:?}",
+            st.entries
+        );
+    }
+
+    #[test]
+    fn worktree_status_untracked_file_only_is_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/untracked");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            st.dirty,
+            "untracked ファイルだけの worktree が clean 判定された"
+        );
+        assert_eq!(st.entries, vec!["?? new.txt".to_string()]);
+    }
+
+    #[test]
+    fn worktree_status_modified_tracked_file_is_dirty() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/modified");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+
+        assert!(
+            st.dirty,
+            "追跡ファイルを変更した worktree が clean 判定された"
+        );
+        assert_eq!(st.entries, vec![" M README.md".to_string()]);
+    }
+
+    #[test]
+    fn worktree_status_missing_path_is_git_error() {
+        let repo = TestRepo::new();
+
+        let err = worktree_status(&repo.path().join(".worktrees/does-not-exist"))
+            .expect_err("存在しないパスでエラーにならなかった");
+
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
     }
 }

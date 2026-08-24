@@ -8,7 +8,7 @@
 //! （worktree/mod.rs）で行う。ここで重ねて `#![cfg(test)]` を書くと
 //! clippy::duplicated_attributes に引っかかるため書かない。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -33,6 +33,23 @@ impl TestRepo {
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// worktree を 1 つ追加して、そのパスを返す（Task 1 / Task 2 で共用）。
+    ///
+    /// macOS の `TempDir` は `/var -> /private/var` のシンボリックリンク配下なので、
+    /// git が返すパスと突き合わせられるよう、パスを組み立てる前に canonicalize する。
+    pub fn add_worktree(&self, branch: &str) -> PathBuf {
+        let repo = std::fs::canonicalize(self.path()).expect("canonicalize repo path");
+        let wt = repo.join(".worktrees").join(branch.replace('/', "-"));
+        self.git(&[
+            "worktree",
+            "add",
+            wt.to_str().expect("worktree path must be utf-8"),
+            "-b",
+            branch,
+        ]);
+        wt
     }
 
     /// 隔離した環境で git を実行する。失敗したら panic（テストの前提条件なので）。
