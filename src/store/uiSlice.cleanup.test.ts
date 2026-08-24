@@ -79,4 +79,29 @@ describe('掃除ダイアログ', () => {
 
     expect(useAppStore.getState().cleanupDialog).toBeNull();
   });
+
+  it('先に開いた s1 の遅延応答が、後から開いた s2 のダイアログを上書きしない', async () => {
+    let resolveS1: (v: { dirty: boolean; entries: string[] }) => void = () => {};
+    const s1Response = new Promise<{ dirty: boolean; entries: string[] }>((resolve) => {
+      resolveS1 = resolve;
+    });
+    worktreeStatus.mockImplementation((sessionId: unknown) =>
+      sessionId === 's1' ? s1Response : Promise.resolve({ dirty: false, entries: [] }),
+    );
+
+    const p1 = useAppStore.getState().openCleanupDialog('s1');
+    const p2 = useAppStore.getState().openCleanupDialog('s2');
+    await p2;
+
+    // s2 が先に解決した後で、s1 の遅れた応答が届く。
+    resolveS1({ dirty: true, entries: ['?? stale.txt'] });
+    await p1;
+
+    expect(useAppStore.getState().cleanupDialog).toEqual({
+      sessionId: 's2',
+      status: { dirty: false, entries: [] },
+      error: null,
+      busy: false,
+    });
+  });
 });
