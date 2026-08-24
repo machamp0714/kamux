@@ -10,12 +10,19 @@ use std::time::Instant;
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 /// `run()` の一番最初に呼ぶ。2 回目以降の呼び出しは無視される
-/// （`OnceLock::set` は既に値が入っていれば `Err` を返すだけで上書きしない）。
+/// （`OnceLock::set` は既に値が入っていれば `Err` を返すだけで上書きしない。
+/// `elapsed_ms_grows_after_mark_process_start` の後半で確認している）。
 pub fn mark_process_start() {
     let _ = PROCESS_START.set(Instant::now());
 }
 
 /// `mark_process_start()` からの経過ミリ秒。未設定なら 0。
+///
+/// この 0 分岐（未設定時）は、同じテストバイナリ内の他のテストが先に
+/// `mark_process_start()` を呼んでいる可能性があり実行順に依存するため、
+/// 決定的なテストを書けない（`PROCESS_START` はプロセス全体で共有される
+/// `static`）。したがってこの分岐は本ファイルのどのテストからも到達確認して
+/// いない —— 未検証のまま断定しないよう、ここに明記する。
 pub fn elapsed_ms() -> u128 {
     PROCESS_START
         .get()
@@ -40,6 +47,11 @@ pub fn format_line(event: &str, ms: u128) -> String {
 /// `log_path()` に依存しないので、テストから一時ディレクトリを渡して
 /// ユーザーの実ファイルを汚さずに検証できる（この分離自体がテスト対象。
 /// `record()`（引数なしの側）を呼ぶテストは書かない —— 実ファイルに書くため）。
+///
+/// この関数の中身（`log_path()` / `event` の受け渡し）は、上と同じ理由で
+/// 直接のテストが無い。ここを壊す変異は必ず緑になる —— `run()` 内の
+/// `mark_process_start()` / `record("rust_setup_ms")` / `report_frontend_ready`
+/// と同じ到達不能領域として documented-green である。
 pub fn record(event: &str) {
     record_to(&log_path(), event);
 }
@@ -68,6 +80,16 @@ mod tests {
         let b = elapsed_ms();
         assert!(b >= a, "経過時間が巻き戻った: {a} -> {b}");
         assert!(b >= 20, "20ms 待ったのに経過が {b}ms");
+
+        // 2 回目の mark_process_start() は無視される（OnceLock::set は
+        // 既に値がある場合に上書きしない）。もし上書きされていたら経過が
+        // ほぼ 0 に巻き戻るはずなので、b と同じ下限で弁別できる。
+        mark_process_start();
+        let c = elapsed_ms();
+        assert!(
+            c >= b,
+            "2 回目の mark_process_start() で計測開始時刻が巻き戻った: {b} -> {c}"
+        );
     }
 
     #[test]
@@ -77,6 +99,15 @@ mod tests {
         assert!(
             s.ends_with("Library/Application Support/kamux/perf.log"),
             "ログパスが契約 §0 の DB ディレクトリと揃っていない: {s}"
+        );
+
+        // `ends_with` だけでは HOME を実際に使っているかを測れない
+        // （リテラル "/tmp" に差し替えても "Library/Application Support/..."
+        // の接尾一致は崩れない）。HOME を読んで完全一致させる。
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(
+            p,
+            PathBuf::from(home).join("Library/Application Support/kamux/perf.log")
         );
     }
 
