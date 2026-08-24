@@ -13,6 +13,17 @@ export type Layout = 'single' | 'split2' | 'split2-v';
 /** カンバンの列の表示順。DB の並び順ではなくこれが表示の正典。 */
 export const KANBAN_STATUSES: KanbanStatus[] = ['backlog', 'in_progress', 'review', 'done'];
 
+/**
+ * プロジェクトごとに退避するターミナル画面のペイン状態（契約 §28.6）。
+ * `layout` は永続化型。狭いままだと縦分割がプロジェクト切替で消えるため、
+ * 3 値の Layout をそのまま使う（'single' | 'split2' に直書きしない）。
+ */
+export interface TerminalWorkspace {
+  layout: Layout;
+  paneAssignment: [string | null, string | null];
+  activePane: 0 | 1;
+}
+
 export interface Project {
   id: string;
   name: string;

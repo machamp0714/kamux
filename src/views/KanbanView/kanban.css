@@ -29,8 +29,11 @@
 }
 
 /* components.md「ボタン」節の「副」（--bg-hover / --text-primary / 1px solid var(--border)）。
-   画面の主操作は「新規セッション」1 つだけなので、こちらは一段落とす。 */
-.kanban-view__hooks {
+   画面の主操作は「新規セッション」1 つだけなので、こちらは一段落とす。
+   kanban-view__archived（M3-4 Task 10 のアーカイブ済みドロワー開閉ボタン）も
+   同じ副ボタンの扱いなので宣言を共有する。 */
+.kanban-view__hooks,
+.kanban-view__archived {
   padding: var(--space-4) var(--space-7);
   border-radius: var(--radius-md);
   /* 線幅。border/outline の幅は色でも余白でもないためトークン化対象外 */
@@ -246,6 +249,16 @@
      カードから溢れさせない */
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* 契約 §76.5: ❌ のカードは枠を赤くする。`.kanban-card--error` の修飾子クラスは作らない
+   —— 付けるには KanbanCard が runtimeStates を購読することになり §25.5 が壊れる。
+   :has() は購読を増やさずに済む唯一の経路である（§76.5）。
+   :has() が解決しない環境では枠が既定のまま残るだけで、エラー本文は
+   .kanban-card__error で従来どおり出る（機能は失われない）。
+   .kanban-card:hover（上）と詳細度が同値なので、順序で勝つよう後ろに置く。 */
+.kanban-card:has(.kanban-card__error) {
+  border-color: var(--state-error);
 }
 
 /* components.md「カード」節: kanban-card__actions は「ホバーで出す」。

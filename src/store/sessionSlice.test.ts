@@ -105,7 +105,7 @@ describe('indexSessions', () => {
 });
 
 describe('loadSessions', () => {
-  it('アーカイブ済みを除いて取得し、ストアに展開する', async () => {
+  it('アーカイブ済みも含めて取得し（盤面には出さない）、ストアに展開する', async () => {
     listSessions.mockResolvedValue([
       session({ id: 'a', sort_order: 2 }),
       session({ id: 'b', sort_order: 1 }),
@@ -113,13 +113,15 @@ describe('loadSessions', () => {
 
     await useAppStore.getState().loadSessions('p1');
 
-    expect(listSessions).toHaveBeenCalledWith('p1', false);
+    // include_archived: true —— アーカイブ済みもストアには載せる。盤面に出すかどうかは
+    // buildSessionOrder（アーカイブ除外）が決める（Task 6 の仕様変更）。
+    expect(listSessions).toHaveBeenCalledWith('p1', true);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b', 'a']);
     expect(useAppStore.getState().sessions.a.sort_order).toBe(2);
   });
 
-  it('プロジェクトを切り替えると前のセッションを完全に置き換える', async () => {
-    listSessions.mockResolvedValue([session({ id: 'old' })]);
+  it('別プロジェクトを読み込んでも、既に読み込んだプロジェクトの sessions は残る（sessionOrder には現れない）', async () => {
+    listSessions.mockResolvedValue([session({ id: 'old', project_id: 'p1' })]);
     await useAppStore.getState().loadSessions('p1');
 
     listSessions.mockResolvedValue([session({ id: 'new', project_id: 'p2' })]);
@@ -128,8 +130,10 @@ describe('loadSessions', () => {
     useAppStore.setState({ activeProjectId: 'p2' });
     await useAppStore.getState().loadSessions('p2');
 
-    expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', false);
-    expect(Object.keys(useAppStore.getState().sessions)).toEqual(['new']);
+    expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', true);
+    // 置換ではなくマージ —— p1 の 'old' は sessions マップに残る
+    expect(Object.keys(useAppStore.getState().sessions).sort()).toEqual(['new', 'old']);
+    // ただし sessionOrder はアクティブプロジェクト(p2)の分だけ
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['new']);
   });
 
@@ -219,6 +223,129 @@ describe('loadSessions', () => {
     await pendingA;
 
     expect(useAppStore.getState().runtimeStates).toEqual({ b1: 'idle' });
+  });
+
+  // 以下 3 件は brief（Task 6）が指定した新規テスト。上のテストと assertion が
+  // 重なる部分はあるが、lane-controller 裁定 28 の指示どおり別出しで追記する。
+  it('include_archived: true で取得する', async () => {
+    listSessions.mockResolvedValue([]);
+    await useAppStore.getState().loadSessions('p1');
+    expect(listSessions).toHaveBeenCalledWith('p1', true);
+  });
+
+  it('別プロジェクトを読み込んでも既存プロジェクトのセッションを消さない', async () => {
+    listSessions.mockResolvedValueOnce([session({ id: 'a1', project_id: 'p1' })]);
+    await useAppStore.getState().loadSessions('p1');
+
+    listSessions.mockResolvedValueOnce([session({ id: 'b1', project_id: 'p2' })]);
+    // activeProjectId を切り替えないと isStillActiveProject ガードに弾かれる
+    // （実経路では setActiveProject → loadSessions の順で必ず切り替わる）。
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(Object.keys(useAppStore.getState().sessions).sort()).toEqual(['a1', 'b1']);
+  });
+
+  it('sessionOrder は読み込んだプロジェクトの分だけになる', async () => {
+    listSessions.mockResolvedValueOnce([session({ id: 'a1', project_id: 'p1' })]);
+    await useAppStore.getState().loadSessions('p1');
+
+    listSessions.mockResolvedValueOnce([session({ id: 'b1', project_id: 'p2' })]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+  });
+
+  // sessionOrder は「今回の応答(list)」ではなく「マージ後の sessions（同一プロジェクトの
+  // 既知エントリを含む）」から作ること。list をそのまま渡す実装に取り違えても、
+  // 他プロジェクトを跨がないケースでは他のテストが気づかない。
+  it('同一プロジェクトの sessionOrder は、応答に含まれない既存エントリも含めて作る', async () => {
+    useAppStore.setState({
+      sessions: {
+        existing: session({ id: 'existing', project_id: 'p1', sort_order: 1 }),
+      },
+    });
+    listSessions.mockResolvedValueOnce([session({ id: 'fresh', project_id: 'p1', sort_order: 2 })]);
+
+    await useAppStore.getState().loadSessions('p1');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['existing', 'fresh']);
+  });
+
+  // M3-4 PR31 Task 7: PTY を殺さない設計（stop_session を呼ばない）の裏返しとして、
+  // 背景プロジェクトのセッションはバックグラウンドで動き続け、そのイベントは
+  // applyStateEvent 経由で runtimeStates に届き続ける。seedRuntimeStates(list, true)
+  // は list に無い id を全部消す仕様（契約 §34.6「作り直し」）なので、対策なしだと
+  // プロジェクトを切り替えるたびに背景プロジェクトの runtimeStates が消える。
+  it('別プロジェクトへ切り替えても、既に読み込んだプロジェクトの runtimeStates は消さない', async () => {
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    await useAppStore.getState().loadSessions('p1');
+    useAppStore.getState().applyStateEvent({
+      session_id: 'a1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_notification',
+    });
+
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().runtimeStates.a1).toBe('waiting_input');
+    expect(useAppStore.getState().runtimeStates.b1).toBe('running');
+  });
+
+  // 上のテストは runtimeStates しか守っていない。退避・復元ロジックは runtimeStates /
+  // runtimeReasons / runtimeErrors の 3 つの並行フィールドを同じ形で扱っており、
+  // 取り違え（例: runtimeErrors への代入に runtimeReasons のデータを使う）が起きても
+  // runtimeStates 用の assertion だけでは検出できない。runtimeReasons / runtimeErrors も
+  // 具体値で検証する。
+  it('別プロジェクトへ切り替えても、既に読み込んだプロジェクトの runtimeReasons/runtimeErrors は消さない', async () => {
+    listSessions.mockResolvedValueOnce([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running', first_started_at: 1 }),
+    ]);
+    await useAppStore.getState().loadSessions('p1');
+    useAppStore.getState().applyStateEvent({
+      session_id: 'a1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_notification',
+    });
+    useAppStore.getState().setRuntimeError('a1', 'boom');
+
+    // 切替先プロジェクト自身（b1）にも、切替前の時点で PTY イベントが届いているケースを
+    // 再現する。b1 はまだ一度も loadSessions で読み込まれていないが、applyStateEvent は
+    // sessionId さえあれば動く（バックグラウンドで起動済みの PTY からイベントが先に届く経路）。
+    useAppStore.getState().applyStateEvent({
+      session_id: 'b1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_permission',
+    });
+
+    listSessions.mockResolvedValueOnce([
+      session({
+        id: 'b1',
+        project_id: 'p2',
+        last_runtime_state: 'running',
+        last_runtime_error: 'b1-error',
+        first_started_at: 1,
+      }),
+    ]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().runtimeReasons.a1).toBe('hook_notification');
+    expect(useAppStore.getState().runtimeErrors.a1).toBe('boom');
+    // 切替先プロジェクト自身（b1）側: runtimeErrors は seedRuntimeStates(list, true) が
+    // b1 の last_runtime_error からその場で作り直す値なので、具体値で検証できる。
+    expect(useAppStore.getState().runtimeErrors.b1).toBe('b1-error');
+    // runtimeReasons は reset のたびに必ず空へ作り直される仕様（reason は Session の
+    // フィールドではなく PTY イベント由来のため、seedRuntimeStates は復元しない）。
+    // 切替前に積んだ古い reason（'hook_permission'）が残っていないことを確認する。
+    expect(useAppStore.getState().runtimeReasons.b1).toBeUndefined();
   });
 });
 

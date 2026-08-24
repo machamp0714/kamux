@@ -15,6 +15,8 @@ import { useAppStore } from '../../store';
 import { toAppError } from '../../store/uiSlice';
 import { HooksStatusPanel } from '../../components/HooksStatusPanel';
 import { KANBAN_STATUSES, type Session } from '../../types/model';
+import { ArchivedDrawer } from './ArchivedDrawer';
+import { CleanupWorktreeDialogContainer } from './CleanupWorktreeDialogContainer';
 import { KanbanCard } from './KanbanCard';
 import { KanbanColumn } from './KanbanColumn';
 import { resolveDragEnd } from './dragEnd';
@@ -37,9 +39,16 @@ export function KanbanView() {
   const moveCard = useAppStore((s) => s.moveCard);
   const openModal = useAppStore((s) => s.openModal);
   const setError = useAppStore((s) => s.setError);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  // アーカイブ済みドロワー（M3-4 Task 10）。網羅検査（paneInvariant.test.ts の
+  // 「引数表 ARGS が母数（組み立て済みストアの関数型メンバ全体）を覆っている」テスト）の
+  // 対象にするため uiSlice に置く。hooks 疎通ステータスのドロワー（hooksOpen）は
+  // その検査と無関係なのでローカル state のままにする。
+  const showArchived = useAppStore((s) => s.showArchived);
+  const setShowArchived = useAppStore((s) => s.setShowArchived);
+  const restoreSession = useAppStore((s) => s.restoreSession);
+  const openCleanupDialog = useAppStore((s) => s.openCleanupDialog);
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  // ドロワーの開閉はこのビューのローカル state に置く（uiSlice には足さない。
-  // M3-4 の ArchivedDrawer が同じファイルへ showArchived を足す予定のため）。
   const [hooksOpen, setHooksOpen] = useState(false);
 
   const sensors = useSensors(
@@ -74,6 +83,13 @@ export function KanbanView() {
         <div className="kanban-view__actions">
           <button type="button" className="kanban-view__hooks" onClick={() => setHooksOpen(true)}>
             hooks 疎通ステータス
+          </button>
+          <button
+            type="button"
+            className="kanban-view__archived"
+            onClick={() => setShowArchived(true)}
+          >
+            アーカイブ済み
           </button>
           <button
             type="button"
@@ -139,6 +155,28 @@ export function KanbanView() {
           {dragging === undefined ? null : <KanbanCard session={dragging} />}
         </DragOverlay>
       </DndContext>
+
+      {/* open が false の間は自分で null を返す（M3-4 Task 10）。 */}
+      <ArchivedDrawer
+        open={showArchived}
+        sessions={Object.values(sessions).filter((s) => s.project_id === activeProjectId)}
+        onRestore={(id) => {
+          restoreSession(id).catch((e: unknown) => setError(toAppError(e)));
+        }}
+        onCleanup={(id) => void openCleanupDialog(id)}
+        onClose={() => setShowArchived(false)}
+      />
+
+      {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。
+          .cleanup-worktree-dialog__backdrop と .archived-drawer__scrim は同一の --z-scrim
+          を使うため、同一スタッキングレベルでは tree order が重なり順を決める（CSS 仕様）。
+          ArchivedDrawer より後にマウントすることで、確認ダイアログが常に ArchivedDrawer
+          より前面へ来るようにする（PR #106 全体レビュー I-1。この重なり順は
+          index.test.tsx で固定している。tokens.css は編集しない —— 契約 §53.2 が
+          実装者によるトークンの追加・変更を禁じている）。
+          KanbanView の外にある SessionFormModal との重なりはこの並び順では閉じない
+          （本 PR の射程外。lane-controller が team-lead へ上げる）。 */}
+      <CleanupWorktreeDialogContainer />
     </div>
   );
 }

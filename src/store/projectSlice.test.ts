@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const listProjects = vi.fn();
 const createProject = vi.fn();
 const listSessions = vi.fn();
+const stopSession = vi.fn();
 vi.mock('../ipc/commands', () => ({
   listProjects: (...args: unknown[]) => listProjects(...args),
   createProject: (...args: unknown[]) => createProject(...args),
   listSessions: (...args: unknown[]) => listSessions(...args),
+  stopSession: (...args: unknown[]) => stopSession(...args),
   createSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -53,12 +55,18 @@ beforeEach(() => {
   listProjects.mockReset();
   createProject.mockReset();
   listSessions.mockReset().mockResolvedValue([]);
+  stopSession.mockReset();
   localStorage.clear();
   useAppStore.setState({
     projects: [],
     activeProjectId: null,
     sessions: {},
     sessionOrder: emptySessionOrder(),
+    runtimeStates: {},
+    workspaceByProject: {},
+    layout: 'single',
+    paneAssignment: [null, null],
+    activePane: 0,
   });
 });
 
@@ -89,7 +97,7 @@ describe('setActiveProject', () => {
 
     expect(useAppStore.getState().activeProjectId).toBe('p2');
     expect(localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY)).toBe('p2');
-    expect(listSessions).toHaveBeenCalledWith('p2', false);
+    expect(listSessions).toHaveBeenCalledWith('p2', true);
   });
 
   it('loadSessions の完了を待ってから返る（await 落ちを検出する）', async () => {
@@ -126,6 +134,84 @@ describe('setActiveProject', () => {
 
     expect(settled).toBe(true);
     expect(Object.keys(useAppStore.getState().sessions)).toEqual(['s-in-p2']);
+  });
+
+  it('切替時に stop_session を呼ばない（走っているエージェントを殺さない）', async () => {
+    listSessions.mockResolvedValue([session({ id: 'a1', project_id: 'p1' })]);
+    await useAppStore.getState().setActiveProject('p1');
+    listSessions.mockResolvedValue([session({ id: 'b1', project_id: 'p2' })]);
+    await useAppStore.getState().setActiveProject('p2');
+
+    expect(stopSession).not.toHaveBeenCalled();
+  });
+
+  it('裏プロジェクトの runtimeStates を保持する', async () => {
+    listSessions.mockResolvedValue([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p1');
+    useAppStore.getState().applyStateEvent({
+      session_id: 'a1',
+      runtime_state: 'waiting_input',
+      reason: 'hook_notification',
+    });
+
+    listSessions.mockResolvedValue([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p2');
+
+    expect(useAppStore.getState().runtimeStates.a1).toBe('waiting_input');
+  });
+
+  it('プロジェクトごとのターミナルワークスペースを退避して復元する', async () => {
+    listSessions.mockResolvedValue([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p1');
+    useAppStore.setState({ layout: 'split2', paneAssignment: ['a1', null], activePane: 1 });
+
+    listSessions.mockResolvedValue([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p2');
+    expect(useAppStore.getState().layout).toBe('single');
+    expect(useAppStore.getState().paneAssignment).toEqual(['b1', null]);
+
+    listSessions.mockResolvedValue([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p1');
+    expect(useAppStore.getState().layout).toBe('split2');
+    expect(useAppStore.getState().paneAssignment).toEqual(['a1', null]);
+    expect(useAppStore.getState().activePane).toBe(1);
+  });
+
+  it('初回の切替では先頭セッションをペイン 0 に割り当てる', async () => {
+    listSessions.mockResolvedValue([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p2');
+
+    expect(useAppStore.getState().paneAssignment).toEqual(['b1', null]);
+    expect(useAppStore.getState().activeProjectId).toBe('p2');
+  });
+
+  it('復元先のワークスペースの focusedSessionId を paneAssignment[activePane] と一致させる（契約 §85.1）', async () => {
+    listSessions.mockResolvedValue([
+      session({ id: 'a1', project_id: 'p1', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p1');
+    useAppStore.setState({ layout: 'split2', paneAssignment: ['a1', null], activePane: 1 });
+
+    listSessions.mockResolvedValue([
+      session({ id: 'b1', project_id: 'p2', last_runtime_state: 'running' }),
+    ]);
+    await useAppStore.getState().setActiveProject('p2');
+
+    const st = useAppStore.getState();
+    expect(st.focusedSessionId).toBe(st.paneAssignment[st.activePane]);
+    expect(st.focusedSessionId).toBe('b1');
   });
 });
 

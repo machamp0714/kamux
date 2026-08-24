@@ -24,7 +24,8 @@ import type {
   StateReason,
 } from '../types/model';
 import { surfaceId } from '../types/model';
-import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
+import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
+import { buildSessionOrder as buildProjectSessionOrder, compareSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
 import { toAppError } from './uiSlice';
 
@@ -80,6 +81,12 @@ export interface SessionSlice {
   moveCard: (sessionId: string, to: KanbanStatus, index: number) => Promise<void>;
   editSession: (id: string, patch: SessionPatch) => Promise<Session>;
   archiveSession: (id: string) => Promise<void>;
+  /**
+   * アーカイブ解除。契約 §144.2: 復元位置は update_session が sort_order を変えない
+   * ことで定まる（新コマンドを足さない）。契約 §144.5: 局所挿入（buildSessionOrder
+   * による全列再構築は使わない。他カードの並びは 1 つも変えない）。
+   */
+  restoreSession: (id: string) => Promise<void>;
   applyStateEvent: (p: SessionStatePayload) => void;
   /**
    * last_runtime_state から初期値を埋める。
@@ -111,21 +118,62 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
   resumeFailedSessionIds: [],
 
   loadSessions: async (projectId) => {
-    // アーカイブ済みは表示しない（復活 UX は M3-4）
-    const list = await listSessions(projectId, false);
+    // アーカイブ済みもストアには載せる（ボードに出すかは buildSessionOrder が決める。
+    // Task 6: 復活 UX が別プロジェクトの sessions を必要とするため include_archived: true）。
+    const list = await listSessions(projectId, true);
     // 応答が返るまでにプロジェクトが切り替わっていたら捨てる（M1-1 からの申し送り）。
-    // sessions / sessionOrder を所有する sessionSlice が「これらは常に activeProjectId の
-    // ものである」という不変条件も持つ。projectSlice.setActiveProject は
+    // sessionOrder を所有する sessionSlice が「これは常に activeProjectId のものである」
+    // という不変条件も持つ。projectSlice.setActiveProject は
     // activeProjectId を set してから loadSessions を await するので、初回ロードは弾かれない。
     // 【この行より上で set() しないこと】ガードは「この応答を捨てるかどうか」の判定であり、
     // ガードより前に set すると、捨てたはずの応答の副作用だけがストアに残る。
     // 例: 契約 §34.6 で M2-1 が足す予定の seedRuntimeStates(list, true) は、必ずこのガードの
     // 下（return の後）に置くこと。上に置くと runtimeStates だけ stale なプロジェクトで
-    // seed され、sessions / sessionOrder は現行のまま、という split-brain に戻ってしまう。
+    // seed され、sessionOrder は現行のまま、という split-brain に戻ってしまう。
     if (get().activeProjectId !== projectId) return;
-    set(indexSessions(list));
-    // 起動時正規化済みの last_runtime_state から ⏸ を復元する
+    // 置換ではなくマージ。他プロジェクトの sessions を消すと
+    // バッジ・Dock バッジ数・通知ルーティングが壊れる（Task 6）。
+    // sessionOrder は読み込んだプロジェクト（アクティブプロジェクト）の分だけに絞る。
+    set((st) => {
+      const sessions = { ...st.sessions };
+      for (const x of list) sessions[x.id] = x;
+      return {
+        sessions,
+        sessionOrder: buildProjectSessionOrder(Object.values(sessions), projectId),
+      };
+    });
+    // 起動時正規化済みの last_runtime_state から ⏸ を復元する。
+    // seedRuntimeStates(list, true) の reset は「list に無い id を全部消す」仕様
+    // （契約 §34.6「作り直し」。sessionSlice.test.ts の 'project switch' テストが
+    // その仕様自体を固定している ので、ここでは書き換えない）。
+    // M3-4: setActiveProject は stop_session を呼ばず PTY を維持する（Task 7）ため、
+    // 背景プロジェクトのセッションは動き続け、そのイベントは applyStateEvent 経由で
+    // runtimeStates に届き続ける。reset をそのまま呼ぶと、プロジェクトを切り替える
+    // たびに「今回の list（=切替先プロジェクトの分だけ）」に無い背景プロジェクトの
+    // エントリが消えてしまう。list に無い id のエントリだけ退避 → reset 後に戻す。
+    const before = get();
+    const listIds = new Set(list.map((x) => x.id));
+    const otherProjectStates: [string, RuntimeState][] = Object.entries(
+      before.runtimeStates,
+    ).filter(([id]) => !listIds.has(id));
+    const otherProjectReasons: [string, StateReason][] = Object.entries(
+      before.runtimeReasons,
+    ).filter(([id]) => !listIds.has(id));
+    const otherProjectErrors: [string, string][] = Object.entries(before.runtimeErrors).filter(
+      ([id]) => !listIds.has(id),
+    );
     get().seedRuntimeStates(list, true);
+    if (
+      otherProjectStates.length > 0 ||
+      otherProjectReasons.length > 0 ||
+      otherProjectErrors.length > 0
+    ) {
+      set((st) => ({
+        runtimeStates: { ...Object.fromEntries(otherProjectStates), ...st.runtimeStates },
+        runtimeReasons: { ...Object.fromEntries(otherProjectReasons), ...st.runtimeReasons },
+        runtimeErrors: { ...Object.fromEntries(otherProjectErrors), ...st.runtimeErrors },
+      }));
+    }
   },
 
   addSession: async (args) => {
@@ -216,6 +264,53 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     } catch (e) {
       // 切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で上書きしない。
       // throw はガードと無関係に行う（呼び出し側がエラーを表示する契約は変えない）
+      if (isStillActive()) {
+        set({ sessions: snapshot, sessionOrder: prevOrder });
+      }
+      throw e;
+    }
+  },
+
+  restoreSession: async (id) => {
+    const isStillActive = isStillActiveProject(get);
+    const snapshot = get().sessions;
+    const prevOrder = get().sessionOrder;
+    const target = snapshot[id];
+    if (target === undefined) return;
+
+    // 楽観更新: 局所挿入（archiveSession の局所除去の鏡像。契約 §144.5）。
+    // buildSessionOrder による全列再構築は使わない（moveCard の in-flight 中と
+    // 重なると、他のカードが古い sort_order の位置へ吸着して見えるおそれがある）。
+    const restoredTarget: Session = { ...target, archived_at: null };
+    const column = prevOrder[target.kanban_status];
+    let optimisticOrder = prevOrder;
+    // 冪等性ガード（契約 §144.5 / 裁定 70）: 既に列に居れば挿入しない。
+    // アーカイブされていない（archived_at: null の）セッションに restoreSession を
+    // 呼ぶ経路（paneInvariant.test.ts の ARGS がその 1 つ）では、ガードが無いと
+    // 同じ id が列に 2 つ入る（archive.test.ts の冪等性テストで実測）。
+    if (!column.includes(id)) {
+      // 挿入位置は (sort_order, id) の全順序で決める（契約 §144.7 / 裁定 72）。
+      // 土台 column の並び自体は 1 つも変えない —— 「column の中で restoredTarget
+      // より全順序上前に来るべき要素の個数」を数えるだけなので、column の並び順が
+      // sort_order 昇順とずれていても（moveCard の楽観更新の in-flight 中に実在する
+      // 状態）、挿入位置は土台の作られ方に依存しない。
+      const insertAt = column.filter(
+        (cid) => compareSessionOrder(snapshot[cid], restoredTarget) < 0,
+      ).length;
+      const nextColumn = [...column];
+      nextColumn.splice(insertAt, 0, id);
+      optimisticOrder = { ...prevOrder, [target.kanban_status]: nextColumn };
+    }
+    set({ sessions: { ...snapshot, [id]: restoredTarget }, sessionOrder: optimisticOrder });
+
+    try {
+      const saved = await updateSessionCmd(id, { archived_at: null });
+      if (isStillActive()) {
+        set({ sessions: { ...get().sessions, [saved.id]: saved } });
+      }
+    } catch (e) {
+      // 切り替わっていたら、今の(別プロジェクトの)盤面を A の状態で上書きしない。
+      // throw はガードと無関係に行う（archiveSession と同じ形）
       if (isStillActive()) {
         set({ sessions: snapshot, sessionOrder: prevOrder });
       }
