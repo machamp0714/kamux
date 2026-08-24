@@ -83,6 +83,28 @@ pub fn worktree_status(worktree_path: &Path) -> AppResult<WorktreeStatus> {
     })
 }
 
+/// worktree を削除する。契約 §13 に従い **ブランチは決して削除しない**。
+/// `force == false` のとき、未コミット変更があれば git 自身が拒否し、その stderr が
+/// そのまま `AppError::Git` に入る（契約 §6）。`run_git` 経由で実行するため、
+/// 対話プロンプトでハングしない防御（`GIT_TERMINAL_PROMPT=0`）を共有する。
+pub fn remove_worktree(repo_path: &Path, worktree_path: &Path, force: bool) -> AppResult<()> {
+    let path_str = worktree_path.to_str().ok_or_else(|| {
+        AppError::Git(format!(
+            "worktree path is not valid UTF-8: {worktree_path:?}"
+        ))
+    })?;
+
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path_str);
+
+    run_git(repo_path, &args)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +375,98 @@ mod tests {
             "想定外のエラー種別: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn remove_worktree_clean_succeeds_and_keeps_branch() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/clean-remove");
+
+        remove_worktree(repo.path(), &wt, false).expect("clean な worktree の削除に失敗");
+
+        assert!(
+            !wt.exists(),
+            "worktree ディレクトリが残っている: {}",
+            wt.display()
+        );
+        assert!(
+            branch_exists(repo.path(), "session/clean-remove"),
+            "ブランチが削除された。契約 §13: ブランチは残さなければならない"
+        );
+    }
+
+    /// 判定の一致テスト: アプリの dirty 判定と git の拒否は同じ条件でなければならない。
+    /// untracked ファイル 1 個だけのケースで両方を同時に検証する。
+    #[test]
+    fn remove_worktree_untracked_only_is_refused_without_force() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/untracked-remove");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let st = worktree_status(&wt).expect("worktree_status が失敗");
+        assert!(st.dirty, "アプリ側は clean と判定した");
+
+        let err = remove_worktree(repo.path(), &wt, false)
+            .expect_err("untracked ファイルがあるのに非 force 削除が成功した");
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+    }
+
+    #[test]
+    fn remove_worktree_modified_is_refused_without_force() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/modified-remove");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+
+        let err = remove_worktree(repo.path(), &wt, false)
+            .expect_err("未コミット変更があるのに非 force 削除が成功した");
+
+        assert!(
+            matches!(err, AppError::Git(_)),
+            "想定外のエラー種別: {:?}",
+            err
+        );
+        assert!(wt.exists(), "拒否されたのに worktree が消えている");
+    }
+
+    #[test]
+    fn remove_worktree_dirty_with_force_succeeds_and_keeps_branch() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/force-remove");
+        std::fs::write(wt.join("README.md"), "# changed\n").expect("書き込みに失敗");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        remove_worktree(repo.path(), &wt, true).expect("force 削除に失敗");
+
+        assert!(!wt.exists(), "worktree ディレクトリが残っている");
+        assert!(
+            branch_exists(repo.path(), "session/force-remove"),
+            "force 削除でブランチまで消えた。契約 §13 違反"
+        );
+    }
+
+    #[test]
+    fn remove_worktree_error_message_contains_raw_git_stderr() {
+        let repo = TestRepo::new();
+        let wt = repo.add_worktree("session/stderr-check");
+        std::fs::write(wt.join("new.txt"), "x\n").expect("書き込みに失敗");
+
+        let err = remove_worktree(repo.path(), &wt, false).expect_err("削除が成功してしまった");
+
+        match err {
+            AppError::Git(msg) => {
+                // 契約 §6: 加工していない stderr がそのまま入る
+                assert!(
+                    msg.contains("--force"),
+                    "git の stderr が加工されている可能性がある: {msg}"
+                );
+            }
+            other => panic!("想定外のエラー種別: {other:?}"),
+        }
     }
 
     #[test]
