@@ -83,6 +83,13 @@ describe('ipc/commands', () => {
     });
   });
 
+  it('updateSession の未指定フィールドはキーごと落ちる（変更しない経路）', async () => {
+    await updateSession('s1', { kanban_status: 'done' });
+
+    const [, args] = invoke.mock.calls[0] as [string, { patch: Record<string, unknown> }];
+    expect(Object.prototype.hasOwnProperty.call(args.patch, 'archived_at')).toBe(false);
+  });
+
   it('listSessions が projectId と includeArchived を渡す', async () => {
     await listSessions('p1', false);
     expect(invoke).toHaveBeenCalledWith('list_sessions', {
