@@ -382,7 +382,7 @@ idle_case() {
 }
 
 # ケース A: block2 = 0.25 / block3 = 0.75 → mean 0.50 / peak 0.75。両方 PASS。
-out="$(idle_case "0.10 0.05 0.05 0.05" "0.30 0.20 0.15 0.10")"
+out="$(idle_case "0.30 0.20 0.15 0.10" "0.10 0.05 0.05 0.05")"
 contains "アイドル CPU 平均は 1 ブロック目を捨てて平均する" "$out" "PASS  アイドルCPU平均 0.50% (上限 1.0%)"
 contains "アイドル CPU 最大は 2 ブロック目以降の最大" "$out" "PASS  アイドルCPU最大 0.75% (上限 5.0%)"
 contains "アイドル CPU が両方上限未満なら exit_code=0" "$out" "exit_code=0"
