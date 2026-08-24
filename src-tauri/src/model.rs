@@ -434,11 +434,13 @@ mod tests {
     fn session_patch_absent_fields_are_none() {
         let patch: SessionPatch = serde_json::from_str("{}").expect("deserialize");
         assert!(patch.title.is_none());
+        assert!(patch.description.is_none());
         assert!(patch.kanban_status.is_none());
         assert!(patch.sort_order.is_none());
         assert!(patch.archived_at.is_none(), "不在は「変更しない」");
         assert!(patch.heuristics_enabled.is_none());
         assert!(patch.silence_timeout_secs.is_none());
+        assert!(patch.claude_session_id.is_none());
     }
 
     #[test]

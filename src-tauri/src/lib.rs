@@ -3213,6 +3213,100 @@ mod tests {
             assert_eq!(session_2["sort_order"], json!(2.0));
         }
 
+        // Task 5: update_session コマンド境界で archived_at の double-option 3 分岐
+        // （不在 / 明示 null / 値あり）が Store::update_session まで正しく届くことを固定する。
+        // 分岐 2（不在）が無いと「archived_at を常に上書きする」実装、
+        // 分岐 3 の list_sessions 確認が無いと「戻り値だけ null にしてDBへ書かない」実装が
+        // どちらも通ってしまう。
+        #[test]
+        fn update_session_restores_archived_session_via_explicit_null_over_the_command_boundary() {
+            let (_dir, store) = open_temp();
+            let app = build_app(store);
+            let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .expect("build webview");
+
+            let project = invoke_ok(
+                &webview,
+                "create_project",
+                json!({"name": "kamux", "repoPath": "/x/kamux", "defaultCli": "claude"}),
+            );
+            let project_id = project["id"].as_str().expect("project id").to_owned();
+
+            let session = invoke_ok(
+                &webview,
+                "create_session",
+                json!({
+                    "projectId": project_id,
+                    "title": "original",
+                    "description": "",
+                    "mode": "in_place",
+                    "branch": null,
+                    "cliKind": "claude",
+                    "cliCommand": null,
+                }),
+            );
+            let session_id = session["id"].as_str().expect("session id").to_owned();
+
+            // 分岐 1: 値あり -> アーカイブされる。
+            let archived = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"archived_at": 1_700_000_000_000_i64}}),
+            );
+            assert_eq!(
+                archived["archived_at"],
+                json!(1_700_000_000_000_i64),
+                "値ありの patch はアーカイブとして書き込まれなければならない"
+            );
+            let archived_list = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": false}),
+            );
+            assert_eq!(
+                archived_list.as_array().expect("array").len(),
+                0,
+                "アーカイブ直後は includeArchived: false で 0 件でなければならない"
+            );
+
+            // 分岐 2: 不在（archived_at キーを含めない）-> 変更しない。
+            let renamed = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"title": "renamed"}}),
+            );
+            assert_eq!(
+                renamed["archived_at"],
+                json!(1_700_000_000_000_i64),
+                "archived_at キーを含めない patch はアーカイブ状態を変更してはならない"
+            );
+            assert_eq!(renamed["title"], json!("renamed"));
+
+            // 分岐 3: 明示 null -> クリア（復元）。戻り値だけでなく list_sessions でも確認する。
+            let restored = invoke_ok(
+                &webview,
+                "update_session",
+                json!({"id": session_id, "patch": {"archived_at": null}}),
+            );
+            assert_eq!(
+                restored["archived_at"],
+                json!(null),
+                "明示 null の patch は archived_at を JSON null にクリアしなければならない"
+            );
+            let restored_list = invoke_ok(
+                &webview,
+                "list_sessions",
+                json!({"projectId": project_id, "includeArchived": false}),
+            );
+            assert_eq!(
+                restored_list.as_array().expect("array").len(),
+                1,
+                "復元は戻り値だけでなく DB にも届いていなければならない \
+                 （includeArchived: false で 1 件返ることが独立な観測）"
+            );
+        }
+
         // 変異 4: move_session の toStatus / toIndex が正しくバインドされているか。
         // 契約 §7.3 の落とし穴（camelCase 変換はコマンド引数名にしか効かない）は
         // move_session の引数がネスト構造を持たないため再現しないが、
