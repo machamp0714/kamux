@@ -16,7 +16,7 @@ import { tauriMockScript } from './support/tauriMock';
  * `beforeEach` を持ち、掃除導線の前提（`kanban_status: 'done'` + `mode: 'worktree'` +
  * `worktree_path` 非 null。`store/cleanup.ts` の `isCleanupSuggested`）とも
  * `worktree_status` コマンドのモックとも噛み合わない。共通フィクスチャを掃除向けに
- * 広げると、あちらの既存 12 テストの前提が本題と無関係に動く。
+ * 広げると、その beforeEach を共有する既存テストの前提が本題と無関係に動く。
  */
 test('worktree 掃除ダイアログが実ブラウザで開き、backdrop が position: fixed のオーバーレイに解決される（契約 §54.1 / 裁定 48）', async ({
   page,
@@ -63,7 +63,7 @@ test('worktree 掃除ダイアログが実ブラウザで開き、backdrop が p
   await expect(dialog).toBeVisible();
 
   // 本題。CSS が配線されていなければ backdrop は既定の `static` になる。
-  // E2E のための data-testid は足さない（契約 §26 の方針）ので、CSS のブロック名で引く。
+  // E2E のためだけの data-testid は増やさないので、CSS のブロック名で引く。
   const backdropPosition = await page
     .locator('.cleanup-worktree-dialog__backdrop')
     .evaluate((el) => getComputedStyle(el).position);
