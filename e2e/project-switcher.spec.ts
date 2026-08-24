@@ -8,8 +8,9 @@ import { tauriMockScript } from './support/tauriMock';
  * jsdom は外部 CSS を解決しないので `ProjectSwitcher.test.tsx`（vitest）は
  * `import './ProjectSwitcher.css';` の 1 行が消えても緑のままになる。その状態では
  * `position: fixed` / `inset: 0` / `z-index` が失われ、スイッチャーはオーバーレイでは
- * なくページ内へインラインで流れ込む（先例 `archived-drawer.spec.ts` / 契約 §126）。
- * **ここがその観測点。**
+ * なくページ内へインラインで流れ込む（先例 `e2e/archived-drawer.spec.ts`）。
+ * **ここがその観測点。** vitest を緑のまま通す変異（import 1 行の削除）をこの spec が
+ * 赤にすることを変異検証で確認した。
  */
 test('Cmd+P のプロジェクトスイッチャーが実ブラウザで開き、position: fixed のオーバーレイに解決される（契約 §54.1）', async ({
   page,

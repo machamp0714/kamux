@@ -13,8 +13,10 @@ import { render, screen } from '@testing-library/react';
  * `<SessionFormModal />` を `<ProjectSwitcherContainer />` より後にマウントする。
  *
  * 固定できるのは `App.tsx` の JSX の並びだけである（両方 sentinel モックに差し替えるため、
- * 実 CSS も実描画も見ていない）。マウント順を入れ替える変異はこのテストが無いと全緑になる
- * —— 先例は `src/views/KanbanView/index.test.tsx` の兄弟順テスト（契約 §145.4）。
+ * 実 CSS も実描画も見ていない）。2 つを入れ替える変異をこのテストが赤にすることは
+ * 変異検証で確認した —— 先例は `src/views/KanbanView/index.test.tsx` の兄弟順テスト
+ * （契約 §145.4 が「順序が意味を持つオーバーレイの対を作ったら、その順序を固定する
+ * テストを 1 本置く」を正典としている）。
  */
 vi.mock('./components/ErrorToast', () => ({ ErrorToast: () => null }));
 vi.mock('./components/ProjectBar', () => ({ ProjectBar: () => null }));

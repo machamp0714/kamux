@@ -20,7 +20,8 @@ export function ProjectSwitcherContainer() {
       activeProjectId={activeProjectId}
       onSelect={(id) => {
         setProjectSwitcherOpen(false);
-        // PTY には触れない。表示を切り替えるだけ（設計書 §3 / §6.1）
+        // PTY には触れない。setActiveProject は activeProjectId を差し替えて
+        // セッション一覧を取り直すだけである（src/store/projectSlice.ts）。
         void setActiveProject(id);
       }}
       onClose={() => setProjectSwitcherOpen(false)}

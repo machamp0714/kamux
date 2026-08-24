@@ -49,9 +49,10 @@ describe('ProjectSwitcher', () => {
     expect(screen.getByRole('option').textContent).toContain('kamux');
   });
 
-  // filterProjects は大文字小文字を無視する（filterProjects.ts:13-:14 の toLowerCase()）。
-  // filterProjects.test.ts の needle / query は 15 件すべて小文字のみなので、
-  // toLowerCase() を落とす変異はあちらでは緑になる。大文字クエリの経路をここで押さえる。
+  // filterProjects は大文字小文字を無視する（filterProjects.ts の h / n の toLowerCase()）。
+  // filterProjects.test.ts の 15 件の呼び出しは needle / query 側がすべて小文字なので、
+  // needle 側の toLowerCase() を落とす変異はあちらでは緑になる（変異検証で確認した）。
+  // 大文字クエリの経路をここで押さえる。
   it('大文字のクエリでも小文字の候補にマッチする', () => {
     render(
       <ProjectSwitcher
