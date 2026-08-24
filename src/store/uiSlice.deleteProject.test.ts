@@ -125,6 +125,34 @@ describe('deleteProjectDialog', () => {
     });
   });
 
+  // 上のテスト（成功側）の鏡像（catch 側）。`await listSessions` が reject する経路にも
+  // 同じガード（`st.deleteProjectDialog?.projectId === projectId`）があり、往復中に
+  // 対象が変わっていたら古い reject を適用してはいけない（先例は
+  // `uiSlice.overlayExclusion.test.ts` の
+  // 'openCleanupDialog の遅延応答（catch 側）は、往復中に対象がずれたら modal に触れない'）。
+  it('往復中に対象が変わったら古い応答（catch 側）を適用しない', async () => {
+    let rejectSessions: (e: { code: string; message: string }) => void = () => {};
+    listSessions.mockImplementation(
+      () =>
+        new Promise<Session[]>((_resolve, reject) => {
+          rejectSessions = reject;
+        }),
+    );
+
+    const stale = useAppStore.getState().openDeleteProjectDialog('p7');
+    // 往復中に対象が 'p9' へ切り替わる。
+    useAppStore.setState({ deleteProjectDialog: { projectId: 'p9', sessions: null, error: null } });
+
+    rejectSessions({ code: 'git', message: 'stale error' });
+    await stale;
+
+    expect(useAppStore.getState().deleteProjectDialog).toEqual({
+      projectId: 'p9',
+      sessions: null,
+      error: null,
+    });
+  });
+
   it('closeDeleteProjectDialog は自分だけを倒し、他のオーバーレイには触れない', () => {
     useAppStore.setState({
       deleteProjectDialog: PENDING,

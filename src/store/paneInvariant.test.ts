@@ -180,7 +180,9 @@ const ARGS: Record<string, unknown[]> = {
   restoreSession: ['a'],
   setShowArchived: [true],
   // M3-4 Task 12: Cmd+P のプロジェクトスイッチャー。projectSwitcherOpen / modal /
-  // cleanupDialog だけを書き、フォーカス 3 状態には触れない。
+  // cleanupDialog / deleteProjectDialog だけを書き、フォーカス 3 状態には触れない
+  // （12-B(iii) で deleteProjectDialog も対象に加わった。`uiSlice.ts` の
+  // `setProjectSwitcherOpen` の `set({...})` を実際に読んで確認した）。
   setProjectSwitcherOpen: [true],
   // M3-4 Task 12: プロジェクト削除の確認ダイアログ。deleteProjectDialog / modal /
   // cleanupDialog / projectSwitcherOpen だけを書き、フォーカス 3 状態には触れない。

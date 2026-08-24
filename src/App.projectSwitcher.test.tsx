@@ -6,17 +6,21 @@ import { render, screen } from '@testing-library/react';
  * 同じ `--z-scrim` を使う（`src/styles/tokens.css` が重なり順の正典。契約 §145.2）ので、
  * 前後関係は DOM の tree order だけで決まる —— 同一スタッキングレベルでは後に来た要素が前面。
  *
- * 2 枚が同時に開く経路は残っている: `setProjectSwitcherOpen(true)` は `modal` を倒すが、
- * 逆向きの `openModal` は `projectSwitcherOpen` を倒さない（`openModal` は本タスクの射程外。
- * 契約 §145.5 が機構として記録している）。つまり「スイッチャーを開いたまま Cmd+N」で
- * 2 枚になる。そのとき後から開いた `SessionFormModal` が前面に来る必要があるため、
- * `<SessionFormModal />` を `<ProjectSwitcherContainer />` より後にマウントする。
+ * 12-C（コミット `698f9fb`）で `openModal` / `openCleanupDialog` / `setProjectSwitcherOpen` /
+ * `openDeleteProjectDialog` の 4 つの opener が相互排他で全方向閉じた（`src/store/uiSlice.ts`
+ * の各 `set({...})` を実際に読んで確認した —— `openModal` は `projectSwitcherOpen: false` を
+ * 含む。`src/store/uiSlice.overlayExclusion.test.ts` の
+ * `it('openModal は projectSwitcherOpen を落とす')` が実測している）。
+ * 「スイッチャーを開いたまま Cmd+N」で 2 枚になる経路はもう無い。
+ *
+ * それでも `<SessionFormModal />` を `<ProjectSwitcherContainer />` より後にマウントする
+ * 順序を固定するのは、契約 §145.4 が「順序が意味を持つ対を作ったら、その順序を固定する
+ * テストを 1 本置くこと」を正典としているためである —— 新しいオーバーレイが足されたときに
+ * 再びこの順序が意味を持ちうる。
  *
  * 固定できるのは `App.tsx` の JSX の並びだけである（両方 sentinel モックに差し替えるため、
  * 実 CSS も実描画も見ていない）。2 つを入れ替える変異をこのテストが赤にすることは
- * 変異検証で確認した —— 先例は `src/views/KanbanView/index.test.tsx` の兄弟順テスト
- * （契約 §145.4 が「順序が意味を持つオーバーレイの対を作ったら、その順序を固定する
- * テストを 1 本置く」を正典としている）。
+ * 変異検証で確認した —— 先例は `src/views/KanbanView/index.test.tsx` の兄弟順テスト。
  */
 vi.mock('./components/ErrorToast', () => ({ ErrorToast: () => null }));
 vi.mock('./components/ProjectBar', () => ({ ProjectBar: () => null }));
