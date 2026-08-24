@@ -176,6 +176,29 @@ describe('ProjectBar の削除導線', () => {
     expect(await screen.findByText('セッション 4 件が一緒に消えます')).toBeTruthy();
   });
 
+  // 🔴 N-1: Container の `error` 配線（ストアと純表示の間の継ぎ目）を測る。
+  // list_sessions が失敗しても「セッションを数えています…」のまま固まらず、
+  // 契約 §6 の生メッセージが出て、canDelete は false のまま留まることを見る。
+  it('件数の取得が失敗したら生メッセージを出し、確定できないまま留まる（契約 §6 / §130.4）', async () => {
+    listSessions.mockImplementation((projectId: string) =>
+      projectId === 'p2'
+        ? Promise.reject({ code: 'db', message: 'db is locked' })
+        : Promise.resolve(REMOTE_SESSIONS[projectId] ?? []),
+    );
+    render(<ProjectBar />);
+
+    clickDelete('beta');
+
+    expect(await screen.findByText('db is locked')).toBeTruthy();
+    // 「出ない」だけを見ると画面が丸ごと描かれていなくても通る。他が描かれていることを添える。
+    expect(screen.queryByText('セッションを数えています…')).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'プロジェクトを削除' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('checkbox'));
+    expect((screen.getByRole('button', { name: '削除する' }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
   it('キャンセルするとダイアログが閉じ、何も消えない', async () => {
     render(<ProjectBar />);
 
