@@ -40,6 +40,11 @@ describe('fuzzyScore', () => {
   it('順序が違えばマッチしない', () => {
     expect(fuzzyScore('kamux', 'xk')).toBeNull();
   });
+
+  it('繰り返し文字は連続一致しない（カーソルは一致ごとに進む）', () => {
+    // 'kamux' に 'k' は 1 個しか無いので 'kk' はマッチしない
+    expect(fuzzyScore('kamux', 'kk')).toBeNull();
+  });
 });
 
 describe('filterProjects', () => {
@@ -71,5 +76,13 @@ describe('filterProjects', () => {
 
   it('前後の空白を無視する', () => {
     expect(filterProjects(projects, '  alpha  ').map((x) => x.id)).toEqual(['3']);
+  });
+
+  it('パス一致は name 一致より必ず下位に来る（後方の name 一致でも先頭の path 一致より上位）', () => {
+    // lateName: byName スコア 3（後方一致）。earlyPath: byPath スコア 1（先頭一致、name は無マッチ）。
+    // PATH_PENALTY が効いていれば、byPath にペナルティが乗るため lateName が必ず先に来る。
+    const lateName = p('L', 'my-user', '/opt/late');
+    const earlyPath = p('E', 'zzz', '/Users/x');
+    expect(filterProjects([earlyPath, lateName], 'user').map((x) => x.id)).toEqual(['L', 'E']);
   });
 });
