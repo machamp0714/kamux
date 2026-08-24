@@ -6,7 +6,7 @@
    .kanban-view__drawer* に倣う。パネル寸法は components.md「モーダル・ダイアログ」節
    （幅 500〜600px）、一覧の行は「パネル・表」節、0 件時の案内は「空状態」節に従う。 */
 
-.archived-drawer-scrim {
+.archived-drawer__scrim {
   position: fixed;
   inset: 0;
   z-index: var(--z-scrim);

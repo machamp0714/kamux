@@ -27,7 +27,7 @@ export function ArchivedDrawer({
     .sort((a, b) => (b.archived_at ?? 0) - (a.archived_at ?? 0));
 
   return (
-    <div className="archived-drawer-scrim" onMouseDown={onClose}>
+    <div className="archived-drawer__scrim" onMouseDown={onClose}>
       <aside
         className="archived-drawer"
         aria-label="アーカイブ済み"

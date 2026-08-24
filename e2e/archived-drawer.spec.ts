@@ -57,7 +57,7 @@ test('アーカイブ済みドロワーが実ブラウザで開き、position: f
   // 本題。CSS が配線されていなければ scrim は既定の `static` になる。
   // E2E のためだけの data-testid は増やさないので、CSS のブロック名で引く。
   const scrimPosition = await page
-    .locator('.archived-drawer-scrim')
+    .locator('.archived-drawer__scrim')
     .evaluate((el) => getComputedStyle(el).position);
   expect(scrimPosition).toBe('fixed');
 });

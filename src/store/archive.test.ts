@@ -155,6 +155,34 @@ describe('アーカイブと復元', () => {
 
       expect(useAppStore.getState().sessions).toEqual(bSessions);
     });
+
+    // レビュー Important-1: catch 内の isStillActiveProject ガードは、成功経路の鏡像
+    // （上のテスト）しか測られていなかった。archiveSession の失敗側の鏡像
+    // （sessionActions.test.ts:201）と同じ形をここに置く。
+    it('失敗し、かつ応答までに切り替わっていたら、B の盤面へロールバックしない。ただし throw はする', async () => {
+      useAppStore.setState({
+        sessions: { a: s({ id: 'a', archived_at: 1754006400000 }) },
+        sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      });
+      updateSession.mockImplementation(async () => {
+        switchToB();
+        throw { code: 'db', message: 'locked' };
+      });
+
+      await expect(useAppStore.getState().restoreSession('a')).rejects.toEqual({
+        code: 'db',
+        message: 'locked',
+      });
+
+      // A の盤面（a を含む）へロールバックされていないこと。B の盤面のまま
+      expect(useAppStore.getState().sessions).toEqual(bSessions);
+      expect(useAppStore.getState().sessionOrder).toEqual({
+        backlog: [],
+        in_progress: [],
+        review: [],
+        done: ['b'],
+      });
+    });
   });
 
   // 契約 §144.5 / 裁定 70: 復元は冪等でなければならない。

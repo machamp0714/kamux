@@ -246,4 +246,59 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
 
     await waitFor(() => expect(updateSession).toHaveBeenCalledWith('s1', { archived_at: null }));
   });
+
+  // レビュー Important-2: sessions は project_id === activeProjectId で絞る唯一の
+  // 防波堤。restoreSession は target.project_id を見ないので、ここが外れると他
+  // プロジェクトのアーカイブ済みが挿入可能な状態でドロワーへ混入する。
+  it('ドロワーへ渡す sessions はアクティブプロジェクト（p1）だけに絞る', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'p1 task', project_id: 'p1', archived_at: 1754006400000 }),
+        s2: session({ id: 's2', title: 'p2 task', project_id: 'p2', archived_at: 1754006400000 }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByText('p1 task')).toBeInTheDocument();
+    expect(screen.queryByText('p2 task')).toBeNull();
+  });
+
+  // レビュー Important-3: 閉じる・掃除の配線 4 経路のうち、container 側の 2 経路
+  // （onClose / onCleanup）をここで測る。component 側は ArchivedDrawer.test.tsx。
+  it('ドロワーの閉じるボタンを押すと showArchived が false になる', () => {
+    useAppStore.setState({
+      sessions: { s1: session({ archived_at: 1754006400000 }) },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+
+    render(<KanbanView />);
+    fireEvent.click(screen.getByRole('button', { name: '閉じる' }));
+
+    expect(useAppStore.getState().showArchived).toBe(false);
+  });
+
+  it('掃除ボタンを押すと openCleanupDialog がそのセッション ID で呼ばれる', () => {
+    const openCleanupDialog = vi.fn(async () => undefined);
+    useAppStore.setState({
+      sessions: {
+        s1: session({
+          mode: 'worktree',
+          worktree_path: '/repo/a/.worktrees/session-x',
+          archived_at: 1754006400000,
+        }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+      openCleanupDialog,
+    });
+
+    render(<KanbanView />);
+    fireEvent.click(screen.getByRole('button', { name: 'worktree を掃除' }));
+
+    expect(openCleanupDialog).toHaveBeenCalledWith('s1');
+  });
 });

@@ -116,4 +116,42 @@ describe('ArchivedDrawer', () => {
     const titles = screen.getAllByText(/^task /).map((el) => el.textContent);
     expect(titles).toEqual(['task new', 'task old']);
   });
+
+  // レビュー Important-3: 閉じる・掃除の配線 4 経路のうち、ここで測るのは
+  // component 側の 2 経路（閉じるボタン / スクリム）。
+  it('閉じるボタンを押すと onClose が呼ばれる', () => {
+    const onClose = vi.fn();
+    render(
+      <ArchivedDrawer
+        open
+        sessions={[s('a', 1754006400000)]}
+        onRestore={vi.fn()}
+        onCleanup={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '閉じる' }));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('スクリムを押すと onClose が呼ばれる。ドロワー本体を押しても呼ばれない', () => {
+    const onClose = vi.fn();
+    const { container } = render(
+      <ArchivedDrawer
+        open
+        sessions={[s('a', 1754006400000)]}
+        onRestore={vi.fn()}
+        onCleanup={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+
+    fireEvent.mouseDown(screen.getByRole('complementary', { name: 'アーカイブ済み' }));
+    expect(onClose).not.toHaveBeenCalled();
+
+    const scrim = container.querySelector('.archived-drawer__scrim');
+    if (scrim === null) throw new Error('scrim が見つからない');
+    fireEvent.mouseDown(scrim);
+    expect(onClose).toHaveBeenCalled();
+  });
 });
