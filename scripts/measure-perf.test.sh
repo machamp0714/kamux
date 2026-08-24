@@ -386,7 +386,7 @@ out="$(idle_case "0.10 0.05 0.05 0.05" "0.30 0.20 0.15 0.10")"
 contains "アイドル CPU 平均は 1 ブロック目を捨てて平均する" "$out" "PASS  アイドルCPU平均 0.50% (上限 1.0%)"
 contains "アイドル CPU 最大は 2 ブロック目以降の最大" "$out" "PASS  アイドルCPU最大 0.75% (上限 5.0%)"
 contains "アイドル CPU が両方上限未満なら exit_code=0" "$out" "exit_code=0"
-# §104.3「top -l 61 -s 1 -stats pid,cpu -pid … を 1 回だけ走らせ」。
+# §104.3「`top -l 61 -s 1 -stats pid,cpu -pid …` を 1 回だけ走らせ」。
 # -pid は統制対象 4 本ぶん渡ること（§104.2 理由 2「2 本しか挙げない手順は数え漏らす」）。
 eq "top は §104.3 の逐語の引数で 1 回だけ走る" "$(cat "$idle_top_args")" \
   "-l 61 -s 1 -stats pid,cpu -pid 1000 -pid 1001 -pid 1002 -pid 1003"
