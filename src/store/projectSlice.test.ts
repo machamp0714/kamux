@@ -89,7 +89,7 @@ describe('setActiveProject', () => {
 
     expect(useAppStore.getState().activeProjectId).toBe('p2');
     expect(localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY)).toBe('p2');
-    expect(listSessions).toHaveBeenCalledWith('p2', false);
+    expect(listSessions).toHaveBeenCalledWith('p2', true);
   });
 
   it('loadSessions の完了を待ってから返る（await 落ちを検出する）', async () => {

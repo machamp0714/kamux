@@ -44,7 +44,7 @@ describe('bootstrap', () => {
     await bootstrap();
 
     expect(useAppStore.getState().activeProjectId).toBe('p2');
-    expect(listSessions).toHaveBeenCalledWith('p2', false);
+    expect(listSessions).toHaveBeenCalledWith('p2', true);
   });
 
   it('保存が無ければ先頭のプロジェクトを選ぶ', async () => {
@@ -53,7 +53,7 @@ describe('bootstrap', () => {
     await bootstrap();
 
     expect(useAppStore.getState().activeProjectId).toBe('p1');
-    expect(listSessions).toHaveBeenCalledWith('p1', false);
+    expect(listSessions).toHaveBeenCalledWith('p1', true);
   });
 
   it('保存された ID が消えたプロジェクトを指していたら先頭に落とす', async () => {

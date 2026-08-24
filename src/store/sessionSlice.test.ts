@@ -105,7 +105,7 @@ describe('indexSessions', () => {
 });
 
 describe('loadSessions', () => {
-  it('アーカイブ済みを除いて取得し、ストアに展開する', async () => {
+  it('アーカイブ済みも含めて取得し（盤面には出さない）、ストアに展開する', async () => {
     listSessions.mockResolvedValue([
       session({ id: 'a', sort_order: 2 }),
       session({ id: 'b', sort_order: 1 }),
@@ -113,13 +113,15 @@ describe('loadSessions', () => {
 
     await useAppStore.getState().loadSessions('p1');
 
-    expect(listSessions).toHaveBeenCalledWith('p1', false);
+    // include_archived: true —— アーカイブ済みもストアには載せる。盤面に出すかどうかは
+    // buildSessionOrder（アーカイブ除外）が決める（Task 6 の仕様変更）。
+    expect(listSessions).toHaveBeenCalledWith('p1', true);
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b', 'a']);
     expect(useAppStore.getState().sessions.a.sort_order).toBe(2);
   });
 
-  it('プロジェクトを切り替えると前のセッションを完全に置き換える', async () => {
-    listSessions.mockResolvedValue([session({ id: 'old' })]);
+  it('別プロジェクトを読み込んでも、既に読み込んだプロジェクトの sessions は残る（sessionOrder には現れない）', async () => {
+    listSessions.mockResolvedValue([session({ id: 'old', project_id: 'p1' })]);
     await useAppStore.getState().loadSessions('p1');
 
     listSessions.mockResolvedValue([session({ id: 'new', project_id: 'p2' })]);
@@ -128,8 +130,10 @@ describe('loadSessions', () => {
     useAppStore.setState({ activeProjectId: 'p2' });
     await useAppStore.getState().loadSessions('p2');
 
-    expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', false);
-    expect(Object.keys(useAppStore.getState().sessions)).toEqual(['new']);
+    expect(listSessions).toHaveBeenNthCalledWith(2, 'p2', true);
+    // 置換ではなくマージ —— p1 の 'old' は sessions マップに残る
+    expect(Object.keys(useAppStore.getState().sessions).sort()).toEqual(['new', 'old']);
+    // ただし sessionOrder はアクティブプロジェクト(p2)の分だけ
     expect(useAppStore.getState().sessionOrder.backlog).toEqual(['new']);
   });
 
@@ -219,6 +223,54 @@ describe('loadSessions', () => {
     await pendingA;
 
     expect(useAppStore.getState().runtimeStates).toEqual({ b1: 'idle' });
+  });
+
+  // 以下 3 件は brief（Task 6）が指定した新規テスト。上のテストと assertion が
+  // 重なる部分はあるが、lane-controller 裁定 28 の指示どおり別出しで追記する。
+  it('include_archived: true で取得する', async () => {
+    listSessions.mockResolvedValue([]);
+    await useAppStore.getState().loadSessions('p1');
+    expect(listSessions).toHaveBeenCalledWith('p1', true);
+  });
+
+  it('別プロジェクトを読み込んでも既存プロジェクトのセッションを消さない', async () => {
+    listSessions.mockResolvedValueOnce([session({ id: 'a1', project_id: 'p1' })]);
+    await useAppStore.getState().loadSessions('p1');
+
+    listSessions.mockResolvedValueOnce([session({ id: 'b1', project_id: 'p2' })]);
+    // activeProjectId を切り替えないと isStillActiveProject ガードに弾かれる
+    // （実経路では setActiveProject → loadSessions の順で必ず切り替わる）。
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(Object.keys(useAppStore.getState().sessions).sort()).toEqual(['a1', 'b1']);
+  });
+
+  it('sessionOrder は読み込んだプロジェクトの分だけになる', async () => {
+    listSessions.mockResolvedValueOnce([session({ id: 'a1', project_id: 'p1' })]);
+    await useAppStore.getState().loadSessions('p1');
+
+    listSessions.mockResolvedValueOnce([session({ id: 'b1', project_id: 'p2' })]);
+    useAppStore.setState({ activeProjectId: 'p2' });
+    await useAppStore.getState().loadSessions('p2');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['b1']);
+  });
+
+  // sessionOrder は「今回の応答(list)」ではなく「マージ後の sessions（同一プロジェクトの
+  // 既知エントリを含む）」から作ること。list をそのまま渡す実装に取り違えても、
+  // 他プロジェクトを跨がないケースでは他のテストが気づかない。
+  it('同一プロジェクトの sessionOrder は、応答に含まれない既存エントリも含めて作る', async () => {
+    useAppStore.setState({
+      sessions: {
+        existing: session({ id: 'existing', project_id: 'p1', sort_order: 1 }),
+      },
+    });
+    listSessions.mockResolvedValueOnce([session({ id: 'fresh', project_id: 'p1', sort_order: 2 })]);
+
+    await useAppStore.getState().loadSessions('p1');
+
+    expect(useAppStore.getState().sessionOrder.backlog).toEqual(['existing', 'fresh']);
   });
 });
 

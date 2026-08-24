@@ -24,7 +24,8 @@ import type {
   StateReason,
 } from '../types/model';
 import { surfaceId } from '../types/model';
-import { emptySessionOrder, indexSessions, moveCardInOrder } from './kanbanOrder';
+import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
+import { buildSessionOrder as buildProjectSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
 import { toAppError } from './uiSlice';
 
@@ -111,19 +112,30 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
   resumeFailedSessionIds: [],
 
   loadSessions: async (projectId) => {
-    // アーカイブ済みは表示しない（復活 UX は M3-4）
-    const list = await listSessions(projectId, false);
+    // アーカイブ済みもストアには載せる（ボードに出すかは buildSessionOrder が決める。
+    // Task 6: 復活 UX が別プロジェクトの sessions を必要とするため include_archived: true）。
+    const list = await listSessions(projectId, true);
     // 応答が返るまでにプロジェクトが切り替わっていたら捨てる（M1-1 からの申し送り）。
-    // sessions / sessionOrder を所有する sessionSlice が「これらは常に activeProjectId の
-    // ものである」という不変条件も持つ。projectSlice.setActiveProject は
+    // sessionOrder を所有する sessionSlice が「これは常に activeProjectId のものである」
+    // という不変条件も持つ。projectSlice.setActiveProject は
     // activeProjectId を set してから loadSessions を await するので、初回ロードは弾かれない。
     // 【この行より上で set() しないこと】ガードは「この応答を捨てるかどうか」の判定であり、
     // ガードより前に set すると、捨てたはずの応答の副作用だけがストアに残る。
     // 例: 契約 §34.6 で M2-1 が足す予定の seedRuntimeStates(list, true) は、必ずこのガードの
     // 下（return の後）に置くこと。上に置くと runtimeStates だけ stale なプロジェクトで
-    // seed され、sessions / sessionOrder は現行のまま、という split-brain に戻ってしまう。
+    // seed され、sessionOrder は現行のまま、という split-brain に戻ってしまう。
     if (get().activeProjectId !== projectId) return;
-    set(indexSessions(list));
+    // 置換ではなくマージ。他プロジェクトの sessions を消すと
+    // バッジ・Dock バッジ数・通知ルーティングが壊れる（Task 6）。
+    // sessionOrder は読み込んだプロジェクト（アクティブプロジェクト）の分だけに絞る。
+    set((st) => {
+      const sessions = { ...st.sessions };
+      for (const x of list) sessions[x.id] = x;
+      return {
+        sessions,
+        sessionOrder: buildProjectSessionOrder(Object.values(sessions), projectId),
+      };
+    });
     // 起動時正規化済みの last_runtime_state から ⏸ を復元する
     get().seedRuntimeStates(list, true);
   },
