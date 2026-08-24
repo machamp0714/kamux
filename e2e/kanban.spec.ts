@@ -632,6 +632,25 @@ test('.kanban-card__error が実ブラウザで描かれ、生 stderr が原文�
             // （first_started_at === null の除外例外）。
             first_started_at: null,
           },
+          // 対照カード。:has() が「選択している」ことの向きを測るために要る（下の assert 参照）。
+          // last_runtime_error を null にしておくこと —— 非 null だと KanbanCardError が
+          // 2 枚目の .kanban-card__error を描き、上の toBeVisible() が strict mode violation で
+          // 落ちて、このテストの本題（error 側）ごと意味が変わる。
+          {
+            id: 's2',
+            project_id: 'p1',
+            title: 'no error',
+            description: '',
+            kanban_status: 'backlog',
+            sort_order: 2000,
+            cli_kind: 'claude',
+            mode: 'worktree',
+            branch: 'no-error',
+            archived_at: null,
+            last_runtime_state: 'idle',
+            last_runtime_error: null,
+            first_started_at: null,
+          },
         ],
       },
     }),
@@ -672,4 +691,31 @@ test('.kanban-card__error が実ブラウザで描かれ、生 stderr が原文�
 
   expect(borderColor).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
   expect(borderColor).toBe(expectedBorderColor);
+
+  // ここまでの assert には向きが無い ——「❌ のカードだけが赤枠」と「全カードが赤枠」
+  // （= .kanban-card の素の border を赤にしただけ）を区別しない。:has() が実際に
+  // 選択していることは、エラーでない対照カードの枠が既定色のままであることでしか測れない。
+  // 対照側も probe 解決値との toBe で見るので、error 側とまったく同じ強さになる
+  // （「異なる」assert だと --border 以外の何色でも通ってしまう）。
+  // ホバーしないこと —— .kanban-card:hover は border-color: var(--border-strong) を当てるので、
+  // hover したまま測ると変異と無関係に落ちる。
+  await expect(page.locator('[data-session-id="s2"]')).toBeVisible();
+  const controlBorderColor = await page
+    .locator('[data-session-id="s2"].kanban-card')
+    .evaluate((el) => getComputedStyle(el).borderTopColor);
+
+  const expectedControlBorderColor = await page.evaluate(() => {
+    const probe = document.createElement('div');
+    probe.style.color = 'var(--border)';
+    document.body.appendChild(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  });
+
+  // 2 つの probe が同じ値に解決されると、下の toBe は「全カードが赤枠」でも通ってしまう。
+  // 母数が生きていることの確認（恒真ではない —— --border と --state-error が
+  // 同じ色に変えられたらここが落ちる）。
+  expect(expectedControlBorderColor).not.toBe(expectedBorderColor);
+  expect(controlBorderColor).toBe(expectedControlBorderColor);
 });
