@@ -23,8 +23,8 @@ function isLive(state: RuntimeState | undefined): boolean {
  * 購読しない。両方が購読すると許可リストの行が 2 つ要り、それは移設ではなく追加になる
  * （契約 §147.4）。射程は表示だけで、`stop_session` の分岐には使わない（契約 §147.2）。
  *
- * セレクタはプリミティブ（数値・文字列）を返す。件数のためにセッション辞書全体を
- * select すると、無関係なセッションの更新でダイアログが再レンダリングされる。
+ * 件数のためにセッション辞書全体を select しないこと —— 無関係なセッションが 1 つ更新
+ * されるたびにダイアログが再レンダリングされる。セレクタはプリミティブを返す形にする。
  */
 export function DeleteProjectDialogContainer(): JSX.Element | null {
   const projectId = useAppStore((s) => s.deleteProjectDialog?.projectId ?? null);
