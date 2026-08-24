@@ -38,12 +38,18 @@ const reportFrontendReadySpy = vi.fn().mockResolvedValue(undefined);
 // （「モックが実際に reject していること」を測れなくなる）。呼び出し回数の記録はスパイに
 // 任せつつ、App.tsx へ渡す Promise はスパイの外側で作った素の Promise にする。
 let reportFrontendReadyRejects = false;
+// 「拒否が実際に起きたこと」を直接数える。モックを常に resolve に差し替える変異を
+// 打っても、呼び出し回数や unhandledRejection の不在だけでは拒否の経路を測れない
+// （修正ラウンド2、レビュー指摘）。ここでカウントし、テスト側で `toBe(1)` を固定する。
+let rejectionsProduced = 0;
 vi.mock('./ipc/commands', () => ({
   reportFrontendReady: () => {
     reportFrontendReadySpy();
-    return reportFrontendReadyRejects
-      ? Promise.reject(new Error('report_frontend_ready failed'))
-      : Promise.resolve(undefined);
+    if (reportFrontendReadyRejects) {
+      rejectionsProduced += 1;
+      return Promise.reject(new Error('report_frontend_ready failed'));
+    }
+    return Promise.resolve(undefined);
   },
 }));
 
@@ -125,6 +131,7 @@ describe('App', () => {
     beforeEach(() => {
       reportFrontendReadySpy.mockClear();
       reportFrontendReadyRejects = false;
+      rejectionsProduced = 0;
       raf = fakeRaf();
       vi.stubGlobal('requestAnimationFrame', raf.raf);
       vi.stubGlobal('cancelAnimationFrame', raf.caf);
@@ -171,6 +178,10 @@ describe('App', () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(reportFrontendReadySpy).toHaveBeenCalledTimes(1);
         expect(onUnhandledRejection).not.toHaveBeenCalled();
+        // モックが実際に reject を生成したことそのものを見る（resolve に差し替える
+        // 変異を打つと 0 のまま赤になる。呼び出し回数・unhandledRejection の不在だけでは
+        // この経路を測れない）。
+        expect(rejectionsProduced).toBe(1);
       } finally {
         process.off('unhandledRejection', onUnhandledRejection);
       }
