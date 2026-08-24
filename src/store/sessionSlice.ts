@@ -285,8 +285,9 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     const column = prevOrder[target.kanban_status];
     let optimisticOrder = prevOrder;
     // 冪等性ガード（契約 §144.5 / 裁定 70）: 既に列に居れば挿入しない。
-    // paneInvariant.test.ts の baseline は archived_at: null のセッションに
-    // restoreSession を呼ぶため、ガードが無いと同じ id が列に 2 つ入る。
+    // アーカイブされていない（archived_at: null の）セッションに restoreSession を
+    // 呼ぶ経路（paneInvariant.test.ts の ARGS がその 1 つ）では、ガードが無いと
+    // 同じ id が列に 2 つ入る（archive.test.ts の冪等性テストで実測）。
     if (!column.includes(id)) {
       // 挿入位置は (sort_order, id) の全順序で決める（契約 §144.7 / 裁定 72）。
       // 土台 column の並び自体は 1 つも変えない —— 「column の中で restoredTarget
