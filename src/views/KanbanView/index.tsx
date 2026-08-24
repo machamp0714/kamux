@@ -168,17 +168,14 @@ export function KanbanView() {
       />
 
       {/* cleanupDialog が null の間は自分で null を返す（M3-4 Task 9）。
-          KanbanView 内の他のオーバーレイ（hooks ドロワーのスクリム / ArchivedDrawer）は
-          いずれも .cleanup-worktree-dialog__backdrop と同じ --z-scrim を使うため、同一
-          スタッキングレベルでは tree order が重なり順を決める（CSS 仕様）。ここを最後に
-          マウントすることで、確認ダイアログが KanbanView 内の他のオーバーレイより常に
-          前面へ来るようにする（PR #106 全体レビュー I-1。tokens.css は編集しない —— 契約
-          §53.2 が実装者によるトークンの追加・変更を禁じている）。
-          KanbanView の外にある SessionFormModal（src/App.tsx）との重なりはこの並び順では
-          閉じない。App.tsx 側で KanbanView より後にマウントされているため、今は
-          tree order で SessionFormModal が前に来て問題は起きないが、これは
-          KanbanView の外の並びに依存しており、この並び順の変更だけでは保証されない
-          （直さない。lane-controller が team-lead へ上げる）。 */}
+          .cleanup-worktree-dialog__backdrop と .archived-drawer__scrim は同一の --z-scrim
+          を使うため、同一スタッキングレベルでは tree order が重なり順を決める（CSS 仕様）。
+          ArchivedDrawer より後にマウントすることで、確認ダイアログが常に ArchivedDrawer
+          より前面へ来るようにする（PR #106 全体レビュー I-1。この重なり順は
+          index.test.tsx で固定している。tokens.css は編集しない —— 契約 §53.2 が
+          実装者によるトークンの追加・変更を禁じている）。
+          KanbanView の外にある SessionFormModal との重なりはこの並び順では閉じない
+          （本 PR の射程外。lane-controller が team-lead へ上げる）。 */}
       <CleanupWorktreeDialogContainer />
     </div>
   );
