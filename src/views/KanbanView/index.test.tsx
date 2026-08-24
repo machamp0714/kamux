@@ -159,3 +159,43 @@ describe('KanbanView と HooksStatusPanel の統合点', () => {
     expect(screen.getByTestId('hooks-socket-path')).toBeInTheDocument();
   });
 });
+
+// マウントの 1 行（<CleanupWorktreeDialogContainer />）が落ちても、ダイアログ側の
+// テストも container 側のテストも緑のままになる。呼び出し側をここで見る。
+describe('KanbanView が worktree 掃除ダイアログをマウントする（M3-4 Task 9）', () => {
+  it('cleanupDialog が立っていれば確認ダイアログが出る', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({
+          mode: 'worktree',
+          branch: 'session/fix-login',
+          worktree_path: '/repo/a/.worktrees/session-fix-login',
+          kanban_status: 'done',
+        }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: ['s1'] },
+      cleanupDialog: {
+        sessionId: 's1',
+        status: { dirty: false, entries: [] },
+        error: null,
+        busy: false,
+      },
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByRole('dialog', { name: 'worktree を掃除' })).toBeInTheDocument();
+  });
+
+  it('cleanupDialog が null なら確認ダイアログは出ない', () => {
+    useAppStore.setState({
+      sessions: { s1: session({}) },
+      sessionOrder: { backlog: ['s1'], in_progress: [], review: [], done: [] },
+      cleanupDialog: null,
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.queryByRole('dialog', { name: 'worktree を掃除' })).toBeNull();
+  });
+});
