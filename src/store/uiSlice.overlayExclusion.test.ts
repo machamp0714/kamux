@@ -110,4 +110,27 @@ describe('overlay 相互排他（openModal / openCleanupDialog）', () => {
 
     expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
   });
+
+  // 上のテストの鏡像（catch 側）。`await worktreeStatus` が reject する経路にも同じ
+  // ガード（`st.cleanupDialog?.sessionId === sessionId`）があり、往復中に cleanupDialog が
+  // 閉じられていたら modal には触れてはいけない。catch 側のガードの外側で無条件に
+  // `modal: null` を足す変異（成功側と鏡像の欠陥）を打つとここが赤くなる。
+  it('openCleanupDialog の遅延応答（catch 側）は、往復中に対象がずれたら modal に触れない', async () => {
+    let rejectStatus: (e: { code: string; message: string }) => void = () => {};
+    worktreeStatus.mockImplementation(
+      () =>
+        new Promise<WorktreeStatus>((_resolve, reject) => {
+          rejectStatus = reject;
+        }),
+    );
+
+    const pending = useAppStore.getState().openCleanupDialog('s1');
+    // 往復中に cleanupDialog が閉じられ（対象ガードが外れ）、modal が開かれる。
+    useAppStore.setState({ cleanupDialog: null, modal: { kind: 'create_session' } });
+
+    rejectStatus({ code: 'git', message: 'stale error' });
+    await pending;
+
+    expect(useAppStore.getState().modal).toEqual({ kind: 'create_session' });
+  });
 });
