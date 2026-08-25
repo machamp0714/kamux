@@ -623,6 +623,12 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         manager.app_handle().clone(),
         Arc::clone(&notifier),
     )));
+    // 裁定 119（契約 §121.3 / §121.4）: 手動スモーク項目 1 / 5 / 9 / 10 が
+    // `session://state` の `reason` を読む入口。既定の TracingLineSink は
+    // init_tracing_subscriber() が INFO で立てた subscriber へ出す。
+    runtime.register_observer(Arc::new(
+        crate::session::runtime_state::StateLineObserver::with_tracing_sink(),
+    ));
 
     // 起動時の Dock バッジは必ず空から始める。**DB の `last_runtime_state` から
     // 復元してはならない。** 理由は 2 つ:
@@ -1921,6 +1927,34 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
             assert_eq!(payload["session_id"], serde_json::json!(session.id));
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// 裁定 119: `install_app_state_with` は observer を **3 つ**登録している
+        /// (`TauriEmitObserver` / `NotifyObserver` / `StateLineObserver`)。
+        /// 将来 4 つ目を足す者が何を壊したのかを 1 行で知れるよう、assert
+        /// メッセージに 3 つの名前を書く。
+        #[test]
+        fn install_app_state_with_registers_three_observers() {
+            let (_dir, store) = open_temp();
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+            );
+
+            let count = app.state::<AppState>().runtime.observer_count();
+            assert_eq!(
+                count, 3,
+                "install_app_state_with は TauriEmitObserver / NotifyObserver / \
+                 StateLineObserver の 3 つを register_observer していなければならない \
+                 (実測: {count})"
+            );
         }
 
         /// M2-3 Task 10: `install_app_state_with` が `NotifyObserver` を

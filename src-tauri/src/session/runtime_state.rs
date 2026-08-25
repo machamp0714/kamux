@@ -410,6 +410,16 @@ impl RuntimeStateManager {
             .push(observer);
     }
 
+    /// 現在登録されている observer の数。production の配線 1 行
+    /// (`install_app_state_with` が 3 つ register_observer していること)を
+    /// 守るために在る。
+    pub fn observer_count(&self) -> usize {
+        self.observers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     pub fn current(&self, session_id: &str) -> RuntimeState {
         read_map(&self.states)
             .get(session_id)
@@ -628,6 +638,65 @@ impl<R: tauri::Runtime> StateObserver for TauriEmitObserver<R> {
     }
 }
 
+/// 裁定 119（契約 §121.3 / §121.4）: `session://state` の `reason` を人間が読む入口。
+///
+/// `SessionStatePayload` をそのまま `serde_json` でシリアライズし、`kamux state ` を
+/// 前置した 1 行にする。手で 3 フィールドを並べない —— `SessionStatePayload`
+/// (`model.rs`) の serde 表現は契約 §33.2 の snake_case 文字列にテストで固定されており、
+/// 手で組むとその固定から外れた 2 つ目の真実源ができる。
+///
+/// シリアライズに失敗した場合（通常起きない）も panic せず、その旨を 1 行にして返す
+/// （契約 §0: panic 経路を作らない）。
+pub fn format_state_line(payload: &SessionStatePayload) -> String {
+    match serde_json::to_string(payload) {
+        Ok(json) => format!("kamux state {json}"),
+        Err(err) => format!("kamux state <serialize failed: {err}>"),
+    }
+}
+
+/// 整形済みの 1 行の出力先。既定は `tracing` の INFO。
+pub trait StateLineSink: Send + Sync {
+    fn write_line(&self, line: &str);
+}
+
+/// 既定の出力先。`init_tracing_subscriber()`（`lib.rs`）が `Level::INFO` で立てた
+/// subscriber へ出す。追加の初期化は不要。
+pub struct TracingLineSink;
+
+impl StateLineSink for TracingLineSink {
+    fn write_line(&self, line: &str) {
+        tracing::info!("{line}");
+    }
+}
+
+/// 裁定 119: `reason` の到達経路として `RuntimeStateManager::register_observer` に足す
+/// 3 つ目の observer。整形は `format_state_line` に委譲し、この型自身は
+/// 「整形結果を sink へ渡す」以外の判断を持たない。
+///
+/// `S: StateLineSink` は `TauriEmitObserver<R: Runtime>` とまったく同じ理由で
+/// 一般化されている —— テストのために足した内部実装の一般化であり、契約上の型ではない。
+pub struct StateLineObserver<S: StateLineSink = TracingLineSink> {
+    sink: Arc<S>,
+}
+
+impl<S: StateLineSink> StateLineObserver<S> {
+    pub fn new(sink: Arc<S>) -> Self {
+        Self { sink }
+    }
+}
+
+impl StateLineObserver<TracingLineSink> {
+    pub fn with_tracing_sink() -> Self {
+        Self::new(Arc::new(TracingLineSink))
+    }
+}
+
+impl<S: StateLineSink> StateObserver for StateLineObserver<S> {
+    fn on_state(&self, payload: &SessionStatePayload) {
+        self.sink.write_line(&format_state_line(payload));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +709,107 @@ mod tests {
         assert_eq!(
             state_topic("3f2a9c1e-0000-4000-8000-000000000001"),
             "session://state/3f2a9c1e-0000-4000-8000-000000000001"
+        );
+    }
+
+    /// 裁定 119: `format_state_line` は `kamux state ` で始まり、続く JSON が
+    /// `session_id` / `runtime_state` / `reason` の 3 キーちょうどを持ち、
+    /// 値がそれぞれ渡した payload と一致する。部分文字列一致では、値が
+    /// 入れ替わっていても通ってしまうため JSON をパースして比較する。
+    #[test]
+    fn format_state_line_has_kamux_state_prefix_and_exact_three_fields() {
+        let payload = SessionStatePayload {
+            session_id: "3f2a9c1e-0000-4000-8000-000000000001".to_string(),
+            runtime_state: RuntimeState::WaitingInput,
+            reason: StateReason::BelDetected,
+        };
+
+        let line = format_state_line(&payload);
+
+        let prefix = "kamux state ";
+        assert!(
+            line.starts_with(prefix),
+            "line must start with 'kamux state ': {line}"
+        );
+        let json_part = &line[prefix.len()..];
+        let value: serde_json::Value = serde_json::from_str(json_part).expect("valid json");
+        let object = value.as_object().expect("json object");
+        assert_eq!(object.len(), 3, "expected exactly 3 keys: {object:?}");
+        assert_eq!(
+            object["session_id"],
+            serde_json::json!("3f2a9c1e-0000-4000-8000-000000000001")
+        );
+        assert_eq!(object["runtime_state"], serde_json::json!("waiting_input"));
+        assert_eq!(object["reason"], serde_json::json!("bel_detected"));
+    }
+
+    /// 裁定 119・契約 §121.4 条件 1: `reason` が異なれば行が異なる。
+    /// 手動スモーク項目 1 / 5 / 9 / 10 が読む 4 値それぞれを逐語で assert する。
+    #[test]
+    fn format_state_line_differs_by_reason_for_the_four_manual_smoke_values() {
+        let make = |reason: StateReason| {
+            format_state_line(&SessionStatePayload {
+                session_id: "s1".to_string(),
+                runtime_state: RuntimeState::Running,
+                reason,
+            })
+        };
+
+        let bel = make(StateReason::BelDetected);
+        let output = make(StateReason::OutputActivity);
+        let hook_stop = make(StateReason::HookStop);
+        let silence = make(StateReason::SilenceTimeout);
+
+        assert!(bel.contains("\"reason\":\"bel_detected\""));
+        assert!(output.contains("\"reason\":\"output_activity\""));
+        assert!(hook_stop.contains("\"reason\":\"hook_stop\""));
+        assert!(silence.contains("\"reason\":\"silence_timeout\""));
+
+        let lines = [&bel, &output, &hook_stop, &silence];
+        for (i, a) in lines.iter().enumerate() {
+            for (j, b) in lines.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "reason={i} と reason={j} の行が同一になっている");
+                }
+            }
+        }
+    }
+
+    /// 裁定 119: `StateLineObserver` に記録用の `StateLineSink` を差し込み、
+    /// `on_state` を 1 回呼ぶと `format_state_line` と同じ 1 行が sink に届く。
+    #[test]
+    fn state_line_observer_writes_formatted_line_to_sink() {
+        #[derive(Default)]
+        struct RecordingSink {
+            lines: Mutex<Vec<String>>,
+        }
+
+        impl StateLineSink for RecordingSink {
+            fn write_line(&self, line: &str) {
+                self.lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(line.to_string());
+            }
+        }
+
+        let sink = Arc::new(RecordingSink::default());
+        let observer = StateLineObserver::new(Arc::clone(&sink));
+        let payload = SessionStatePayload {
+            session_id: "s1".to_string(),
+            runtime_state: RuntimeState::Running,
+            reason: StateReason::OutputActivity,
+        };
+
+        observer.on_state(&payload);
+
+        let expected = format_state_line(&payload);
+        assert_eq!(
+            sink.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[expected]
         );
     }
 
