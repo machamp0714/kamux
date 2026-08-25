@@ -328,4 +328,25 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
     expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
     expect(useAppStore.getState().paneAssignment[0]).toBe('s1');
   });
+
+  it('split2 で activePane が 0 のときは 0 側のスロットへ割り当てる（1 固定の取り違えを検出する対称ケース）', () => {
+    const s1 = session('s1');
+    const s2 = session('s2');
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+      layout: 'split2',
+      activePane: 0,
+      paneAssignment: [null, 's2'],
+    });
+    renderTabs();
+
+    const tab = container.querySelector('[data-session-id="s1"]');
+    act(() => {
+      (tab as HTMLButtonElement).click();
+    });
+
+    expect(useAppStore.getState().paneAssignment[0]).toBe('s1');
+    expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
+  });
 });
