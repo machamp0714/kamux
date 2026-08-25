@@ -1,10 +1,12 @@
 import type { StateCreator } from 'zustand';
 
 import {
+  createScratchSession,
   createSession,
   listSessions,
   moveSession,
   resumeSession as resumeSessionCmd,
+  stopSession,
   updateSession as updateSessionCmd,
   type CreateSessionArgs,
 } from '../ipc/commands';
@@ -107,6 +109,22 @@ export interface SessionSlice {
    * SessionPatch は claude_session_id のクリアだけを受け付ける（§4.9）。
    */
   retryResumeAsFresh: (sessionId: string) => Promise<void>;
+  /**
+   * Cmd+T（契約 §29.8）。フォーカス中ペインにスクラッチ端末を新規作成する。
+   * アクティブプロジェクトが無ければ何もしない（Ruling 20-E）。
+   * 作成した Session は sessions へ挿入するが sessionOrder には入れない
+   * （契約 §29.4 の除外）。そのうえで assignPane(activePane, created.id) を呼ぶ
+   * （Ruling 20-F）。
+   */
+  createScratchTerminal: () => Promise<void>;
+  /**
+   * Cmd+W（契約 §29.8）。フォーカス中ペインのスクラッチを閉じる。対象はスクラッチ
+   * だけ（Ruling 20-C）—— is_scratch !== true なら stopSession も archiveSession も
+   * 呼ばずに return する。新しいアーカイブ経路は書かず、stopSession(id) を呼んでから
+   * 既存の archiveSession(id) を呼ぶ（Ruling 20-B。ロールバックとプロジェクト切替
+   * ガードを二重に書かないため）。
+   */
+  closeScratchTerminal: () => Promise<void>;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
@@ -479,6 +497,25 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       }
       return changed ? { runtimeStates: next, runtimeErrors: nextErrors } : {};
     }),
+
+  createScratchTerminal: async () => {
+    const projectId = get().activeProjectId;
+    if (projectId === null) return;
+    // cwd は常に null を渡す（契約 §29.3: None なら project.repo_path）。
+    const created = await createScratchSession(projectId, null);
+    set((s) => ({ sessions: { ...s.sessions, [created.id]: created } }));
+    get().assignPane(get().activePane, created.id);
+  },
+
+  closeScratchTerminal: async () => {
+    const id = get().focusedSessionId;
+    if (id === null) return;
+    const target = get().sessions[id];
+    // スクラッチ限定の門（Ruling 20-C）。本物のセッションはここで何も呼ばずに抜ける。
+    if (target === undefined || !target.is_scratch) return;
+    await stopSession(id);
+    await get().archiveSession(id);
+  },
 });
 
 /**

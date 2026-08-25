@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 
 import { useAppStore } from '../store';
+import { toAppError } from '../store/uiSlice';
 import { resolveKeymap } from './keymap';
 import { nextLayout } from '../store/paneLogic';
 
@@ -53,6 +54,14 @@ export function handleKeymapKeyDown(event: KeyboardEvent): void {
       break;
     case 'toggle_project_switcher':
       store.setProjectSwitcherOpen(!store.projectSwitcherOpen);
+      break;
+    case 'create_scratch_terminal':
+      // 契約 §105.2.1: エラートーストを出すのは呼び出し側のハンドラである
+      // （ProjectBar.tsx の setActiveProject(...).catch(...) と同じ形）。
+      void store.createScratchTerminal().catch((e: unknown) => store.setError(toAppError(e)));
+      break;
+    case 'close_scratch_terminal':
+      void store.closeScratchTerminal().catch((e: unknown) => store.setError(toAppError(e)));
       break;
   }
 }

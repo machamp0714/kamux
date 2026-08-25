@@ -13,6 +13,8 @@ function session(
   id: string,
   kanbanStatus: KanbanStatus,
   archivedAt: number | null = null,
+  isScratch = false,
+  sortOrder = 1,
 ): Session {
   return {
     id,
@@ -20,7 +22,7 @@ function session(
     title: id,
     description: '',
     kanban_status: kanbanStatus,
-    sort_order: 1,
+    sort_order: sortOrder,
     mode: 'in_place',
     branch: null,
     worktree_path: null,
@@ -32,7 +34,7 @@ function session(
     first_started_at: 1,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
-    is_scratch: false,
+    is_scratch: isScratch,
     archived_at: archivedAt,
     created_at: 0,
     updated_at: 0,
@@ -96,6 +98,52 @@ describe('selectTerminalTabs', () => {
     order.backlog = ['zeta', 'alpha'];
     const store = makeStore([session('alpha', 'backlog'), session('zeta', 'backlog')], order);
     expect(selectTerminalTabs(store.getState())).toEqual(['zeta', 'alpha']);
+  });
+
+  // Ruling 20-G（lane-controller、契約 §29.7）: sessionOrder は scratch を含まない
+  // 設計（契約 §29.4）だが、供給源がそれしか無いと SCRATCH グループが production で
+  // 恒久的に空になる。sessions から is_scratch === true && archived_at === null を
+  // 直接引いて連結する。フィクスチャは sessionOrder に scratch の id を置かない
+  // （production が到達できる状態で測る）。
+  it('SCRATCH セッションは sessionOrder ではなく sessions から直接引いて末尾に連結する（契約 §29.7 / Ruling 20-G）', () => {
+    const order = emptyOrder();
+    order.backlog = ['b1'];
+    const store = makeStore(
+      [session('b1', 'backlog'), session('scratch1', 'backlog', null, true)],
+      order,
+    );
+    expect(selectTerminalTabs(store.getState())).toEqual(['b1', 'scratch1']);
+  });
+
+  it('archived な scratch は含めない', () => {
+    const order = emptyOrder();
+    const store = makeStore([session('s1', 'backlog', 1000, true)], order);
+    expect(selectTerminalTabs(store.getState())).toEqual([]);
+  });
+
+  it('複数の SCRATCH は sort_order 昇順、同値なら id 辞書順で並ぶ（buildSessionOrder と同じタイブレーク）', () => {
+    const order = emptyOrder();
+    const store = makeStore(
+      [
+        session('z', 'backlog', null, true, 2),
+        session('a', 'backlog', null, true, 2),
+        session('m', 'backlog', null, true, 1),
+      ],
+      order,
+    );
+    expect(selectTerminalTabs(store.getState())).toEqual(['m', 'a', 'z']);
+  });
+
+  // 自己設計の変異検証（advisor 指摘）: sessionOrder.ts の buildSessionOrder（loadSessions が
+  // 使う実体）は is_scratch を絞らないため、プロジェクト再訪後は scratch の id が
+  // sessionOrder.backlog に紛れ込みうる（sessionSlice.ts の loadSessions →
+  // projectSlice.ts の setActiveProject 経由。§29.4 の境界そのものである
+  // sessionOrder.ts / kanbanOrder.ts 自体は変更しない）。この状態でも id が重複しないこと。
+  it('sessionOrder に scratch の id が紛れ込んでいても重複させない', () => {
+    const order = emptyOrder();
+    order.backlog = ['scratch1'];
+    const store = makeStore([session('scratch1', 'backlog', null, true)], order);
+    expect(selectTerminalTabs(store.getState())).toEqual(['scratch1']);
   });
 });
 

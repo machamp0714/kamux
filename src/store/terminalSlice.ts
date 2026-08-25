@@ -10,6 +10,7 @@ import {
   type PaneIndex,
   type PaneState,
 } from './paneLogic';
+import { compareSessionOrder } from './sessionOrder';
 
 /**
  * ターミナル画面のタブ順。実行中のものから見たいので in_progress を先頭にする。
@@ -17,11 +18,35 @@ import {
  */
 export const TAB_COLUMN_ORDER: KanbanStatus[] = ['in_progress', 'backlog', 'review', 'done'];
 
-export function selectTerminalTabs(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
+/**
+ * 契約 §29.7: SESSIONS グループは !is_scratch（カンバン由来のセッション）。
+ * sessionOrder は本来 scratch を含まない設計（契約 §29.4）だが、プロジェクト再訪時の
+ * loadSessions が使う buildSessionOrder（sessionOrder.ts）は is_scratch を絞らないため、
+ * scratch の id が sessionOrder に紛れ込みうる。ここで明示的に除外し、下の SCRATCH
+ * 側との重複を防ぐ（Ruling 20-G。sessionOrder.ts / kanbanOrder.ts 自体は変更しない）。
+ */
+function sessionTabsFromOrder(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
   return TAB_COLUMN_ORDER.flatMap((status) => state.sessionOrder[status] ?? []).filter((id) => {
     const session = state.sessions[id];
-    return session !== undefined && session.archived_at === null;
+    return session !== undefined && session.archived_at === null && !session.is_scratch;
   });
+}
+
+/**
+ * SCRATCH グループ（契約 §29.7）。sessionOrder には供給源が無い（契約 §29.4 の除外）ため
+ * sessions から直接引く。並びは sort_order 昇順、同値なら id 辞書順
+ * （buildSessionOrder と同じタイブレーク。無いと再レンダリングのたびに順序が
+ * 入れ替わりうる）。
+ */
+function scratchTabs(state: Pick<AppStore, 'sessions'>): string[] {
+  return Object.values(state.sessions)
+    .filter((session) => session.is_scratch && session.archived_at === null)
+    .sort(compareSessionOrder)
+    .map((session) => session.id);
+}
+
+export function selectTerminalTabs(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
+  return [...sessionTabsFromOrder(state), ...scratchTabs(state)];
 }
 
 export interface TerminalSlice {

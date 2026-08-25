@@ -252,4 +252,65 @@ describe('resolveKeymap', () => {
   it('未知の矢印（Alt なし）は無視する', () => {
     expect(resolveKeymap(ev({ key: 'ArrowLeft', metaKey: true }), terminalView)).toBeNull();
   });
+
+  // --- M3-4 Task 20: Cmd+T（スクラッチ新規作成）/ Cmd+W（スクラッチを閉じる）契約 §29.8 ---
+
+  it('ターミナル画面では Cmd+T が create_scratch_terminal', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: true }), terminalView)).toEqual({
+      type: 'create_scratch_terminal',
+    });
+  });
+
+  it('ターミナル画面では Cmd+W が close_scratch_terminal', () => {
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true }), terminalView)).toEqual({
+      type: 'close_scratch_terminal',
+    });
+  });
+
+  it('ターミナル画面でないときは Cmd+T / Cmd+W を無視する（契約 §11.4.2: view 条件は terminal のみ）', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: true }), closed)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true }), closed)).toBeNull();
+    expect(resolveKeymap(ev({ key: 't', metaKey: true }), editorView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true }), editorView)).toBeNull();
+  });
+
+  it('Ctrl 併用の Cmd+T / Cmd+W は無視する（契約 §97.2 規則 C の 7 キー集合に含まれる）', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true, ctrlKey: true }), terminalView)).toBeNull();
+  });
+
+  it('Alt 併用の Cmd+T / Cmd+W は無視する（契約 §97.2 規則 A。Cmd+D と同じ扱い）', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: true, altKey: true }), terminalView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true, altKey: true }), terminalView)).toBeNull();
+  });
+
+  it('Shift 併用で大文字になった T / W も受理する（契約 §97.2 規則 S）', () => {
+    expect(resolveKeymap(ev({ key: 'T', metaKey: true }), terminalView)).toEqual({
+      type: 'create_scratch_terminal',
+    });
+    expect(resolveKeymap(ev({ key: 'W', metaKey: true }), terminalView)).toEqual({
+      type: 'close_scratch_terminal',
+    });
+  });
+
+  it('モーダル表示中でも terminal 画面なら Cmd+T / Cmd+W は発火する（契約 §11.4.1 規則 M）', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: true }), terminalModal)).toEqual({
+      type: 'create_scratch_terminal',
+    });
+    expect(resolveKeymap(ev({ key: 'w', metaKey: true }), terminalModal)).toEqual({
+      type: 'close_scratch_terminal',
+    });
+  });
+
+  it('Cmd なしの t / w は無視する（terminal でも通常入力を奪わない）', () => {
+    expect(resolveKeymap(ev({ key: 't', metaKey: false }), terminalView)).toBeNull();
+    expect(resolveKeymap(ev({ key: 'w', metaKey: false }), terminalView)).toBeNull();
+  });
+
+  // 契約 §103.6（§87.2 の形 1）: macOS では Alt が event.key そのものを書き換えるため、
+  // Cmd+Alt+J は 'j' の分岐に到達しない。KeymapEvent が code を持たないので
+  // key: '∆' だけで書く（§103.6.1: 穴を塞ぐために型へ code を足さない）。
+  it('Cmd+Alt+J は event.key が書き換わるため cycle_session を返さない（契約 §103.6）', () => {
+    expect(resolveKeymap(ev({ key: '∆', metaKey: true, altKey: true }), terminalView)).toBeNull();
+  });
 });
