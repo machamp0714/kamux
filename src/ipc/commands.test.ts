@@ -123,6 +123,15 @@ describe('ipc/commands', () => {
     });
   });
 
+  // 契約 §29.3: cwd は省略可能にしない（型レベル）。渡し忘れと意図的な null が
+  // 区別できなくなるため、TS の引数省略そのものをコンパイルエラーにする。
+  // cwd が optional になると @ts-expect-error が「使われていない」扱いになり
+  // TS2578 で tsc が落ちる —— これが唯一の観測点（実行時には JS は arity を強制しない）。
+  it('createScratchSession は cwd を省略するとコンパイルエラーになる', () => {
+    // @ts-expect-error cwd は必須引数（契約 §29.3）
+    void createScratchSession('p1');
+  });
+
   it('updateSession の patch は snake_case のまま渡す（Tauri の自動変換は引数名だけに効く）', async () => {
     await updateSession('s1', { kanban_status: 'review', sort_order: 1.5 });
     expect(invoke).toHaveBeenCalledWith('update_session', {
