@@ -150,9 +150,15 @@ export function KanbanView() {
               // move_session（session_dao.rs）。sessionOrder に scratch の id が
               // 紛れ込んでもここで落とす。sessions[id] は undefined になりうる
               // （move_session の戻り値を反映する経路が buildSessionOrder を経由しない
-              // ため、sessionOrder にあって sessions に無い id が到達しうる）ので、
-              // オプショナルチェーンで扱い、未知の場合は除外しない。
-              sessionIds={sessionOrder[status].filter((id) => sessions[id]?.is_scratch !== true)}
+              // ため、sessionOrder にあって sessions に無い id が到達しうる）。
+              // 未知 id は残さず落とす —— KanbanColumn は
+              // `<SortableCard session={sessions[id]} />` と非オプショナルな
+              // props で渡しており（SortableCard.tsx の `session: Session`）、
+              // 未知 id がここを通り抜けると SortableCard 内部の
+              // `session.id` 参照で描画時に throw する（task-18-review.md I-2 (c)）。
+              sessionIds={sessionOrder[status].filter(
+                (id) => sessions[id] !== undefined && !sessions[id].is_scratch,
+              )}
               sessions={sessions}
             />
           ))}

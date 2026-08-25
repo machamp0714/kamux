@@ -377,4 +377,27 @@ describe('KanbanView が is_scratch のセッションを盤面から除外す�
     expect(screen.getByText('normal card')).toBeInTheDocument();
     expect(screen.queryByText('scratch card')).toBeNull();
   });
+
+  // レビュー指摘 I-2 (c)（task-18-review.md）。sessionOrder にあって sessions に
+  // 無い id は SortableCard の非オプショナル props に到達すると描画時に throw する
+  // （src/views/KanbanView/SortableCard.tsx の session: Session）。フィルタは
+  // 未知 id を残さず落とす向きでなければならない。
+  it('sessionOrder に sessions へ無い id が混ざっていても throw せず描画からも落ちる', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal card' }),
+      },
+      sessionOrder: { backlog: ['s1', 'ghost-id'], in_progress: [], review: [], done: [] },
+    });
+
+    let container!: HTMLElement;
+    expect(() => {
+      container = render(<KanbanView />).container;
+    }).not.toThrow();
+
+    expect(screen.getByText('normal card')).toBeInTheDocument();
+    const backlogList = requireElement(container.querySelector('[data-column="backlog"]'));
+    // 未知 id（ghost-id）を落とした結果、backlog には normal card の 1 枚だけが残る。
+    expect(backlogList.querySelectorAll('.kanban-sortable')).toHaveLength(1);
+  });
 });
