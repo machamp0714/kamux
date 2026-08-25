@@ -80,6 +80,16 @@ describe('buildSessionOrder', () => {
     buildSessionOrder(sessions);
     expect(sessions.a.sort_order).toBe(3);
   });
+
+  it('is_scratch のセッションを除外する（契約 §29.4、主たる境界）', () => {
+    const order = buildSessionOrder(
+      toMap([
+        makeSession({ id: 'scratch1', kanban_status: 'backlog', sort_order: 1, is_scratch: true }),
+        makeSession({ id: 'normal1', kanban_status: 'backlog', sort_order: 2, is_scratch: false }),
+      ]),
+    );
+    expect(order.backlog).toEqual(['normal1']);
+  });
 });
 
 describe('indexSessions', () => {

@@ -357,3 +357,24 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     expect(openCleanupDialog).toHaveBeenCalledWith('sess-cleanup-9');
   });
 });
+
+// スクラッチをカンバンから分離する（契約 §29.4）。主たる境界は buildSessionOrder と
+// move_session（session_dao.rs）で、ここは二重防御。buildSessionOrder 経由で
+// sessionOrder を作ると主たる境界が先に落とすため二重防御を測れない。sessionOrder に
+// scratch の id を直接置く（lane-controller の解釈）。
+describe('KanbanView が is_scratch のセッションを盤面から除外する（二重防御、Task 18）', () => {
+  it('sessionOrder に scratch の id が混ざっていても盤面には描画しない', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal card' }),
+        s2: session({ id: 's2', title: 'scratch card', is_scratch: true }),
+      },
+      sessionOrder: { backlog: ['s1', 's2'], in_progress: [], review: [], done: [] },
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByText('normal card')).toBeInTheDocument();
+    expect(screen.queryByText('scratch card')).toBeNull();
+  });
+});

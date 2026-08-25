@@ -146,7 +146,13 @@ export function KanbanView() {
             <KanbanColumn
               key={status}
               status={status}
-              sessionIds={sessionOrder[status]}
+              // 二重防御（契約 §29.4）。主たる境界は buildSessionOrder と
+              // move_session（session_dao.rs）。sessionOrder に scratch の id が
+              // 紛れ込んでもここで落とす。sessions[id] は undefined になりうる
+              // （move_session の戻り値を反映する経路が buildSessionOrder を経由しない
+              // ため、sessionOrder にあって sessions に無い id が到達しうる）ので、
+              // オプショナルチェーンで扱い、未知の場合は除外しない。
+              sessionIds={sessionOrder[status].filter((id) => sessions[id]?.is_scratch !== true)}
               sessions={sessions}
             />
           ))}
