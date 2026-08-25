@@ -20,6 +20,22 @@ import { tauriMockScript } from './support/tauriMock';
  *   - stop_session / update_session（close_scratch_terminal: stopSession → archiveSession）
  * 「0 件」という assert は押鍵そのものが届いていなくても緑になるため、
  * 各テストに陽性対照（同じ経路で別のキーが実際に効くこと）を 1 つ置く。
+ *
+ * Cmd+W 側は `closeScratchTerminal`（src/store/sessionSlice.ts:515）が内部に
+ * `is_scratch` ガードを持つ。`focusedSessionId` が指すセッションが
+ * `is_scratch !== true` のままだと、view ゲート（resolveKeymap:91）を外しても
+ * この内部ガードだけで発火が止まり、「0 件」が変化しないため view ゲート単独の
+ * 効力を検証できない（修正ラウンド1 レビュー指摘）。そのため各テストでは
+ * `focusedSessionId` を `is_scratch: true` の s2 へ向けてから kanban / editor
+ * 画面へ戻り、Cmd+W が内部ガードを通過しうる状態で view ゲートだけを検証する。
+ *
+ * s2 へ focusedSessionId を向ける手段は kanban カードのクリックではない
+ * ——is_scratch なセッションは契約 §29.4 によりカンバンに現れない
+ * （`src/store/kanbanOrder.ts` が除外する）。かわりに terminal 画面の
+ * `SessionTabList` は SCRATCH グループとして is_scratch セッションのタブを描く
+ * （契約 §29.7 / `src/store/terminalSlice.ts` の `scratchTabs`）ので、s1 の
+ * カードで terminal 画面に入ってから SCRATCH タブ（s2）をクリックして
+ * `assignPane` 経由で focusedSessionId を s2 へ移す。
  */
 function commonInitScript(): string {
   return tauriMockScript({
@@ -44,6 +60,30 @@ function commonInitScript(): string {
           last_runtime_state: 'idle',
           last_runtime_error: null,
           first_started_at: null,
+          archived_at: null,
+          created_at: 0,
+          updated_at: 0,
+        },
+        // is_scratch: true（契約 §29.2）。closeScratchTerminal の内部ガード
+        // （sessionSlice.ts:515）を通過させ、Cmd+W 側で view ゲート単独の
+        // 効力を検証できるようにするための固定具（修正ラウンド1 レビュー指摘）。
+        {
+          id: 's2',
+          project_id: 'p1',
+          title: 'scratch two',
+          description: '',
+          kanban_status: 'in_progress',
+          sort_order: 2000,
+          mode: 'worktree',
+          branch: null,
+          worktree_path: null,
+          cli_kind: 'claude',
+          cli_command: null,
+          claude_session_id: null,
+          last_runtime_state: 'idle',
+          last_runtime_error: null,
+          first_started_at: null,
+          is_scratch: true,
           archived_at: null,
           created_at: 0,
           updated_at: 0,
@@ -98,7 +138,18 @@ test.describe('Cmd+T / Cmd+W は terminal 画面限定（契約 §11.4.2 / §97.
     await page.addInitScript(commonInitScript());
     await page.goto('/');
     await expect(page.locator('.kanban-view')).toBeVisible();
-    await expect(page.locator('[data-session-id="s1"]')).toBeVisible();
+    const card = page.locator('.kanban-card[data-session-id="s1"]');
+    await expect(card).toBeVisible();
+
+    // s1 のカードで terminal 画面へ入り、SCRATCH タブ（s2）をクリックして
+    // focusedSessionId を is_scratch な s2 へ向けてから kanban 画面へ戻る。
+    // closeScratchTerminal の内部ガード（sessionSlice.ts:515）を通過できる状態に
+    // しないと、Cmd+W 側で view ゲート単独の効力を検証できない（修正ラウンド1 指摘）。
+    await card.click();
+    await expect(page.locator('.kamux-terminal-view')).toBeVisible();
+    await page.locator('.kamux-tab[data-session-id="s2"]').click();
+    await page.keyboard.press('Meta+1');
+    await expect(page.locator('.kanban-view')).toBeVisible();
 
     await page.keyboard.press('Meta+t');
     await page.keyboard.press('Meta+w');
@@ -121,6 +172,10 @@ test.describe('Cmd+T / Cmd+W は terminal 画面限定（契約 §11.4.2 / §97.
     await expect(card).toBeVisible();
     await card.click();
     await expect(page.locator('.kamux-terminal-view')).toBeVisible();
+
+    // SCRATCH タブ（s2）をクリックして focusedSessionId を is_scratch な s2 へ
+    // 向けてから editor 画面へ入る（理由は kanban 側のテストと同じ。上のコメント参照）。
+    await page.locator('.kamux-tab[data-session-id="s2"]').click();
     await page.keyboard.press('Meta+3');
     await expect(page.locator('.kamux-editor-view')).toBeVisible();
 
