@@ -27,7 +27,6 @@ function renderTab(
   sessions: Record<string, Session>,
   paneState: PaneState,
   current: string | null,
-  activePane: PaneIndex,
   assignPane: (pane: PaneIndex, sessionId: string) => void,
 ): JSX.Element {
   // 契約 §28.3: split2 なら L / R、split2-v なら U / D、single なら null。
@@ -42,7 +41,7 @@ function renderTab(
       data-session-id={id}
       data-pane-badge={paneBadge ?? ''}
       aria-selected={id === current}
-      onClick={() => assignPane(activePane, id)}
+      onClick={() => assignPane(paneState.activePane, id)}
     >
       <span className="kamux-tab__title">{sessions[id]?.title ?? id}</span>
       <span className="kamux-tab__meta">
@@ -80,9 +79,7 @@ export function SessionTabList(): JSX.Element {
           <span className="kamux-tablist__group-label" aria-hidden>
             SESSIONS
           </span>
-          {sessionTabs.map((id) =>
-            renderTab(id, sessions, paneState, current, activePane, assignPane),
-          )}
+          {sessionTabs.map((id) => renderTab(id, sessions, paneState, current, assignPane))}
         </div>
       ) : null}
       {scratchTabs.length > 0 ? (
@@ -90,9 +87,7 @@ export function SessionTabList(): JSX.Element {
           <span className="kamux-tablist__group-label" aria-hidden>
             SCRATCH
           </span>
-          {scratchTabs.map((id) =>
-            renderTab(id, sessions, paneState, current, activePane, assignPane),
-          )}
+          {scratchTabs.map((id) => renderTab(id, sessions, paneState, current, assignPane))}
         </div>
       ) : null}
     </div>
