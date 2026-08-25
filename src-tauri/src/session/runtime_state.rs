@@ -410,16 +410,6 @@ impl RuntimeStateManager {
             .push(observer);
     }
 
-    /// 現在登録されている observer の数。production の配線 1 行
-    /// (`install_app_state_with` が 3 つ register_observer していること)を
-    /// 守るために在る。
-    pub fn observer_count(&self) -> usize {
-        self.observers
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
-    }
-
     pub fn current(&self, session_id: &str) -> RuntimeState {
         read_map(&self.states)
             .get(session_id)
@@ -675,11 +665,15 @@ impl StateLineSink for TracingLineSink {
 ///
 /// `S: StateLineSink` は `TauriEmitObserver<R: Runtime>` とまったく同じ理由で
 /// 一般化されている —— テストのために足した内部実装の一般化であり、契約上の型ではない。
-pub struct StateLineObserver<S: StateLineSink = TracingLineSink> {
+///
+/// `?Sized` を足しているのは `install_app_state_with` が `sink` / `permission` と
+/// 同じ理由で `Arc<dyn StateLineSink>` を注入できる seam にするため
+/// （レビュー修正: 裁定 119 Important 1 件）。
+pub struct StateLineObserver<S: StateLineSink + ?Sized = TracingLineSink> {
     sink: Arc<S>,
 }
 
-impl<S: StateLineSink> StateLineObserver<S> {
+impl<S: StateLineSink + ?Sized> StateLineObserver<S> {
     pub fn new(sink: Arc<S>) -> Self {
         Self { sink }
     }
@@ -691,7 +685,7 @@ impl StateLineObserver<TracingLineSink> {
     }
 }
 
-impl<S: StateLineSink> StateObserver for StateLineObserver<S> {
+impl<S: StateLineSink + ?Sized> StateObserver for StateLineObserver<S> {
     fn on_state(&self, payload: &SessionStatePayload) {
         self.sink.write_line(&format_state_line(payload));
     }

@@ -23,7 +23,10 @@ use crate::notify::{
     mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
     SessionLabel, ViewKind,
 };
-use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
+use crate::session::runtime_state::{
+    RuntimeStateManager, StateLineObserver, StateLineSink, StatePersist, TauriEmitObserver,
+    TracingLineSink,
+};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
 
@@ -530,7 +533,13 @@ fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
     // `mac_sink::read_permission()` を残すと `cargo test` のたびに実 OS API
     // （`get_notification_settings()`）が叩かれてしまう（実測: 修正前は 11 回）。
     let permission = mac_sink::read_permission();
-    install_app_state_with(manager, store, persist, sink, permission, bootstrap);
+    // 裁定 119 レビュー修正: 実 sink を差す結線はここにある（`sink` / `permission` と
+    // 同じ形）。既定は `TracingLineSink`（`init_tracing_subscriber()` が INFO で
+    // 立てた subscriber へ出す）。
+    let line_sink: Arc<dyn StateLineSink> = Arc::new(TracingLineSink);
+    install_app_state_with(
+        manager, store, persist, sink, permission, bootstrap, line_sink,
+    );
 }
 
 /// 通知バナーがクリックされたときの処理を組み立てる。
@@ -611,6 +620,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     sink: Arc<dyn NotificationSink>,
     permission: NotifyPermission,
     bootstrap: HooksBootstrap,
+    line_sink: Arc<dyn StateLineSink>,
 ) {
     let notifier = build_notifier(Arc::clone(&store), sink, permission);
     let runtime = RuntimeStateManager::new(persist);
@@ -623,12 +633,14 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         manager.app_handle().clone(),
         Arc::clone(&notifier),
     )));
-    // 裁定 119（契約 §121.3 / §121.4）: 手動スモーク項目 1 / 5 / 9 / 10 が
-    // `session://state` の `reason` を読む入口。既定の TracingLineSink は
-    // init_tracing_subscriber() が INFO で立てた subscriber へ出す。
-    runtime.register_observer(Arc::new(
-        crate::session::runtime_state::StateLineObserver::with_tracing_sink(),
-    ));
+    // 裁定 119（契約 §121.3 / §121.4）レビュー修正: 手動スモーク項目 1 / 5 / 9 / 10 が
+    // `session://state` の `reason` を読む入口。`line_sink` を引数に出しているのは
+    // `sink` / `permission` と同じ理由である —— production の既定は `TracingLineSink`
+    // （`init_tracing_subscriber()` が INFO で立てた subscriber へ出す）だが、
+    // テストから「StateLineObserver が実際に register_observer されているか」を
+    // 観測するには記録用の `StateLineSink` を差せる seam が要る。実 sink を差す
+    // 結線は `install_app_state` 側にある。
+    runtime.register_observer(Arc::new(StateLineObserver::new(line_sink)));
 
     // 起動時の Dock バッジは必ず空から始める。**DB の `last_runtime_state` から
     // 復元してはならない。** 理由は 2 つ:
@@ -1576,6 +1588,13 @@ mod tests {
             Arc::new(crate::notify::RecordingSink::default())
         }
 
+        /// `line_sink` のテスト既定値（裁定 119 レビュー修正）。`test_sink` /
+        /// `test_permission` と同じ理由 —— この経路を検証しないテストは、
+        /// production と同じ `TracingLineSink` をそのまま通す。
+        fn test_line_sink() -> Arc<dyn crate::session::runtime_state::StateLineSink> {
+            Arc::new(crate::session::runtime_state::TracingLineSink)
+        }
+
         /// 通知許可のテスト固定値。`test_sink` と同じ理由で、テストから実 OS API
         /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4。
         /// 契約上の章番号は 00-contracts.md に本文照合が取れなかったため引用しない）。
@@ -1748,6 +1767,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert!(
@@ -1782,6 +1802,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let queried = probe.queried();
@@ -1863,6 +1884,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert!(!probe.queried().is_empty(), "正規化は試みられている");
@@ -1913,6 +1935,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             app.state::<AppState>()
@@ -1929,14 +1952,45 @@ mod tests {
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
         }
 
-        /// 裁定 119: `install_app_state_with` は observer を **3 つ**登録している
-        /// (`TauriEmitObserver` / `NotifyObserver` / `StateLineObserver`)。
-        /// 将来 4 つ目を足す者が何を壊したのかを 1 行で知れるよう、assert
-        /// メッセージに 3 つの名前を書く。
+        /// 裁定 119 レビュー修正（Important 1 件）: `install_app_state_with` が
+        /// 実際に `StateLineObserver` を配線していることを見る。
+        ///
+        /// `observer_count() == 3` という**本数**だけの検査は、3 つ目に登録される
+        /// 型を判別できない（task-reviewer の自己設計変異で実証済み: 3 つ目の
+        /// `register_observer` の引数を `TauriEmitObserver::new(...)` へ差し替えても
+        /// 本数は 3 のまま変わらず全緑だった）。ここでは observer を 1 つも直接
+        /// 構築せず、**`sender()` に入力を積んで記録用の `StateLineSink` に
+        /// `kamux state` 行が届くか**だけを見る
+        /// （`install_app_state_registers_the_emit_observer_on_the_runtime` /
+        /// `install_app_state_posts_a_notification_through_the_registered_observer`
+        /// と同じ形に揃えた）。
         #[test]
-        fn install_app_state_with_registers_three_observers() {
+        fn install_app_state_with_registers_the_state_line_observer_on_the_runtime() {
+            use crate::session::runtime_state::{format_state_line, StateLineSink};
+
+            #[derive(Default)]
+            struct RecordingLineSink {
+                lines: Mutex<Vec<String>>,
+            }
+
+            impl StateLineSink for RecordingLineSink {
+                fn write_line(&self, line: &str) {
+                    self.lines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(line.to_string());
+                }
+            }
+
             let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
             let app = mock_app();
+            let line_sink = Arc::new(RecordingLineSink::default());
             let store = Arc::new(store);
             let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
             super::super::install_app_state_with(
@@ -1946,14 +2000,38 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                Arc::clone(&line_sink) as Arc<dyn StateLineSink>,
             );
 
-            let count = app.state::<AppState>().runtime.observer_count();
+            app.state::<AppState>()
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+
+            assert!(
+                wait_until(|| !line_sink
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()),
+                "kamux state の行が1つも届かない: install_app_state_with が \
+                 StateLineObserver を register_observer していない"
+            );
+
+            let expected = format_state_line(&crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::Running,
+                reason: crate::model::StateReason::Spawned,
+            });
             assert_eq!(
-                count, 3,
-                "install_app_state_with は TauriEmitObserver / NotifyObserver / \
-                 StateLineObserver の 3 つを register_observer していなければならない \
-                 (実測: {count})"
+                line_sink
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[expected],
+                "StateLineObserver が届けた行が format_state_line の出力と一致しない \
+                 （3 つ目の register_observer に渡された型が StateLineObserver でない疑い）"
             );
         }
 
@@ -2004,6 +2082,7 @@ mod tests {
                 sink.clone(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let state = app.state::<AppState>();
@@ -2106,6 +2185,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert_eq!(
@@ -2385,6 +2465,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let handle = app.handle().clone();
@@ -2451,6 +2532,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
             let state = app.state::<AppState>();
 
