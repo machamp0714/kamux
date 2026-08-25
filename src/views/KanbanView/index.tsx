@@ -169,9 +169,15 @@ export function KanbanView() {
       </DndContext>
 
       {/* open が false の間は自分で null を返す（M3-4 Task 10）。 */}
+      {/* is_scratch は二重防御（契約 §29.4。PR 33 全体レビュー Critical 1）。主たる境界は
+          restoreSession 側の is_scratch ガード（sessionSlice.ts）だが、起動時の自動
+          アーカイブ（§29.5）でストアに載ったアーカイブ済みスクラッチを「復元」ボタン
+          付きで並ばせないよう、ここでも落とす。 */}
       <ArchivedDrawer
         open={showArchived}
-        sessions={Object.values(sessions).filter((s) => s.project_id === activeProjectId)}
+        sessions={Object.values(sessions).filter(
+          (s) => s.project_id === activeProjectId && !s.is_scratch,
+        )}
         onRestore={(id) => {
           restoreSession(id).catch((e: unknown) => setError(toAppError(e)));
         }}

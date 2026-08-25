@@ -317,6 +317,30 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     expect(screen.queryByText('p1 task')).toBeNull();
   });
 
+  // PR 33 全体レビュー Critical 1（契約 §29.4 二重防御）: ArchivedDrawer へ渡す配列は
+  // project_id だけでなく is_scratch も落とす。起動時の自動アーカイブ（§29.5）で
+  // アーカイブ済みスクラッチがストアに載っても、復元ボタン付きで並ばせない。
+  it('ドロワーへ渡す sessions は is_scratch のセッションを含まない', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal task', archived_at: 1754006400000 }),
+        s2: session({
+          id: 's2',
+          title: 'scratch task',
+          is_scratch: true,
+          archived_at: 1754006400000,
+        }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByText('normal task')).toBeInTheDocument();
+    expect(screen.queryByText('scratch task')).toBeNull();
+  });
+
   // レビュー Important-3: 閉じる・掃除の配線 4 経路のうち、container 側の 2 経路
   // （onClose / onCleanup）をここで測る。component 側は ArchivedDrawer.test.tsx。
   it('ドロワーの閉じるボタンを押すと showArchived が false になる', () => {

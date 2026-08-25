@@ -229,6 +229,28 @@ describe('アーカイブと復元', () => {
     expect(useAppStore.getState().sessionOrder.done).toEqual(['x', 'a', 'y']);
   });
 
+  // 契約 §29.4: sessionOrder はスクラッチを含まない。restoreSession は局所挿入で
+  // buildSessionOrder を通らないため、is_scratch のガードを自前で持たなければ
+  // アーカイブ済みスクラッチの復元が sessionOrder を汚す（PR 33 全体レビュー Critical 1）。
+  it('is_scratch のセッションを復元しても sessionOrder へは挿入しない', async () => {
+    useAppStore.setState({
+      sessions: {
+        sc: s({ id: 'sc', is_scratch: true, sort_order: 0, archived_at: 1754006400000 }),
+        b: s({ id: 'b', sort_order: 2 }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: ['b'] },
+    });
+    updateSession.mockResolvedValue(
+      s({ id: 'sc', is_scratch: true, sort_order: 0, archived_at: null }),
+    );
+
+    await useAppStore.getState().restoreSession('sc');
+
+    expect(useAppStore.getState().sessionOrder.done).toEqual(['b']);
+    // sessions 側の archived_at 反映は変えない（SCRATCH タブへ戻るために必要）。
+    expect(useAppStore.getState().sessions.sc.archived_at).toBeNull();
+  });
+
   // 挿入探索は compareSessionOrder（sort_order, id の全順序）を使う。sort_order だけの
   // 比較（タイブレーク無し）に差し替えると、同値同士は常に「0 < 0 = false」となり
   // insertAt が変わらないケースが多いため、id がタイブレークで前後にまたがる（列の中に

@@ -306,7 +306,11 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // アーカイブされていない（archived_at: null の）セッションに restoreSession を
     // 呼ぶ経路（paneInvariant.test.ts の ARGS がその 1 つ）では、ガードが無いと
     // 同じ id が列に 2 つ入る（archive.test.ts の冪等性テストで実測）。
-    if (!column.includes(id)) {
+    // is_scratch ガード（契約 §29.4。PR 33 全体レビュー Critical 1）: sessionOrder は
+    // スクラッチを含まない。restoreSession は buildSessionOrder を通らない局所挿入
+    // なので、自前でガードしないとアーカイブ済みスクラッチの復元が sessionOrder を
+    // 汚す。sessions への archived_at: null の反映は変えない（SCRATCH タブへ戻るため）。
+    if (!target.is_scratch && !column.includes(id)) {
       // 挿入位置は (sort_order, id) の全順序で決める（契約 §144.7 / 裁定 72）。
       // 土台 column の並び自体は 1 つも変えない —— 「column の中で restoredTarget
       // より全順序上前に来るべき要素の個数」を数えるだけなので、column の並び順が
