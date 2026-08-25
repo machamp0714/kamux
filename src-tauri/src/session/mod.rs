@@ -1162,7 +1162,12 @@ mod tests {
     /// `state.hooks` が `Some` のとき、`plan_agent_spawn_with` が組み立てる
     /// `SpawnSpec` に `--settings` と `KAMUX_HOOKS_SOCK` が実際に流れることを固定する
     /// （契約 §31.4 / §102）。`apply_hooks` 単体のテストは `cli_args.rs` にあるが、
-    /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）はここでしか踏めない。
+    /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）を固定するのはこのテスト。
+    /// **訂正（Task 17 fix round 1 / I-2）**: `state.hooks.as_ref()` の呼び出し側は
+    /// もうここだけではない —— `plan_scratch_session_with`（Task 17、shell 経路）が
+    /// 2 つ目の呼び出し側を新設した。その鏡像は
+    /// `scratch_session::plan_scratch_session_injects_the_hooks_sock_env_even_for_the_shell_cli_kind`
+    /// が持つ。
     #[test]
     fn plan_agent_spawn_injects_hooks_settings_and_sock_for_claude() {
         // ENV_LOCK は不要: CliKind::Claude は fake_resolve_program 経由で解決され、
@@ -2131,6 +2136,11 @@ mod tests {
 
         #[test]
         fn plan_scratch_session_fixes_is_scratch_mode_and_cli_kind() {
+            // I-4: この経路は login_shell()（$SHELL 読み取り）を踏むため ENV_LOCK で
+            // 直列化する（cli_args.rs の ENV_LOCK doc）。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let (session, _spec) =
@@ -2141,6 +2151,11 @@ mod tests {
                 session.is_scratch,
                 "スクラッチは常に is_scratch: true（契約 §29.1）"
             );
+            // I-1: `Session::new_backlog` へ渡す title/description の 2 引数（どちらも
+            // &str）は位置引数の取り違えでは気づけない。取り違えたら別物になる具体値
+            // で固定する（レビュー処方 P1）。
+            assert_eq!(session.title, "Scratch");
+            assert_eq!(session.description, "");
             assert_eq!(session.mode, SessionMode::InPlace, "契約 §29.6");
             assert_eq!(session.cli_kind, CliKind::Shell, "契約 §29.3");
             assert_eq!(session.branch, None, "契約 §29.6");
@@ -2155,6 +2170,10 @@ mod tests {
         /// cwd が None のときは project.repo_path へフォールバックする（契約 §29.3）。
         #[test]
         fn plan_scratch_session_falls_back_to_the_project_repo_path_when_cwd_is_none() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let (_session, spec) =
@@ -2169,6 +2188,10 @@ mod tests {
         /// 使う」変異（cwd を無視する変異）を弁別する。
         #[test]
         fn plan_scratch_session_uses_the_given_cwd_over_the_project_repo_path() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
             let custom = tempfile::tempdir().expect("custom cwd dir");
             assert_ne!(
@@ -2214,6 +2237,10 @@ mod tests {
         /// `plan_scratch_session_with` は spawn の前に DB へ確定させる。
         #[test]
         fn plan_scratch_session_persists_the_row_before_returning() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let (session, _spec) =
@@ -2230,6 +2257,10 @@ mod tests {
         /// M4: 作成だけでなく start（spawn の呼び出し）まで含めて 1 手であること。
         #[test]
         fn create_and_start_scratch_session_calls_the_injected_spawn() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
             let mut called = false;
 
@@ -2252,6 +2283,10 @@ mod tests {
         /// spawn 成功後は runtime_state が Spawned を経て Running へ遷移すること。
         #[test]
         fn create_and_start_scratch_session_reaches_running_on_success() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let session = create_and_start_scratch_session_with(
@@ -2275,6 +2310,10 @@ mod tests {
         /// 行は残り、error 状態になる（`start_session` の spawn 失敗と同じ扱い）。
         #[test]
         fn create_and_start_scratch_session_leaves_the_row_and_marks_error_when_spawn_fails() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let err = create_and_start_scratch_session_with(
@@ -2304,6 +2343,10 @@ mod tests {
         /// C1（陽性の対照）: 永続化を飛ばすと、この後の store 読み戻しが検知する。
         #[test]
         fn create_and_start_scratch_session_row_is_readable_after_success() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let (_db_dir, _repo, state, project) = project_with_temp_repo();
 
             let session = create_and_start_scratch_session_with(
@@ -2323,6 +2366,66 @@ mod tests {
             assert!(reloaded.is_scratch);
             assert_eq!(reloaded.mode, SessionMode::InPlace);
             assert_eq!(reloaded.cli_kind, CliKind::Shell);
+            // I-5: start 後も kanban_status は Backlog のまま（§29.1）。
+            // `commit_started_session` を呼んで in_progress へ進めると §29.4 の
+            // カンバン除外フィルタが漏れた瞬間にカードとして現れる（レビュー処方 P5）。
+            assert_eq!(reloaded.kanban_status, KanbanStatus::Backlog);
+        }
+
+        /// I-2 の鏡像: agent 経路の `plan_agent_spawn_injects_hooks_settings_and_sock_for_claude`
+        /// に対応するスクラッチ経路のテスト。`cli_args.rs:285-287` の doc は逐語で
+        /// 「env（KAMUX_HOOKS_SOCK）は全 cli_kind 共通…shell のスクラッチ端末から手で
+        /// 起動した claude の hook も relay に届く必要があるため、cli_kind で絞っては
+        /// ならない」と書いている。`apply_hooks(&session, launch, state.hooks.as_ref())`
+        /// の呼び出し（本ファイル `plan_scratch_session_with` 内）を削っても、この
+        /// テストを足す前は全緑だった（レビュー指摘 I-2）。`--settings` は claude 専用
+        /// フラグなのでここでは assert しない。
+        #[test]
+        fn plan_scratch_session_injects_the_hooks_sock_env_even_for_the_shell_cli_kind() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, mut state, project) = project_with_temp_repo();
+            state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                socket_path: PathBuf::from("/tmp/kamux-hooks-scratch.sock"),
+                settings_path: PathBuf::from("/tmp/kamux-hooks-scratch.settings.json"),
+                relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+            });
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert!(
+                spec.env.contains(&(
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux-hooks-scratch.sock".to_string()
+                )),
+                "actual env: {:?}",
+                spec.env
+            );
+        }
+
+        /// I-3 / I-4: `spec.program` にログインシェル自身が入ることを固定する
+        /// （直上の production コメント「ログインシェル自身が起動対象になる」の断定
+        /// を偽にする変異 `login_shell()` → `"/bin/false"` を弁別する）。既存 agent 経路
+        /// の先例 `plan_agent_spawn_uses_the_login_shell_for_custom_cli_kind_not_resolve_program`
+        /// と同型。login_shell()（$SHELL 読み取り）を踏むため ENV_LOCK + ShellEnvGuard
+        /// で直列化・固定する。
+        #[test]
+        fn plan_scratch_session_uses_the_login_shell_as_the_program() {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = ShellEnvGuard::set("/tmp/kamux-test-login-shell");
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert_eq!(spec.program, "/tmp/kamux-test-login-shell");
         }
     }
 }
