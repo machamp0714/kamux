@@ -261,6 +261,18 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
     expect(container.querySelectorAll('.kamux-tablist__group')).toHaveLength(1);
   });
 
+  it('SESSIONS が 0 件のときは見出しごと描かない', () => {
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s2 },
+      sessionOrder: { backlog: [], in_progress: ['s2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SCRATCH']);
+    expect(container.querySelectorAll('.kamux-tablist__group')).toHaveLength(1);
+  });
+
   it('role="tablist" は 1 つのまま（グループがロールを割らない）', () => {
     const s1 = session('s1');
     const s2 = { ...session('s2'), is_scratch: true };
@@ -272,6 +284,13 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
 
     expect(container.querySelectorAll('[role="tablist"]')).toHaveLength(1);
     expect(container.querySelectorAll('[role="tab"]')).toHaveLength(2);
+    // グループの入れ物 div は a11y ツリーから透過させ、tab が tablist の
+    // 直接の子として扱われる状態に戻す（role="presentation"）
+    const groups = container.querySelectorAll('.kamux-tablist__group');
+    expect(groups).toHaveLength(2);
+    groups.forEach((group) => {
+      expect(group.getAttribute('role')).toBe('presentation');
+    });
   });
 
   it('グループの並びは SESSIONS が先、SCRATCH が後', () => {
@@ -284,5 +303,29 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
     renderTabs();
 
     expect(groupLabels()).toEqual(['SESSIONS', 'SCRATCH']);
+  });
+
+  it('split2 でタブをクリックすると activePane 側のスロットへ割り当てる', () => {
+    const s1 = session('s1');
+    const s2 = session('s2');
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+      layout: 'split2',
+      activePane: 1,
+      paneAssignment: ['s1', null],
+    });
+    renderTabs();
+
+    const tab = container.querySelector('[data-session-id="s2"]');
+    act(() => {
+      (tab as HTMLButtonElement).click();
+    });
+
+    // クリックは activePane（この場合 1）のスロットへ割り当てる。
+    // pane 引数を取り違えて 0 固定にすると s1 が上書きされ、
+    // 1 固定にすると常に正しく見えてしまうため、両スロットを見る
+    expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
+    expect(useAppStore.getState().paneAssignment[0]).toBe('s1');
   });
 });

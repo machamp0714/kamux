@@ -75,7 +75,7 @@ export function SessionTabList(): JSX.Element {
   return (
     <div className="kamux-tablist" role="tablist" aria-label="セッション">
       {sessionTabs.length > 0 ? (
-        <div className="kamux-tablist__group">
+        <div className="kamux-tablist__group" role="presentation">
           <span className="kamux-tablist__group-label" aria-hidden>
             SESSIONS
           </span>
@@ -83,7 +83,7 @@ export function SessionTabList(): JSX.Element {
         </div>
       ) : null}
       {scratchTabs.length > 0 ? (
-        <div className="kamux-tablist__group">
+        <div className="kamux-tablist__group" role="presentation">
           <span className="kamux-tablist__group-label" aria-hidden>
             SCRATCH
           </span>
