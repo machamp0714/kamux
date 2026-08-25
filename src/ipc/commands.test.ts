@@ -7,6 +7,7 @@ import {
   ackPty,
   cleanupWorktree,
   createProject,
+  createScratchSession,
   createSession,
   deleteProject,
   getHooksDiagnostics,
@@ -27,6 +28,7 @@ import {
   writePty,
   writePtyBytes,
 } from './commands';
+import type { Session } from '../types/model';
 
 beforeEach(() => {
   invoke.mockReset();
@@ -72,6 +74,52 @@ describe('ipc/commands', () => {
       branch: 'session/fix-login',
       cliKind: 'claude',
       cliCommand: null,
+    });
+  });
+
+  // 契約 §29.3: create_scratch_session(project_id, cwd) を camelCase 引数で invoke する。
+  it('createScratchSession が projectId と cwd を camelCase で渡し、戻り値の Session をそのまま返す', async () => {
+    const created: Session = {
+      id: 's-scratch',
+      project_id: 'p1',
+      title: 'scratch',
+      description: '',
+      kanban_status: 'backlog',
+      sort_order: 1,
+      mode: 'in_place',
+      branch: null,
+      worktree_path: null,
+      cli_kind: 'shell',
+      cli_command: null,
+      claude_session_id: null,
+      last_runtime_state: 'running',
+      last_runtime_error: null,
+      first_started_at: 1,
+      heuristics_enabled: false,
+      silence_timeout_secs: 30,
+      is_scratch: true,
+      archived_at: null,
+      created_at: 1,
+      updated_at: 1,
+    };
+    invoke.mockResolvedValue(created);
+
+    const got = await createScratchSession('p1', '/Users/x/repo/kamux');
+
+    expect(invoke).toHaveBeenCalledWith('create_scratch_session', {
+      projectId: 'p1',
+      cwd: '/Users/x/repo/kamux',
+    });
+    expect(got).toEqual(created);
+  });
+
+  // 契約 §29.3: cwd が None なら project.repo_path。呼び出し側が明示的に null を渡すことで
+  // その分岐に入る（省略可能にすると渡し忘れと区別できなくなる）。
+  it('createScratchSession は cwd に null を渡せる', async () => {
+    await createScratchSession('p1', null);
+    expect(invoke).toHaveBeenCalledWith('create_scratch_session', {
+      projectId: 'p1',
+      cwd: null,
     });
   });
 

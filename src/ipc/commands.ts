@@ -43,6 +43,12 @@ export interface CreateSessionArgs {
 export const createSession = (args: CreateSessionArgs): Promise<Session> =>
   invoke('create_session', { ...args });
 
+/** スクラッチ端末の作成 + start を 1 コマンドで原子的に行う（契約 §29.3）。
+ *  cwd は省略できない。null を明示することで「cwd が None なら project.repo_path」の
+ *  分岐に入る（渡し忘れと意図的な null を区別するため）。 */
+export const createScratchSession = (projectId: string, cwd: string | null): Promise<Session> =>
+  invoke('create_scratch_session', { projectId, cwd });
+
 export const updateSession = (id: string, patch: SessionPatch): Promise<Session> =>
   invoke('update_session', { id, patch });
 
