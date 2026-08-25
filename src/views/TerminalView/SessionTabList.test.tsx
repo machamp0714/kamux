@@ -210,3 +210,79 @@ describe('SessionTabList のペインバッジ（契約 §28.3）', () => {
     expect(badgeOf('s2')).toBe('D');
   });
 });
+
+describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
+  function renderTabs(): void {
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionTabList />);
+    });
+  }
+
+  function groupLabels(): string[] {
+    return Array.from(container.querySelectorAll('.kamux-tablist__group-label')).map(
+      (el) => el.textContent ?? '',
+    );
+  }
+
+  function sessionIdsInGroup(label: string): string[] {
+    const labelEl = Array.from(container.querySelectorAll('.kamux-tablist__group-label')).find(
+      (el) => el.textContent === label,
+    );
+    const group = labelEl?.closest('.kamux-tablist__group');
+    return Array.from(group?.querySelectorAll('[data-session-id]') ?? []).map(
+      (el) => el.getAttribute('data-session-id') ?? '',
+    );
+  }
+
+  it('is_scratch で SESSIONS と SCRATCH に振り分ける（両方向）', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    // SCRATCH には s2 が居る
+    expect(sessionIdsInGroup('SCRATCH')).toEqual(['s2']);
+    // SESSIONS には s2 が居ない（逆方向も確認しないと「常に両方描く」変異と潰れる）
+    expect(sessionIdsInGroup('SESSIONS')).toEqual(['s1']);
+  });
+
+  it('SCRATCH が 0 件のときは見出しごと描かない', () => {
+    useAppStore.setState({
+      sessions: { s1: session('s1') },
+      sessionOrder: { backlog: [], in_progress: ['s1'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SESSIONS']);
+    expect(container.querySelectorAll('.kamux-tablist__group')).toHaveLength(1);
+  });
+
+  it('role="tablist" は 1 つのまま（グループがロールを割らない）', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(container.querySelectorAll('[role="tablist"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(2);
+  });
+
+  it('グループの並びは SESSIONS が先、SCRATCH が後', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SESSIONS', 'SCRATCH']);
+  });
+});
