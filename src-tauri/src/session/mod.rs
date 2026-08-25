@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{KanbanStatus, Session, SessionPatch, SurfaceKind};
+use crate::model::{CliKind, KanbanStatus, Session, SessionMode, SessionPatch, SurfaceKind};
 use crate::pty::launch_env::{probe_login_env, resolve_program, LaunchEnv};
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::session::heuristics::sink_impl::{attach_heuristics, detach_heuristics};
 use crate::session::heuristics::OutputObserver;
 use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
+use crate::store::now_ms;
 use cli_args::{
     apply_hooks, binary_name, build_launch_command, login_shell, resume_mode, resume_plan,
     ResumeMode,
@@ -540,6 +541,146 @@ fn stop_agent_surface(state: &AppState, id: &str) -> AppResult<Session> {
     // `exited` + `PtyExited` は遷移なしなので DB もイベントも動かない（計画 §6.5）。
     state.runtime.sender().send(id, StateInput::UserStopped);
     Ok(session)
+}
+
+/// スクラッチ端末の「作成して DB へ確定させる」部分だけを切り出した構築点
+/// (契約 §29.1 / §29.2 / §29.3 / §29.6)。`AppHandle` を要らないのでそのまま
+/// ユニットテストできる。
+///
+/// スクラッチの構築点は `Session::new_backlog` とは別にここへ置く —— `new_backlog`
+/// は常に `is_scratch: false` を入れる契約（§29.1 の申し送り）なので、そのまま呼んで
+/// フィールドを上書きする。`SessionPatch` は経由しない —— スクラッチかどうかは
+/// 作成時に決まり、後から切り替わらない（契約 §29.2）。
+///
+/// `plan_agent_spawn`（既存の agent サーフェス起動）を経由しない。スクラッチは常に
+/// `mode: in_place`（契約 §29.6）だが、`prepare_worktree` の in_place 腕は
+/// `project.repo_path` しか返さず、呼び出し元が指定した `cwd` を通す経路が無い。
+/// `prepare_worktree` に分岐を足すと §13 の worktree 契約に例外を持ち込むことになり、
+/// それは契約 §29.6 が名指しで禁じている。cwd の決定はここで独立に行う。
+fn plan_scratch_session_with(
+    state: &AppState,
+    project_id: &str,
+    cwd: Option<String>,
+    now: i64,
+    launch_env: &LaunchEnv,
+) -> AppResult<(Session, SpawnSpec)> {
+    let project = state.store.get_project(project_id)?;
+    let sort_order = state
+        .store
+        .next_sort_order(project_id, KanbanStatus::Backlog)?;
+
+    let mut session = Session::new_backlog(
+        project_id,
+        "Scratch",
+        "",
+        SessionMode::InPlace,
+        None,
+        CliKind::Shell,
+        None,
+        sort_order,
+        now,
+    );
+    // `new_backlog` が入れた既定値 false を、スクラッチだけがここで上書きする
+    // (契約 §29.1 / §29.2)。
+    session.is_scratch = true;
+
+    let resolved_cwd = match cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => PathBuf::from(&project.repo_path),
+    };
+    // portable-pty 0.9.0 が cwd の実在を `is_dir()` でしか検証せず、ディレクトリで
+    // なければ chdir を試みず黙って $HOME へフォールバックする問題は
+    // `plan_agent_spawn_with`（このファイル上方）と同じ。述語を逐語で一致させる。
+    if !resolved_cwd.is_dir() {
+        return Err(AppError::InvalidState(format!(
+            "working directory does not exist or is not a directory: {}",
+            resolved_cwd.display()
+        )));
+    }
+
+    // cli_kind は常に Shell（契約 §29.3）なので binary_name() は常に None ——
+    // resolve_program の PATH 探索（契約 §18）を経由しない。ログインシェル自身が
+    // 起動対象になる。
+    let program = login_shell();
+    let launch = build_launch_command(
+        &session,
+        &program,
+        &resolved_cwd,
+        launch_env,
+        ResumeMode::None,
+    )?;
+    let launch = apply_hooks(&session, launch, state.hooks.as_ref());
+
+    let spec = SpawnSpec {
+        surface_id: surface_id(&session.id, SurfaceKind::Agent),
+        program: launch.program.to_string_lossy().into_owned(),
+        env: launch.env,
+        args: launch.args,
+        cwd: launch.cwd,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+    };
+
+    // spawn より前に DB へ確定させる。ここが本コマンドの「作成」半分である。
+    let session = state.store.insert_session(&session)?;
+    Ok((session, spec))
+}
+
+/// `create_scratch_session` の `AppHandle` 非依存の本体（契約 §29.3）。
+/// `spawn` をクロージャとして受け取るのは `spawn_agent_surface_with` と同じ理由 ——
+/// `PtyManager::spawn` は Wry 固定（契約 §15）で `MockRuntime` に登録できず、この形に
+/// しない限り「作成 → 永続化 → start」という合成そのものをユニットテストから
+/// 固定できない。
+///
+/// **失敗時はロールバックしない。行は残し、`error` へ遷移させる**
+/// （`start_session` / `resume_session` の spawn 失敗と同じ扱い。契約 §40.3）。
+/// DB に delete API は無く、削除コマンドの新設は契約 §7.4 / §29.3 の却下記録と
+/// 矛盾する。行を残せば `error` の理由がユーザーに見える（契約 §2 の `error` の
+/// 存在理由）—— 消すとその痕跡ごと失われる。
+fn create_and_start_scratch_session_with(
+    state: &AppState,
+    project_id: &str,
+    cwd: Option<String>,
+    now: i64,
+    launch_env: &LaunchEnv,
+    spawn: impl FnOnce(SpawnSpec, Option<Box<dyn OutputObserver>>) -> AppResult<()>,
+) -> AppResult<Session> {
+    let (session, spec) = plan_scratch_session_with(state, project_id, cwd, now, launch_env)?;
+
+    if let Err(err) = spawn_agent_surface_with(state, &session, spec, spawn) {
+        state
+            .runtime
+            .sender()
+            .mark_error(&session.id, &err.to_string());
+        return Err(err);
+    }
+    // これが「start」半分。作成（上の insert_session）と合わせて 1 コマンドの
+    // 原子性を成す（契約 §29.3 の「create_session を分岐させずに別コマンドにした
+    // 理由」）。
+    state
+        .runtime
+        .sender()
+        .send(&session.id, StateInput::Spawned);
+    Ok(session)
+}
+
+/// スクラッチ端末（M3-4、契約 §29）。作成と start を 1 コマンドで原子的に行う。
+/// cwd が None なら project.repo_path。mode は常に in_place、cli_kind は常に shell
+#[tauri::command]
+pub async fn create_scratch_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    cwd: Option<String>,
+) -> AppResult<Session> {
+    create_and_start_scratch_session_with(
+        &state,
+        &project_id,
+        cwd,
+        now_ms(),
+        probe_login_env(),
+        |spec, observer| state.pty.spawn_with_observer(&app, spec, observer),
+    )
 }
 
 /// 既存セッション向けのブランチ名提案（契約 §60.1 / §60.1.1）。
@@ -1954,6 +2095,234 @@ mod tests {
                 state.heuristics.diagnostics().is_empty(),
                 "stop_session でヒューリスティックが外れていない"
             );
+        }
+    }
+
+    // --- M3-4 Task 17: create_scratch_session（契約 §29.3）---
+
+    mod scratch_session {
+        use super::*;
+
+        fn wait_until(f: impl Fn() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            f()
+        }
+
+        /// `build_state` は repo_path を文字列として保存するだけで実ディレクトリを
+        /// 要求しないため、DB 用の TempDir とは別に repo_path 用の TempDir を持つ。
+        /// 両方を呼び出し側が保持し続けないと途中でディレクトリごと消える。
+        fn project_with_temp_repo() -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            AppState,
+            crate::model::Project,
+        ) {
+            let repo = tempfile::tempdir().expect("tempdir for repo_path");
+            let (db_dir, state, project) =
+                build_state(repo.path().to_str().expect("utf8 repo path"));
+            (db_dir, repo, state, project)
+        }
+
+        #[test]
+        fn plan_scratch_session_fixes_is_scratch_mode_and_cli_kind() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (session, _spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert!(
+                session.is_scratch,
+                "スクラッチは常に is_scratch: true（契約 §29.1）"
+            );
+            assert_eq!(session.mode, SessionMode::InPlace, "契約 §29.6");
+            assert_eq!(session.cli_kind, CliKind::Shell, "契約 §29.3");
+            assert_eq!(session.branch, None, "契約 §29.6");
+            assert_eq!(session.worktree_path, None, "契約 §29.6");
+            assert_eq!(
+                session.kanban_status,
+                KanbanStatus::Backlog,
+                "契約 §29.1: NOT NULL のまま 'backlog'"
+            );
+        }
+
+        /// cwd が None のときは project.repo_path へフォールバックする（契約 §29.3）。
+        #[test]
+        fn plan_scratch_session_falls_back_to_the_project_repo_path_when_cwd_is_none() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert_eq!(spec.cwd, PathBuf::from(&project.repo_path));
+        }
+
+        /// 弁別: `cwd: Some(..)` は project.repo_path とは別のディレクトリへ通ること。
+        /// フォールバック値とは明確に別の値を使うことで、「常に project.repo_path を
+        /// 使う」変異（cwd を無視する変異）を弁別する。
+        #[test]
+        fn plan_scratch_session_uses_the_given_cwd_over_the_project_repo_path() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+            let custom = tempfile::tempdir().expect("custom cwd dir");
+            assert_ne!(
+                custom.path(),
+                std::path::Path::new(&project.repo_path),
+                "テスト前提: custom は repo_path と別のディレクトリであること"
+            );
+
+            let (_session, spec) = plan_scratch_session_with(
+                &state,
+                &project.id,
+                Some(custom.path().to_str().expect("utf8").to_string()),
+                1_000,
+                &fake_launch_env(),
+            )
+            .expect("plan scratch session");
+
+            assert_eq!(spec.cwd, custom.path());
+        }
+
+        /// 自分で設計した変異: `is_dir()` を `exists()` に緩めると、通常ファイルの cwd が
+        /// ここを素通りしてしまう（`workspace.rs` の
+        /// `existing_worktree_path_that_is_a_regular_file_errors` と同種の実害。
+        /// portable-pty は chdir を試みず黙って $HOME へフォールバックする）。
+        #[test]
+        fn plan_scratch_session_rejects_a_cwd_that_is_a_regular_file() {
+            let (_db_dir, repo, state, project) = project_with_temp_repo();
+            let fake_cwd = repo.path().join("not-a-directory");
+            std::fs::write(&fake_cwd, b"").expect("write regular file");
+
+            let err = plan_scratch_session_with(
+                &state,
+                &project.id,
+                Some(fake_cwd.to_str().expect("utf8").to_string()),
+                1_000,
+                &fake_launch_env(),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+        }
+
+        /// `plan_scratch_session_with` は spawn の前に DB へ確定させる。
+        #[test]
+        fn plan_scratch_session_persists_the_row_before_returning() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (session, _spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            let reloaded = state
+                .store
+                .get_session(&session.id)
+                .expect("row must exist in the store");
+            assert!(reloaded.is_scratch);
+        }
+
+        /// M4: 作成だけでなく start（spawn の呼び出し）まで含めて 1 手であること。
+        #[test]
+        fn create_and_start_scratch_session_calls_the_injected_spawn() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+            let mut called = false;
+
+            create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| {
+                    called = true;
+                    Ok(())
+                },
+            )
+            .expect("create and start");
+
+            assert!(called, "start（spawn の呼び出し）が起きていない");
+        }
+
+        /// spawn 成功後は runtime_state が Spawned を経て Running へ遷移すること。
+        #[test]
+        fn create_and_start_scratch_session_reaches_running_on_success() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let session = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Ok(()),
+            )
+            .expect("create and start");
+
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "現在: {:?}",
+                state.runtime.current(&session.id)
+            );
+        }
+
+        /// 解釈 6（原子性）で選んだ形の固定: spawn が失敗してもロールバックしない。
+        /// 行は残り、error 状態になる（`start_session` の spawn 失敗と同じ扱い）。
+        #[test]
+        fn create_and_start_scratch_session_leaves_the_row_and_marks_error_when_spawn_fails() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let err = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Err(AppError::InvalidState("boom".to_string())),
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+
+            let rows = state
+                .store
+                .list_sessions(&project.id, true)
+                .expect("list sessions");
+            assert_eq!(rows.len(), 1, "行がロールバックされている（残すのが仕様）");
+            assert!(rows[0].is_scratch);
+
+            assert!(
+                wait_for_error_state(&state, &rows[0].id),
+                "spawn 失敗は error へ遷移するはず"
+            );
+        }
+
+        /// C1（陽性の対照）: 永続化を飛ばすと、この後の store 読み戻しが検知する。
+        #[test]
+        fn create_and_start_scratch_session_row_is_readable_after_success() {
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let session = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Ok(()),
+            )
+            .expect("create and start");
+
+            let reloaded = state
+                .store
+                .get_session(&session.id)
+                .expect("row must exist in the store after success");
+            assert!(reloaded.is_scratch);
+            assert_eq!(reloaded.mode, SessionMode::InPlace);
+            assert_eq!(reloaded.cli_kind, CliKind::Shell);
         }
     }
 }

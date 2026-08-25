@@ -830,6 +830,7 @@ pub fn run() {
             session::resume_session,
             session::stop_session,
             session::suggest_branch_name,
+            session::create_scratch_session,
             crate::pty::editor::spawn_editor,
             report_frontend_ready,
         ])
