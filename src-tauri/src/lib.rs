@@ -2067,7 +2067,7 @@ mod tests {
         /// `normalize_on_startup()` の**前**に配線する。判定に使える情報
         /// （正規化前の `last_runtime_state`）は正規化の前だけに在るため。
         ///
-        /// 4 行を DB に入れて `archived_at` の結果を見る（裁定 1 の免除集合
+        /// 5 行を DB に入れて `archived_at` の結果を見る（裁定 1 の免除集合
         /// `{Running, WaitingInput}` が実際に配線へ渡っていること、`is_scratch = 0`
         /// の行が対象外であることの両方を固定する）。
         fn insert_scratch_session(

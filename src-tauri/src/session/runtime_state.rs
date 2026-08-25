@@ -187,9 +187,7 @@ pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
 /// ではない（裁定 3）。免除された行は `archive_stale_scratch_sessions` の判定を
 /// 生き延びるだけであり、直後に呼ばれる `normalize_on_startup()` が
 /// `running` / `waiting_input` の行を無条件に `Interrupted` へ書き換えるため、
-/// **免除された行も同じ起動で `Interrupted` になる**
-/// （`list_sessions_by_last_runtime_state` に `archived_at` の絞りが無いため、
-/// アーカイブされずに残った行がそのまま正規化の対象に含まれる）。次回起動の時点では
+/// **免除された行も同じ起動で `Interrupted` になる**。次回起動の時点では
 /// `last_runtime_state` が既に免除集合の外（`Interrupted`）になっているため、
 /// 次回のアーカイブでは免除されない。§29.5 の「ユーザーが閉じるまで消さない」は今回の
 /// 起動 1 回分の意味であり、恒久的に免除すると §29.5 自身が防ごうとした
