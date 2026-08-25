@@ -37,10 +37,18 @@ const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 # kamux CLI shim（契約 §30.1）。アプリ起動のたびに書き直されるので手で編集しない。
 #
 # 本体の解決は KAMUX_SHIM_DIR を除いた PATH で行う（自分自身を再帰的に exec しないため）。
+# KAMUX_SHIM_DIR が未設定でも自己再帰しないよう、$0 から導いた自分自身のディレクトリも
+# 併せて除外する（契約 §154.2。KAMUX_SHIM_DIR の比較を置き換えるのではなく加える）。
+# $0 に / が無い場合は導けないので除外候補にしない（契約 §154.3 ハザード 1）。
+case "$0" in
+  */*) kamux_self_dir=${0%/*} ;;
+  *) kamux_self_dir='' ;;
+esac
 kamux_path=''
 IFS=':'
 for kamux_dir in $PATH; do
   [ "$kamux_dir" = "$KAMUX_SHIM_DIR" ] && continue
+  [ -n "$kamux_self_dir" ] && [ "$kamux_dir" = "$kamux_self_dir" ] && continue
   if [ -z "$kamux_path" ]; then
     kamux_path="$kamux_dir"
   else
@@ -215,6 +223,31 @@ mod tests {
         );
     }
 
+    /// 契約 §154.2: 自己除外を `KAMUX_SHIM_DIR` の設定に依存させない。`$0` から
+    /// 導いた自分自身のディレクトリも PATH 走査の除外候補に加える（`KAMUX_SHIM_DIR`
+    /// の比較と**併せて**。既存の比較を置き換えるのではない —— §30.1 の字面の担保は
+    /// `shim_resolves_the_real_binary_from_a_path_without_the_shim_dir` が別に見ている）。
+    #[test]
+    fn shim_also_excludes_its_own_directory_derived_from_dollar_zero() {
+        let script = shim_script("claude", true);
+
+        // `$0` に `/` が無い場合（契約 §154.3 ハザード 1）に備えて分岐すること。
+        assert!(
+            script.contains("case \"$0\" in"),
+            "$0 の形で分岐していない（ハザード 1 未対応の疑い）:\n{script}"
+        );
+        // 導いた自分自身のディレクトリも PATH 走査で除外する。
+        assert!(
+            script.contains("kamux_self_dir"),
+            "$0 から導いた自分自身のディレクトリを除外候補にしていない:\n{script}"
+        );
+        // 既存の KAMUX_SHIM_DIR 比較は残る（置き換えではなく併用）。
+        assert!(
+            script.contains("[ \"$kamux_dir\" = \"$KAMUX_SHIM_DIR\" ] && continue\n"),
+            "既存の KAMUX_SHIM_DIR 比較が失われている:\n{script}"
+        );
+    }
+
     #[test]
     fn shim_script_is_a_posix_sh_script() {
         for (binary, adds_settings) in SHIMMED_CLIS {
@@ -337,12 +370,118 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// 契約 §154.3: 自己再帰が再発したとき、このテストは「失敗」ではなく
+    /// 「無限にハング」する。素の `Command::output()` にはタイムアウトが無いので、
+    /// `spawn` + `try_wait` のポーリングで上限（10 秒）を超えたら `kill()` してから
+    /// `panic!` する。既存の `run_shim`（`cmd.output()` ベース）は変更しない。
+    fn run_shim_with_deadline(cmd: &mut std::process::Command) -> std::process::Output {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn shim");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_end(&mut stdout).expect("read stdout");
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    err.read_to_end(&mut stderr).expect("read stderr");
+                }
+                return std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("shim が 10 秒以内に終了しなかった。自己再帰 exec が疑われる（契約 §154）");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 契約 §154.2: 自己除外を `KAMUX_SHIM_DIR` の設定に依存させない。shim
+    /// ディレクトリを PATH の**先頭**に置き、`KAMUX_SHIM_DIR` を `env_remove` で
+    /// 未設定にしても、自己再帰 exec せず本体（tempdir に置いた偽物）へ届くこと。
+    #[test]
+    fn the_generated_claude_shim_does_not_self_recurse_when_kamux_shim_dir_is_unset() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = install_shims(base.path()).expect("install shims");
+        let real_dir = base.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\nprintf 'ARGS:%s\\n' \"$*\"\n").expect("write real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mut cmd = std::process::Command::new(dir.join("claude"));
+        cmd.arg("hello")
+            // shim ディレクトリを PATH の先頭に置く（KAMUX_SHIM_DIR 無しでも
+            // shim 自身が command -v で見つかる位置）。
+            .env("PATH", format!("{}:{}", dir.display(), real_dir.display()))
+            .env_remove("KAMUX_SHIM_DIR")
+            .env_remove("KAMUX_HOOKS_SETTINGS");
+
+        let out = run_shim_with_deadline(&mut cmd);
+        assert!(
+            out.status.success(),
+            "shim が失敗した: status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ARGS:hello\n");
+    }
+
     #[test]
     fn the_generated_claude_shim_adds_settings_only_when_the_env_is_set() {
         assert_eq!(run_shim("claude", None), "ARGS:hello\n");
         assert_eq!(
             run_shim("claude", Some("/tmp/kamux-hooks.settings.json")),
             "ARGS:--settings /tmp/kamux-hooks.settings.json hello\n"
+        );
+    }
+
+    /// 契約 §154.3 ハザード 1 の実測: zsh（macOS の既定シェル）で `PATH` の先頭に
+    /// 空要素があり、その要素がカレントディレクトリを意味する場合、名前だけで
+    /// 起動されたコマンドの `$0` はディレクトリを含まない（`/` が無い）。POSIX の
+    /// `sh`/`bash` はこの位置に `./` を補って `$0` に反映するが、zsh は補わない。
+    ///
+    /// **この経路は解決していない** —— `case "$0" in */*) … ;; esac` は `/` の
+    /// 無い `$0` を誤ってディレクトリ扱いしない（`kamux_self_dir` を空にする）だけで、
+    /// この経路での自己除外は既存の `KAMUX_SHIM_DIR` 比較に委ねられたままである
+    /// （契約 §154.3 は「測れ」であって「解け」ではない）。
+    #[test]
+    fn dollar_zero_has_no_slash_when_a_leading_empty_path_element_resolves_to_cwd_in_zsh() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let probe = base.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write probe");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let out = std::process::Command::new("zsh")
+            .arg("-c")
+            .arg("PATH=\":$PATH\" probe")
+            .current_dir(base.path())
+            .output()
+            .expect("run probe via zsh");
+        assert!(
+            out.status.success(),
+            "status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "probe",
+            "zsh の PATH 先頭空要素経由では $0 がコマンド名のまま（/ を含まない）になることを期待した"
         );
     }
 
