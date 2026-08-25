@@ -351,6 +351,10 @@ mod tests {
     ///
     /// `KAMUX_SHIM_DIR` を PATH に**先頭で**入れたうえで走らせるので、shim が自分自身を
     /// 再帰 exec する形（契約 §30.1 の禁止）ならここでハングまたは 127 になる。
+    ///
+    /// **`run_shim_with_deadline` 経由で打ち切り付きにしている**（修正ラウンド1
+    /// レビュー Important 3 の是正）—— 素の `cmd.output()` はタイムアウトを持たず、
+    /// 自己再帰が再発したときこのヘルパを使う 2 テストが CI を無限に止める。
     fn run_shim(binary: &str, settings: Option<&str>) -> String {
         let base = tempfile::tempdir().expect("tempdir");
         let dir = install_shims(base.path()).expect("install shims");
@@ -368,7 +372,7 @@ mod tests {
             Some(path) => cmd.env("KAMUX_HOOKS_SETTINGS", path),
             None => cmd.env_remove("KAMUX_HOOKS_SETTINGS"),
         };
-        let out = cmd.output().expect("run shim");
+        let out = run_shim_with_deadline(&mut cmd);
         assert!(
             out.status.success(),
             "shim が失敗した: status={:?} stderr={}",
