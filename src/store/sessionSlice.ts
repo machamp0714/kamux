@@ -62,7 +62,7 @@ export interface SessionSlice {
   runtimeErrors: Record<string, string>;
   /**
    * reason: 'resume_failed'（契約 §8 の StateReason）を受け取ったセッションの id 集合。
-   * InterruptedOverlay / KanbanCardResume の「新しい会話として開始」導線と
+   * KanbanCardResume の「新しい会話として開始」導線と
    * retryResumeAsFresh はこの配列だけを見る（第1部 §4.4）。
    *
    * 出入りの規則（両方とも applyStateEvent が担う。resumeSession アクションの
@@ -100,7 +100,7 @@ export interface SessionSlice {
    * 許可リスト（契約 §40.3）の複製はしない。ズレの境界は契約 §42.3.1 が定めている。
    */
   setRuntimeError: (sessionId: string, message: string) => void;
-  /** カードの再開ボタン / InterruptedOverlay が呼ぶ（第1部 §4.4: 経路を分けない）。 */
+  /** カードの再開ボタン（KanbanCardResume）が呼ぶ（第1部 §4.4: 経路を分けない）。 */
   resumeSession: (sessionId: string) => Promise<void>;
   /**
    * 無効な claude_session_id を捨ててから再開する（第1部 §4.2）。
@@ -370,9 +370,9 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // バックエンドの二重起動ガードである。レビュー task-1-review.md Minor 訂正）。
     // 🔴 この順序（ペインの .then よりこちらの .then が先に登録されるので markStarted が
     // 先に走る）は「再開ボタンを押す時点で TerminalPane が必ず未マウントである」
-    // （App.tsx の view ゲート）に依存する。InterruptedOverlay など terminal 面へ
-    // 再開ボタンを持ち込む変更を入れる際は、先にこの競合（マイクロタスク順の逆転）を
-    // 解くこと（レビュー task-1-review.md I-3）。
+    // （App.tsx の view ゲート）に依存する。terminal 面へ再開ボタンを持ち込む変更を
+    // 入れる際は、先にこの競合（マイクロタスク順の逆転）を解くこと
+    // （レビュー task-1-review.md I-3）。
     const surface = surfaceId(sessionId, 'agent');
 
     // 段 1: listen 登録の完了を待つ（契約 §16）。待たずに invoke すると、再開直後の

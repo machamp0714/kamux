@@ -25,8 +25,8 @@ function stopOpen(e: MouseEvent<HTMLButtonElement>) {
  * セッションは「新しい会話として開始」（`retryResumeAsFresh`）に切り替わる。
  * それ以外は `resumeAffordance()` のラベルで通常の再開（`resumeSession`）を出す。
  *
- * `InterruptedOverlay.tsx` と同じ `store.resumeSession` / `store.retryResumeAsFresh`
- * を呼ぶ（第1部 §4.4: 経路を分けない）。
+ * 再開の導線は `store.resumeSession` / `store.retryResumeAsFresh` のこの 1 経路だけを
+ * 呼ぶ（第1部 §4.4: 経路を分けない）。
  */
 export function KanbanCardResume({ sessionId }: { sessionId: string }): JSX.Element | null {
   const runtimeState = useAppStore((s) => s.runtimeStates[sessionId]);
