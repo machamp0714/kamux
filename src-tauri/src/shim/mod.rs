@@ -18,11 +18,12 @@ pub const SHIM_DIR_NAME: &str = "shim";
 
 /// 書き出す shim と、`--settings` を足すかどうか。
 ///
-/// **`codex` の shim は `--settings` を足さない。** 契約 §30.2 が argv の `--settings` を
-/// `cli_kind == Claude` 限定と定めており（`apply_hooks` の実装もそうなっている）、
-/// §30.1 のガードの目的は逐語で「存在しない settings を指す `--settings` を渡して
-/// claude を壊さないため」である —— codex に claude 専用フラグを渡すのは、そのガードが
-/// 防ごうとしている事故そのものになる。**2 ファイルとも作るのは §30.1 の表が置き場所を
+/// **`codex` の shim は `--settings` を足さない。** 契約 §30 の本文は逐語で
+/// 「`--settings` は `cli_args.rs` が claude の argv を組むときだけ足す」と書いており
+/// （`apply_hooks` の実装も `cli_kind == Claude` 限定になっている）、§30.1 のガードの
+/// 目的は逐語で「存在しない settings ファイルを指す `--settings` を渡して claude を
+/// 壊さないため」である —— codex に claude 専用フラグを渡すのは、そのガードが防ごうと
+/// している事故そのものになる。**2 ファイルとも作るのは §30.1 の表が置き場所を
 /// `shim/{claude,codex}` と定めているためである。**
 pub const SHIMMED_CLIS: [(&str, bool); 2] = [("claude", true), ("codex", false)];
 
@@ -171,7 +172,8 @@ mod tests {
     }
 
     /// 裁定 21-A: `codex` の shim は引数を一切変えずに本体を exec する。
-    /// 契約 §30.2 が argv の `--settings` を `cli_kind == Claude` 限定と定めている。
+    /// 契約 §30 の本文が逐語で「`--settings` は `cli_args.rs` が claude の argv を
+    /// 組むときだけ足す」と書いている。
     #[test]
     fn codex_shim_never_adds_the_settings_flag() {
         let script = shim_script("codex", false);
