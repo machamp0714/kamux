@@ -17,7 +17,8 @@ export function compareSessionOrder(a: Session, b: Session): number {
 /**
  * ボード 1 枚分の表示順を作る。
  * `sessions` はプロジェクト横断のグローバルキャッシュを渡してよい。
- * アクティブプロジェクト以外と、アーカイブ済み（archived_at !== null）は除外する。
+ * アクティブプロジェクト以外、アーカイブ済み（archived_at !== null）、
+ * スクラッチ端末（is_scratch）は除外する（契約 §29.4）。
  */
 export function buildSessionOrder(
   sessions: Session[],
@@ -30,7 +31,7 @@ export function buildSessionOrder(
     done: [],
   };
   sessions
-    .filter((x) => x.project_id === projectId && x.archived_at === null)
+    .filter((x) => x.project_id === projectId && x.archived_at === null && !x.is_scratch)
     .slice()
     .sort(compareSessionOrder)
     .forEach((x) => order[x.kanban_status].push(x.id));

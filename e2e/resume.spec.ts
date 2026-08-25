@@ -13,9 +13,8 @@ import { tauriMockScript } from './support/tauriMock';
  * 総当たりを持つ。ここに置くのは **実ストア + 実 `listen()` 配線 + 実カード（dnd-kit の
  * context の中）を跨ぐ経路**だけである（契約 §26）。
  *
- * `⚠ ${note}` の前置（`InterruptedOverlay.tsx:41`）は現ビルドのどこにもマウントされて
- * いない（§6.0(a) の 🔴 実測: `InterruptedOverlay` の import/JSX 使用は 0 件）ため、
- * ここでは移さない。カード側（`KanbanCardResume.tsx:60`）は `title={note}` のみで
+ * `⚠ ${note}` の前置を描くコンポーネントは M3-4 で撤去された（契約 §126.4 の 2 / §150）
+ * ため、ここでは移さない。カード側（`KanbanCardResume.tsx:60`）は `title={note}` のみで
  * ⚠ を付けないので、`title` 属性の値だけを見る。
  *
  * fixture の前提（落とすと全 assert が無関係な理由で赤くなる）:

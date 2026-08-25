@@ -20,10 +20,8 @@ export const TAB_COLUMN_ORDER: KanbanStatus[] = ['in_progress', 'backlog', 'revi
 
 /**
  * 契約 §29.7: SESSIONS グループは !is_scratch（カンバン由来のセッション）。
- * sessionOrder は本来 scratch を含まない設計（契約 §29.4）だが、プロジェクト再訪時の
- * loadSessions が使う buildSessionOrder（sessionOrder.ts）は is_scratch を絞らないため、
- * scratch の id が sessionOrder に紛れ込みうる。ここで明示的に除外し、下の SCRATCH
- * 側との重複を防ぐ（Ruling 20-G。sessionOrder.ts / kanbanOrder.ts 自体は変更しない）。
+ * 主たる境界は sessionOrder.ts の buildSessionOrder（is_scratch を絞る。契約 §29.4）に
+ * あり、ここは二重防御である。下の SCRATCH 側との重複を防ぐためにも明示的に除外する。
  */
 function sessionTabsFromOrder(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
   return TAB_COLUMN_ORDER.flatMap((status) => state.sessionOrder[status] ?? []).filter((id) => {

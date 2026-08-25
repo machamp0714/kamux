@@ -313,7 +313,7 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
       sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
       layout: 'split2',
       activePane: 1,
-      paneAssignment: ['s1', null],
+      paneAssignment: [null, 's1'],
     });
     renderTabs();
 
@@ -324,9 +324,11 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
 
     // クリックは activePane（この場合 1）のスロットへ割り当てる。
     // pane 引数を取り違えて 0 固定にすると s1 が上書きされ、
-    // 1 固定にすると常に正しく見えてしまうため、両スロットを見る
+    // 1 固定にすると常に正しく見えてしまうため、両スロットを見る。
+    // 空いているペイン(0)へ入れる実装との区別のため、0 側は埋まっていない
+    // （null のまま）ことも見る（契約 §29 系ではなく再レビュアーの逐語処方）。
     expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
-    expect(useAppStore.getState().paneAssignment[0]).toBe('s1');
+    expect(useAppStore.getState().paneAssignment[0]).toBeNull();
   });
 
   it('split2 で activePane が 0 のときは 0 側のスロットへ割り当てる（1 固定の取り違えを検出する対称ケース）', () => {
