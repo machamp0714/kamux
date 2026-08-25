@@ -2579,6 +2579,20 @@ mod tests {
         assert_eq!(archived, vec![stale.id.clone()]);
         let reloaded = store.get_session(&stale.id).expect("get");
         assert!(reloaded.archived_at.is_some(), "アーカイブされていない");
+        // rust-brief B-2: archived_at と updated_at の両方に同じ「今回時刻」を入れる。
+        // フィクスチャは session_with_sentinel_updated_at 経由で updated_at = 1 を
+        // 入れているので、センチネルから動いていること自体が「updated_at を書いている」
+        // ことの観測になる（now_ms() から期待値を再導出すると production と同じ材料に
+        // 依存してしまい何も測らなくなるため、この形を採る）。
+        assert_ne!(
+            reloaded.updated_at, 1,
+            "updated_at がセンチネル値のまま動いていない"
+        );
+        assert_eq!(
+            reloaded.updated_at,
+            reloaded.archived_at.expect("archived_at is some"),
+            "updated_at と archived_at に別々の値が入っている"
+        );
     }
 
     #[test]

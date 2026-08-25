@@ -2112,6 +2112,16 @@ mod tests {
             insert_scratch_session(&store, &project_id, "live", RuntimeState::Running);
             insert_scratch_session(&store, &project_id, "waiting", RuntimeState::WaitingInput);
             insert_scratch_session(&store, &project_id, "stale", RuntimeState::Idle);
+            // 配線サイトが渡す免除集合の過大化を検出する行（レビュー修正 I-2 (a)）。
+            // `last_runtime_state = interrupted` は SCRATCH_SURVIVING_STATES の外なので、
+            // 配線サイトが誤って Interrupted を免除集合へ加える変異（`&[Running,
+            // WaitingInput, Interrupted]`）を打つとこの行がアーカイブされなくなる。
+            insert_scratch_session(
+                &store,
+                &project_id,
+                "already-interrupted",
+                RuntimeState::Interrupted,
+            );
             let normal = insert_test_session(&store, &project_id, "normal");
 
             let app = mock_app();
@@ -2153,11 +2163,33 @@ mod tests {
             );
             assert!(
                 store
+                    .get_session("already-interrupted")
+                    .expect("get already-interrupted")
+                    .archived_at
+                    .is_some(),
+                "already-interrupted（interrupted）がアーカイブされていない \
+                 （配線サイトの免除集合が過大化している疑い。レビュー修正 I-2 (a)）"
+            );
+            assert!(
+                store
                     .get_session(&normal.id)
                     .expect("get normal")
                     .archived_at
                     .is_none(),
                 "スクラッチでない normal 行がアーカイブされた"
+            );
+            // レビュー修正 I-1: SCRATCH_SURVIVING_STATES で免除された行は、直後の
+            // normalize_on_startup() で running/waiting_input から interrupted へ
+            // 書き換えられる（＝同じ起動で Interrupted になる）。doc コメントの
+            // 断定をこの assert に結びつけて固定する。
+            assert_eq!(
+                store
+                    .get_session("live")
+                    .expect("get live")
+                    .last_runtime_state,
+                RuntimeState::Interrupted,
+                "免除された live 行が同じ起動の正規化で Interrupted になっていない \
+                 （runtime_state.rs の SCRATCH_SURVIVING_STATES doc の断定が崩れている）"
             );
         }
 

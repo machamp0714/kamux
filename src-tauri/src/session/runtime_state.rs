@@ -184,9 +184,14 @@ pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
 /// が固定している）。
 ///
 /// 免除は「今回の起動で作業中だったものを黙って消さない」ことであって、恒久的な保護
-/// ではない（裁定 3）。免除された行は今回 `Interrupted` にはならないが、次回起動では
-/// `normalize_startup_state` が `Interrupted` を返す状態ではなくなるため、次回の
-/// アーカイブでは免除されない。§29.5 の「ユーザーが閉じるまで消さない」は今回の
+/// ではない（裁定 3）。免除された行は `archive_stale_scratch_sessions` の判定を
+/// 生き延びるだけであり、直後に呼ばれる `normalize_on_startup()` が
+/// `running` / `waiting_input` の行を無条件に `Interrupted` へ書き換えるため、
+/// **免除された行も同じ起動で `Interrupted` になる**
+/// （`list_sessions_by_last_runtime_state` に `archived_at` の絞りが無いため、
+/// アーカイブされずに残った行がそのまま正規化の対象に含まれる）。次回起動の時点では
+/// `last_runtime_state` が既に免除集合の外（`Interrupted`）になっているため、
+/// 次回のアーカイブでは免除されない。§29.5 の「ユーザーが閉じるまで消さない」は今回の
 /// 起動 1 回分の意味であり、恒久的に免除すると §29.5 自身が防ごうとした
 /// 「SCRATCH グループが際限なく伸びる」蓄積がそのまま起きる。
 pub const SCRATCH_SURVIVING_STATES: [RuntimeState; 2] =
