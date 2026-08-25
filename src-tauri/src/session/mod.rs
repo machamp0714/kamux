@@ -368,14 +368,31 @@ fn spawn_agent_surface_with(
     // この関数を通らず `PtyManager::spawn` を直に呼ぶので、構造的に対象外である
     //（§64.3 の「`spawn_editor` は対象外」）。
     //
-    // `Err` を握り潰さない: 1 行が届かなければ shim は PATH に立たず、手打ちの
-    // `claude` の hook が黙って飛ばなくなる（§0「エラーは AppError に載せる」）。
+    // **`Err` を `?` で伝播させない**（契約 §153.3）。ここに来た時点で `spawn` は
+    // 成功しており PTY は生きている。伝播させると 3 つの呼び出し側
+    //（`start_session` / `resume_session` / `create_and_start_scratch_session_with`）
+    // の `mark_error` へ届き、契約 §40.3 の判定基準（「その `Err` の時点で
+    // セッションが起動していないことが確実か」）を満たさない `Err` で ❌ を出す。
+    // 開くのは「PTY は動いているのにカードが ❌ になり、その間ユーザーは再起動も
+    // できない」窓である（`error` から出る唯一の入力は `Spawned` だが、PTY が
+    // 生きている間は二重起動ガードが `InvalidState` を返すので `Spawned` が来ない）。
+    //
+    // **握り潰しではなく縮退である。** 1 行が届かなければ shim は PATH に立たず、
+    // 手打ちの `claude` の hook が黙って飛ばなくなる —— その事実は `warn!` に残す
+    // （`bootstrap_hooks` が relay / ソケット / settings の 3 つで採っているのと
+    // 同じ形。設計書 §12「hooks が使えなくてもアプリは起動する」）。
     // spawn 済みの surface は生きているので、掃除は `sink.rs` の `on_exit` が行う。
     if let Some(line) = crate::shim::shell_path_line(
         session.cli_kind,
         state.hooks.as_ref().and_then(|h| h.shim_dir.as_deref()),
     ) {
-        state.pty.write(&surface_id, line)?;
+        if let Err(err) = state.pty.write(&surface_id, line) {
+            tracing::warn!(
+                error = %err,
+                surface_id = %surface_id,
+                "shim PATH line was not delivered to the pty"
+            );
+        }
     }
     Ok(())
 }
@@ -1997,6 +2014,10 @@ mod tests {
 
     mod heuristics_lifecycle {
         use super::*;
+        // 契約 §64.3 の 1 行の観測に使う。**複製せず共有する** —— 同一プロセスに
+        // `tracing` の subscriber は 1 人しか立てられない（`payload.rs` の
+        // `tests` モジュールの doc）。
+        use crate::hooks_srv::payload::tests::{capture_events, CapturedEvent};
 
         fn wait_until(f: impl Fn() -> bool) -> bool {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2108,19 +2129,46 @@ mod tests {
             );
         }
 
-        /// `cli_kind` と shim の有無を指定して、`spawn_agent_surface_with` を
-        /// **成功する** spawn クロージャで通す。戻り値はその結果。
+        /// spawn クロージャが走ったことを示すマーカー。契約 §64.3 の「`PtyManager::spawn`
+        /// の**成功直後**」という**順序**は、このマーカーと shim の warn の出現位置の
+        /// 前後で見る（`assert` の対象は件数ではなく index である —— 同じスレッドで
+        /// 鳴る無関係なイベント（`runtime_state.rs` の `info!` など）が混ざりうる）。
+        const SPAWN_MARKER: &str = "test-marker: the injected spawn ran";
+
+        /// shim の 1 行が PTY へ届かなかったときの `warn!` だけを、鳴った順に拾う。
         ///
-        /// PTY へ実際に書けるかどうかは観測の対象ではない —— `PtyManager::spawn` は
-        /// `AppHandle`（Wry 固定。契約 §15）を要求してテストから起こせないので、
-        /// レジストリに surface は 1 つも居ない。**したがって「書きに行った」ことは
-        /// `AppError::NotFound(surface_id)` として観測できる**（書きに行かなければ
-        /// `Ok(())` になる）。1 行の**中身**の逐語を守るのは `shim::SHELL_PATH_LINE`
-        /// 側のテストである（契約 §64.3）。
+        /// **メッセージ本文では絞らない**（文言の変更で無音になる形を作らない）。
+        /// `session/` と `pty/` の production が出す `tracing` イベントは
+        /// `runtime_state.rs` の `info!` 1 つだけで、`surface_id` フィールドを
+        /// 持つ `WARN` は本件以外に存在しない。
+        fn shim_line_warns(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
+            events
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("surface_id"))
+                .collect()
+        }
+
+        /// `cli_kind` と shim の有無を指定して、`spawn_agent_surface_with` を
+        /// **成功する** spawn クロージャで通す。戻り値はその結果と、その間に鳴った
+        /// `tracing` イベント全件である。
+        ///
+        /// **戻り値からは書き込みの成否が見えない。** 契約 §153.3（「`PtyManager::write`
+        /// の `Err` は §40.3 の「呼ばない」側である」）により、`write` の `Err` は
+        /// `spawn_agent_surface_with` の中で握られて `warn!` へ落ち、関数は `Ok` を返す。
+        /// 一方 `PtyManager::spawn` は `AppHandle`（Wry 固定。契約 §15）を要求して
+        /// テストから起こせず、レジストリに surface は 1 つも居ないので write は必ず
+        /// 失敗する。**したがって「書きに行った」「宛先はどこか」「spawn より後か」は
+        /// すべてその warn で観測する。** 1 行の**中身**の逐語を守るのは
+        /// `shim::SHELL_PATH_LINE` 側のテストである（契約 §64.3）。
         fn spawn_shell_surface_with_shim(
             cli_kind: CliKind,
             shim_dir: Option<&str>,
-        ) -> (tempfile::TempDir, Session, AppResult<()>) {
+        ) -> (
+            tempfile::TempDir,
+            Session,
+            AppResult<()>,
+            Vec<CapturedEvent>,
+        ) {
             let (dir, store, session) = build_project_and_session(
                 "/tmp/kamux-shim-line",
                 SessionMode::InPlace,
@@ -2139,11 +2187,13 @@ mod tests {
                     shim_dir: Some(PathBuf::from(shim_dir)),
                 });
             }
-            let result =
+            let (result, events) = capture_events(|| {
                 spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| {
+                    tracing::info!("{}", SPAWN_MARKER);
                     Ok(())
-                });
-            (dir, session, result)
+                })
+            });
+            (dir, session, result, events)
         }
 
         /// 契約 §64.3: 「`PtyManager::spawn` の成功直後、呼び出し側が
@@ -2151,38 +2201,104 @@ mod tests {
         /// `resume_session` / `create_scratch_session`）はすべてこの関数を経由する**
         /// ので、置き場所はここ 1 箇所である（`spawn_editor` はこの関数を通らない）。
         ///
-        /// 宛先が **agent サーフェス**であることも同時に見る —— 別の `surface_id` へ
-        /// 書く変異は `NotFound` の中身が変わるので弁別される。
+        /// 同時に 2 つ見る:
+        /// - **宛先が agent サーフェスであること** —— warn の `error` フィールドは
+        ///   `PtyManager::write` に**実際に渡した** `surface_id` から生えるので、
+        ///   別の id へ書く変異はここで弁別される。
+        /// - **spawn の「成功直後」であること** —— spawn クロージャが出すマーカーが
+        ///   warn より**前**に鳴っていること。書き込みを `spawn(...)` の手前へ移す
+        ///   変異はこの順序で赤になる。
         #[test]
-        fn spawning_a_shell_surface_with_the_shim_enabled_writes_the_pty_line() {
-            let (_dir, session, result) =
+        fn spawning_a_shell_surface_with_the_shim_enabled_writes_the_pty_line_after_the_spawn() {
+            let (_dir, session, result, events) =
                 spawn_shell_surface_with_shim(CliKind::Shell, Some("/tmp/kamux-shim"));
 
-            let err = result.expect_err("1 行を書きに行けば surface 不在で Err になる");
+            result.expect("write の Err は握る（契約 §153.3）");
+            let warns = shim_line_warns(&events);
+            assert_eq!(warns.len(), 1, "1 行を書きに行っていない: {events:?}");
+
             let expected = crate::pty::surface_id(&session.id, SurfaceKind::Agent);
+            assert_eq!(
+                warns[0].fields.get("surface_id").map(String::as_str),
+                Some(expected.as_str()),
+                "warn が名指しした宛先が agent サーフェスではない: {:?}",
+                warns[0]
+            );
+            assert_eq!(
+                warns[0].fields.get("error").map(String::as_str),
+                Some(AppError::NotFound(expected.clone()).to_string().as_str()),
+                "`PtyManager::write` に渡した宛先が agent サーフェスではない: {:?}",
+                warns[0]
+            );
+
+            let marker = events
+                .iter()
+                .position(|e| e.message == SPAWN_MARKER)
+                .expect("spawn クロージャが走っていない");
+            let warn = events
+                .iter()
+                .position(|e| std::ptr::eq(e, warns[0]))
+                .expect("warn の位置");
             assert!(
-                matches!(&err, AppError::NotFound(id) if id == &expected),
-                "agent サーフェスへ書いていない: {err:?}（期待した宛先: {expected}）"
+                marker < warn,
+                "契約 §64.3 の 1 行が spawn の**前**に書かれている: {events:?}"
+            );
+        }
+
+        /// 契約 §153.3 / Ruling 21-D: **`PtyManager::write` の `Err` は §40.3 の
+        /// 「`mark_error` を呼ばない `Err`」側である。** spawn は成功していて PTY は
+        /// 生きているので、ここで `?` を使って伝播させると 3 コマンド
+        /// （`start_session` / `resume_session` / `create_and_start_scratch_session_with`）
+        /// の `mark_error` へ届き、「PTY は動いているのにカードが ❌ になり、
+        /// その間ユーザーは再起動もできない」窓が開く。
+        ///
+        /// **握り潰しではなく縮退である**ことも同時に見る —— `Ok` を返しつつ
+        /// `warn!` が必ず 1 件鳴っていること。
+        #[test]
+        fn a_failed_pty_line_write_is_degraded_to_a_warning_and_does_not_fail_the_spawn() {
+            let (_dir, _session, result, events) =
+                spawn_shell_surface_with_shim(CliKind::Shell, Some("/tmp/kamux-shim"));
+
+            assert!(
+                result.is_ok(),
+                "write の Err が伝播している（3 コマンドの mark_error へ届く）: {result:?}"
+            );
+            assert_eq!(
+                shim_line_warns(&events).len(),
+                1,
+                "無音で握り潰している（warn が鳴っていない）: {events:?}"
             );
         }
 
         /// 契約 §64.3: 「書くのは shim 有効時 かつ `cli_kind == Shell` のときだけ」。
         /// shim 無効（`state.hooks == None`）では 1 行も書かない。
+        ///
+        /// **戻り値の `Ok` では見ない** —— 契約 §153.3 の縮退により「書きに行って
+        /// 失敗した」も `Ok` になるため、`Ok` を見るだけの assert は恒真である。
         #[test]
         fn spawning_a_shell_surface_without_the_shim_writes_nothing() {
-            let (_dir, _session, result) = spawn_shell_surface_with_shim(CliKind::Shell, None);
+            let (_dir, _session, result, events) =
+                spawn_shell_surface_with_shim(CliKind::Shell, None);
             result.expect("shim 無効なら PTY へ 1 行も書かない");
+            assert!(
+                shim_line_warns(&events).is_empty(),
+                "shim 無効なのに 1 行書きに行っている: {events:?}"
+            );
         }
 
         /// 同上の裏側: shim 有効でも `Shell` 以外へは書かない。
+        /// ここも戻り値ではなく warn の件数で見る（上と同じ理由）。
         #[test]
         fn spawning_a_non_shell_surface_with_the_shim_enabled_writes_nothing() {
             for cli_kind in [CliKind::Claude, CliKind::Codex, CliKind::Custom] {
-                let (_dir, _session, result) =
+                let (_dir, _session, result, events) =
                     spawn_shell_surface_with_shim(cli_kind, Some("/tmp/kamux-shim"));
-                result.unwrap_or_else(|e| {
-                    panic!("cli_kind={cli_kind:?} へ 1 行書きに行っている: {e:?}")
-                });
+                result
+                    .unwrap_or_else(|e| panic!("cli_kind={cli_kind:?} で Err になっている: {e:?}"));
+                assert!(
+                    shim_line_warns(&events).is_empty(),
+                    "cli_kind={cli_kind:?} へ 1 行書きに行っている: {events:?}"
+                );
             }
         }
 
@@ -2356,6 +2472,13 @@ mod tests {
         }
 
         /// M4: 作成だけでなく start（spawn の呼び出し）まで含めて 1 手であること。
+        ///
+        /// **`spawn_agent_surface_with` を経由していることも同時に見る。** 裁定 21-B
+        /// は「3 消費者がすべてこの関数を経由するので、契約 §64.3 の 1 行は 1 箇所に
+        /// 置けばよい」を前提にしている。経由を外して `spawn` を直に呼ぶ形は、
+        /// §64.3 の 1 行と M3-3 のヒューリスティック装着を同時に落とす。
+        /// `observer` が `Some` なのは `spawn_agent_surface_with` が
+        /// `attach_heuristics` の結果を渡すからで、直呼びでは `None` になる。
         #[test]
         fn create_and_start_scratch_session_calls_the_injected_spawn() {
             // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
@@ -2371,8 +2494,12 @@ mod tests {
                 None,
                 1_000,
                 &fake_launch_env(),
-                |_spec, _observer| {
+                |_spec, observer| {
                     called = true;
+                    assert!(
+                        observer.is_some(),
+                        "spawn_agent_surface_with を経由していない（裁定 21-B の前提が崩れている）"
+                    );
                     Ok(())
                 },
             )
