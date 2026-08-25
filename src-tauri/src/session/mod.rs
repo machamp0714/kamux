@@ -341,6 +341,8 @@ fn spawn_agent_surface_with(
     spec: SpawnSpec,
     spawn: impl FnOnce(SpawnSpec, Option<Box<dyn OutputObserver>>) -> AppResult<()>,
 ) -> AppResult<()> {
+    // 契約 §64.3 の 1 行を送る宛先。`spec` はこの後 `spawn` へ move される。
+    let surface_id = spec.surface_id.clone();
     let observer = attach_heuristics(&state.heuristics, session);
     spawn(spec, Some(observer)).inspect_err(|_| {
         // spawn に失敗したセッションは読み取りスレッドを持たず、`sink.rs` の `on_exit` も
@@ -355,7 +357,27 @@ fn spawn_agent_surface_with(
         // ので、**外さないほうが状態が壊れる**（押し出された側は `register` の resume
         // 腕で既に停止済みで、レジストリには新しい死んだエントリだけが残る）。
         detach_heuristics(&state.heuristics, &session.id);
-    })
+    })?;
+
+    // 契約 §64.3: **spawn の成功直後**に 1 行だけ送る。フロント（`ptyBridge`）からは
+    // 送らない —— ユーザーの最初の入力より前であることを保証できない（§16 の
+    // `term.onData` の所有と競合する）。
+    //
+    // **消費者 3 つ（`start_session` / `resume_session` / `create_scratch_session`）は
+    // すべてこの関数を経由するので、ここ 1 箇所に置く。** `spawn_editor`（M3-1）は
+    // この関数を通らず `PtyManager::spawn` を直に呼ぶので、構造的に対象外である
+    //（§64.3 の「`spawn_editor` は対象外」）。
+    //
+    // `Err` を握り潰さない: 1 行が届かなければ shim は PATH に立たず、手打ちの
+    // `claude` の hook が黙って飛ばなくなる（§0「エラーは AppError に載せる」）。
+    // spawn 済みの surface は生きているので、掃除は `sink.rs` の `on_exit` が行う。
+    if let Some(line) = crate::shim::shell_path_line(
+        session.cli_kind,
+        state.hooks.as_ref().and_then(|h| h.shim_dir.as_deref()),
+    ) {
+        state.pty.write(&surface_id, line)?;
+    }
+    Ok(())
 }
 
 /// セッションの agent サーフェスを起動する。
@@ -1178,6 +1200,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/kamux-hooks-test.sock"),
             settings_path: PathBuf::from("/tmp/kamux-hooks-test.settings.json"),
             relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+            shim_dir: None,
         });
 
         let (_, spec) = plan(&state, &session.id).expect("plan spawn");
@@ -2085,6 +2108,84 @@ mod tests {
             );
         }
 
+        /// `cli_kind` と shim の有無を指定して、`spawn_agent_surface_with` を
+        /// **成功する** spawn クロージャで通す。戻り値はその結果。
+        ///
+        /// PTY へ実際に書けるかどうかは観測の対象ではない —— `PtyManager::spawn` は
+        /// `AppHandle`（Wry 固定。契約 §15）を要求してテストから起こせないので、
+        /// レジストリに surface は 1 つも居ない。**したがって「書きに行った」ことは
+        /// `AppError::NotFound(surface_id)` として観測できる**（書きに行かなければ
+        /// `Ok(())` になる）。1 行の**中身**の逐語を守るのは `shim::SHELL_PATH_LINE`
+        /// 側のテストである（契約 §64.3）。
+        fn spawn_shell_surface_with_shim(
+            cli_kind: CliKind,
+            shim_dir: Option<&str>,
+        ) -> (tempfile::TempDir, Session, AppResult<()>) {
+            let (dir, store, session) = build_project_and_session(
+                "/tmp/kamux-shim-line",
+                SessionMode::InPlace,
+                cli_kind,
+                match cli_kind {
+                    CliKind::Custom => Some("my-cli"),
+                    _ => None,
+                },
+            );
+            let mut state = crate::state::test_support::app_state(store);
+            if let Some(shim_dir) = shim_dir {
+                state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                    socket_path: PathBuf::from("/tmp/kamux-hooks-shimline.sock"),
+                    settings_path: PathBuf::from("/tmp/kamux-hooks-shimline.settings.json"),
+                    relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                    shim_dir: Some(PathBuf::from(shim_dir)),
+                });
+            }
+            let result =
+                spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| {
+                    Ok(())
+                });
+            (dir, session, result)
+        }
+
+        /// 契約 §64.3: 「`PtyManager::spawn` の成功直後、呼び出し側が
+        /// `PtyManager::write` で送る」。**3 消費者（`start_session` /
+        /// `resume_session` / `create_scratch_session`）はすべてこの関数を経由する**
+        /// ので、置き場所はここ 1 箇所である（`spawn_editor` はこの関数を通らない）。
+        ///
+        /// 宛先が **agent サーフェス**であることも同時に見る —— 別の `surface_id` へ
+        /// 書く変異は `NotFound` の中身が変わるので弁別される。
+        #[test]
+        fn spawning_a_shell_surface_with_the_shim_enabled_writes_the_pty_line() {
+            let (_dir, session, result) =
+                spawn_shell_surface_with_shim(CliKind::Shell, Some("/tmp/kamux-shim"));
+
+            let err = result.expect_err("1 行を書きに行けば surface 不在で Err になる");
+            let expected = crate::pty::surface_id(&session.id, SurfaceKind::Agent);
+            assert!(
+                matches!(&err, AppError::NotFound(id) if id == &expected),
+                "agent サーフェスへ書いていない: {err:?}（期待した宛先: {expected}）"
+            );
+        }
+
+        /// 契約 §64.3: 「書くのは shim 有効時 かつ `cli_kind == Shell` のときだけ」。
+        /// shim 無効（`state.hooks == None`）では 1 行も書かない。
+        #[test]
+        fn spawning_a_shell_surface_without_the_shim_writes_nothing() {
+            let (_dir, _session, result) = spawn_shell_surface_with_shim(CliKind::Shell, None);
+            result.expect("shim 無効なら PTY へ 1 行も書かない");
+        }
+
+        /// 同上の裏側: shim 有効でも `Shell` 以外へは書かない。
+        #[test]
+        fn spawning_a_non_shell_surface_with_the_shim_enabled_writes_nothing() {
+            for cli_kind in [CliKind::Claude, CliKind::Codex, CliKind::Custom] {
+                let (_dir, _session, result) =
+                    spawn_shell_surface_with_shim(cli_kind, Some("/tmp/kamux-shim"));
+                result.unwrap_or_else(|e| {
+                    panic!("cli_kind={cli_kind:?} へ 1 行書きに行っている: {e:?}")
+                });
+            }
+        }
+
         /// `stop_session` でも外す。`PtyManager::kill` は冪等で、既に死んでいる
         /// サーフェスでは `on_exit` が二度と来ないため、そこ任せにすると登録が残る。
         #[test]
@@ -2391,6 +2492,7 @@ mod tests {
                 socket_path: PathBuf::from("/tmp/kamux-hooks-scratch.sock"),
                 settings_path: PathBuf::from("/tmp/kamux-hooks-scratch.settings.json"),
                 relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                shim_dir: None,
             });
 
             let (_session, spec) =
@@ -2403,6 +2505,71 @@ mod tests {
                     "/tmp/kamux-hooks-scratch.sock".to_string()
                 )),
                 "actual env: {:?}",
+                spec.env
+            );
+        }
+
+        /// **スクラッチ経路（`cli_kind == Shell`）の shim 配線の観測**（契約 §30.2 /
+        /// §64.5.1）。手打ちした `claude` に `--settings` が届くために必要なものが
+        /// 全部揃っていることを 1 本で見る:
+        ///
+        /// - `KAMUX_HOOKS_SOCK`（relay の宛先）
+        /// - `KAMUX_HOOKS_SETTINGS`（shim がこれを見て `--settings` を足す）
+        /// - `KAMUX_SHIM_DIR`（shim 自身が PATH から自分を除くために見る）
+        /// - `PATH` の**先頭**が shim ディレクトリであること（`{shim_dir}:{現プロセスの
+        ///   PATH}`。§30.2 の逐語）
+        ///
+        /// **3 つのうち 1 つでも欠けると手打ちの `claude` は hook を飛ばさない。**
+        /// 既存の `..._injects_the_hooks_sock_env_even_for_the_shell_cli_kind` は
+        /// `KAMUX_HOOKS_SOCK` しか見ておらず、shim を落としても全緑だった。
+        #[test]
+        fn plan_scratch_session_carries_the_whole_shim_env_for_the_shell_cli_kind() {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, mut state, project) = project_with_temp_repo();
+            state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                socket_path: PathBuf::from("/tmp/kamux-hooks-scratch.sock"),
+                settings_path: PathBuf::from("/tmp/kamux-hooks-scratch.settings.json"),
+                relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                shim_dir: Some(PathBuf::from("/tmp/kamux-scratch-shim")),
+            });
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            for (key, value) in [
+                ("KAMUX_HOOKS_SOCK", "/tmp/kamux-hooks-scratch.sock"),
+                (
+                    "KAMUX_HOOKS_SETTINGS",
+                    "/tmp/kamux-hooks-scratch.settings.json",
+                ),
+                ("KAMUX_SHIM_DIR", "/tmp/kamux-scratch-shim"),
+            ] {
+                assert!(
+                    spec.env.contains(&(key.to_string(), value.to_string())),
+                    "{key} が env に無い: {:?}",
+                    spec.env
+                );
+            }
+
+            let paths: Vec<&str> = spec
+                .env
+                .iter()
+                .filter(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            // 契約 §30.2: `{shim_dir}:{現プロセスの PATH}`。`launch_env.path`
+            // （`/fake/bin`）を土台にする変異はここで赤くなる。
+            assert_eq!(
+                paths,
+                vec![format!(
+                    "/tmp/kamux-scratch-shim:{}",
+                    std::env::var("PATH").unwrap_or_default()
+                )
+                .as_str()],
+                "PATH の対が 1 つでその先頭が shim ディレクトリであること: {:?}",
                 spec.env
             );
         }

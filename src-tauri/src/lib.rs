@@ -6,6 +6,7 @@ pub mod notify;
 pub mod perf;
 pub mod pty;
 pub mod session;
+pub mod shim;
 pub mod state;
 pub mod store;
 pub mod worktree;
@@ -1269,6 +1270,7 @@ mod tests {
             socket_path: tmp.join(format!("kamux-runeventexit-sock-{pid}.sock")),
             settings_path: settings_path.clone(),
             relay_bin: tmp.join(format!("kamux-runeventexit-relay-{pid}")),
+            shim_dir: None,
         });
         state.hooks_server = std::sync::Mutex::new(Some(probe_server));
 
@@ -1792,6 +1794,7 @@ mod tests {
                     socket_path,
                     settings_path,
                     relay_bin,
+                    shim_dir: None,
                 }),
                 Some(server),
             )

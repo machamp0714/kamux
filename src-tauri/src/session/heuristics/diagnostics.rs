@@ -162,6 +162,7 @@ mod tests {
             socket_path,
             settings_path: dir.join(format!("kamux-diagtest-{tag}-{pid}-settings.json")),
             relay_bin: dir.join(format!("kamux-diagtest-{tag}-{pid}-relay")),
+            shim_dir: None,
         }
     }
 

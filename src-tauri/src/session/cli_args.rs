@@ -244,6 +244,48 @@ pub fn write_hook_settings_file(path: &Path, relay_bin: &Path) -> AppResult<()> 
 pub const ENV_SESSION_ID: &str = "KAMUX_SESSION_ID";
 /// 契約への追加提案 B: relay はアプリの pid を知らないのでソケットパスを env で受け取る。
 pub const ENV_HOOKS_SOCK: &str = "KAMUX_HOOKS_SOCK";
+/// 契約 §30.1 / §30.2: shim ディレクトリの絶対パス。**shim はこの env が
+/// PATH に居るかどうかではなく、`KAMUX_HOOKS_SETTINGS` の有無で `--settings` を
+/// 足すか決める。** shim 有効時のみ入る。
+pub const ENV_SHIM_DIR: &str = "KAMUX_SHIM_DIR";
+/// 契約 §30.1 / §30.2: shim が `--settings` に渡す settings ファイルの絶対パス。
+/// **shim が有効なのは kamux が起こした PTY の中だけ、という性質をこの env の有無で
+/// 構造的に保証する。**
+pub const ENV_HOOKS_SETTINGS: &str = "KAMUX_HOOKS_SETTINGS";
+
+/// 契約 §64.5.1 の「`PATH` の最終値」の表を 1 箇所で持つ純関数。
+///
+/// `process_path` は**現プロセスの `PATH`**（契約 §30.2 の逐語）。`cli_kind == Shell`
+/// のときだけ使う —— その腕は §23 により `launch_env.path` を持たないので、土台に
+/// できるのは現プロセスの `PATH` だけである。
+///
+/// **`env` へ 2 つ目の `PATH` を push しない。** `Claude` / `Codex` は
+/// `build_launch_command` が既に入れた対を**書き換える** —— `Vec<(String, String)>`
+/// に `PATH` が 2 つ並ぶと、どちらが勝つかが並び順に依存する（§64.5.1 が
+/// `hook_env_vars` について却下したのと同じ形の事故）。
+fn prepend_shim_dir_to_path(
+    cli_kind: CliKind,
+    shim_dir: &str,
+    process_path: &str,
+    env: &mut Vec<(String, String)>,
+) {
+    match cli_kind {
+        // §64.5: custom は `$SHELL -l -c "<cli_command>"` で起動し、`-l` が
+        // path_helper を通すので shim は末尾へ落ちる。手前に本物の claude が
+        // 居るかどうかで発火したりしなかったりする「動くこともある状態」を
+        // 作らないため、入れない。
+        CliKind::Custom => {}
+        // §23 が `PATH` を入れない唯一の腕。ここでだけ対を新しく push する。
+        CliKind::Shell => env.push(("PATH".to_string(), format!("{shim_dir}:{process_path}"))),
+        CliKind::Claude | CliKind::Codex => {
+            for (key, value) in env.iter_mut() {
+                if key == "PATH" {
+                    *value = format!("{shim_dir}:{value}");
+                }
+            }
+        }
+    }
+}
 
 /// claude の argv に足す hooks 引数。
 ///
@@ -269,13 +311,28 @@ pub fn claude_hook_args(hooks: Option<&HooksRuntime>) -> Vec<String> {
 /// 構造的に書けなくしてある。引数を残して散文で禁じる形は採らない
 /// （§102.3 の却下記録）。
 pub fn hook_env_vars(hooks: Option<&HooksRuntime>) -> Vec<(String, String)> {
-    match hooks {
-        Some(h) => vec![(
+    let Some(h) = hooks else {
+        return Vec::new();
+    };
+    let mut env = vec![
+        (
             ENV_HOOKS_SOCK.to_string(),
             h.socket_path.to_string_lossy().into_owned(),
-        )],
-        None => Vec::new(),
+        ),
+        (
+            ENV_HOOKS_SETTINGS.to_string(),
+            h.settings_path.to_string_lossy().into_owned(),
+        ),
+    ];
+    // shim 無効時は対そのものを入れない。空文字を入れると、shim スクリプトの
+    // 「KAMUX_SHIM_DIR を除いた PATH」の比較が空文字と突き合わさって壊れる。
+    if let Some(shim_dir) = h.shim_dir.as_ref() {
+        env.push((
+            ENV_SHIM_DIR.to_string(),
+            shim_dir.to_string_lossy().into_owned(),
+        ));
     }
+    env
 }
 
 /// `build_launch_command` が組み立てた結果に hooks 由来の値を重ねる。**argv と env で
@@ -301,6 +358,28 @@ pub fn apply_hooks(
         cmd.args.extend(claude_hook_args(hooks));
     }
     cmd.env.extend(hook_env_vars(hooks));
+
+    // `PATH` への shim ディレクトリの prepend（契約 §64.5 / §64.5.1）。
+    //
+    // **ここに置く理由**: `PATH` の最終値を組むには `cli_kind` と `HooksRuntime` と
+    // 組み立て済みの `env` の 3 つが同時に見える場所が要る。`build_launch_command` は
+    // §23 の 5 引数固定で `HooksRuntime` に辿り着けず、純粋関数なので現プロセスの
+    // `PATH` も読めない。`hook_env_vars` は §64.5.1 が `PATH` の対を返すことを名指しで
+    // 却下している（`cli_kind` も見られない）。**シグネチャ固定の下で残るのは、
+    // この doc が既に「後段の合流点」と呼んでいるこの関数だけである。**
+    // 契約 §64.5.1 の逐語は「`PATH` の最終値は `build_launch_command` が組む」だが、
+    // その文は同節が想定した「`hooks` を見られる `build_launch_command`」を前提に
+    // している —— 5 引数を変えない限り成立しない。**主旨（受け渡し口を 1 本に絞る /
+    // `PATH` の対を 2 つ作らない）はこの置き場所で満たされる。**
+    if let Some(shim_dir) = hooks.and_then(|h| h.shim_dir.as_ref()) {
+        let process_path = std::env::var("PATH").unwrap_or_default();
+        prepend_shim_dir_to_path(
+            session.cli_kind,
+            &shim_dir.to_string_lossy(),
+            &process_path,
+            &mut cmd.env,
+        );
+    }
     cmd
 }
 
@@ -884,11 +963,24 @@ pub(crate) mod tests {
     /// （`claude_hook_args` / `hook_env_vars` の doc コメントが「シェルを経由しないため
     /// 空白や `'` を含んでもクォート不要かつ有害」と主張しており、その主張を検査するため。
     /// フィックス対象レビュー指摘: `cli_args.rs` Task 10 fix round 1）。
+    /// hooks も shim も**有効**なランタイム。`shim_dir` は `test_env().path`
+    /// （`/fake/bin`）の部分文字列にならない値にしてある —— 部分文字列だと
+    /// 「prepend されたか」と「元のままか」を `starts_with` で弁別できなくなる。
     fn fake_runtime() -> HooksRuntime {
         HooksRuntime {
             socket_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.sock"),
             settings_path: PathBuf::from("/tmp/kamux's dir/kamux-hooks-4321.settings.json"),
             relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+            shim_dir: Some(PathBuf::from("/tmp/kamux's dir/shim")),
+        }
+    }
+
+    /// hooks は有効・shim は**無効**（`shim_dir == None`）。契約 §64.5.1 の
+    /// 「shim 無効時は §23 / §30.2 の既存規定のまま」を見るテストが使う。
+    fn fake_runtime_without_shim() -> HooksRuntime {
+        HooksRuntime {
+            shim_dir: None,
+            ..fake_runtime()
         }
     }
 
@@ -910,18 +1002,160 @@ pub(crate) mod tests {
         assert!(hook_env_vars(None).is_empty());
     }
 
+    /// 契約 §64.5.1 の逐語: 「`hook_env_vars` が返し続けるのは `KAMUX_SHIM_DIR` /
+    /// `KAMUX_HOOKS_SETTINGS` / `KAMUX_HOOKS_SOCK` である。」
+    ///
+    /// **`contains` ではなく完全一致で見る。** 緩めると、`PATH` の対を返させる変異
+    /// （契約 §64.5.1 が名指しで却下した形）がここを素通りする。
+    /// 契約 §102.3: `KAMUX_SESSION_ID` は返さない（所有者は `build_launch_command`）。
     #[test]
-    fn injects_socket_path() {
-        // 契約 §102.3: hook_env_vars は KAMUX_SESSION_ID を返さない
-        // （所有者は build_launch_command。§102.2）。
+    fn injects_sock_settings_and_shim_dir_and_nothing_else() {
         let env = hook_env_vars(Some(&fake_runtime()));
         assert_eq!(
             env,
-            vec![(
-                "KAMUX_HOOKS_SOCK".to_string(),
-                "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
-            )]
+            vec![
+                (
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+                ),
+                (
+                    "KAMUX_HOOKS_SETTINGS".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.settings.json".to_string()
+                ),
+                (
+                    "KAMUX_SHIM_DIR".to_string(),
+                    "/tmp/kamux's dir/shim".to_string()
+                ),
+            ]
         );
+    }
+
+    /// shim 無効時（`shim_dir == None`）は `KAMUX_SHIM_DIR` を返さない。
+    /// **空文字の対を返す**変異（`unwrap_or_default()` 相当）は、shim スクリプトの
+    /// PATH 除去を空文字と比較させて壊すので、ここで弁別する。
+    #[test]
+    fn omits_the_shim_dir_env_when_the_shim_is_disabled() {
+        let env = hook_env_vars(Some(&fake_runtime_without_shim()));
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.sock".to_string()
+                ),
+                (
+                    "KAMUX_HOOKS_SETTINGS".to_string(),
+                    "/tmp/kamux's dir/kamux-hooks-4321.settings.json".to_string()
+                ),
+            ]
+        );
+    }
+
+    /// 契約 §64.5.1 の「`PATH` の最終値」の表そのもの（4 行）。`process_path` を
+    /// 引数で受ける純関数に閉じてあるので、実行環境の `PATH` に依存しない。
+    #[test]
+    fn the_path_table_of_the_contract_holds_for_the_four_cli_kinds() {
+        let cases = [
+            // (cli_kind, build_launch_command が入れた PATH, 期待値)
+            (CliKind::Claude, Some("/fake/bin"), Some("/shim:/fake/bin")),
+            (CliKind::Codex, Some("/fake/bin"), Some("/shim:/fake/bin")),
+            // Shell は §23 により PATH の対を持たない。ここで初めて 1 つだけ push される
+            (CliKind::Shell, None, Some("/shim:/proc/path")),
+            // §64.5: custom には shim を入れない
+            (CliKind::Custom, Some("/fake/bin"), Some("/fake/bin")),
+        ];
+        for (cli_kind, base, expected) in cases {
+            let mut env: Vec<(String, String)> = vec![("LANG".to_string(), "C".to_string())];
+            if let Some(path) = base {
+                env.push(("PATH".to_string(), path.to_string()));
+            }
+
+            prepend_shim_dir_to_path(cli_kind, "/shim", "/proc/path", &mut env);
+
+            let paths: Vec<&str> = env
+                .iter()
+                .filter(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                expected.into_iter().collect::<Vec<_>>(),
+                "cli_kind={cli_kind:?} の PATH が契約 §64.5.1 の表と違う: {env:?}"
+            );
+        }
+    }
+
+    /// 契約 §64.5.1: shim 無効時は §23 / §30.2 の既存規定のまま。
+    /// `Shell` に `PATH` の対が生えないことも同時に見る。
+    #[test]
+    fn the_path_is_untouched_when_the_shim_is_disabled() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime_without_shim()) {
+            let paths: Vec<&str> = cmd
+                .env
+                .iter()
+                .filter(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            let expected: Vec<&str> = match cli_kind {
+                CliKind::Shell => Vec::new(),
+                _ => vec!["/fake/bin"],
+            };
+            assert_eq!(paths, expected, "cli_kind={cli_kind:?}: {:?}", cmd.env);
+        }
+    }
+
+    /// 契約 §64.8 の (a) / (b) / (c) を 1 本で見る。
+    ///
+    /// - (a) `Custom` の `PATH` は `launch_env.path` **そのもの**（完全一致）
+    /// - (b) `Claude` / `Codex` の `PATH` は `{shim_dir}:{launch_env.path}`
+    /// - (c) `env` に `PATH` の対が 2 つ現れない（`filter` の結果が 1 要素）
+    ///
+    /// `Shell` は §30.2 の逐語のとおり `{shim_dir}:{現プロセスの PATH}` である ——
+    /// `launch_env.path`（`/fake/bin`）を土台にする変異をここで弁別する。
+    #[test]
+    fn the_shim_dir_is_prepended_to_path_for_every_cli_kind_except_custom() {
+        let process_path = std::env::var("PATH").unwrap_or_default();
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
+            let paths: Vec<&str> = cmd
+                .env
+                .iter()
+                .filter(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            let expected = match cli_kind {
+                CliKind::Custom => "/fake/bin".to_string(),
+                CliKind::Shell => format!("/tmp/kamux's dir/shim:{process_path}"),
+                CliKind::Claude | CliKind::Codex => "/tmp/kamux's dir/shim:/fake/bin".to_string(),
+            };
+            assert_eq!(
+                paths,
+                vec![expected.as_str()],
+                "cli_kind={cli_kind:?} の PATH: {:?}",
+                cmd.env
+            );
+        }
+    }
+
+    /// 契約 §30.2 の env 表: `KAMUX_SHIM_DIR` / `KAMUX_HOOKS_SETTINGS` は
+    /// **全 `cli_kind` 共通**である（`PATH` に居なければ不活性なので、例外を
+    /// 2 つに増やす理由が無い。§64.5）。`Custom` にも入ることを固定する。
+    #[test]
+    fn the_shim_env_vars_are_injected_for_claude_codex_shell_and_custom() {
+        for (cli_kind, cmd) in apply_hooks_for_the_four_cli_kinds(&fake_runtime()) {
+            for (key, value) in [
+                ("KAMUX_SHIM_DIR", "/tmp/kamux's dir/shim"),
+                (
+                    "KAMUX_HOOKS_SETTINGS",
+                    "/tmp/kamux's dir/kamux-hooks-4321.settings.json",
+                ),
+            ] {
+                assert!(
+                    cmd.env.contains(&(key.to_string(), value.to_string())),
+                    "cli_kind={cli_kind:?} の env に {key} が入っていない: {:?}",
+                    cmd.env
+                );
+            }
+        }
     }
 
     // ---- Task 11: M1-4 の claude 起動経路への結線（契約 §31.4 / §102） ----
