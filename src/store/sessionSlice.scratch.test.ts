@@ -105,6 +105,14 @@ describe('closeScratchTerminal（契約 §29.3 / §29.8。Cmd+W が呼ぶ）', (
       sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
       focusedSessionId: 'scr1',
       activeProjectId: 'p1',
+      // Ruling 20-D（Cmd+W 後に paneAssignment を触らない）を、スクラッチ限定の門
+      // （Ruling 20-C）を通り抜けた本体実行経路で観測するための baseline。
+      // paneInvariant.test.ts の FOCUS_TOUCHING_ACTIONS 側は baseline のフォーカス
+      // 中セッションが非 scratch なので早期 return しか測れない
+      // （task-20 レビュー Important 2）。ここは focusedSessionId が scratch なので
+      // 本体（stopSession → archiveSession）を実行してから below で不変を確認する。
+      paneAssignment: ['scr1', null],
+      activePane: 0,
     });
     const calls: string[] = [];
     stopSession.mockImplementation(async (id: string) => {
@@ -125,6 +133,12 @@ describe('closeScratchTerminal（契約 §29.3 / §29.8。Cmd+W が呼ぶ）', (
     const [id, patch] = updateSession.mock.calls[0] as [string, { archived_at: number }];
     expect(id).toBe('scr1');
     expect(typeof patch.archived_at).toBe('number');
+
+    // Ruling 20-D: archive 後も paneAssignment / focusedSessionId は変化しない
+    // （アーカイブ済みの scratch を指し続ける。タブ列からは消えるがペインには残る）。
+    expect(useAppStore.getState().paneAssignment).toEqual(['scr1', null]);
+    expect(useAppStore.getState().activePane).toBe(0);
+    expect(useAppStore.getState().focusedSessionId).toBe('scr1');
   });
 
   it('フォーカス中ペインが非 scratch のとき stopSession も updateSession も呼ばない（Ruling 20-C の門）', async () => {

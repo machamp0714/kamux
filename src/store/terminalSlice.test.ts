@@ -15,10 +15,11 @@ function session(
   archivedAt: number | null = null,
   isScratch = false,
   sortOrder = 1,
+  projectId = 'p1',
 ): Session {
   return {
     id,
-    project_id: 'p1',
+    project_id: projectId,
     title: id,
     description: '',
     kanban_status: kanbanStatus,
@@ -41,13 +42,22 @@ function session(
   };
 }
 
-type TestStore = Pick<AppStore, 'sessions' | 'sessionOrder' | 'focusedSessionId'> & TerminalSlice;
+type TestStore = Pick<
+  AppStore,
+  'sessions' | 'sessionOrder' | 'focusedSessionId' | 'activeProjectId'
+> &
+  TerminalSlice;
 
-function makeStore(sessions: Session[], sessionOrder: Record<KanbanStatus, string[]>) {
+function makeStore(
+  sessions: Session[],
+  sessionOrder: Record<KanbanStatus, string[]>,
+  activeProjectId = 'p1',
+) {
   return create<TestStore>()((set, get, api) => ({
     sessions: Object.fromEntries(sessions.map((s) => [s.id, s])),
     sessionOrder,
     focusedSessionId: null,
+    activeProjectId,
     ...(createTerminalSlice as unknown as StateCreator<TestStore, [], [], TerminalSlice>)(
       set,
       get,
@@ -105,11 +115,21 @@ describe('selectTerminalTabs', () => {
   // 恒久的に空になる。sessions から is_scratch === true && archived_at === null を
   // 直接引いて連結する。フィクスチャは sessionOrder に scratch の id を置かない
   // （production が到達できる状態で測る）。
-  it('SCRATCH セッションは sessionOrder ではなく sessions から直接引いて末尾に連結する（契約 §29.7 / Ruling 20-G）', () => {
+  //
+  // state.sessions はプロジェクト横断のグローバルキャッシュ（sessionSlice.ts の
+  // loadSessions がマージする）なので、他プロジェクトの scratch も残り続ける。
+  // ここで project_id が異なる scratch（'other-project-scratch'、projectId='p2'）を
+  // 混ぜて、activeProjectId(='p1') のものだけが連結されることを固定する
+  // （task-20 レビュー Important 1 / 変異 #5 の是正）。
+  it('SCRATCH セッションは sessionOrder ではなく sessions から直接引いて末尾に連結する（契約 §29.7 / Ruling 20-G）。他プロジェクトの scratch は含めない', () => {
     const order = emptyOrder();
     order.backlog = ['b1'];
     const store = makeStore(
-      [session('b1', 'backlog'), session('scratch1', 'backlog', null, true)],
+      [
+        session('b1', 'backlog'),
+        session('scratch1', 'backlog', null, true),
+        session('other-project-scratch', 'backlog', null, true, 1, 'p2'),
+      ],
       order,
     );
     expect(selectTerminalTabs(store.getState())).toEqual(['b1', 'scratch1']);
@@ -343,6 +363,7 @@ describe('withFocus は set() へ渡す形を 4 フィールドに保つ（PR 25
         sessions: {},
         sessionOrder: emptyOrder(),
         focusedSessionId: null,
+        activeProjectId: 'p1',
         ...(createTerminalSlice as unknown as StateCreator<TestStore, [], [], TerminalSlice>)(
           spySet,
           get,

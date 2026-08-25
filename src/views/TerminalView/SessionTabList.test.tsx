@@ -52,6 +52,10 @@ beforeEach(() => {
     activePane: 0,
     runtimeStates: {},
     runtimeReasons: {},
+    // scratchTabs（terminalSlice.ts）が project_id === activeProjectId で絞るように
+    // なった（task-20 レビュー Important 1）。フィクスチャの session() は project_id
+    // 'p1' 固定なので、activeProjectId もここで 'p1' に合わせる。
+    activeProjectId: 'p1',
   });
 
   container = document.createElement('div');

@@ -35,15 +35,28 @@ function sessionTabsFromOrder(state: Pick<AppStore, 'sessionOrder' | 'sessions'>
  * sessions から直接引く。並びは sort_order 昇順、同値なら id 辞書順
  * （buildSessionOrder と同じタイブレーク。無いと再レンダリングのたびに順序が
  * 入れ替わりうる）。
+ *
+ * state.sessions はプロジェクト横断のグローバルキャッシュ（sessionSlice.ts の
+ * loadSessions がマージする不変条件）なので、project_id === activeProjectId で
+ * 明示的に絞る。絞らないと他プロジェクトの scratch がタブ列・cycleSession の
+ * 候補列に混入し、Cmd+W が別プロジェクトの行へ update_session を発行しうる
+ * （task-20 レビュー Important 1）。
  */
-function scratchTabs(state: Pick<AppStore, 'sessions'>): string[] {
+function scratchTabs(state: Pick<AppStore, 'sessions' | 'activeProjectId'>): string[] {
   return Object.values(state.sessions)
-    .filter((session) => session.is_scratch && session.archived_at === null)
+    .filter(
+      (session) =>
+        session.is_scratch &&
+        session.archived_at === null &&
+        session.project_id === state.activeProjectId,
+    )
     .sort(compareSessionOrder)
     .map((session) => session.id);
 }
 
-export function selectTerminalTabs(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
+export function selectTerminalTabs(
+  state: Pick<AppStore, 'sessionOrder' | 'sessions' | 'activeProjectId'>,
+): string[] {
   return [...sessionTabsFromOrder(state), ...scratchTabs(state)];
 }
 
