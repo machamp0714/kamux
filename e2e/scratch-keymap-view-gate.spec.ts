@@ -12,9 +12,12 @@ import { tauriMockScript } from './support/tauriMock';
  * （契約 §26.3: E2E はユニットテストの代替ではない）。
  *
  * scratch 端末が絡む IPC は 3 つ（src/store/sessionSlice.ts の
- * createScratchTerminal / closeScratchTerminal 経由）:
+ * createScratchTerminal / closeScratchTerminal 経由。実 IPC 名は
+ * src/ipc/commands.ts / src/store/sessionSlice.ts:259 の archiveSession の
+ * 実装を実読して確認した —— archiveSession は専用コマンドではなく
+ * updateSession(id, { archived_at }) = IPC `update_session` を呼ぶ）:
  *   - create_scratch_session（create_scratch_terminal）
- *   - stop_session / archive_session（close_scratch_terminal）
+ *   - stop_session / update_session（close_scratch_terminal: stopSession → archiveSession）
  * 「0 件」という assert は押鍵そのものが届いていなくても緑になるため、
  * 各テストに陽性対照（同じ経路で別のキーが実際に効くこと）を 1 つ置く。
  */
@@ -80,7 +83,7 @@ function commonInitScript(): string {
 function scratchCalls(calls: Array<{ cmd: string }>): Array<{ cmd: string }> {
   return calls.filter(
     (c) =>
-      c.cmd === 'create_scratch_session' || c.cmd === 'stop_session' || c.cmd === 'archive_session',
+      c.cmd === 'create_scratch_session' || c.cmd === 'stop_session' || c.cmd === 'update_session',
   );
 }
 
