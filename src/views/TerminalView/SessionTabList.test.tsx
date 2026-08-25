@@ -215,6 +215,17 @@ describe('SessionTabList のペインバッジ（契約 §28.3）', () => {
   });
 });
 
+// Task 20 修正ラウンド 2（team-lead 追加義務）: このブロックのテストは
+// sessionOrder へ scratch の id を直接フィクスチャで置いている
+// （例: `sessionOrder: { ..., in_progress: ['s1', 's2'], ... }` に is_scratch な s2 を混ぜる）。
+// production では buildSessionOrder（契約 §29.4）が is_scratch を絞るため、
+// sessionOrder が scratch の id を持つ状態そのものに到達しない。ここは
+// is_scratch → SESSIONS/SCRATCH の振り分け描画（selectTerminalTabs の後段）を
+// 状態直置きで観測するテスト群であり、その価値ゆえに残す。production が実際に
+// 到達できる経路（createScratchTerminal → selectTerminalTabs）の観測は
+// src/store/sessionSlice.scratch.test.ts の
+// 「createScratchTerminal が作った Session は selectTerminalTabs の SCRATCH 経路
+// （契約 §29.7 / Ruling 20-G）に現れる」が持つ。
 describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
   function renderTabs(): void {
     act(() => {

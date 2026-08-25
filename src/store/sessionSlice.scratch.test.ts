@@ -11,6 +11,7 @@ vi.mock('../ipc/commands', async (importOriginal) => ({
 }));
 
 import { useAppStore } from './index';
+import { selectTerminalTabs } from './terminalSlice';
 import type { Session } from '../types/model';
 
 const s = (over: Partial<Session> & { id: string }): Session => ({
@@ -81,6 +82,21 @@ describe('createScratchTerminal（契約 §29.3 / §29.8。Cmd+T が呼ぶ）', 
     // activePane と sessionId は同じ「取り違えても素朴なテストは通る」形の値では
     // ないが、引数の順序を保つために具体値で固定する。
     expect(assignPane).toHaveBeenCalledWith(1, 'scr1');
+  });
+
+  // Task 20 修正ラウンド 2（team-lead 追加義務）: terminalSlice.test.ts の SCRATCH 系
+  // テストは sessions へ scratch の Session をフィクスチャで直置きして
+  // selectTerminalTabs を呼ぶだけで、「createScratchTerminal が実際に作った Session が
+  // タブへ出る」ことは誰も見ていなかった。ここでは sessions / sessionOrder を一切
+  // 直置きせず（beforeEach のリセットのみ）、createScratchSession のモック戻り値だけを
+  // 経路にして createScratchTerminal を実行し、その結果を selectTerminalTabs へ渡す。
+  it('createScratchTerminal が作った Session は selectTerminalTabs の SCRATCH 経路（契約 §29.7 / Ruling 20-G）に現れる', async () => {
+    const created = s({ id: 'scr1', is_scratch: true });
+    createScratchSession.mockResolvedValue(created);
+
+    await useAppStore.getState().createScratchTerminal();
+
+    expect(selectTerminalTabs(useAppStore.getState())).toEqual(['scr1']);
   });
 
   it('アクティブプロジェクトが無ければ何も呼ばない（Ruling 20-E）', async () => {
