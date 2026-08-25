@@ -131,6 +131,10 @@ pub struct Session {
     /// 沈黙タイムアウト（秒）。許容範囲は
     /// `MIN_SILENCE_TIMEOUT_SECS..=MAX_SILENCE_TIMEOUT_SECS`（契約 §20 / M3-3）
     pub silence_timeout_secs: u32,
+    /// スクラッチ端末（`⌘T`）かどうか。作成時に決まり、後から切り替わらない
+    /// （契約 §29.1 / §29.2）。true にできるのは `create_scratch_session`
+    /// （M3-4 Task 17）だけであり、`SessionPatch` は持たない
+    pub is_scratch: bool,
     pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -175,6 +179,9 @@ impl Session {
                 cli_kind,
             ),
             silence_timeout_secs: crate::session::heuristics::DEFAULT_SILENCE_TIMEOUT_SECS,
+            // カンバン由来のセッションは常に false。true は create_scratch_session
+            // （M3-4 Task 17）だけが作る（契約 §29.1 / §29.2）
+            is_scratch: false,
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -391,6 +398,7 @@ mod tests {
             first_started_at: None,
             heuristics_enabled: true,
             silence_timeout_secs: 30,
+            is_scratch: false,
             archived_at: None,
             created_at: 1,
             updated_at: 2,
@@ -560,6 +568,28 @@ mod tests {
         assert!(
             built_with(CliKind::Custom).heuristics_enabled,
             "custom は既定オン"
+        );
+    }
+
+    /// 契約 §29.2: `is_scratch` は作成時に決まり後から切り替わらないため
+    /// `SessionPatch` には無い。カンバン由来の通常セッションは常に false
+    /// （true を作るのは M3-4 Task 17 の `create_scratch_session` だけ）。
+    #[test]
+    fn new_backlog_defaults_is_scratch_to_false() {
+        let s = Session::new_backlog(
+            "pid",
+            "fix login",
+            "",
+            SessionMode::InPlace,
+            None,
+            CliKind::Claude,
+            None,
+            1.0,
+            1,
+        );
+        assert!(
+            !s.is_scratch,
+            "カンバン由来のセッションは is_scratch = false"
         );
     }
 

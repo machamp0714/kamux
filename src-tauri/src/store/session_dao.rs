@@ -8,7 +8,7 @@ use crate::store::{now_ms, Store};
 pub(crate) const SESSION_COLUMNS: &str = "id, project_id, title, description, kanban_status, \
      sort_order, mode, branch, worktree_path, cli_kind, cli_command, claude_session_id, \
      last_runtime_state, last_runtime_error, first_started_at, heuristics_enabled, \
-     silence_timeout_secs, archived_at, created_at, updated_at";
+     silence_timeout_secs, is_scratch, archived_at, created_at, updated_at";
 
 pub(crate) fn row_to_session(row: &Row<'_>) -> AppResult<Session> {
     let kanban_status: String = row.get("kanban_status")?;
@@ -41,6 +41,7 @@ pub(crate) fn row_to_session(row: &Row<'_>) -> AppResult<Session> {
         first_started_at: row.get("first_started_at")?,
         heuristics_enabled: row.get("heuristics_enabled")?,
         silence_timeout_secs: row.get("silence_timeout_secs")?,
+        is_scratch: row.get("is_scratch")?,
         archived_at: row.get("archived_at")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -61,13 +62,14 @@ impl Store {
         Ok(sort_order)
     }
 
-    /// 契約 §17: 組み立て済みの Session をそのまま 20 カラム書く。
+    /// 契約 §17: 組み立て済みの Session をそのまま 21 カラム書く。
     /// id / sort_order / タイムスタンプの決定は呼び出し側の責務。
     ///
-    /// heuristics_enabled / silence_timeout_secs も **渡された値をそのまま**書く。
-    /// ここで cli_kind から既定値を再計算すると、Session が false を持っていても
-    /// DB には true が入る（構造体と DB の split-brain）。既定値の決定は
-    /// `Session::new_backlog` だけの責務である（契約 §20 / 設計 §4.6）。
+    /// heuristics_enabled / silence_timeout_secs / is_scratch も
+    /// **渡された値をそのまま**書く。ここで cli_kind から既定値を再計算すると、
+    /// Session が false を持っていても DB には true が入る（構造体と DB の
+    /// split-brain）。既定値の決定は `Session::new_backlog` だけの責務である
+    /// （契約 §20 / §29.1 / 設計 §4.6）。
     pub fn insert_session(&self, session: &Session) -> AppResult<Session> {
         let conn = self.conn()?;
 
@@ -76,10 +78,10 @@ impl Store {
                 (id, project_id, title, description, kanban_status, sort_order, mode,
                  branch, worktree_path, cli_kind, cli_command, claude_session_id,
                  last_runtime_state, last_runtime_error, first_started_at,
-                 heuristics_enabled, silence_timeout_secs, archived_at,
+                 heuristics_enabled, silence_timeout_secs, is_scratch, archived_at,
                  created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20)",
+                     ?18, ?19, ?20, ?21)",
             params![
                 session.id,
                 session.project_id,
@@ -98,6 +100,7 @@ impl Store {
                 session.first_started_at,
                 session.heuristics_enabled,
                 session.silence_timeout_secs,
+                session.is_scratch,
                 session.archived_at,
                 session.created_at,
                 session.updated_at,
@@ -476,6 +479,7 @@ mod tests {
             first_started_at: None,
             heuristics_enabled: false,
             silence_timeout_secs: 30,
+            is_scratch: false,
             archived_at: None,
             created_at: 1,
             updated_at: 1,
@@ -616,6 +620,7 @@ mod tests {
         let pid = project(&store);
         let session = Session {
             id: "sid-preserve".to_owned(),
+            is_scratch: false,
             project_id: pid,
             title: "before".to_owned(),
             description: "before-description".to_owned(),
@@ -694,6 +699,7 @@ mod tests {
         let pid = project(&store);
         let session = Session {
             id: "sid-full-patch".to_owned(),
+            is_scratch: false,
             project_id: pid,
             title: "before-title".to_owned(),
             description: "before-description".to_owned(),
@@ -1169,10 +1175,14 @@ mod tests {
     fn insert_session_writes_every_field_to_its_own_bound_position() {
         // `new_backlog` は 5 フィールドを常に None に固定するため使わない。
         // INSERT 列 <-> params! の対応が 1 か所でもズレたら必ず落ちるよう、
-        // 20 フィールド全部に相互に区別できる非 NULL 値を入れる
+        // 21 フィールド全部に相互に区別できる非 NULL 値を入れる
         // （特に created_at != updated_at）。往復テスト
         // (row_to_session_round_trips_...) は生 UPDATE で値を入れており
         // insert_session の位置ズレは検出できないため、これで補う。
+        //
+        // is_scratch は既定値 false と区別できる true にする（契約 §29.1）。
+        // `row_to_session` が DB の値を無視して false 固定を返す変異と、
+        // `SESSION_COLUMNS` から is_scratch が抜け落ちる変異の両方をここで検出する。
         let (_dir, store) = open_temp();
         let pid = project(&store);
 
@@ -1194,6 +1204,7 @@ mod tests {
             first_started_at: Some(111),
             heuristics_enabled: false,
             silence_timeout_secs: 90,
+            is_scratch: true,
             archived_at: Some(222),
             created_at: 333,
             updated_at: 444,
@@ -1237,6 +1248,11 @@ mod tests {
             "cli_kind = custom の既定（true）で上書きされている"
         );
         assert_eq!(fetched.silence_timeout_secs, 90);
+        assert!(
+            fetched.is_scratch,
+            "is_scratch が false 固定で返っている（SESSION_COLUMNS からの脱落 / \
+             row_to_session の値無視のどちらかを検出する）"
+        );
         assert_eq!(fetched.archived_at, Some(222));
         assert_eq!(fetched.created_at, 333);
         assert_eq!(
@@ -1372,6 +1388,7 @@ mod tests {
                 first_started_at: None,
                 heuristics_enabled: true,
                 silence_timeout_secs: 30,
+                is_scratch: false,
                 archived_at: None,
                 created_at: 1,
                 updated_at: 1,
@@ -1723,6 +1740,7 @@ mod tests {
                 first_started_at: None,
                 heuristics_enabled: true,
                 silence_timeout_secs: 30,
+                is_scratch: false,
                 archived_at: None,
                 created_at,
                 updated_at: created_at,
