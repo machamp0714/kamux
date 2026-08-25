@@ -39,7 +39,12 @@ const SHIM_TEMPLATE: &str = r#"#!/bin/sh
 # 本体の解決は KAMUX_SHIM_DIR を除いた PATH で行う（自分自身を再帰的に exec しないため）。
 # KAMUX_SHIM_DIR が未設定でも自己再帰しないよう、$0 から導いた自分自身のディレクトリも
 # 併せて除外する（契約 §154.2。KAMUX_SHIM_DIR の比較を置き換えるのではなく加える）。
-# $0 に / が無い場合は導けないので除外候補にしない（契約 §154.3 ハザード 1）。
+# $0 に / が無い場合は導けないので kamux_self_dir を空にする（契約 §154.3 ハザード 1）。
+# この空文字列は「自分自身のディレクトリが不明」を表すセンチネルであると同時に、
+# PATH の空要素（= カレントディレクトリ。POSIX の意味）とも一致する。$0 に / が
+# 無いのは名前だけで（= 空の PATH 要素経由を含む）解決された場合であることが多く、
+# その場合は PATH の空要素を丸ごと除外候補にする方が安全である（KAMUX_SHIM_DIR の
+# 値には依存しない。修正ラウンド1レビュー Important 2 / P2 の是正）。
 case "$0" in
   */*) kamux_self_dir=${0%/*} ;;
   *) kamux_self_dir='' ;;
@@ -48,7 +53,7 @@ kamux_path=''
 IFS=':'
 for kamux_dir in $PATH; do
   [ "$kamux_dir" = "$KAMUX_SHIM_DIR" ] && continue
-  [ -n "$kamux_self_dir" ] && [ "$kamux_dir" = "$kamux_self_dir" ] && continue
+  [ "$kamux_dir" = "$kamux_self_dir" ] && continue
   if [ -z "$kamux_path" ]; then
     kamux_path="$kamux_dir"
   else
@@ -236,9 +241,12 @@ mod tests {
             script.contains("case \"$0\" in"),
             "$0 の形で分岐していない（ハザード 1 未対応の疑い）:\n{script}"
         );
-        // 導いた自分自身のディレクトリも PATH 走査で除外する。
+        // 導いた自分自身のディレクトリも PATH 走査で除外する。識別子の出現だけでは
+        // なく行そのものを見る —— `kamux_self_dir` という識別子は case ブロックにも
+        // 現れるため、除外行そのものを丸ごと消してもテストが緑のままになってしまう
+        // （修正ラウンド1レビュー Important 1 の是正）。
         assert!(
-            script.contains("kamux_self_dir"),
+            script.contains("[ \"$kamux_dir\" = \"$kamux_self_dir\" ] && continue\n"),
             "$0 から導いた自分自身のディレクトリを除外候補にしていない:\n{script}"
         );
         // 既存の KAMUX_SHIM_DIR 比較は残る（置き換えではなく併用）。
@@ -494,6 +502,45 @@ mod tests {
             "probe",
             "zsh の PATH 先頭空要素経由では $0 がコマンド名のまま（/ を含まない）になることを期待した"
         );
+    }
+
+    /// 修正ラウンド1レビューの Important 2 是正: PATH の**中間**に空要素
+    /// (= カレントディレクトリ)があり、`KAMUX_SHIM_DIR` が**非空**(無関係な値)
+    /// であっても、自己再帰せず本体へ届くこと。レビュアーが exit=124 (ハング)を
+    /// 実測した経路(P2)を再現する。修正前は `[ -n "$kamux_self_dir" ]` ガードが
+    /// 空の自己ディレクトリ由来の除外を無効化し、cwd 経由で shim 自身を再帰
+    /// exec してこのテストはタイムアウトする。
+    #[test]
+    fn the_generated_claude_shim_does_not_self_recurse_with_a_mid_path_empty_element_and_an_unrelated_kamux_shim_dir(
+    ) {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = install_shims(base.path()).expect("install shims");
+        let real_dir = base.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real");
+        let real = real_dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\nprintf 'ARGS:%s\\n' \"$*\"\n").expect("write real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // cwd を shim ディレクトリにし、PATH の中間に空要素を置く(bare name 起動で
+        // $0 に / が付かない経路。dollar_zero_has_no_slash_… と同じ機構)。
+        // KAMUX_SHIM_DIR は無関係な非空値にする(「未設定」ではなく
+        // 「設定されているが別物を指す」= §154.2 の射程が非空側にも及ぶことを確認する)。
+        let mut cmd = std::process::Command::new("zsh");
+        cmd.arg("-c")
+            .arg(format!(
+                "unset KAMUX_HOOKS_SETTINGS; PATH=\"/nonexistent-kamux-154-dummy::{}\" KAMUX_SHIM_DIR=/nonexistent-kamux-154-unrelated claude hello",
+                real_dir.display()
+            ))
+            .current_dir(&dir);
+
+        let out = run_shim_with_deadline(&mut cmd);
+        assert!(
+            out.status.success(),
+            "shim が失敗した: status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ARGS:hello\n");
     }
 
     /// 裁定 21-A の実行時の姿: `KAMUX_HOOKS_SETTINGS` が設定されていても
