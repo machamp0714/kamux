@@ -2674,6 +2674,36 @@ mod tests {
 
         assert_eq!(archived, vec![live.id.clone()]);
     }
+
+    #[test]
+    fn archive_stale_scratch_sessions_archives_a_previously_exempt_row_once_it_is_interrupted() {
+        // 裁定 3: 免除は恒久的な保護ではない。前回の呼び出しで免除された行でも、
+        // last_runtime_state が免除集合の外に変わっていれば次の呼び出しでアーカイブされる。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let session = scratch_session(&pid, "was-live", RuntimeState::Running);
+        store.insert_session(&session).expect("insert");
+        let survives = [RuntimeState::Running, RuntimeState::WaitingInput];
+
+        let first = store
+            .archive_stale_scratch_sessions(&survives)
+            .expect("archive 1");
+        assert!(first.is_empty(), "1 回目は running なので免除されるはず");
+
+        // 起動時正規化が running -> interrupted へ書き換えたことを模す。
+        store
+            .set_last_runtime_state(&session.id, RuntimeState::Interrupted)
+            .expect("set_last_runtime_state");
+
+        let second = store
+            .archive_stale_scratch_sessions(&survives)
+            .expect("archive 2");
+        assert_eq!(
+            second,
+            vec![session.id.clone()],
+            "interrupted になった行が次回もなお免除された（恒久的な免除になっている）"
+        );
+    }
 }
 
 #[cfg(test)]
