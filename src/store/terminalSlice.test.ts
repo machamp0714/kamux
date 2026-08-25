@@ -134,11 +134,9 @@ describe('selectTerminalTabs', () => {
     expect(selectTerminalTabs(store.getState())).toEqual(['m', 'a', 'z']);
   });
 
-  // 自己設計の変異検証（advisor 指摘）: sessionOrder.ts の buildSessionOrder（loadSessions が
-  // 使う実体）は is_scratch を絞らないため、プロジェクト再訪後は scratch の id が
-  // sessionOrder.backlog に紛れ込みうる（sessionSlice.ts の loadSessions →
-  // projectSlice.ts の setActiveProject 経由。§29.4 の境界そのものである
-  // sessionOrder.ts / kanbanOrder.ts 自体は変更しない）。この状態でも id が重複しないこと。
+  // sessionOrder.ts の buildSessionOrder は is_scratch を絞る（契約 §29.4、Task 20
+  // バッチで是正）。ここでの is_scratch 混入フィクスチャは、その除外がすり抜けた
+  // 場合に備える二重防御（sessionTabsFromOrder 側のフィルタ）を固定するためのもの。
   it('sessionOrder に scratch の id が紛れ込んでいても重複させない', () => {
     const order = emptyOrder();
     order.backlog = ['scratch1'];

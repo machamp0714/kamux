@@ -326,7 +326,7 @@ describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
     // pane 引数を取り違えて 0 固定にすると s1 が上書きされ、
     // 1 固定にすると常に正しく見えてしまうため、両スロットを見る。
     // 空いているペイン(0)へ入れる実装との区別のため、0 側は埋まっていない
-    // （null のまま）ことも見る（契約 §29 系ではなく再レビュアーの逐語処方）。
+    // （null のまま）ことも見る。
     expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
     expect(useAppStore.getState().paneAssignment[0]).toBeNull();
   });
