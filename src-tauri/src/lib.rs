@@ -679,6 +679,34 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     // 「まだ配らない」で塞ぐ —— `sender()` は `&self` なので、返した時点で誰でも
     // 入力を積めてしまう。
     //
+    // 契約 §29.5（裁定 2）: スクラッチの自動アーカイブは `normalize_on_startup()` の
+    // **前**に行う。`normalize_on_startup` は `{running, waiting_input}` を
+    // `interrupted` へ書き換えるため、後で判定すると「前回 running だった行」と
+    // 「2 起動前から死んでいる行」がどちらも `interrupted` になり区別が付かない。
+    // 判定に使える情報が在るのは正規化の前だけである。
+    //
+    // 免除集合 `SCRATCH_SURVIVING_STATES` は「今回の起動で作業中だったものを黙って
+    // 消さない」ためであって恒久的な保護ではない（裁定 3）。今回免除された行は
+    // 次回の起動では `interrupted` になり免除集合に入らなくなるため、次回アーカイブ
+    // される。§29.5 の「ユーザーが閉じるまで消さない」は今回の起動 1 回分の意味であり、
+    // 恒久的に免除すると §29.5 自身が防ごうとした「SCRATCH グループが際限なく伸びる」
+    // 蓄積がそのまま起きる。
+    match store
+        .archive_stale_scratch_sessions(&crate::session::runtime_state::SCRATCH_SURVIVING_STATES)
+    {
+        Ok(archived) if !archived.is_empty() => {
+            eprintln!(
+                "[kamux] archived {} stale scratch session(s)",
+                archived.len()
+            );
+        }
+        Ok(_) => {}
+        // 失敗しても起動を続ける（`normalize_on_startup` の直後の Err 分岐と同じ形。
+        // 契約 §0 が panic 経路を禁じているのと、正規化と同じくアーカイブも冪等で
+        // 次回起動で自己修復するため）。
+        Err(err) => eprintln!("[kamux] scratch archive failed: {err}"),
+    }
+
     // WebView はまだ listen していないので、ここではイベントを出さない（計画 §4.9）。
     // フロントは `list_sessions` の戻り値（正規化済みの `last_runtime_state`）から
     // シードする。
@@ -2032,6 +2060,104 @@ mod tests {
                 &[expected],
                 "StateLineObserver が届けた行が format_state_line の出力と一致しない \
                  （3 つ目の register_observer に渡された型が StateLineObserver でない疑い）"
+            );
+        }
+
+        /// 契約 §29.5（裁定 2）: `install_app_state_with` はアーカイブを
+        /// `normalize_on_startup()` の**前**に配線する。判定に使える情報
+        /// （正規化前の `last_runtime_state`）は正規化の前だけに在るため。
+        ///
+        /// 4 行を DB に入れて `archived_at` の結果を見る（裁定 1 の免除集合
+        /// `{Running, WaitingInput}` が実際に配線へ渡っていること、`is_scratch = 0`
+        /// の行が対象外であることの両方を固定する）。
+        fn insert_scratch_session(
+            store: &crate::store::Store,
+            project_id: &str,
+            id: &str,
+            last_runtime_state: RuntimeState,
+        ) -> crate::model::Session {
+            use crate::model::{CliKind as SessionCliKind, Session, SessionMode};
+            let sort_order = store
+                .next_sort_order(project_id, crate::model::KanbanStatus::Backlog)
+                .expect("next_sort_order");
+            let session = Session {
+                id: id.to_owned(),
+                is_scratch: true,
+                last_runtime_state,
+                ..Session::new_backlog(
+                    project_id,
+                    id,
+                    "",
+                    SessionMode::InPlace,
+                    None,
+                    SessionCliKind::Shell,
+                    None,
+                    sort_order,
+                    crate::store::now_ms(),
+                )
+            };
+            store
+                .insert_session(&session)
+                .expect("insert scratch session")
+        }
+
+        #[test]
+        fn install_app_state_with_archives_stale_scratch_sessions_before_normalizing() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+
+            insert_scratch_session(&store, &project_id, "live", RuntimeState::Running);
+            insert_scratch_session(&store, &project_id, "waiting", RuntimeState::WaitingInput);
+            insert_scratch_session(&store, &project_id, "stale", RuntimeState::Idle);
+            let normal = insert_test_session(&store, &project_id, "normal");
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                Arc::clone(&store),
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+                test_line_sink(),
+            );
+
+            assert!(
+                store
+                    .get_session("live")
+                    .expect("get live")
+                    .archived_at
+                    .is_none(),
+                "live（running）がアーカイブされた"
+            );
+            assert!(
+                store
+                    .get_session("waiting")
+                    .expect("get waiting")
+                    .archived_at
+                    .is_none(),
+                "waiting（waiting_input）がアーカイブされた（裁定 1）"
+            );
+            assert!(
+                store
+                    .get_session("stale")
+                    .expect("get stale")
+                    .archived_at
+                    .is_some(),
+                "stale（idle）がアーカイブされていない"
+            );
+            assert!(
+                store
+                    .get_session(&normal.id)
+                    .expect("get normal")
+                    .archived_at
+                    .is_none(),
+                "スクラッチでない normal 行がアーカイブされた"
             );
         }
 

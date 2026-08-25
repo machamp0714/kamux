@@ -343,7 +343,7 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT id, sort_order FROM sessions
                  WHERE project_id = ?1 AND kanban_status = ?2
-                       AND archived_at IS NULL AND id != ?3
+                       AND archived_at IS NULL AND id != ?3 AND is_scratch = 0
                  ORDER BY sort_order ASC, id ASC",
             )?;
             let rows = stmt.query_map(params![project_id, to_status.as_db_str(), id], |r| {
@@ -399,6 +399,7 @@ impl Store {
             let sql = format!(
                 "SELECT {SESSION_COLUMNS} FROM sessions
                  WHERE project_id = ?1 AND kanban_status = ?2 AND archived_at IS NULL
+                       AND is_scratch = 0
                  ORDER BY sort_order ASC, id ASC"
             );
             let mut stmt = tx.prepare(&sql)?;
@@ -409,6 +410,59 @@ impl Store {
 
         tx.commit()?;
         Ok(column)
+    }
+
+    /// 契約 §29.5: 起動時にスクラッチを自動アーカイブする。`survives` に挙げた
+    /// `last_runtime_state` を持つ行だけを免除する。戻り値はアーカイブした id の一覧。
+    ///
+    /// 免除は「今回の起動で作業中だったものを黙って消さない」ためであって恒久的な
+    /// 保護ではない（`SCRATCH_SURVIVING_STATES` の doc コメント、裁定 3 を参照）。
+    /// 今回免除された行も、次回の起動では `Interrupted` になり免除集合から外れるため
+    /// アーカイブされる。
+    pub fn archive_stale_scratch_sessions(
+        &self,
+        survives: &[RuntimeState],
+    ) -> AppResult<Vec<String>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let now = now_ms();
+
+        // survives が空でも `NOT IN ()` という不正な SQL を組まない
+        // （プレースホルダを動的に組む。空なら絞り込み自体を付けない = 1 件も免除しない）。
+        let exclude_clause = if survives.is_empty() {
+            String::new()
+        } else {
+            let placeholders = (1..=survives.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" AND last_runtime_state NOT IN ({placeholders})")
+        };
+        let survives_params: Vec<&str> = survives.iter().map(|s| s.as_db_str()).collect();
+
+        // archived_at IS NULL が無いと、毎回の起動で既にアーカイブ済みの行の
+        // archived_at / updated_at を書き直してしまう。
+        let ids: Vec<String> = {
+            let sql = format!(
+                "SELECT id FROM sessions
+                 WHERE is_scratch = 1 AND archived_at IS NULL{exclude_clause}"
+            );
+            let mut stmt = tx.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(survives_params.iter()), |r| {
+                r.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for id in &ids {
+            tx.execute(
+                "UPDATE sessions SET archived_at = ?1, updated_at = ?2 WHERE id = ?3",
+                params![now, now, id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(ids)
     }
 }
 
@@ -2446,6 +2500,179 @@ mod tests {
             other_high_after.sort_order, 2.0,
             "他プロジェクトの行の sort_order が動いた"
         );
+    }
+
+    #[test]
+    fn move_session_excludes_scratch_rows_from_the_insertion_index_calculation() {
+        // §29.4: 不可視のスクラッチ行が L に混ざると to_index がずれる。
+        // scratch を除外できていれば L は空になり、mid = 1.0（空列への挿入）。
+        // 除外できていなければ L = [(scratch, 1.0)] となり、mid = 1.0 - 1.0 = 0.0。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let scratch = Session {
+            sort_order: 1.0,
+            kanban_status: KanbanStatus::Review,
+            is_scratch: true,
+            ..session_with_sentinel_updated_at(&pid, "scratch")
+        };
+        store.insert_session(&scratch).expect("insert scratch");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        let moved = column
+            .iter()
+            .find(|s| s.id == target.id)
+            .expect("moved row");
+        assert_eq!(
+            moved.sort_order, 1.0,
+            "スクラッチ行が L に数えられ、to_index がずれている"
+        );
+    }
+
+    #[test]
+    fn move_session_excludes_scratch_rows_from_the_returned_column() {
+        // §29.4 が名指しした帰結: 戻り値の Vec<Session> がスクラッチ id で
+        // sessionOrder[backlog] を汚す。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let scratch = Session {
+            sort_order: 5.0,
+            kanban_status: KanbanStatus::Review,
+            is_scratch: true,
+            ..session_with_sentinel_updated_at(&pid, "scratch")
+        };
+        store.insert_session(&scratch).expect("insert scratch");
+        let target = insert_test_session(&store, &pid, "target");
+
+        let column = store
+            .move_session(&target.id, KanbanStatus::Review, 0)
+            .expect("move_session");
+
+        assert!(
+            column.iter().all(|s| s.id != scratch.id),
+            "戻り値の列にスクラッチ行が混ざっている"
+        );
+    }
+
+    fn scratch_session(project_id: &str, id: &str, last_runtime_state: RuntimeState) -> Session {
+        Session {
+            is_scratch: true,
+            last_runtime_state,
+            ..session_with_sentinel_updated_at(project_id, id)
+        }
+    }
+
+    #[test]
+    fn archive_stale_scratch_sessions_archives_rows_not_in_survives() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let stale = scratch_session(&pid, "stale", RuntimeState::Idle);
+        store.insert_session(&stale).expect("insert stale");
+
+        let archived = store
+            .archive_stale_scratch_sessions(&[RuntimeState::Running, RuntimeState::WaitingInput])
+            .expect("archive");
+
+        assert_eq!(archived, vec![stale.id.clone()]);
+        let reloaded = store.get_session(&stale.id).expect("get");
+        assert!(reloaded.archived_at.is_some(), "アーカイブされていない");
+    }
+
+    #[test]
+    fn archive_stale_scratch_sessions_exempts_rows_in_survives() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let live = scratch_session(&pid, "live", RuntimeState::Running);
+        let waiting = scratch_session(&pid, "waiting", RuntimeState::WaitingInput);
+        store.insert_session(&live).expect("insert live");
+        store.insert_session(&waiting).expect("insert waiting");
+
+        let archived = store
+            .archive_stale_scratch_sessions(&[RuntimeState::Running, RuntimeState::WaitingInput])
+            .expect("archive");
+
+        assert!(
+            archived.is_empty(),
+            "免除対象がアーカイブされた: {archived:?}"
+        );
+        assert!(store
+            .get_session(&live.id)
+            .expect("get")
+            .archived_at
+            .is_none());
+        assert!(store
+            .get_session(&waiting.id)
+            .expect("get")
+            .archived_at
+            .is_none());
+    }
+
+    #[test]
+    fn archive_stale_scratch_sessions_does_not_touch_non_scratch_rows() {
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let normal = insert_test_session(&store, &pid, "normal");
+
+        let archived = store
+            .archive_stale_scratch_sessions(&[RuntimeState::Running, RuntimeState::WaitingInput])
+            .expect("archive");
+
+        assert!(
+            archived.is_empty(),
+            "スクラッチでない行がアーカイブされた: {archived:?}"
+        );
+        assert!(store
+            .get_session(&normal.id)
+            .expect("get")
+            .archived_at
+            .is_none());
+    }
+
+    #[test]
+    fn archive_stale_scratch_sessions_does_not_rewrite_already_archived_rows() {
+        // archived_at IS NULL が無いと、毎回の起動で既にアーカイブ済みの行の
+        // archived_at / updated_at を書き直してしまう。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let already = Session {
+            archived_at: Some(999),
+            updated_at: 999,
+            ..scratch_session(&pid, "already", RuntimeState::Idle)
+        };
+        store.insert_session(&already).expect("insert already");
+
+        let archived = store
+            .archive_stale_scratch_sessions(&[RuntimeState::Running, RuntimeState::WaitingInput])
+            .expect("archive");
+
+        assert!(
+            archived.is_empty(),
+            "既にアーカイブ済みの行を再度アーカイブ対象にした"
+        );
+        let reloaded = store.get_session(&already.id).expect("get");
+        assert_eq!(
+            reloaded.archived_at,
+            Some(999),
+            "archived_at が書き直された"
+        );
+        assert_eq!(reloaded.updated_at, 999, "updated_at が書き直された");
+    }
+
+    #[test]
+    fn archive_stale_scratch_sessions_with_empty_survives_archives_every_scratch_row() {
+        // survives が空でも NOT IN () という不正な SQL を組んではいけない
+        // （1 件も免除しない、が正しい挙動）。
+        let (_dir, store) = open_temp();
+        let pid = project(&store);
+        let live = scratch_session(&pid, "live", RuntimeState::Running);
+        store.insert_session(&live).expect("insert live");
+
+        let archived = store.archive_stale_scratch_sessions(&[]).expect("archive");
+
+        assert_eq!(archived, vec![live.id.clone()]);
     }
 }
 

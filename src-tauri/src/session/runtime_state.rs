@@ -178,6 +178,20 @@ pub fn normalize_startup_state(last: RuntimeState) -> Option<RuntimeState> {
     }
 }
 
+/// 起動時の自動アーカイブ（契約 §29.5）で、スクラッチが免除される
+/// `last_runtime_state` の集合。**`normalize_on_startup` が ⏸ へ昇格させる集合と
+/// 一致していなければならない**（`scratch_surviving_states_matches_the_states_normalize_promotes`
+/// が固定している）。
+///
+/// 免除は「今回の起動で作業中だったものを黙って消さない」ことであって、恒久的な保護
+/// ではない（裁定 3）。免除された行は今回 `Interrupted` にはならないが、次回起動では
+/// `normalize_startup_state` が `Interrupted` を返す状態ではなくなるため、次回の
+/// アーカイブでは免除されない。§29.5 の「ユーザーが閉じるまで消さない」は今回の
+/// 起動 1 回分の意味であり、恒久的に免除すると §29.5 自身が防ごうとした
+/// 「SCRATCH グループが際限なく伸びる」蓄積がそのまま起きる。
+pub const SCRATCH_SURVIVING_STATES: [RuntimeState; 2] =
+    [RuntimeState::Running, RuntimeState::WaitingInput];
+
 /// surface_id の suffix（契約 §5）。agent サーフェスだけが状態機械に影響する。
 const SURFACE_KIND_AGENT: &str = "agent";
 
@@ -1253,6 +1267,22 @@ mod tests {
                     state
                 );
             }
+        }
+    }
+
+    /// 契約 §29.5（裁定 1）: スクラッチの自動アーカイブの免除集合
+    /// `SCRATCH_SURVIVING_STATES` は「起動時正規化が ⏸ へ昇格させる集合」と
+    /// 一致していなければならない。`ALL_STATES` を共有せず 6 値を手で並べる
+    /// （lane-controller の裁定。共有すると片方を直したときにもう片方が黙って追随する）。
+    #[test]
+    fn scratch_surviving_states_matches_the_states_normalize_promotes() {
+        for state in [Running, WaitingInput, Idle, Exited, Interrupted, Error] {
+            assert_eq!(
+                SCRATCH_SURVIVING_STATES.contains(&state),
+                normalize_startup_state(state).is_some(),
+                "{:?} で免除集合と正規化の昇格規則が食い違っている",
+                state
+            );
         }
     }
 
