@@ -6,7 +6,8 @@
 //! muda 0.19.3 はメニュー項目を構築するたびに実際の OS main thread
 //! （`objc2::MainThreadMarker::new()`）を要求する
 //! （`muda-0.19.3/src/platform_impl/macos/mod.rs:132`（`Menu::new`）/
-//! `:328`（`Submenu::new`）ほか）。`cfg!(test)` によるマーカー省略は
+//! `:328`（`MenuChild::new_submenu`。`Submenu::new` が内部で呼ぶ）ほか）。
+//! `cfg!(test)` によるマーカー省略は
 //! `new_submenu` にしかなく、しかも muda 自身のクレート内テストにしか効かない
 //! （依存クレート側からは `cfg!(test)` は常に false）。
 //!

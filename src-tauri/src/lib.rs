@@ -867,7 +867,8 @@ fn init_tracing_subscriber() {
 /// **⚠️ `MockRuntime` から呼べるが、`cargo test` の通常の `#[test]`（libtest の
 /// ワーカースレッド）からは呼べない。** muda 0.19.3 はメニュー項目の構築時に実際の
 /// OS main thread（`objc2::MainThreadMarker::new()`）を要求し（`muda-0.19.3/src/
-/// platform_impl/macos/mod.rs:132`（`Menu::new`）/ `:328`（`Submenu::new`）/
+/// platform_impl/macos/mod.rs:132`（`Menu::new`）/ `:328`（`MenuChild::new_submenu`。
+/// `Submenu::new` が内部で呼ぶ）/
 /// `:775,830,859,903,935`（各 `create_ns_item_for_*`。`MenuItemKind` の enumerate は
 /// これを経由しない）を実測）、`cfg!(test)` によるマーカー省略は `new_submenu` にしか
 /// 無くしかも muda 自身のクレート内テストにしか効かない（依存側の `cfg!(test)` は常に
