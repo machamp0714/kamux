@@ -835,11 +835,129 @@ fn init_tracing_subscriber() {
     }
 }
 
+/// アプリのメインメニューを組み立てる（契約 §29.8）。
+///
+/// **`Cmd+W` を実装する前提条件として、既定の Close Window 項目を持たないメニューを
+/// 明示的に組み直す**（brief の実装方針 (b)）。既定メニュー
+/// （`tauri::menu::Menu::default`。`app.rs:2245-2249` により `.menu()` を呼ばない限り
+/// 現在はこれが使われている）と同じ構成を、macOS 限定で複製する
+/// （契約 §0: 対象 OS は macOS のみ、クロスプラットフォーム分岐を作り込まない）。
+///
+/// 既定との差分は 2 つだけ:
+/// 1. **`PredefinedMenuItem::close_window` を一度も呼ばない。** 既定では File
+///    サブメニューと Window サブメニューの両方に現れる（`tauri-2.11.5/src/menu/menu.rs:163,209`
+///    を実測）。File サブメニューは既定でもこの 1 項目しか持たないため、削除すると
+///    空の File メニューが残る。空のドロップダウンを見せるより、File サブメニュー自体を
+///    落とす
+/// 2. Window サブメニューは minimize / maximize だけを残す（既定にあった
+///    close_window の直前のセパレータも、対になる項目が無いので落とす）
+///
+/// **落としてはならないもの**（brief の「落とすと壊れるもの」）:
+/// - **quit（Cmd+Q）。** `kill_on_run_event_exit` の doc コメントが依存する
+///   `terminate:` -> `RunEvent::Exit` の経路はこの項目が無いと発火しない
+/// - **Edit サブメニューの copy / paste（および undo/redo/cut/select_all）。**
+///   WebView 上のコピー＆ペーストはこれらの既定項目のアクセラレータで動く
+///
+/// About メタデータ（name/version/copyright/authors）は `Menu::default` と同じ値を
+/// 詰める（`tauri-2.11.5/src/menu/menu.rs:142-151` を実測して複製）。
+///
+/// **`run()` / `.setup()` は契約 §96.4 の到達不能領域なので、この構築ロジックを
+/// `.menu(|app| { .. })` のクロージャへインラインで書かないこと。**
+///
+/// **⚠️ `MockRuntime` から呼べるが、`cargo test` の通常の `#[test]`（libtest の
+/// ワーカースレッド）からは呼べない。** muda 0.19.3 はメニュー項目の構築時に実際の
+/// OS main thread（`objc2::MainThreadMarker::new()`）を要求し（`muda-0.19.3/src/
+/// platform_impl/macos/mod.rs:132`（`Menu::new`）/ `:328`（`Submenu::new`）/
+/// `:775,830,859,903,935`（各 `create_ns_item_for_*`。`MenuItemKind` の enumerate は
+/// これを経由しない）を実測）、`cfg!(test)` によるマーカー省略は `new_submenu` にしか
+/// 無くしかも muda 自身のクレート内テストにしか効かない（依存側の `cfg!(test)` は常に
+/// false）ため、libtest のワーカースレッドから呼ぶと
+/// `` `muda::MenuChild` can only be created on the main thread `` で panic する
+/// （実測）。**固定するテストは `harness = false` の統合テスト
+/// （`tests/menu_no_close_window.rs`。その `fn main()` はプロセスの実の main thread
+/// で走る）に置く。**
+///
+/// `R: tauri::Runtime` はテストのための一般化であり、契約上の型ではない
+/// （`kill_on_window_destroyed` と同じ前例）。
+pub fn build_app_menu<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{AboutMetadata, Menu, PredefinedMenuItem, Submenu};
+
+    let pkg_info = app_handle.package_info();
+    let config = app_handle.config();
+    let about_metadata = AboutMetadata {
+        name: Some(pkg_info.name.clone()),
+        version: Some(pkg_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    };
+
+    let app_menu = Submenu::with_items(
+        app_handle,
+        pkg_info.name.clone(),
+        true,
+        &[
+            &PredefinedMenuItem::about(app_handle, None, Some(about_metadata))?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::services(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::hide(app_handle, None)?,
+            &PredefinedMenuItem::hide_others(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::quit(app_handle, None)?,
+        ],
+    )?;
+
+    let edit_menu = Submenu::with_items(
+        app_handle,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app_handle, None)?,
+            &PredefinedMenuItem::redo(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::cut(app_handle, None)?,
+            &PredefinedMenuItem::copy(app_handle, None)?,
+            &PredefinedMenuItem::paste(app_handle, None)?,
+            &PredefinedMenuItem::select_all(app_handle, None)?,
+        ],
+    )?;
+
+    let view_menu = Submenu::with_items(
+        app_handle,
+        "View",
+        true,
+        &[&PredefinedMenuItem::fullscreen(app_handle, None)?],
+    )?;
+
+    // Close Window を含めない Window サブメニュー（契約 §29.8）。
+    let window_menu = Submenu::with_items(
+        app_handle,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app_handle, None)?,
+            &PredefinedMenuItem::maximize(app_handle, None)?,
+        ],
+    )?;
+
+    Menu::with_items(
+        app_handle,
+        &[&app_menu, &edit_menu, &view_menu, &window_menu],
+    )
+}
+
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
     crate::perf::mark_process_start();
     let app = tauri::Builder::default()
+        // 契約 §29.8: 既定メニューの Close Window を落とす。`.menu(..)` は
+        // `Builder` 側で上書き型（`app.rs:1981` の `self.menu.replace(..)`）
+        // なので、1 回しか書かないこと。
+        .menu(build_app_menu)
         .setup(|app| {
             init_tracing_subscriber();
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可

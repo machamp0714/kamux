@@ -33,3 +33,12 @@ tempfile = "3"
 # の `cargo build` / `cargo build --release` には影響しない。
 tauri = { version = "2", features = ["test", "unstable"] }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "test-util"] }
+
+[[test]]
+# 契約 §29.8: `harness = false` の `fn main()` は libtest のワーカースレッドを
+# 経由せずプロセスの実の main thread で走る。muda 0.19.3 のメニュー構築 API は
+# 実の main thread を要求するため（`src-tauri/src/lib.rs` の `build_app_menu`
+# doc コメント参照）、通常の `#[test]` からは呼べない。
+name = "menu_no_close_window"
+path = "tests/menu_no_close_window.rs"
+harness = false
