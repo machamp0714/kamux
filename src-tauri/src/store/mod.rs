@@ -541,6 +541,17 @@ mod tests {
                 Some("30".to_owned()),
                 0,
             ),
+            // 契約 §29.1（schema_version 3 / M3-4）の ALTER TABLE から書き写す。
+            // §116.2 (a): 列追加に伴う期待値更新は §46 の射程外であり、比較方法
+            // （完全一致）は動かさない。
+            (
+                20,
+                "is_scratch".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                Some("0".to_owned()),
+                0,
+            ),
         ];
 
         assert_eq!(rows, expected);

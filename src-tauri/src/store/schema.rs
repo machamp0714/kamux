@@ -5,7 +5,7 @@ use crate::error::{AppError, AppResult};
 /// M1-1 で確定するスキーマ版。以降のフェーズは +1 して match に 1 アーム足すだけでよい。
 /// 2 = §20（M3-3: heuristics_enabled / silence_timeout_secs）
 /// 3 = §29.1（M3-4: is_scratch）。この順序を入れ替えないこと（§34.1）
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DDL_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -66,6 +66,19 @@ ALTER TABLE sessions ADD COLUMN silence_timeout_secs INTEGER NOT NULL DEFAULT 30
 UPDATE sessions SET heuristics_enabled = 0 WHERE cli_kind = 'shell';
 "#;
 
+/// 契約 §29.1 の DDL をそのまま写したもの（M3-4: スクラッチセッション）。
+///
+/// **`DDL_V1` 側にこの列を足してはならない。** `MIGRATION_V2` の doc コメントと
+/// 同じ理由（`duplicate column name` で新規 DB が開けなくなる）。
+///
+/// `UPDATE` は足さない。契約 §117.4 が §117.3 の 4 手順を適用済みで、結論は
+/// 「該当 0 件」——移行前の行に `create_scratch_session` 由来のものは無く
+/// （version 3 と同じフェーズで新設される）、全行の構築点は
+/// `Session::new_backlog`（`is_scratch: false`）であり `DEFAULT 0` と一致する。
+const MIGRATION_V3: &str = r#"
+ALTER TABLE sessions ADD COLUMN is_scratch INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// PRAGMA は接続ごとの設定。foreign_keys は特に永続化されないので
 /// 新しい Connection を開くたびに必ず適用する。
 /// journal_mode = WAL は結果行を返すため execute() ではなく execute_batch() を使う。
@@ -94,7 +107,7 @@ pub fn migrate(conn: &mut Connection) -> AppResult<()> {
         match v {
             1 => tx.execute_batch(DDL_V1)?,
             2 => tx.execute_batch(MIGRATION_V2)?, // §20（M3-3）
-            // 3 => tx.execute_batch(MIGRATION_V3)?,   // §29.1（M3-4 が足す）
+            3 => tx.execute_batch(MIGRATION_V3)?, // §29.1（M3-4）
             other => return Err(AppError::Db(format!("unknown schema version {other}"))),
         }
         // 単一行を保つ。INSERT OR REPLACE は使えない（§46.3 の落とし穴 3）
@@ -209,16 +222,21 @@ mod migration_v2_tests {
         );
     }
 
+    /// 契約 §29.1 で `SCHEMA_VERSION` が 3 になったことで、v1 からの `migrate` は
+    /// v1 → v2 → v3 の 3 反復を通るようになった。フィクスチャ（`v1_conn`）は
+    /// 無変更だが、この経路の変化により旧名 `migrate_records_version_2` は
+    /// 実態と食い違う（実際には 3 まで進む）ため改名する（契約に名指しの凍結
+    /// 対象ではないことを `grep` で確認済み。§116.2 (c) の一般原則に従う）。
     #[test]
-    fn migrate_records_version_2() {
+    fn migrate_from_v1_reaches_the_current_schema_version() {
         let mut conn = v1_conn();
         migrate(&mut conn).expect("migrate");
 
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 2);
-        assert_eq!(SCHEMA_VERSION, 2, "契約 §20: M3-3 の版は 2");
+        assert_eq!(version, 3);
+        assert_eq!(SCHEMA_VERSION, 3, "契約 §29.1: M3-4 の版は 3");
     }
 
     #[test]
@@ -245,11 +263,13 @@ mod migration_v2_tests {
     ///
     /// ここでは `schema_version` に「迷子の version 0 行」を置いてそれを作る
     /// （`COALESCE(MAX(version), 0)` は空テーブルと version 0 行を区別しないので、
-    /// `current = 0` すなわち `1..=2` の 2 反復に入る）。v1 は既存スキーマの上を
-    /// `IF NOT EXISTS` で素通りし、v2 は列がまだ無いので成功する。
+    /// `current = 0` すなわち `1..=3` の 3 反復に入る。契約 §29.1 で
+    /// `SCHEMA_VERSION` が 3 になったため、旧コメントの `1..=2` から更新）。
+    /// v1 は既存スキーマの上を `IF NOT EXISTS` で素通りし、v2 / v3 は列がまだ
+    /// 無いので成功する。
     ///
     /// `v1_conn()` を使わないのは意図的である —— あちらは版 1 を記録するため
-    /// ループが `2..=2` になり、`DDL_V1` が 1 度も実行されない。
+    /// ループが `2..=3` になり、`DDL_V1` が 1 度も実行されない。
     #[test]
     fn migrate_applies_ddl_v1_over_an_existing_schema_when_the_version_row_is_stray() {
         let mut conn = Connection::open_in_memory().expect("in-memory db");
@@ -265,7 +285,7 @@ mod migration_v2_tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 2, "迷子行から v1 → v2 を通した後の版");
+        assert_eq!(version, 3, "迷子行から v1 → v2 → v3 を通した後の版");
 
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
@@ -323,6 +343,116 @@ mod migration_v2_tests {
                 .filter(|c| *c == "heuristics_enabled")
                 .count(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod migration_v3_tests {
+    use super::*;
+
+    /// `migration_v2_tests::columns` と同じ実装。あちらはモジュール private
+    /// なのでここで複製する。
+    fn columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .expect("prepare pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query pragma");
+        rows.map(|r| r.expect("column name")).collect()
+    }
+
+    /// v2 まで適用済みの DB を作る（`DDL_V1` → `MIGRATION_V2`）。`schema_version` に 2 を
+    /// 記録することで、`migrate` が `(2+1)..=SCHEMA_VERSION` すなわち v3 だけを
+    /// 適用する経路に入る（`migration_v2_tests::v1_conn` と同じ作法）。
+    fn v2_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(DDL_V1).expect("v1 ddl");
+        conn.execute_batch(MIGRATION_V2).expect("v2 migration");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY NOT NULL);
+             INSERT INTO schema_version (version) VALUES (2);",
+        )
+        .expect("record version 2");
+        conn
+    }
+
+    /// v2 の時代に既に存在していた行を 1 本作る（契約 §117.3/§117.4 の観測対象。
+    /// 「移行前の行」を持つフィクスチャ）。
+    fn insert_v2_session(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, name, repo_path, created_at, updated_at)
+             VALUES ('p1', 'kamux', '/Users/x/repo/kamux', 0, 0)",
+            [],
+        )
+        .expect("insert project");
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, title, sort_order, mode, cli_kind,
+                                   created_at, updated_at)
+             VALUES (?1, 'p1', 'old row', 1.0, 'in_place', 'shell', 0, 0)",
+            [id],
+        )
+        .expect("insert v2 session");
+    }
+
+    /// 契約 §117.3 の 4 手順を実測する（§117.4）。
+    /// 1. 新規行への構築点は `Session::new_backlog`（`is_scratch: false`）と
+    ///    `create_scratch_session`（M3-4 Task 17、常に true）の 2 つ
+    /// 2. 移行前の行に `create_scratch_session` 由来のものは無い
+    ///    （version 3 と同じフェーズで新設されるコマンドのため）。したがって
+    ///    移行前の行の構築点はすべて `new_backlog` であり、値は `false`
+    /// 3. `DEFAULT 0` と一致し、食い違う部分集合は無い
+    /// 4. 結論: 「該当 0 件」。`UPDATE` は足さない
+    ///
+    /// 「該当 0 件」は机上の結論に過ぎないため、移行前の行を最低 1 本持つ
+    /// フィクスチャで実測する（§117.3 の 🔴。母数 0 の検査は「違反なし」と
+    /// 区別が付かない）。
+    #[test]
+    fn migrate_leaves_pre_v3_rows_with_is_scratch_defaulted_to_zero() {
+        let mut conn = v2_conn();
+        insert_v2_session(&conn, "s_old");
+
+        migrate(&mut conn).expect("migrate to v3");
+
+        let is_scratch: i64 = conn
+            .query_row(
+                "SELECT is_scratch FROM sessions WHERE id = 's_old'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read back the migrated row");
+        assert_eq!(
+            is_scratch, 0,
+            "移行前の行は DDL の DEFAULT 0 のまま（契約 §117.4: 該当 0 件）"
+        );
+    }
+
+    #[test]
+    fn migrate_records_version_3() {
+        let mut conn = v2_conn();
+        migrate(&mut conn).expect("migrate");
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 3);
+        assert_eq!(SCHEMA_VERSION, 3, "契約 §29.1: M3-4 の版は 3");
+    }
+
+    /// `DDL_V1` 側に `is_scratch` を足してはならないという `MIGRATION_V3` の doc
+    /// コメントの断定を実測で固定する（`MIGRATION_V2` の doc と同型の禁止。
+    /// `MIGRATION_V2` 側は同種のテストを持たないため独立に観測する）。
+    /// `DDL_V1` が列を持つと、直後の v1 → v3 のループ内で `ALTER TABLE ADD COLUMN`
+    /// が `duplicate column name` を返し、新規 DB が 1 つも開けなくなる。
+    #[test]
+    fn a_fresh_database_opens_without_duplicate_column_errors_through_v3() {
+        let mut conn = Connection::open_in_memory().expect("in-memory db");
+        migrate(&mut conn).expect("新規 DB が v1..=v3 を通せていない");
+
+        assert!(
+            columns(&conn).contains(&"is_scratch".to_owned()),
+            "is_scratch が追加されていない"
         );
     }
 }
