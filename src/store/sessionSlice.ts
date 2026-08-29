@@ -29,6 +29,10 @@ import { KANBAN_STATUSES, surfaceId } from '../types/model';
 import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
 import { buildSessionOrder as buildProjectSessionOrder, compareSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
+// 契約 §85.1 の不変条件を維持する唯一の出口。terminalSlice.ts は M3-2 の所有だが、
+// ここは import するだけで 1 行も変更しない（直接 set({ paneAssignment }) すると
+// focusedSessionId === paneAssignment[activePane] が破れる）。
+import { withFocus } from './terminalSlice';
 import { toAppError } from './uiSlice';
 
 export { emptySessionOrder, indexSessions } from './kanbanOrder';
@@ -143,7 +147,8 @@ export interface SessionSlice {
    * だけ（Ruling 20-C）—— is_scratch !== true なら stopSession も archiveSession も
    * 呼ばずに return する。新しいアーカイブ経路は書かず、stopSession(id) を呼んでから
    * 既存の archiveSession(id) を呼ぶ（Ruling 20-B。ロールバックとプロジェクト切替
-   * ガードを二重に書かないため）。
+   * ガードを二重に書かないため）。archive のあと、閉じたスクラッチが載っていた
+   * ペインの割当を外す（ゲート修正 A3。本体の実装コメントに理由がある）。
    */
   closeScratchTerminal: () => Promise<void>;
 }
@@ -599,6 +604,30 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     if (target === undefined || !target.is_scratch) return;
     await stopSession(id);
     await get().archiveSession(id);
+    // ゲート修正 A3（PR 108 人間ゲート）: 閉じたスクラッチをペインから外す。
+    // 外さないとタブ列（terminalSlice の archived_at フィルタ）とカンバンからは
+    // 消えるのにペインには載ったままになり、TerminalGrid が再マウントされた時点で
+    // TerminalPane がもう一度描かれる。stop_session を受けた pty://exit が
+    // 二重起動の門（ptyBridge の startedSurfaces）を開けているので start_session が
+    // 通り、UI のどこにも現れない $SHELL -l が立ち上がる。
+    //
+    // 走査は activePane ではなく id で行う。stopSession / archiveSession の 2 つの
+    // await をまたぐ間に Cmd+] やタブクリックで activePane は動きうるため、
+    // await 後の activePane のスロットを null にすると別のセッションを外しうる。
+    //
+    // set は必ず withFocus を通す（契約 §85.1: focusedSessionId === paneAssignment[activePane]
+    // を focusedSessionId を書くすべてのアクションが出口で維持する）。
+    const pane = get();
+    set(
+      withFocus({
+        layout: pane.layout,
+        activePane: pane.activePane,
+        paneAssignment: [
+          pane.paneAssignment[0] === id ? null : pane.paneAssignment[0],
+          pane.paneAssignment[1] === id ? null : pane.paneAssignment[1],
+        ],
+      }),
+    );
   },
 });
 

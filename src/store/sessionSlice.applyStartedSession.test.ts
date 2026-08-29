@@ -119,12 +119,13 @@ describe('applyStartedSession（ゲート修正 D-1）', () => {
   });
 
   // gate-fix-round1 R-3（P4「全 4 列から除去」）。同じ id 'a' が対象列
-  // （in_progress）と非対象列 2 つ（backlog / review）の両方に居る初期状態から、
-  // applyStartedSession(in_progress の a) を呼ぶ。他列除去ループが backlog と
-  // review の両方を回り切ること（S-3 は break で 1 列しか回らなくなる）、かつ
+  // （in_progress）と非対象列の両方に居る初期状態から、
+  // applyStartedSession(in_progress の a) を呼ぶ。他列除去ループが非対象列を
+  // 回り切ること（S-3 は break で 1 列しか回らなくなる）、かつ
   // targetColumnUnchanged の門（!removedFromOtherColumn）が他列の除去結果を
   // sessionOrder へ実際に反映させること（S-6 は門を落として早期 return し、
-  // backlog / review の重複が残る）を toEqual で一度に見る。
+  // 非対象列の重複が残る）を toEqual で一度に見る。
+  // どの列がどうなるかは下の toEqual がリテラルで固定している。
   // fixture の 'a' は 3 フィルタ（archived_at !== null / is_scratch === true /
   // project_id !== activeProjectId）のどれにも掛からない（s() のデフォルト値と
   // beforeEach の activeProjectId: 'p1' により満たされる）。

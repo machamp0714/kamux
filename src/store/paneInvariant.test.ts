@@ -120,9 +120,10 @@ const FOCUS_TOUCHING_ACTIONS = new Set([
   'removeProject',
   // M3-4 Task 20: createScratchTerminal は末尾で assignPane(activePane, created.id) を
   // 呼ぶため、paneAssignment / focusedSessionId を実際に書く（Ruling 20-F）。
-  // closeScratchTerminal は入れない —— archiveSession 後も paneAssignment を触らない
-  // （Ruling 20-D）ため、baseline のフォーカス中セッション（scratch ではない）に対しては
-  // スクラッチ限定の門（Ruling 20-C）で早期 return し、3 状態は不変のまま。
+  // closeScratchTerminal は入れない —— baseline のフォーカス中セッション 'y' は
+  // scratch ではないため、スクラッチ限定の門（Ruling 20-C）で早期 return し、
+  // 3 状態は不変のまま。門を通り抜けた本体（ゲート修正 A3 でペイン割当を外すように
+  // なった）を観測するのは sessionSlice.scratch.test.ts の側である。
   'createScratchTerminal',
 ]);
 

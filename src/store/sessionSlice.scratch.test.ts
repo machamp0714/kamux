@@ -155,12 +155,13 @@ describe('closeScratchTerminal（契約 §29.3 / §29.8。Cmd+W が呼ぶ）', (
       sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
       focusedSessionId: 'scr1',
       activeProjectId: 'p1',
-      // Ruling 20-D（Cmd+W 後に paneAssignment を触らない）を、スクラッチ限定の門
-      // （Ruling 20-C）を通り抜けた本体実行経路で観測するための baseline。
+      // スクラッチ限定の門（Ruling 20-C）を通り抜けた本体実行経路で、
+      // フォーカス 3 状態がどうなるかを観測するための baseline。
       // paneInvariant.test.ts の FOCUS_TOUCHING_ACTIONS 側は baseline のフォーカス
       // 中セッションが非 scratch なので早期 return しか測れない
       // （task-20 レビュー Important 2）。ここは focusedSessionId が scratch なので
-      // 本体（stopSession → archiveSession）を実行してから below で不変を確認する。
+      // 本体（stopSession → archiveSession）を実行してから below で確認する。
+      layout: 'single',
       paneAssignment: ['scr1', null],
       activePane: 0,
     });
@@ -169,8 +170,8 @@ describe('closeScratchTerminal（契約 §29.3 / §29.8。Cmd+W が呼ぶ）', (
       calls.push(`stop:${id}`);
       return target;
     });
-    updateSession.mockImplementation(async (id: string, patch: Record<string, unknown>) => {
-      calls.push(`update:${id}`);
+    updateSession.mockImplementation(async (updatedId: string, patch: Record<string, unknown>) => {
+      calls.push(`update:${updatedId}`);
       return { ...target, ...patch };
     });
 
@@ -184,11 +185,66 @@ describe('closeScratchTerminal（契約 §29.3 / §29.8。Cmd+W が呼ぶ）', (
     expect(id).toBe('scr1');
     expect(typeof patch.archived_at).toBe('number');
 
-    // Ruling 20-D: archive 後も paneAssignment / focusedSessionId は変化しない
-    // （アーカイブ済みの scratch を指し続ける。タブ列からは消えるがペインには残る）。
-    expect(useAppStore.getState().paneAssignment).toEqual(['scr1', null]);
+    // ゲート修正 A3（PR 108 人間ゲート）: archive 後は閉じたスクラッチをペインから
+    // 外す。外さないと、タブ列とカンバンから消えたセッションがペインにだけ残り、
+    // グリッドが再マウントされた時点で start_session が飛ぶ
+    // （再現は TerminalGrid.scratchRevival.test.tsx）。activePane は動かさない。
+    expect(useAppStore.getState().paneAssignment).toEqual([null, null]);
     expect(useAppStore.getState().activePane).toBe(0);
-    expect(useAppStore.getState().focusedSessionId).toBe('scr1');
+    expect(useAppStore.getState().focusedSessionId).toBeNull();
+  });
+
+  it('閉じたスクラッチのスロットだけを外し、もう一方のペインの割当は残す（A3）', async () => {
+    const scratch = s({ id: 'scr1', is_scratch: true });
+    const other = s({ id: 'real1', is_scratch: false });
+    useAppStore.setState({
+      sessions: { scr1: scratch, real1: other },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      focusedSessionId: 'scr1',
+      activeProjectId: 'p1',
+      layout: 'split2',
+      paneAssignment: ['real1', 'scr1'],
+      activePane: 1,
+    });
+    stopSession.mockResolvedValue(scratch);
+    updateSession.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...scratch,
+      ...patch,
+    }));
+
+    await useAppStore.getState().closeScratchTerminal();
+
+    expect(useAppStore.getState().paneAssignment).toEqual(['real1', null]);
+    expect(useAppStore.getState().activePane).toBe(1);
+    expect(useAppStore.getState().focusedSessionId).toBeNull();
+  });
+
+  it('await をまたいで activePane が動いても、閉じたスクラッチが載っていたスロットを外す（A3）', async () => {
+    const scratch = s({ id: 'scr1', is_scratch: true });
+    const other = s({ id: 'real1', is_scratch: false });
+    useAppStore.setState({
+      sessions: { scr1: scratch, real1: other },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      focusedSessionId: 'scr1',
+      activeProjectId: 'p1',
+      layout: 'split2',
+      paneAssignment: ['scr1', 'real1'],
+      activePane: 0,
+    });
+    stopSession.mockResolvedValue(scratch);
+    // updateSession（archiveSession が await するもの）の解決前に、ユーザーが
+    // Cmd+] でアクティブペインを右へ移したのと同じ状態にする。解除を
+    // 「await 後の activePane のスロット」で書くと、ここで real1 が消える。
+    updateSession.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      useAppStore.setState({ activePane: 1, focusedSessionId: 'real1' });
+      return { ...scratch, ...patch };
+    });
+
+    await useAppStore.getState().closeScratchTerminal();
+
+    expect(useAppStore.getState().paneAssignment).toEqual([null, 'real1']);
+    expect(useAppStore.getState().activePane).toBe(1);
+    expect(useAppStore.getState().focusedSessionId).toBe('real1');
   });
 
   it('フォーカス中ペインが非 scratch のとき stopSession も updateSession も呼ばない（Ruling 20-C の門）', async () => {
