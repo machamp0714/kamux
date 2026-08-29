@@ -12,7 +12,9 @@ vi.mock('../ipc/commands', async (importOriginal) => ({
 
 import { useAppStore } from './index';
 import { selectTerminalTabs } from './terminalSlice';
+import { isStarted, resetPtyBridgeForTest } from '../terminal/ptyBridge';
 import type { Session } from '../types/model';
+import { surfaceId } from '../types/model';
 
 const s = (over: Partial<Session> & { id: string }): Session => ({
   project_id: 'p1',
@@ -44,6 +46,7 @@ const s = (over: Partial<Session> & { id: string }): Session => ({
 describe('createScratchTerminal（契約 §29.3 / §29.8。Cmd+T が呼ぶ）', () => {
   beforeEach(() => {
     createScratchSession.mockReset();
+    resetPtyBridgeForTest();
     useAppStore.setState({
       activeProjectId: 'p1',
       sessions: {},
@@ -97,6 +100,24 @@ describe('createScratchTerminal（契約 §29.3 / §29.8。Cmd+T が呼ぶ）', 
     await useAppStore.getState().createScratchTerminal();
 
     expect(selectTerminalTabs(useAppStore.getState())).toEqual(['scr1']);
+  });
+
+  // ゲート修正 A2（PR 33 人間ゲート）: create_scratch_session はバックエンドで既に
+  // spawn 済みのため、markStarted を呼ばずに assignPane すると TerminalPane のマウントが
+  // isStarted の門を素通りして start_session を投げ、二重起動ガードに invalid_state で
+  // 撥ねられる（症状の再現は TerminalPane.scratchGate.test.tsx）。ここでは根本原因の
+  // 直接観測として、markStarted(surfaceId(created.id, 'agent')) が呼ばれ、実物の
+  // ptyBridge の isStarted がそのサーフェスに対して true を返すことを固定する。
+  it('markStarted(surfaceId(created.id, "agent")) を呼ぶ（A2: 二重起動ガードの誤検出を防ぐ）', async () => {
+    const created = s({ id: 'scr1', is_scratch: true });
+    createScratchSession.mockResolvedValue(created);
+
+    await useAppStore.getState().createScratchTerminal();
+
+    expect(isStarted(surfaceId('scr1', 'agent'))).toBe(true);
+    // 取り違え防止: 別 id や別 surface kind ではフラグが立っていないこと。
+    expect(isStarted(surfaceId('scr1', 'editor'))).toBe(false);
+    expect(isStarted(surfaceId('other', 'agent'))).toBe(false);
   });
 
   it('アクティブプロジェクトが無ければ何も呼ばない（Ruling 20-E）', async () => {

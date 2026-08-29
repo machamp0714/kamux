@@ -578,6 +578,15 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     if (projectId === null) return;
     // cwd は常に null を渡す（契約 §29.3: None なら project.repo_path）。
     const created = await createScratchSession(projectId, null);
+    // ゲート修正 A2（PR 33 人間ゲート）: create_scratch_session はバックエンドで
+    // 既に spawn 済みである。markStarted を呼ばずに assignPane すると、
+    // TerminalPane のマウントが isStarted の門を素通りして start_session を投げ、
+    // バックエンドの二重起動ガードに invalid_state で撥ねられる
+    // （src-tauri/src/session/mod.rs:75）。加えて失敗腕は unmarkStarted を呼ぶため
+    // isStarted が false のまま残り、resize_pty が飛ばず 80x24 に固着する
+    // （fitScheduler.ts の isStarted 門）。assignPane より前に呼ぶこと —— 後ろだと
+    // TerminalPane のマウントとの順序が React のスケジューリング次第になる。
+    markStarted(surfaceId(created.id, 'agent'));
     set((s) => ({ sessions: { ...s.sessions, [created.id]: created } }));
     get().assignPane(get().activePane, created.id);
   },
