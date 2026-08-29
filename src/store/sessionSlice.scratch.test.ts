@@ -111,9 +111,22 @@ describe('createScratchTerminal（契約 §29.3 / §29.8。Cmd+T が呼ぶ）', 
   it('markStarted(surfaceId(created.id, "agent")) を呼ぶ（A2: 二重起動ガードの誤検出を防ぐ）', async () => {
     const created = s({ id: 'scr1', is_scratch: true });
     createScratchSession.mockResolvedValue(created);
+    // gate-fix-round1 R-1: sessionSlice.ts:589 のコメント「assignPane より前に
+    // markStarted を呼ぶこと」を、呼び出し順そのものとして固定する。assignPane を
+    // 呼ばれた瞬間に isStarted を記録してから実物へ委譲するラッパへ差し替える
+    // （実行後の観測だけでは関数内の副作用の順序が原理的に見えないため）。
+    const realAssignPane = useAppStore.getState().assignPane;
+    let startedWhenAssignPaneCalled: boolean | null = null;
+    useAppStore.setState({
+      assignPane: (pane, sessionId) => {
+        startedWhenAssignPaneCalled = isStarted(surfaceId('scr1', 'agent'));
+        return realAssignPane(pane, sessionId);
+      },
+    });
 
     await useAppStore.getState().createScratchTerminal();
 
+    expect(startedWhenAssignPaneCalled).toBe(true);
     expect(isStarted(surfaceId('scr1', 'agent'))).toBe(true);
     // 取り違え防止: 別 id や別 surface kind ではフラグが立っていないこと。
     expect(isStarted(surfaceId('scr1', 'editor'))).toBe(false);

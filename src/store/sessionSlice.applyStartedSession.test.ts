@@ -97,6 +97,54 @@ describe('applyStartedSession（ゲート修正 D-1）', () => {
     expect(useAppStore.getState().sessionOrder.in_progress).toEqual(['p', 'q', 'new', 'r']);
   });
 
+  // gate-fix-round1 R-2（契約 §50.3.2: 並び順は (sort_order, id) の全順序）。
+  // archive.test.ts:258 の restoreSession 版と同じ形。sort_order が同値の 'a'/'z' の
+  // 間へ、id が両者の間に挟まる 'm' を insertAt で挿む。sort_order だけの比較
+  // （タイブレーク無し）だと diff が常に 0 になり insertAt=0（['m','a','z']）になる。
+  // 期待値はリテラルで固定する（production の定数や compareSessionOrder からは
+  // 再導出しない）。
+  it('挿入位置の探索は sort_order 同値のとき id でタイブレークする', () => {
+    useAppStore.setState({
+      sessions: {
+        a: s({ id: 'a', kanban_status: 'in_progress', sort_order: 2 }),
+        z: s({ id: 'z', kanban_status: 'in_progress', sort_order: 2 }),
+      },
+      sessionOrder: { backlog: [], in_progress: ['a', 'z'], review: [], done: [] },
+    });
+    const started = s({ id: 'm', kanban_status: 'in_progress', sort_order: 2 });
+
+    useAppStore.getState().applyStartedSession(started);
+
+    expect(useAppStore.getState().sessionOrder.in_progress).toEqual(['a', 'm', 'z']);
+  });
+
+  // gate-fix-round1 R-3（P4「全 4 列から除去」）。同じ id 'a' が対象列
+  // （in_progress）と非対象列 2 つ（backlog / review）の両方に居る初期状態から、
+  // applyStartedSession(in_progress の a) を呼ぶ。他列除去ループが backlog と
+  // review の両方を回り切ること（S-3 は break で 1 列しか回らなくなる）、かつ
+  // targetColumnUnchanged の門（!removedFromOtherColumn）が他列の除去結果を
+  // sessionOrder へ実際に反映させること（S-6 は門を落として早期 return し、
+  // backlog / review の重複が残る）を toEqual で一度に見る。
+  // fixture の 'a' は 3 フィルタ（archived_at !== null / is_scratch === true /
+  // project_id !== activeProjectId）のどれにも掛からない（s() のデフォルト値と
+  // beforeEach の activeProjectId: 'p1' により満たされる）。
+  it('同じ id が対象列と別の複数列の両方に居るとき、他列すべてから除去する（P4）', () => {
+    useAppStore.setState({
+      sessions: { a: s({ id: 'a', kanban_status: 'in_progress' }) },
+      sessionOrder: { backlog: ['a'], in_progress: ['a'], review: ['a'], done: [] },
+    });
+    const started = s({ id: 'a', kanban_status: 'in_progress' });
+
+    useAppStore.getState().applyStartedSession(started);
+
+    expect(useAppStore.getState().sessionOrder).toEqual({
+      backlog: [],
+      in_progress: ['a'],
+      review: [],
+      done: [],
+    });
+  });
+
   // P2: is_scratch
   it('is_scratch: true の Session を渡しても sessionOrder が変わらない（sessions には入る）', () => {
     const started = s({ id: 'a', kanban_status: 'in_progress', is_scratch: true });
