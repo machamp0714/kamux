@@ -131,7 +131,7 @@ describe('applyStartedSession（ゲート修正 D-1）', () => {
   it('同じ id が対象列と別の複数列の両方に居るとき、他列すべてから除去する（P4）', () => {
     useAppStore.setState({
       sessions: { a: s({ id: 'a', kanban_status: 'in_progress' }) },
-      sessionOrder: { backlog: ['a'], in_progress: ['a'], review: ['a'], done: [] },
+      sessionOrder: { backlog: ['a'], in_progress: ['a'], review: ['a'], done: ['a'] },
     });
     const started = s({ id: 'a', kanban_status: 'in_progress' });
 
