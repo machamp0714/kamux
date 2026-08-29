@@ -75,6 +75,28 @@ describe('applyStartedSession（ゲート修正 D-1）', () => {
     expect(useAppStore.getState().sessionOrder.backlog).toEqual([]);
   });
 
+  // P5: compareSessionOrder の引数順を保つ（取り違え検出）。
+  // 2 対 1 の非対称な分割にすることで、引数を入れ替えた誤実装
+  // （「target より前に来る要素数」ではなく「後に来る要素数」を数える）が
+  // 別の挿入位置を返すようにしてある。3 要素中 2 個が target より小さい
+  // sort_order を持つため、正しい insertAt=2 に対し、引数を入れ替えると
+  // insertAt=1 になる（2 要素だけの対称な入力では両者が偶然一致してしまう）。
+  it('挿入位置の探索は compareSessionOrder(既存, 新規) の引数順を保つ', () => {
+    useAppStore.setState({
+      sessions: {
+        p: s({ id: 'p', kanban_status: 'in_progress', sort_order: 1 }),
+        q: s({ id: 'q', kanban_status: 'in_progress', sort_order: 2 }),
+        r: s({ id: 'r', kanban_status: 'in_progress', sort_order: 3 }),
+      },
+      sessionOrder: { backlog: [], in_progress: ['p', 'q', 'r'], review: [], done: [] },
+    });
+    const started = s({ id: 'new', kanban_status: 'in_progress', sort_order: 2.5 });
+
+    useAppStore.getState().applyStartedSession(started);
+
+    expect(useAppStore.getState().sessionOrder.in_progress).toEqual(['p', 'q', 'new', 'r']);
+  });
+
   // P2: is_scratch
   it('is_scratch: true の Session を渡しても sessionOrder が変わらない（sessions には入る）', () => {
     const started = s({ id: 'a', kanban_status: 'in_progress', is_scratch: true });
