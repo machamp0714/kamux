@@ -25,7 +25,7 @@ import type {
   SessionStatePayload,
   StateReason,
 } from '../types/model';
-import { surfaceId } from '../types/model';
+import { KANBAN_STATUSES, surfaceId } from '../types/model';
 import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
 import { buildSessionOrder as buildProjectSessionOrder, compareSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
@@ -89,6 +89,27 @@ export interface SessionSlice {
    * による全列再構築は使わない。他カードの並びは 1 つも変えない）。
    */
   restoreSession: (id: string) => Promise<void>;
+  /**
+   * ゲート修正 D-1（PR 33 人間ゲート）: start_session / resume_session の戻り値を
+   * ストアへ反映する共有アクション。片方の呼び出し元からしか呼ばない形にしないこと
+   * （TerminalPane の起動成功腕と resumeSession の両方から呼ぶ）。
+   *
+   * 契約 §144.8 のハザード（正典 §155.4）: 局所挿入は buildSessionOrder が持つ
+   * フィルタ（archived_at / is_scratch / project_id）を全部迂回するので、この
+   * アクションが自前で当てる。3 つのうち 1 つでも欠けると盤面を汚す
+   * （restoreSession の is_scratch ガード欠落＝PR 33 全体レビュー Critical 1 と同型）。
+   *
+   * - sessions[session.id] は渡された Session を丸ごと入れる（フィールドを選ばない）。
+   * - archived_at !== null / is_scratch === true / project_id !== activeProjectId の
+   *   いずれかなら sessionOrder には一切触れない（sessions への反映は行う）。
+   * - buildSessionOrder による全列再構築はしない（restoreSession / archiveSession と
+   *   同じ理由。moveCard の in-flight 中に他カードが古い sort_order の位置へ吸着する）。
+   * - 冪等: 全 4 列から対象 id を除去してから挿入位置を探す。
+   * - 挿入位置は compareSessionOrder（sort_order 昇順・id タイブレーク）だけで決める。
+   *   土台の列自体の並びは変えない。
+   * - 列の中身が変わらなければ sessionOrder の参照を保つ（無用な再レンダリングを避ける）。
+   */
+  applyStartedSession: (session: Session) => void;
   applyStateEvent: (p: SessionStatePayload) => void;
   /**
    * last_runtime_state から初期値を埋める。
@@ -340,6 +361,54 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     }
   },
 
+  applyStartedSession: (session) =>
+    set((s) => {
+      const sessions = { ...s.sessions, [session.id]: session };
+      // 契約 §29.4 / §144.8（正典 §155.4）: 局所挿入は buildSessionOrder の
+      // フィルタを通らないので、3 つを自前で当てる。真でなければ sessionOrder には
+      // 一切触れない（sessions への反映だけは行う）。
+      if (
+        session.archived_at !== null ||
+        session.is_scratch === true ||
+        session.project_id !== s.activeProjectId
+      ) {
+        return { sessions };
+      }
+
+      const targetStatus = session.kanban_status;
+      const nextOrder: Record<KanbanStatus, string[]> = { ...s.sessionOrder };
+      // 冪等性ガード: 対象の列以外に同じ id が残っていれば先に除去する
+      // （TerminalPane の effect 再実行・resumeSession の二度押しで起こりうる）。
+      let removedFromOtherColumn = false;
+      for (const status of KANBAN_STATUSES) {
+        if (status === targetStatus) continue;
+        const column = s.sessionOrder[status];
+        if (column.includes(session.id)) {
+          nextOrder[status] = column.filter((sid) => sid !== session.id);
+          removedFromOtherColumn = true;
+        }
+      }
+
+      // 挿入位置は (sort_order, id) の全順序（compareSessionOrder）だけで決める。
+      // 土台 withoutTarget の並び自体は 1 つも変えない（restoreSession と同じ形）。
+      const withoutTarget = s.sessionOrder[targetStatus].filter((sid) => sid !== session.id);
+      const insertAt = withoutTarget.filter(
+        (sid) => compareSessionOrder(sessions[sid], session) < 0,
+      ).length;
+      const nextTargetColumn = [...withoutTarget];
+      nextTargetColumn.splice(insertAt, 0, session.id);
+
+      // P6: 列が変わらないなら sessionOrder の参照を保つ（無用な再レンダリングを避ける）。
+      const targetColumnUnchanged =
+        !removedFromOtherColumn &&
+        nextTargetColumn.length === s.sessionOrder[targetStatus].length &&
+        nextTargetColumn.every((sid, i) => sid === s.sessionOrder[targetStatus][i]);
+      if (targetColumnUnchanged) return { sessions };
+
+      nextOrder[targetStatus] = nextTargetColumn;
+      return { sessions, sessionOrder: nextOrder };
+    }),
+
   applyStateEvent: (p) =>
     set((s) => {
       // 契約 §42.3 規約 3: error 以外へ遷移したら生 stderr を捨てる。
@@ -436,8 +505,10 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       get().setRuntimeError(sessionId, toAppError(e).message);
       throw e;
     }
+    // ゲート修正 D-1: sessionOrder への反映は applyStartedSession（TerminalPane の
+    // 起動成功腕と共有）へ委ねる。resumeFailedSessionIds の除去は既存どおり別途行う。
+    get().applyStartedSession(session);
     set((s) => ({
-      sessions: { ...s.sessions, [sessionId]: session },
       resumeFailedSessionIds: s.resumeFailedSessionIds.filter((id) => id !== sessionId),
     }));
   },

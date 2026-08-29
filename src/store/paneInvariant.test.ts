@@ -175,6 +175,9 @@ const ARGS: Record<string, unknown[]> = {
   moveCard: ['a', 'review', 0],
   editSession: ['a', { title: 'renamed' }],
   archiveSession: ['a'],
+  // ゲート修正 D-1: start_session / resume_session の戻り値の反映。sessions /
+  // sessionOrder だけを書き、フォーカス 3 状態には触れない。
+  applyStartedSession: [makeSession({ id: 'a', kanban_status: 'review' })],
   // 契約 §8 の StateReason::ResumeFailed 経路（M2-4 Task 10）。
   // どちらもフォーカス 3 状態には触れない —— sessions / resumeFailedSessionIds / runtimeErrors だけを書く。
   resumeSession: ['a'],

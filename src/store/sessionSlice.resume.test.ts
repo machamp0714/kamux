@@ -70,6 +70,53 @@ describe('resume の失敗ハンドリング', () => {
     expect(useAppStore.getState().sessions[SID]).toEqual({ id: SID, claude_session_id: null });
   });
 
+  // ゲート修正 D-1（brief item 8）: resume_session も start_session の双子であり
+  // （契約 §123.3）、commit_started_session を通る（applyStartedSession の共有）。
+  // Backlog に居るセッションを再開すると sessionOrder が backlog のまま残る不具合の
+  // 回帰テスト。
+  it('resumeSession が成功すると sessionOrder が更新される（かつ resumeFailedSessionIds から除かれる）', async () => {
+    const { resumeSession } = await import('../ipc/commands');
+    const resumedSession = {
+      id: SID,
+      project_id: 'p1',
+      title: SID,
+      description: '',
+      kanban_status: 'in_progress',
+      sort_order: 1,
+      mode: 'worktree',
+      branch: 'feat/resumed',
+      worktree_path: '/tmp/resumed',
+      cli_kind: 'claude',
+      cli_command: null,
+      claude_session_id: 'cs1',
+      last_runtime_state: 'running',
+      last_runtime_error: null,
+      first_started_at: 1,
+      heuristics_enabled: true,
+      silence_timeout_secs: 30,
+      is_scratch: false,
+      archived_at: null,
+      created_at: 0,
+      updated_at: 0,
+    };
+    vi.mocked(resumeSession).mockResolvedValueOnce(resumedSession as never);
+    useAppStore.setState({
+      activeProjectId: 'p1',
+      resumeFailedSessionIds: [SID],
+      sessionOrder: { backlog: [SID], in_progress: [], review: [], done: [] },
+    });
+
+    await useAppStore.getState().resumeSession(SID);
+
+    expect(useAppStore.getState().sessionOrder).toEqual({
+      backlog: [],
+      in_progress: [SID],
+      review: [],
+      done: [],
+    });
+    expect(useAppStore.getState().resumeFailedSessionIds).toEqual([]);
+  });
+
   // running は resume_failed より必ず先に届く（Spawned → 失敗なら exited/resume_failed の順）。
   // resumeSession の成功以外の経路（例: TerminalPane の直接起動）でも古い失敗フラグが
   // 消えるよう、running を受けたら先に落とす。失敗すれば直後の exited/resume_failed が積み直す。

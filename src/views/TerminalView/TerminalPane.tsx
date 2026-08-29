@@ -53,6 +53,12 @@ export function TerminalPane({ sessionId }: { sessionId: string }): null {
             // first_started_at === null を持ちうる。除外は seedRuntimeStates 側の
             // reset 経路にだけある。
             useAppStore.getState().seedRuntimeStates([session]);
+            // ゲート修正 D-1（PR 33 人間ゲート）: seedRuntimeStates は runtimeStates /
+            // runtimeReasons / runtimeErrors しか書かないため、sessions / sessionOrder
+            // への反映は別アクションで行う。resumeSession（sessionSlice.ts）と
+            // 共有する（片方だけから呼ばない）。購読は増やさない
+            // （useAppStore.getState() のみ。契約 §38.3）。
+            useAppStore.getState().applyStartedSession(session);
             // 必達 1（契約 §16 registry.ts）: 再起動された PTY は fitTerminal の
             // 直近サイズキャッシュにより resize_pty が飛ばず 80x24 のままになる。
             // キャッシュを無効化してから寸法を取り直す。
