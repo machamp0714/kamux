@@ -36,6 +36,7 @@ export interface Project {
 // 契約 §34.3: last_runtime_error の直後、archived_at の直前に first_started_at を置く（18 フィールド）。
 // 契約 §20（M3-3）: heuristics_enabled / silence_timeout_secs は first_started_at の後、archived_at の前
 // （src-tauri/src/model.rs の pub struct Session と同じ位置）。
+// 契約 §29.2（M3-4）: is_scratch は silence_timeout_secs の後、archived_at の前。SessionPatch には追加しない。
 export interface Session {
   id: string;
   project_id: string;
@@ -54,6 +55,7 @@ export interface Session {
   first_started_at: number | null;
   heuristics_enabled: boolean;
   silence_timeout_secs: number;
+  is_scratch: boolean;
   archived_at: number | null;
   created_at: number;
   updated_at: number;

@@ -22,6 +22,25 @@
 
 /* components.md「セッションタブ」節: 縦 2 段。kamux-tab 自身をフレックスの
    縦積みコンテナにし、1 段目 __title / 2 段目 __meta（__cli を含む）を並べる */
+/* 契約 §29.7: SESSIONS / SCRATCH の 2 グループ。グループ自体は表示上の
+   まとまりであり間隔だけを持つ（枠や背景は付けない） */
+.kamux-tablist__group + .kamux-tablist__group {
+  margin-top: var(--space-4);
+}
+
+/* components.md「セッションタブ」節: --text-sm / 600 / letter-spacing 0.6px /
+   --text-secondary。letter-spacing は components.md が px で直接指定する
+   部品固有の寸法であり尺度ではないため literal のままでよい（同ファイル内の
+   選択中バー 3px / 30px と同じ扱い） */
+.kamux-tablist__group-label {
+  display: block;
+  padding: 0 var(--space-5) var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  color: var(--text-secondary);
+}
+
 .kamux-tab {
   position: relative;
   display: flex;

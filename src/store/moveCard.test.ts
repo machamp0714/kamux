@@ -34,6 +34,7 @@ const session = (id: string, status: Session['kanban_status'], sortOrder: number
   first_started_at: null,
   heuristics_enabled: true,
   silence_timeout_secs: 30,
+  is_scratch: false,
   archived_at: null,
   created_at: 1,
   updated_at: 1,

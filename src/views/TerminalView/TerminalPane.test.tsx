@@ -74,6 +74,7 @@ function makeSession(overrides: Partial<Session> & { id: string }): Session {
     first_started_at: null,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: false,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
@@ -216,6 +217,41 @@ describe('TerminalPane（計画 §4.10: コマンドの戻り値でも seedRunti
     // 戻り値の Session は mark_first_started の非同期コミットより前に読まれて
     // first_started_at === null を持ちうるため、除外すると自己修復が壊れる
     expect(useAppStore.getState().runtimeStates['s1']).toBe('running');
+  });
+});
+
+describe('TerminalPane（ゲート修正 D-1: start_session の戻り値をカードの列へ反映する）', () => {
+  it('start_session の解決後に applyStartedSession を呼ぶ', async () => {
+    mocks.ensurePtySubscription.mockResolvedValue(undefined);
+    const session = makeSession({
+      id: 's1',
+      kanban_status: 'in_progress',
+      branch: 'feat/gate-fix',
+      worktree_path: '/tmp/gate-fix',
+      sort_order: 5,
+    });
+    mocks.startSession.mockResolvedValue(session);
+    useAppStore.setState({
+      activeProjectId: 'p1',
+      sessions: {},
+      sessionOrder: { backlog: ['s1'], in_progress: [], review: [], done: [] },
+    });
+    const applyStartedSession = vi.spyOn(useAppStore.getState(), 'applyStartedSession');
+
+    renderPane('s1');
+    await flush();
+
+    expect(applyStartedSession).toHaveBeenCalledWith(session);
+    // 呼ばれた「こと」だけでなく、実際にカードが正しい列へ移ることまで確かめる
+    // （D-1 の症状: カードが BACKLOG 列に留まる / ブランチ名が出ない）。
+    expect(useAppStore.getState().sessionOrder).toEqual({
+      backlog: [],
+      in_progress: ['s1'],
+      review: [],
+      done: [],
+    });
+    expect(useAppStore.getState().sessions.s1.branch).toBe('feat/gate-fix');
+    expect(useAppStore.getState().sessions.s1.worktree_path).toBe('/tmp/gate-fix');
   });
 });
 

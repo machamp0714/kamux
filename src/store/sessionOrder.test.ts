@@ -19,6 +19,7 @@ const s = (over: Partial<Session> & { id: string }): Session => ({
   first_started_at: 1,
   heuristics_enabled: true,
   silence_timeout_secs: 30,
+  is_scratch: false,
   archived_at: null,
   created_at: 0,
   updated_at: 0,
@@ -80,6 +81,21 @@ describe('buildSessionOrder', () => {
       'p1',
     );
     expect(order.backlog).toEqual(['a', 'b']);
+  });
+
+  // 契約 §29.4: sessionOrder はスクラッチを含まない。project_id 一致 / archived_at === null
+  // の他の 2 条件で落ちないフィクスチャで測る（他 2 条件だけで落ちていると is_scratch の
+  // 除外が無くても緑になってしまうため）。
+  it('is_scratch のセッションをボードから除外する', () => {
+    const order = buildSessionOrder(
+      [
+        s({ id: 'live', kanban_status: 'backlog', sort_order: 1 }),
+        s({ id: 'scratch', kanban_status: 'backlog', sort_order: 2, is_scratch: true }),
+      ],
+      'p1',
+    );
+    expect(order.backlog).toEqual(['live']);
+    expect(Object.values(order).flat()).not.toContain('scratch');
   });
 });
 

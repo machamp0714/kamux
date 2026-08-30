@@ -25,6 +25,7 @@ export function makeSession(overrides: Partial<Session> & { id: string }): Sessi
     first_started_at: 1,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: false,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
@@ -78,6 +79,16 @@ describe('buildSessionOrder', () => {
     const sessions = toMap([makeSession({ id: 'a', sort_order: 3 })]);
     buildSessionOrder(sessions);
     expect(sessions.a.sort_order).toBe(3);
+  });
+
+  it('is_scratch のセッションを除外する（契約 §29.4、主たる境界）', () => {
+    const order = buildSessionOrder(
+      toMap([
+        makeSession({ id: 'scratch1', kanban_status: 'backlog', sort_order: 1, is_scratch: true }),
+        makeSession({ id: 'normal1', kanban_status: 'backlog', sort_order: 2, is_scratch: false }),
+      ]),
+    );
+    expect(order.backlog).toEqual(['normal1']);
   });
 });
 

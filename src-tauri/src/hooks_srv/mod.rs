@@ -320,6 +320,12 @@ pub struct HooksRuntime {
     pub socket_path: PathBuf,
     pub settings_path: PathBuf,
     pub relay_bin: PathBuf,
+    /// shim ディレクトリの絶対パス。shim 無効時は None（契約 §30.2.1）。
+    ///
+    /// **shim 専用の第 2 の受け渡し口を作らないこと**（契約 §30.2.1 の逐語）。
+    /// 同じファイルに 4 フェーズ（M1-3 / M1-4 / M2-2 / M3-4）が触るため、
+    /// 受け渡し口が 2 つあると env の真実源が 2 箇所になる。
+    pub shim_dir: Option<PathBuf>,
 }
 
 /// 同梱される relay バイナリのファイル名。
@@ -380,6 +386,7 @@ pub fn bootstrap_hooks_in(
     relay_bin: AppResult<PathBuf>,
     socket_path: PathBuf,
     settings_path: PathBuf,
+    shim_dir: Option<PathBuf>,
 ) -> (Option<HooksRuntime>, Option<HooksServer>) {
     // 設計書 §12: hooks が使えなくてもアプリは起動し、汎用ヒューリスティックへ落ちる。
     let relay_bin = match relay_bin {
@@ -407,6 +414,7 @@ pub fn bootstrap_hooks_in(
         socket_path,
         settings_path,
         relay_bin,
+        shim_dir,
     };
     tracing::info!(socket = %runtime.socket_path.display(), "hooks enabled");
     (Some(runtime), Some(server))
@@ -419,6 +427,7 @@ pub fn bootstrap_hooks_in(
 /// 注入できるテストから到達可能にする。
 fn bootstrap_hooks_from(
     dir: &Path,
+    shim_base: Option<&Path>,
     sink: Arc<dyn HookSink>,
     relay_bin: AppResult<PathBuf>,
 ) -> (Option<HooksRuntime>, Option<HooksServer>) {
@@ -443,12 +452,23 @@ fn bootstrap_hooks_from(
         }
     };
 
-    bootstrap_hooks_in(sink, relay_bin, socket_path, settings_path)
+    // shim の書き出し（契約 §30.1）。`dir`（ランタイムファイル置き場 = $TMPDIR）とは
+    // **別のディレクトリ**である —— shim は `~/Library/Application Support/kamux/shim`
+    // に置く。書き出しに失敗しても `None`（= shim 無効）になるだけで hooks は生きる。
+    let shim_dir = crate::shim::install_shims_or_none(shim_base);
+
+    bootstrap_hooks_in(sink, relay_bin, socket_path, settings_path, shim_dir)
 }
 
 /// 実環境版。アプリ起動時に 1 回だけ呼ぶ。
 pub fn bootstrap_hooks(sink: Arc<dyn HookSink>) -> (Option<HooksRuntime>, Option<HooksServer>) {
-    bootstrap_hooks_from(&std::env::temp_dir(), sink, resolve_relay_bin())
+    let shim_base = crate::shim::shim_base_dir().ok();
+    bootstrap_hooks_from(
+        &std::env::temp_dir(),
+        shim_base.as_deref(),
+        sink,
+        resolve_relay_bin(),
+    )
 }
 
 #[cfg(test)]
@@ -1287,6 +1307,7 @@ mod tests {
             Err(AppError::CliNotFound("relay missing".into())),
             hooks_socket_path().expect("sock"),
             dir.join("settings.json"),
+            None,
         );
 
         assert!(
@@ -1314,6 +1335,7 @@ mod tests {
             Ok(relay.clone()),
             sock.clone(),
             settings.clone(),
+            None,
         );
 
         let runtime = runtime.expect("hooks must be enabled");
@@ -1352,7 +1374,8 @@ mod tests {
         let settings = dir.join("no-such-subdir").join("settings.json");
 
         let sink = Arc::new(RecordingSink::default());
-        let (runtime, server) = bootstrap_hooks_in(sink, Ok(relay), sock.clone(), settings.clone());
+        let (runtime, server) =
+            bootstrap_hooks_in(sink, Ok(relay), sock.clone(), settings.clone(), None);
 
         assert!(
             runtime.is_none(),
@@ -1361,6 +1384,67 @@ mod tests {
         assert!(server.is_none());
         assert!(!settings.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 契約 §30.1 / §30.2.1: shim は `HooksRuntime` に載る。**受け渡し口は 1 本**。
+    ///
+    /// `shim_base` を渡したら (1) 実ファイルが書き出され、(2) その絶対パスが
+    /// `runtime.shim_dir` に載ることを見る。`install_shims_or_none` の呼び出しごと
+    /// 落とす変異、または `shim_dir` へ `None` を渡す変異はここで赤くなる。
+    #[test]
+    fn bootstrap_hooks_from_installs_the_shims_and_carries_the_dir_on_the_runtime() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-shim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+        let shim_base = dir.join("app-support");
+        std::fs::create_dir_all(&shim_base).expect("mkdir shim base");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) =
+            bootstrap_hooks_from(&dir, Some(&shim_base), sink, Ok(relay.clone()));
+
+        let runtime = runtime.expect("hooks must be enabled");
+        assert_eq!(
+            runtime.shim_dir,
+            Some(shim_base.join("shim")),
+            "shim ディレクトリが HooksRuntime に載っていない"
+        );
+        // ランタイムファイルの置き場（$TMPDIR 相当の `dir`）とは別のディレクトリである。
+        assert!(
+            !runtime
+                .shim_dir
+                .as_ref()
+                .expect("shim dir")
+                .starts_with(dir.join("kamux-hooks")),
+            "shim をランタイムファイルの置き場へ書いている"
+        );
+        assert!(shim_base.join("shim").join("claude").is_file());
+        assert!(shim_base.join("shim").join("codex").is_file());
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// shim 無効（`shim_base == None`）でも hooks は生きる。`shim_dir` は `None` の
+    /// ままであり、契約 §64.5.1 の「shim 無効時は §23 / §30.2 の既存規定のまま」に
+    /// 落ちる。
+    #[test]
+    fn bootstrap_hooks_from_leaves_the_shim_dir_none_when_no_base_is_given() {
+        let dir = std::env::temp_dir().join(format!("kamux-boot-noshim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let relay = dir.join(RELAY_BIN_NAME);
+        std::fs::write(&relay, b"").expect("write relay");
+
+        let sink = Arc::new(RecordingSink::default());
+        let (runtime, server) = bootstrap_hooks_from(&dir, None, sink, Ok(relay));
+
+        assert_eq!(runtime.expect("hooks must be enabled").shim_dir, None);
+
+        drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1383,7 +1467,7 @@ mod tests {
         std::fs::write(&relay, b"").expect("write relay");
 
         let sink = Arc::new(RecordingSink::default());
-        let (runtime, server) = bootstrap_hooks_from(&dir, sink, Ok(relay.clone()));
+        let (runtime, server) = bootstrap_hooks_from(&dir, None, sink, Ok(relay.clone()));
 
         let runtime = runtime.expect("hooks must be enabled");
 

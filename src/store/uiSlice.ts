@@ -93,7 +93,11 @@ export interface UiSlice {
    */
   focusSession: (sessionId: string, view?: AppStore['view']) => void;
   modal: ModalState | null;
-  /** 副作用: setView('kanban')。Cmd+N はターミナル画面からも効く（契約 §11）。 */
+  /**
+   * 副作用: setView('kanban')。Cmd+N はターミナル画面からも効く（契約 §11）。
+   * 開くときは開いている他のオーバーレイ（cleanupDialog / projectSwitcherOpen /
+   * deleteProjectDialog）を閉じる。
+   */
   openModal: (m: ModalState) => void;
   /** Cmd+P のプロジェクトスイッチャーの開閉（M3-4 Task 12）。 */
   projectSwitcherOpen: boolean;
@@ -111,7 +115,11 @@ export interface UiSlice {
   setEditorSurface: (sessionId: string, status: EditorSurfaceStatus | null) => void;
   /** worktree 掃除ダイアログの状態。null = 閉じている。 */
   cleanupDialog: CleanupDialogState | null;
-  /** worktree_status を取りに行きつつダイアログを開く（契約 §7.2）。 */
+  /**
+   * worktree_status を取りに行きつつダイアログを開く（契約 §7.2）。
+   * 開くときは開いている他のオーバーレイ（modal / projectSwitcherOpen /
+   * deleteProjectDialog）を閉じる。
+   */
   openCleanupDialog: (sessionId: string) => Promise<void>;
   closeCleanupDialog: () => void;
   /** cleanup_worktree を確定する。成功したらダイアログを閉じてセッション一覧を取り直す。 */

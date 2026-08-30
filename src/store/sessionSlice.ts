@@ -1,10 +1,12 @@
 import type { StateCreator } from 'zustand';
 
 import {
+  createScratchSession,
   createSession,
   listSessions,
   moveSession,
   resumeSession as resumeSessionCmd,
+  stopSession,
   updateSession as updateSessionCmd,
   type CreateSessionArgs,
 } from '../ipc/commands';
@@ -23,10 +25,14 @@ import type {
   SessionStatePayload,
   StateReason,
 } from '../types/model';
-import { surfaceId } from '../types/model';
+import { KANBAN_STATUSES, surfaceId } from '../types/model';
 import { emptySessionOrder, moveCardInOrder } from './kanbanOrder';
 import { buildSessionOrder as buildProjectSessionOrder, compareSessionOrder } from './sessionOrder';
 import type { AppStore } from './index';
+// 契約 §85.1 の不変条件を維持する唯一の出口。terminalSlice.ts は M3-2 の所有だが、
+// ここは import するだけで 1 行も変更しない（直接 set({ paneAssignment }) すると
+// focusedSessionId === paneAssignment[activePane] が破れる）。
+import { withFocus } from './terminalSlice';
 import { toAppError } from './uiSlice';
 
 export { emptySessionOrder, indexSessions } from './kanbanOrder';
@@ -62,7 +68,7 @@ export interface SessionSlice {
   runtimeErrors: Record<string, string>;
   /**
    * reason: 'resume_failed'（契約 §8 の StateReason）を受け取ったセッションの id 集合。
-   * InterruptedOverlay / KanbanCardResume の「新しい会話として開始」導線と
+   * KanbanCardResume の「新しい会話として開始」導線と
    * retryResumeAsFresh はこの配列だけを見る（第1部 §4.4）。
    *
    * 出入りの規則（両方とも applyStateEvent が担う。resumeSession アクションの
@@ -87,6 +93,27 @@ export interface SessionSlice {
    * による全列再構築は使わない。他カードの並びは 1 つも変えない）。
    */
   restoreSession: (id: string) => Promise<void>;
+  /**
+   * ゲート修正 D-1（PR 33 人間ゲート）: start_session / resume_session の戻り値を
+   * ストアへ反映する共有アクション。片方の呼び出し元からしか呼ばない形にしないこと
+   * （TerminalPane の起動成功腕と resumeSession の両方から呼ぶ）。
+   *
+   * 契約 §144.8 のハザード（正典 §155.4）: 局所挿入は buildSessionOrder が持つ
+   * フィルタ（archived_at / is_scratch / project_id）を全部迂回するので、この
+   * アクションが自前で当てる。3 つのうち 1 つでも欠けると盤面を汚す
+   * （restoreSession の is_scratch ガード欠落＝PR 33 全体レビュー Critical 1 と同型）。
+   *
+   * - sessions[session.id] は渡された Session を丸ごと入れる（フィールドを選ばない）。
+   * - archived_at !== null / is_scratch === true / project_id !== activeProjectId の
+   *   いずれかなら sessionOrder には一切触れない（sessions への反映は行う）。
+   * - buildSessionOrder による全列再構築はしない（restoreSession / archiveSession と
+   *   同じ理由。moveCard の in-flight 中に他カードが古い sort_order の位置へ吸着する）。
+   * - 冪等: 全 4 列から対象 id を除去してから挿入位置を探す。
+   * - 挿入位置は compareSessionOrder（sort_order 昇順・id タイブレーク）だけで決める。
+   *   土台の列自体の並びは変えない。
+   * - 列の中身が変わらなければ sessionOrder の参照を保つ（無用な再レンダリングを避ける）。
+   */
+  applyStartedSession: (session: Session) => void;
   applyStateEvent: (p: SessionStatePayload) => void;
   /**
    * last_runtime_state から初期値を埋める。
@@ -100,13 +127,30 @@ export interface SessionSlice {
    * 許可リスト（契約 §40.3）の複製はしない。ズレの境界は契約 §42.3.1 が定めている。
    */
   setRuntimeError: (sessionId: string, message: string) => void;
-  /** カードの再開ボタン / InterruptedOverlay が呼ぶ（第1部 §4.4: 経路を分けない）。 */
+  /** カードの再開ボタン（KanbanCardResume）が呼ぶ（第1部 §4.4: 経路を分けない）。 */
   resumeSession: (sessionId: string) => Promise<void>;
   /**
    * 無効な claude_session_id を捨ててから再開する（第1部 §4.2）。
    * SessionPatch は claude_session_id のクリアだけを受け付ける（§4.9）。
    */
   retryResumeAsFresh: (sessionId: string) => Promise<void>;
+  /**
+   * Cmd+T（契約 §29.8）。フォーカス中ペインにスクラッチ端末を新規作成する。
+   * アクティブプロジェクトが無ければ何もしない（Ruling 20-E）。
+   * 作成した Session は sessions へ挿入するが sessionOrder には入れない
+   * （契約 §29.4 の除外）。そのうえで assignPane(activePane, created.id) を呼ぶ
+   * （Ruling 20-F）。
+   */
+  createScratchTerminal: () => Promise<void>;
+  /**
+   * Cmd+W（契約 §29.8）。フォーカス中ペインのスクラッチを閉じる。対象はスクラッチ
+   * だけ（Ruling 20-C）—— is_scratch !== true なら stopSession も archiveSession も
+   * 呼ばずに return する。新しいアーカイブ経路は書かず、stopSession(id) を呼んでから
+   * 既存の archiveSession(id) を呼ぶ（Ruling 20-B。ロールバックとプロジェクト切替
+   * ガードを二重に書かないため）。archive のあと、閉じたスクラッチが載っていた
+   * ペインの割当を外す（ゲート修正 A3。本体の実装コメントに理由がある）。
+   */
+  closeScratchTerminal: () => Promise<void>;
 }
 
 export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = (set, get) => ({
@@ -288,7 +332,11 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // アーカイブされていない（archived_at: null の）セッションに restoreSession を
     // 呼ぶ経路（paneInvariant.test.ts の ARGS がその 1 つ）では、ガードが無いと
     // 同じ id が列に 2 つ入る（archive.test.ts の冪等性テストで実測）。
-    if (!column.includes(id)) {
+    // is_scratch ガード（契約 §29.4。PR 33 全体レビュー Critical 1）: sessionOrder は
+    // スクラッチを含まない。restoreSession は buildSessionOrder を通らない局所挿入
+    // なので、自前でガードしないとアーカイブ済みスクラッチの復元が sessionOrder を
+    // 汚す。sessions への archived_at: null の反映は変えない（SCRATCH タブへ戻るため）。
+    if (!target.is_scratch && !column.includes(id)) {
       // 挿入位置は (sort_order, id) の全順序で決める（契約 §144.7 / 裁定 72）。
       // 土台 column の並び自体は 1 つも変えない —— 「column の中で restoredTarget
       // より全順序上前に来るべき要素の個数」を数えるだけなので、column の並び順が
@@ -317,6 +365,54 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       throw e;
     }
   },
+
+  applyStartedSession: (session) =>
+    set((s) => {
+      const sessions = { ...s.sessions, [session.id]: session };
+      // 契約 §29.4 / §144.8（正典 §155.4）: 局所挿入は buildSessionOrder の
+      // フィルタを通らないので、3 つを自前で当てる。真でなければ sessionOrder には
+      // 一切触れない（sessions への反映だけは行う）。
+      if (
+        session.archived_at !== null ||
+        session.is_scratch === true ||
+        session.project_id !== s.activeProjectId
+      ) {
+        return { sessions };
+      }
+
+      const targetStatus = session.kanban_status;
+      const nextOrder: Record<KanbanStatus, string[]> = { ...s.sessionOrder };
+      // 冪等性ガード: 対象の列以外に同じ id が残っていれば先に除去する
+      // （TerminalPane の effect 再実行・resumeSession の二度押しで起こりうる）。
+      let removedFromOtherColumn = false;
+      for (const status of KANBAN_STATUSES) {
+        if (status === targetStatus) continue;
+        const column = s.sessionOrder[status];
+        if (column.includes(session.id)) {
+          nextOrder[status] = column.filter((sid) => sid !== session.id);
+          removedFromOtherColumn = true;
+        }
+      }
+
+      // 挿入位置は (sort_order, id) の全順序（compareSessionOrder）だけで決める。
+      // 土台 withoutTarget の並び自体は 1 つも変えない（restoreSession と同じ形）。
+      const withoutTarget = s.sessionOrder[targetStatus].filter((sid) => sid !== session.id);
+      const insertAt = withoutTarget.filter(
+        (sid) => compareSessionOrder(sessions[sid], session) < 0,
+      ).length;
+      const nextTargetColumn = [...withoutTarget];
+      nextTargetColumn.splice(insertAt, 0, session.id);
+
+      // P6: 列が変わらないなら sessionOrder の参照を保つ（無用な再レンダリングを避ける）。
+      const targetColumnUnchanged =
+        !removedFromOtherColumn &&
+        nextTargetColumn.length === s.sessionOrder[targetStatus].length &&
+        nextTargetColumn.every((sid, i) => sid === s.sessionOrder[targetStatus][i]);
+      if (targetColumnUnchanged) return { sessions };
+
+      nextOrder[targetStatus] = nextTargetColumn;
+      return { sessions, sessionOrder: nextOrder };
+    }),
 
   applyStateEvent: (p) =>
     set((s) => {
@@ -370,9 +466,9 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
     // バックエンドの二重起動ガードである。レビュー task-1-review.md Minor 訂正）。
     // 🔴 この順序（ペインの .then よりこちらの .then が先に登録されるので markStarted が
     // 先に走る）は「再開ボタンを押す時点で TerminalPane が必ず未マウントである」
-    // （App.tsx の view ゲート）に依存する。InterruptedOverlay など terminal 面へ
-    // 再開ボタンを持ち込む変更を入れる際は、先にこの競合（マイクロタスク順の逆転）を
-    // 解くこと（レビュー task-1-review.md I-3）。
+    // （App.tsx の view ゲート）に依存する。terminal 面へ再開ボタンを持ち込む変更を
+    // 入れる際は、先にこの競合（マイクロタスク順の逆転）を解くこと
+    // （レビュー task-1-review.md I-3）。
     const surface = surfaceId(sessionId, 'agent');
 
     // 段 1: listen 登録の完了を待つ（契約 §16）。待たずに invoke すると、再開直後の
@@ -414,8 +510,10 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       get().setRuntimeError(sessionId, toAppError(e).message);
       throw e;
     }
+    // ゲート修正 D-1: sessionOrder への反映は applyStartedSession（TerminalPane の
+    // 起動成功腕と共有）へ委ねる。resumeFailedSessionIds の除去は既存どおり別途行う。
+    get().applyStartedSession(session);
     set((s) => ({
-      sessions: { ...s.sessions, [sessionId]: session },
       resumeFailedSessionIds: s.resumeFailedSessionIds.filter((id) => id !== sessionId),
     }));
   },
@@ -479,6 +577,58 @@ export const createSessionSlice: StateCreator<AppStore, [], [], SessionSlice> = 
       }
       return changed ? { runtimeStates: next, runtimeErrors: nextErrors } : {};
     }),
+
+  createScratchTerminal: async () => {
+    const projectId = get().activeProjectId;
+    if (projectId === null) return;
+    // cwd は常に null を渡す（契約 §29.3: None なら project.repo_path）。
+    const created = await createScratchSession(projectId, null);
+    // ゲート修正 A2（PR 33 人間ゲート）: create_scratch_session はバックエンドで
+    // 既に spawn 済みである。markStarted を呼ばずに assignPane すると、
+    // TerminalPane のマウントが isStarted の門を素通りして start_session を投げ、
+    // バックエンドの二重起動ガードに invalid_state で撥ねられる
+    // （src-tauri/src/session/mod.rs:75）。加えて失敗腕は unmarkStarted を呼ぶため
+    // isStarted が false のまま残り、resize_pty が飛ばず 80x24 に固着する
+    // （fitScheduler.ts の isStarted 門）。assignPane より前に呼ぶこと —— 後ろだと
+    // TerminalPane のマウントとの順序が React のスケジューリング次第になる。
+    markStarted(surfaceId(created.id, 'agent'));
+    set((s) => ({ sessions: { ...s.sessions, [created.id]: created } }));
+    get().assignPane(get().activePane, created.id);
+  },
+
+  closeScratchTerminal: async () => {
+    const id = get().focusedSessionId;
+    if (id === null) return;
+    const target = get().sessions[id];
+    // スクラッチ限定の門（Ruling 20-C）。本物のセッションはここで何も呼ばずに抜ける。
+    if (target === undefined || !target.is_scratch) return;
+    await stopSession(id);
+    await get().archiveSession(id);
+    // ゲート修正 A3（PR 108 人間ゲート）: 閉じたスクラッチをペインから外す。
+    // 外さないとタブ列（terminalSlice の archived_at フィルタ）とカンバンからは
+    // 消えるのにペインには載ったままになり、TerminalGrid が再マウントされた時点で
+    // TerminalPane がもう一度描かれる。stop_session を受けた pty://exit が
+    // 二重起動の門（ptyBridge の startedSurfaces）を開けているので start_session が
+    // 通り、UI のどこにも現れない $SHELL -l が立ち上がる。
+    //
+    // 走査は activePane ではなく id で行う。stopSession / archiveSession の 2 つの
+    // await をまたぐ間に Cmd+] やタブクリックで activePane は動きうるため、
+    // await 後の activePane のスロットを null にすると別のセッションを外しうる。
+    //
+    // set は必ず withFocus を通す（契約 §85.1: focusedSessionId === paneAssignment[activePane]
+    // を focusedSessionId を書くすべてのアクションが出口で維持する）。
+    const pane = get();
+    set(
+      withFocus({
+        layout: pane.layout,
+        activePane: pane.activePane,
+        paneAssignment: [
+          pane.paneAssignment[0] === id ? null : pane.paneAssignment[0],
+          pane.paneAssignment[1] === id ? null : pane.paneAssignment[1],
+        ],
+      }),
+    );
+  },
 });
 
 /**

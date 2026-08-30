@@ -35,6 +35,7 @@ const session = (id: string, projectId: string): Session => ({
   first_started_at: null,
   heuristics_enabled: true,
   silence_timeout_secs: 30,
+  is_scratch: false,
   archived_at: null,
   created_at: 1,
   updated_at: 1,
@@ -109,6 +110,7 @@ describe('deleteProjectDialog', () => {
   });
 
   // 往復中に別のプロジェクトへ開き直したら、古い応答は捨てる（openCleanupDialog と同じ形）。
+  // 到達可能な経路の再現ではなく、遅延 set の書き込み射程の固定である。
   it('往復中に対象が変わったら古い応答を適用しない', async () => {
     listSessions.mockImplementation((projectId: string) =>
       projectId === 'p7' ? Promise.resolve([session('old', 'p7')]) : Promise.resolve([]),
@@ -130,6 +132,7 @@ describe('deleteProjectDialog', () => {
   // 対象が変わっていたら古い reject を適用してはいけない（先例は
   // `uiSlice.overlayExclusion.test.ts` の
   // 'openCleanupDialog の遅延応答（catch 側）は、往復中に対象がずれたら modal に触れない'）。
+  // 到達可能な経路の再現ではなく、遅延 set の書き込み射程の固定である。
   it('往復中に対象が変わったら古い応答（catch 側）を適用しない', async () => {
     let rejectSessions: (e: { code: string; message: string }) => void = () => {};
     listSessions.mockImplementation(

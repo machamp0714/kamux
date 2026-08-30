@@ -166,8 +166,19 @@ pub fn parse_hook_event(bytes: &[u8]) -> Result<HookEvent, serde_json::Error> {
     })
 }
 
+/// # なぜ `pub(crate)` か
+///
+/// この中の `capture_events` / `CapturedEvent` は `tracing` イベントを構造化して
+/// 拾う唯一のテストハーネスである。**同じプロセスに subscriber は 1 人しか立てられず**
+/// （`install_capture_subscriber` は `set_global_default` を `OnceLock` で 1 回だけ
+/// 呼ぶ。`lib.rs` の `init_tracing_subscriber` の doc も同じことを書いている）、
+/// 別モジュールで同型のハーネスを複製すると 2 人目の `set_global_default` が失敗して
+/// どちらか一方のテストが並列実行の順序に依存して落ちる。**複製ではなく共有する。**
+///
+/// 現在の利用者は本モジュールのテストと `session/mod.rs` のテスト（契約 §64.3 の
+/// 1 行が `PtyManager::spawn` の**成功直後**に出ることの観測）である。
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -181,10 +192,10 @@ mod tests {
     /// ここではイベントをフィールド単位で構造化して記録し、フィールド値を
     /// 個別に assert する。
     #[derive(Debug, Clone)]
-    struct CapturedEvent {
-        level: tracing::Level,
-        message: String,
-        fields: BTreeMap<String, String>,
+    pub(crate) struct CapturedEvent {
+        pub(crate) level: tracing::Level,
+        pub(crate) message: String,
+        pub(crate) fields: BTreeMap<String, String>,
     }
 
     type Sink = Arc<Mutex<Vec<CapturedEvent>>>;
@@ -315,7 +326,7 @@ mod tests {
     }
 
     /// `f` を実行しつつ、その間に鳴った `tracing` イベントをすべて集めて返す。
-    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+    pub(crate) fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
         install_capture_subscriber();
         let sink: Sink = Arc::new(Mutex::new(Vec::new()));
         let guard = SinkGuard::install(Arc::clone(&sink));

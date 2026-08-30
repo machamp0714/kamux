@@ -27,6 +27,7 @@ const s = (over: Partial<Session> & { id: string }): Session => ({
   first_started_at: 1,
   heuristics_enabled: true,
   silence_timeout_secs: 30,
+  is_scratch: false,
   archived_at: null,
   created_at: 0,
   updated_at: 0,
@@ -226,6 +227,28 @@ describe('アーカイブと復元', () => {
     // するので、土台がずれていても決定的）。x(3) は a(2) より後、y(1) は a(2)
     // より前 → 前に来るべき要素は y の 1 個だけなので index 1 に挿入する。
     expect(useAppStore.getState().sessionOrder.done).toEqual(['x', 'a', 'y']);
+  });
+
+  // 契約 §29.4: sessionOrder はスクラッチを含まない。restoreSession は局所挿入で
+  // buildSessionOrder を通らないため、is_scratch のガードを自前で持たなければ
+  // アーカイブ済みスクラッチの復元が sessionOrder を汚す（PR 33 全体レビュー Critical 1）。
+  it('is_scratch のセッションを復元しても sessionOrder へは挿入しない', async () => {
+    useAppStore.setState({
+      sessions: {
+        sc: s({ id: 'sc', is_scratch: true, sort_order: 0, archived_at: 1754006400000 }),
+        b: s({ id: 'b', sort_order: 2 }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: ['b'] },
+    });
+    updateSession.mockResolvedValue(
+      s({ id: 'sc', is_scratch: true, sort_order: 0, archived_at: null }),
+    );
+
+    await useAppStore.getState().restoreSession('sc');
+
+    expect(useAppStore.getState().sessionOrder.done).toEqual(['b']);
+    // sessions 側の archived_at 反映は変えない（SCRATCH タブへ戻るために必要）。
+    expect(useAppStore.getState().sessions.sc.archived_at).toBeNull();
   });
 
   // 挿入探索は compareSessionOrder（sort_order, id の全順序）を使う。sort_order だけの

@@ -6,6 +6,9 @@ import type { ViewKind } from '../types/model';
  * M1-3 は Cmd+2 と Cmd+J / Cmd+K を追加した。M3-1 は Cmd+3 を追加した。
  * M3-2 が Cmd+D / Cmd+[ / Cmd+]（と WKWebView 奪取時のフォールバック Cmd+Alt+←/→）を追加する。
  * Cmd+P（M3-4）はこのユニオンの toggle_project_switcher で追加した。
+ * Cmd+T / Cmd+W（M3-4 Task 20、契約 §29.8）は resolveTerminalOnlyAction の中に
+ * 足した。ここに置くことで Ctrl 排他（規則 C）・Alt 排他（規則 A）・terminal 限定の
+ * view 条件（§11.4.2）の 3 つが構造的に付いてくる（契約 §97.2）。
  *
  * 契約 §11.3-4「キー → アクションの対応表の正典は §11 であり、その実装は同時に
  * 1 つだけ存在してよい」により、terminal 画面固有のキーも独立した解決関数へ
@@ -18,20 +21,22 @@ export type KeymapAction =
   | { type: 'cycle_session'; dir: 1 | -1 }
   | { type: 'set_active_pane'; pane: PaneIndex }
   | { type: 'toggle_layout' }
-  | { type: 'toggle_project_switcher' };
+  | { type: 'toggle_project_switcher' }
+  | { type: 'create_scratch_terminal' }
+  | { type: 'close_scratch_terminal' };
 
 export interface KeymapEvent {
   key: string;
   metaKey: boolean;
-  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] の判定に使う（Ctrl 併用時はアプリが消費しない。契約 §97.2 規則 C） */
+  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] / Cmd+T / Cmd+W の判定に使う（Ctrl 併用時はアプリが消費しない。契約 §97.2 規則 C） */
   ctrlKey: boolean;
-  /** Cmd+Alt+←/→（Cmd+[/] のフォールバック）の判定に使う */
+  /** Cmd+Alt+←/→（Cmd+[/] のフォールバック）の判定と、Cmd+D / Cmd+T / Cmd+W の Alt 排他（契約 §97.2 規則 A）の判定に使う */
   altKey: boolean;
 }
 
 export interface KeymapContext {
   modalOpen: boolean;
-  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] は terminal 画面でのみ有効（契約 §11.4.2） */
+  /** Cmd+J / Cmd+K / Cmd+D / Cmd+[ / Cmd+] / Cmd+T / Cmd+W は terminal 画面でのみ有効（契約 §11.4.2） */
   view: ViewKind;
 }
 
@@ -56,6 +61,11 @@ function resolveTerminalOnlyAction(e: KeymapEvent): KeymapAction | null {
   }
 
   if (e.key === 'd' || e.key === 'D') return { type: 'toggle_layout' };
+  // 契約 §29.8 / §97.2: Cmd+T / Cmd+W はここ（Ctrl ガードと Alt ガードの後）に置くことで
+  // 規則 C（Ctrl 排他）・規則 A（Alt 排他）・terminal 限定の view 条件の 3 つが
+  // resolveTerminalOnlyAction 経由で構造的に付いてくる。
+  if (e.key === 't' || e.key === 'T') return { type: 'create_scratch_terminal' };
+  if (e.key === 'w' || e.key === 'W') return { type: 'close_scratch_terminal' };
   if (e.key in PANE_KEY_TABLE) {
     return { type: 'set_active_pane', pane: PANE_KEY_TABLE[e.key] };
   }

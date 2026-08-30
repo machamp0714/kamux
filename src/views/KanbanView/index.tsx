@@ -146,7 +146,19 @@ export function KanbanView() {
             <KanbanColumn
               key={status}
               status={status}
-              sessionIds={sessionOrder[status]}
+              // 二重防御（契約 §29.4）。主たる境界は buildSessionOrder と
+              // move_session（session_dao.rs）。sessionOrder に scratch の id が
+              // 紛れ込んでもここで落とす。sessions[id] は undefined になりうる
+              // （move_session の戻り値を反映する経路が buildSessionOrder を経由しない
+              // ため、sessionOrder にあって sessions に無い id が到達しうる）。
+              // 未知 id は残さず落とす —— KanbanColumn は
+              // `<SortableCard session={sessions[id]} />` と非オプショナルな
+              // props で渡しており（SortableCard.tsx の `session: Session`）、
+              // 未知 id がここを通り抜けると SortableCard 内部の
+              // `session.id` 参照で描画時に throw する（task-18-review.md I-2 (c)）。
+              sessionIds={sessionOrder[status].filter(
+                (id) => sessions[id] !== undefined && !sessions[id].is_scratch,
+              )}
               sessions={sessions}
             />
           ))}
@@ -157,9 +169,15 @@ export function KanbanView() {
       </DndContext>
 
       {/* open が false の間は自分で null を返す（M3-4 Task 10）。 */}
+      {/* is_scratch は表示側の二重防御（契約 §29.4。PR 33 全体レビュー Critical 1）。
+          sessionOrder への挿入を止めるのは restoreSession のガード（sessionSlice.ts）で、
+          ここは起動時の自動アーカイブ（§29.5）でストアに載ったアーカイブ済みスクラッチを
+          「復元」ボタン付きで並ばせないための入口封鎖。 */}
       <ArchivedDrawer
         open={showArchived}
-        sessions={Object.values(sessions).filter((s) => s.project_id === activeProjectId)}
+        sessions={Object.values(sessions).filter(
+          (s) => s.project_id === activeProjectId && !s.is_scratch,
+        )}
         onRestore={(id) => {
           restoreSession(id).catch((e: unknown) => setError(toAppError(e)));
         }}

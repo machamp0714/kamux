@@ -6,6 +6,7 @@ pub mod notify;
 pub mod perf;
 pub mod pty;
 pub mod session;
+pub mod shim;
 pub mod state;
 pub mod store;
 pub mod worktree;
@@ -23,7 +24,10 @@ use crate::notify::{
     mac_sink, ClickHandler, LabelResolver, NotificationSink, Notifier, NotifyPermission,
     SessionLabel, ViewKind,
 };
-use crate::session::runtime_state::{RuntimeStateManager, StatePersist, TauriEmitObserver};
+use crate::session::runtime_state::{
+    RuntimeStateManager, StateLineObserver, StateLineSink, StatePersist, TauriEmitObserver,
+    TracingLineSink,
+};
 use crate::state::AppState;
 use crate::store::{db_path, now_ms, Store};
 
@@ -530,7 +534,13 @@ fn install_app_state<R: tauri::Runtime, M: Manager<R>>(
     // `mac_sink::read_permission()` を残すと `cargo test` のたびに実 OS API
     // （`get_notification_settings()`）が叩かれてしまう（実測: 修正前は 11 回）。
     let permission = mac_sink::read_permission();
-    install_app_state_with(manager, store, persist, sink, permission, bootstrap);
+    // 裁定 119 レビュー修正: 実 sink を差す結線はここにある（`sink` / `permission` と
+    // 同じ形）。既定は `TracingLineSink`（`init_tracing_subscriber()` が INFO で
+    // 立てた subscriber へ出す）。
+    let line_sink: Arc<dyn StateLineSink> = Arc::new(TracingLineSink);
+    install_app_state_with(
+        manager, store, persist, sink, permission, bootstrap, line_sink,
+    );
 }
 
 /// 通知バナーがクリックされたときの処理を組み立てる。
@@ -611,6 +621,7 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     sink: Arc<dyn NotificationSink>,
     permission: NotifyPermission,
     bootstrap: HooksBootstrap,
+    line_sink: Arc<dyn StateLineSink>,
 ) {
     let notifier = build_notifier(Arc::clone(&store), sink, permission);
     let runtime = RuntimeStateManager::new(persist);
@@ -623,6 +634,14 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
         manager.app_handle().clone(),
         Arc::clone(&notifier),
     )));
+    // 裁定 119（契約 §121.3 / §121.4）レビュー修正: 手動スモーク項目 1 / 5 / 9 / 10 が
+    // `session://state` の `reason` を読む入口。`line_sink` を引数に出しているのは
+    // `sink` / `permission` と同じ理由である —— production の既定は `TracingLineSink`
+    // （`init_tracing_subscriber()` が INFO で立てた subscriber へ出す）だが、
+    // テストから「StateLineObserver が実際に register_observer されているか」を
+    // 観測するには記録用の `StateLineSink` を差せる seam が要る。実 sink を差す
+    // 結線は `install_app_state` 側にある。
+    runtime.register_observer(Arc::new(StateLineObserver::new(line_sink)));
 
     // 起動時の Dock バッジは必ず空から始める。**DB の `last_runtime_state` から
     // 復元してはならない。** 理由は 2 つ:
@@ -661,6 +680,34 @@ fn install_app_state_with<R: tauri::Runtime, M: Manager<R>>(
     // 「まだ配らない」で塞ぐ —— `sender()` は `&self` なので、返した時点で誰でも
     // 入力を積めてしまう。
     //
+    // 契約 §29.5（裁定 2）: スクラッチの自動アーカイブは `normalize_on_startup()` の
+    // **前**に行う。`normalize_on_startup` は `{running, waiting_input}` を
+    // `interrupted` へ書き換えるため、後で判定すると「前回 running だった行」と
+    // 「2 起動前から死んでいる行」がどちらも `interrupted` になり区別が付かない。
+    // 判定に使える情報が在るのは正規化の前だけである。
+    //
+    // 免除集合 `SCRATCH_SURVIVING_STATES` は「今回の起動で作業中だったものを黙って
+    // 消さない」ためであって恒久的な保護ではない（裁定 3）。今回免除された行は
+    // 次回の起動では `interrupted` になり免除集合に入らなくなるため、次回アーカイブ
+    // される。§29.5 の「ユーザーが閉じるまで消さない」は今回の起動 1 回分の意味であり、
+    // 恒久的に免除すると §29.5 自身が防ごうとした「SCRATCH グループが際限なく伸びる」
+    // 蓄積がそのまま起きる。
+    match store
+        .archive_stale_scratch_sessions(&crate::session::runtime_state::SCRATCH_SURVIVING_STATES)
+    {
+        Ok(archived) if !archived.is_empty() => {
+            eprintln!(
+                "[kamux] archived {} stale scratch session(s)",
+                archived.len()
+            );
+        }
+        Ok(_) => {}
+        // 失敗しても起動を続ける（`normalize_on_startup` の直後の Err 分岐と同じ形。
+        // 契約 §0 が panic 経路を禁じているのと、正規化と同じくアーカイブも冪等で
+        // 次回起動で自己修復するため）。
+        Err(err) => eprintln!("[kamux] scratch archive failed: {err}"),
+    }
+
     // WebView はまだ listen していないので、ここではイベントを出さない（計画 §4.9）。
     // フロントは `list_sessions` の戻り値（正規化済みの `last_runtime_state`）から
     // シードする。
@@ -789,11 +836,130 @@ fn init_tracing_subscriber() {
     }
 }
 
+/// アプリのメインメニューを組み立てる（契約 §29.8）。
+///
+/// **`Cmd+W` を実装する前提条件として、既定の Close Window 項目を持たないメニューを
+/// 明示的に組み直す**（brief の実装方針 (b)）。既定メニュー
+/// （`tauri::menu::Menu::default`。`app.rs:2245-2249` により `.menu()` を呼ばない限り
+/// 現在はこれが使われている）と同じ構成を、macOS 限定で複製する
+/// （契約 §0: 対象 OS は macOS のみ、クロスプラットフォーム分岐を作り込まない）。
+///
+/// 既定との差分は 2 つだけ:
+/// 1. **`PredefinedMenuItem::close_window` を一度も呼ばない。** 既定では File
+///    サブメニューと Window サブメニューの両方に現れる（`tauri-2.11.5/src/menu/menu.rs:163,209`
+///    を実測）。File サブメニューは既定でもこの 1 項目しか持たないため、削除すると
+///    空の File メニューが残る。空のドロップダウンを見せるより、File サブメニュー自体を
+///    落とす
+/// 2. Window サブメニューは minimize / maximize だけを残す（既定にあった
+///    close_window の直前のセパレータも、対になる項目が無いので落とす）
+///
+/// **落としてはならないもの**（brief の「落とすと壊れるもの」）:
+/// - **quit（Cmd+Q）。** `kill_on_run_event_exit` の doc コメントが依存する
+///   `terminate:` -> `RunEvent::Exit` の経路はこの項目が無いと発火しない
+/// - **Edit サブメニューの copy / paste（および undo/redo/cut/select_all）。**
+///   WebView 上のコピー＆ペーストはこれらの既定項目のアクセラレータで動く
+///
+/// About メタデータ（name/version/copyright/authors）は `Menu::default` と同じ値を
+/// 詰める（`tauri-2.11.5/src/menu/menu.rs:142-151` を実測して複製）。
+///
+/// **`run()` / `.setup()` は契約 §96.4 の到達不能領域なので、この構築ロジックを
+/// `.menu(|app| { .. })` のクロージャへインラインで書かないこと。**
+///
+/// **⚠️ `MockRuntime` から呼べるが、`cargo test` の通常の `#[test]`（libtest の
+/// ワーカースレッド）からは呼べない。** muda 0.19.3 はメニュー項目の構築時に実際の
+/// OS main thread（`objc2::MainThreadMarker::new()`）を要求し（`muda-0.19.3/src/
+/// platform_impl/macos/mod.rs:132`（`Menu::new`）/ `:328`（`MenuChild::new_submenu`。
+/// `Submenu::new` が内部で呼ぶ）/
+/// `:775,830,859,903,935`（各 `create_ns_item_for_*`。`MenuItemKind` の enumerate は
+/// これを経由しない）を実測）、`cfg!(test)` によるマーカー省略は `new_submenu` にしか
+/// 無くしかも muda 自身のクレート内テストにしか効かない（依存側の `cfg!(test)` は常に
+/// false）ため、libtest のワーカースレッドから呼ぶと
+/// `` `muda::MenuChild` can only be created on the main thread `` で panic する
+/// （実測）。**固定するテストは `harness = false` の統合テスト
+/// （`tests/menu_no_close_window.rs`。その `fn main()` はプロセスの実の main thread
+/// で走る）に置く。**
+///
+/// `R: tauri::Runtime` はテストのための一般化であり、契約上の型ではない
+/// （`kill_on_window_destroyed` と同じ前例）。
+pub fn build_app_menu<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> tauri::Result<tauri::menu::Menu<R>> {
+    use tauri::menu::{AboutMetadata, Menu, PredefinedMenuItem, Submenu};
+
+    let pkg_info = app_handle.package_info();
+    let config = app_handle.config();
+    let about_metadata = AboutMetadata {
+        name: Some(pkg_info.name.clone()),
+        version: Some(pkg_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    };
+
+    let app_menu = Submenu::with_items(
+        app_handle,
+        pkg_info.name.clone(),
+        true,
+        &[
+            &PredefinedMenuItem::about(app_handle, None, Some(about_metadata))?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::services(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::hide(app_handle, None)?,
+            &PredefinedMenuItem::hide_others(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::quit(app_handle, None)?,
+        ],
+    )?;
+
+    let edit_menu = Submenu::with_items(
+        app_handle,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app_handle, None)?,
+            &PredefinedMenuItem::redo(app_handle, None)?,
+            &PredefinedMenuItem::separator(app_handle)?,
+            &PredefinedMenuItem::cut(app_handle, None)?,
+            &PredefinedMenuItem::copy(app_handle, None)?,
+            &PredefinedMenuItem::paste(app_handle, None)?,
+            &PredefinedMenuItem::select_all(app_handle, None)?,
+        ],
+    )?;
+
+    let view_menu = Submenu::with_items(
+        app_handle,
+        "View",
+        true,
+        &[&PredefinedMenuItem::fullscreen(app_handle, None)?],
+    )?;
+
+    // Close Window を含めない Window サブメニュー（契約 §29.8）。
+    let window_menu = Submenu::with_items(
+        app_handle,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app_handle, None)?,
+            &PredefinedMenuItem::maximize(app_handle, None)?,
+        ],
+    )?;
+
+    Menu::with_items(
+        app_handle,
+        &[&app_menu, &edit_menu, &view_menu, &window_menu],
+    )
+}
+
 // 契約 §45.2: tauri::Builder の組み立てとコマンド登録は lib.rs の run() の中だけに置く。
 // main.rs は `fn main() { kamux::run() }` の 3 行で固定であり、以後どの計画も編集しない。
 pub fn run() {
     crate::perf::mark_process_start();
     let app = tauri::Builder::default()
+        // 契約 §29.8: 既定メニューの Close Window を落とす。`.menu(..)` は
+        // `Builder` 側で上書き型（`app.rs:1981` の `self.menu.replace(..)`）
+        // なので、1 回しか書かないこと。
+        .menu(build_app_menu)
         .setup(|app| {
             init_tracing_subscriber();
             // 契約 §17: db_path() は環境変数 KAMUX_DB_PATH で上書き可
@@ -830,6 +996,7 @@ pub fn run() {
             session::resume_session,
             session::stop_session,
             session::suggest_branch_name,
+            session::create_scratch_session,
             crate::pty::editor::spawn_editor,
             report_frontend_ready,
         ])
@@ -1103,6 +1270,7 @@ mod tests {
             socket_path: tmp.join(format!("kamux-runeventexit-sock-{pid}.sock")),
             settings_path: settings_path.clone(),
             relay_bin: tmp.join(format!("kamux-runeventexit-relay-{pid}")),
+            shim_dir: None,
         });
         state.hooks_server = std::sync::Mutex::new(Some(probe_server));
 
@@ -1569,6 +1737,13 @@ mod tests {
             Arc::new(crate::notify::RecordingSink::default())
         }
 
+        /// `line_sink` のテスト既定値（裁定 119 レビュー修正）。`test_sink` /
+        /// `test_permission` と同じ理由 —— この経路を検証しないテストは、
+        /// production と同じ `TracingLineSink` をそのまま通す。
+        fn test_line_sink() -> Arc<dyn crate::session::runtime_state::StateLineSink> {
+            Arc::new(crate::session::runtime_state::TracingLineSink)
+        }
+
         /// 通知許可のテスト固定値。`test_sink` と同じ理由で、テストから実 OS API
         /// （`get_notification_settings()`）を叩かない（task-10 レビュー I-4。
         /// 契約上の章番号は 00-contracts.md に本文照合が取れなかったため引用しない）。
@@ -1619,6 +1794,7 @@ mod tests {
                     socket_path,
                     settings_path,
                     relay_bin,
+                    shim_dir: None,
                 }),
                 Some(server),
             )
@@ -1741,6 +1917,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert!(
@@ -1775,6 +1952,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let queried = probe.queried();
@@ -1856,6 +2034,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert!(!probe.queried().is_empty(), "正規化は試みられている");
@@ -1906,6 +2085,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             app.state::<AppState>()
@@ -1920,6 +2100,219 @@ mod tests {
             let payload: serde_json::Value = serde_json::from_str(&raw).expect("payload json");
             assert_eq!(payload["session_id"], serde_json::json!(session.id));
             assert_eq!(payload["runtime_state"], serde_json::json!("running"));
+        }
+
+        /// 裁定 119 レビュー修正（Important 1 件）: `install_app_state_with` が
+        /// 実際に `StateLineObserver` を配線していることを見る。
+        ///
+        /// `observer_count() == 3` という**本数**だけの検査は、3 つ目に登録される
+        /// 型を判別できない（task-reviewer の自己設計変異で実証済み: 3 つ目の
+        /// `register_observer` の引数を `TauriEmitObserver::new(...)` へ差し替えても
+        /// 本数は 3 のまま変わらず全緑だった）。ここでは observer を 1 つも直接
+        /// 構築せず、**`sender()` に入力を積んで記録用の `StateLineSink` に
+        /// `kamux state` 行が届くか**だけを見る
+        /// （`install_app_state_registers_the_emit_observer_on_the_runtime` /
+        /// `install_app_state_posts_a_notification_through_the_registered_observer`
+        /// と同じ形に揃えた）。
+        #[test]
+        fn install_app_state_with_registers_the_state_line_observer_on_the_runtime() {
+            use crate::session::runtime_state::{format_state_line, StateLineSink};
+
+            #[derive(Default)]
+            struct RecordingLineSink {
+                lines: Mutex<Vec<String>>,
+            }
+
+            impl StateLineSink for RecordingLineSink {
+                fn write_line(&self, line: &str) {
+                    self.lines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(line.to_string());
+                }
+            }
+
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+            let session = insert_test_session(&store, &project_id, "live");
+
+            let app = mock_app();
+            let line_sink = Arc::new(RecordingLineSink::default());
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                store,
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+                Arc::clone(&line_sink) as Arc<dyn StateLineSink>,
+            );
+
+            app.state::<AppState>()
+                .runtime
+                .sender()
+                .send(&session.id, StateInput::Spawned);
+
+            assert!(
+                wait_until(|| !line_sink
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()),
+                "kamux state の行が1つも届かない: install_app_state_with が \
+                 StateLineObserver を register_observer していない"
+            );
+
+            let expected = format_state_line(&crate::model::SessionStatePayload {
+                session_id: session.id.clone(),
+                runtime_state: RuntimeState::Running,
+                reason: crate::model::StateReason::Spawned,
+            });
+            assert_eq!(
+                line_sink
+                    .lines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[expected],
+                "StateLineObserver が届けた行が format_state_line の出力と一致しない \
+                 （3 つ目の register_observer に渡された型が StateLineObserver でない疑い）"
+            );
+        }
+
+        /// 契約 §29.5（裁定 2）: `install_app_state_with` はアーカイブを
+        /// `normalize_on_startup()` の**前**に配線する。判定に使える情報
+        /// （正規化前の `last_runtime_state`）は正規化の前だけに在るため。
+        ///
+        /// 5 行を DB に入れて `archived_at` の結果を見る（裁定 1 の免除集合
+        /// `{Running, WaitingInput}` が実際に配線へ渡っていること、`is_scratch = 0`
+        /// の行が対象外であることの両方を固定する）。
+        fn insert_scratch_session(
+            store: &crate::store::Store,
+            project_id: &str,
+            id: &str,
+            last_runtime_state: RuntimeState,
+        ) -> crate::model::Session {
+            use crate::model::{CliKind as SessionCliKind, Session, SessionMode};
+            let sort_order = store
+                .next_sort_order(project_id, crate::model::KanbanStatus::Backlog)
+                .expect("next_sort_order");
+            let session = Session {
+                id: id.to_owned(),
+                is_scratch: true,
+                last_runtime_state,
+                ..Session::new_backlog(
+                    project_id,
+                    id,
+                    "",
+                    SessionMode::InPlace,
+                    None,
+                    SessionCliKind::Shell,
+                    None,
+                    sort_order,
+                    crate::store::now_ms(),
+                )
+            };
+            store
+                .insert_session(&session)
+                .expect("insert scratch session")
+        }
+
+        #[test]
+        fn install_app_state_with_archives_stale_scratch_sessions_before_normalizing() {
+            let (_dir, store) = open_temp();
+            let project_id = store
+                .insert_project("kamux", "/x/kamux", CliKind::Claude)
+                .expect("insert_project")
+                .id;
+
+            insert_scratch_session(&store, &project_id, "live", RuntimeState::Running);
+            insert_scratch_session(&store, &project_id, "waiting", RuntimeState::WaitingInput);
+            insert_scratch_session(&store, &project_id, "stale", RuntimeState::Idle);
+            // 配線サイトが渡す免除集合の過大化を検出する行（レビュー修正 I-2 (a)）。
+            // `last_runtime_state = interrupted` は SCRATCH_SURVIVING_STATES の外なので、
+            // 配線サイトが誤って Interrupted を免除集合へ加える変異（`&[Running,
+            // WaitingInput, Interrupted]`）を打つとこの行がアーカイブされなくなる。
+            insert_scratch_session(
+                &store,
+                &project_id,
+                "already-interrupted",
+                RuntimeState::Interrupted,
+            );
+            let normal = insert_test_session(&store, &project_id, "normal");
+
+            let app = mock_app();
+            let store = Arc::new(store);
+            let persist = Arc::clone(&store) as Arc<dyn StatePersist>;
+            super::super::install_app_state_with(
+                &app,
+                Arc::clone(&store),
+                persist,
+                test_sink(),
+                test_permission(),
+                test_bootstrap_hooks,
+                test_line_sink(),
+            );
+
+            assert!(
+                store
+                    .get_session("live")
+                    .expect("get live")
+                    .archived_at
+                    .is_none(),
+                "live（running）がアーカイブされた"
+            );
+            assert!(
+                store
+                    .get_session("waiting")
+                    .expect("get waiting")
+                    .archived_at
+                    .is_none(),
+                "waiting（waiting_input）がアーカイブされた（裁定 1）"
+            );
+            assert!(
+                store
+                    .get_session("stale")
+                    .expect("get stale")
+                    .archived_at
+                    .is_some(),
+                "stale（idle）がアーカイブされていない"
+            );
+            assert!(
+                store
+                    .get_session("already-interrupted")
+                    .expect("get already-interrupted")
+                    .archived_at
+                    .is_some(),
+                "already-interrupted（interrupted）がアーカイブされていない \
+                 （配線サイトの免除集合が過大化している疑い。レビュー修正 I-2 (a)）"
+            );
+            assert!(
+                store
+                    .get_session(&normal.id)
+                    .expect("get normal")
+                    .archived_at
+                    .is_none(),
+                "スクラッチでない normal 行がアーカイブされた"
+            );
+            // レビュー修正 I-1: SCRATCH_SURVIVING_STATES で免除された行は、直後の
+            // normalize_on_startup() で running/waiting_input から interrupted へ
+            // 書き換えられる（＝同じ起動で Interrupted になる）。doc コメントの
+            // 断定をこの assert に結びつけて固定する。
+            assert_eq!(
+                store
+                    .get_session("live")
+                    .expect("get live")
+                    .last_runtime_state,
+                RuntimeState::Interrupted,
+                "免除された live 行が同じ起動の正規化で Interrupted になっていない \
+                 （runtime_state.rs の SCRATCH_SURVIVING_STATES doc の断定が崩れている）"
+            );
         }
 
         /// M2-3 Task 10: `install_app_state_with` が `NotifyObserver` を
@@ -1969,6 +2362,7 @@ mod tests {
                 sink.clone(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let state = app.state::<AppState>();
@@ -2071,6 +2465,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             assert_eq!(
@@ -2350,6 +2745,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
 
             let handle = app.handle().clone();
@@ -2416,6 +2812,7 @@ mod tests {
                 test_sink(),
                 test_permission(),
                 test_bootstrap_hooks,
+                test_line_sink(),
             );
             let state = app.state::<AppState>();
 

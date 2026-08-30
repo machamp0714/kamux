@@ -11,6 +11,9 @@ vi.mock('../ipc/commands', () => ({
   deleteProject: vi.fn(),
   listSessions: vi.fn(),
   createSession: vi.fn(),
+  // M3-4 Task 20: sessionSlice.ts が createScratchSession を import するようになった
+  // ため、この素のファクトリにも足す（brief 記載の既知ハザード。既存の意味は変えない）。
+  createScratchSession: vi.fn(),
   updateSession: vi.fn(),
   moveSession: vi.fn(),
   resumeSession: vi.fn(),
@@ -32,6 +35,7 @@ vi.mock('../terminal/ptyBridge', () => ({
 
 import {
   createProject,
+  createScratchSession,
   createSession,
   deleteProject,
   listProjects,
@@ -65,6 +69,7 @@ function makeSession(overrides: Partial<Session> & { id: string }): Session {
     first_started_at: 1,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: false,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
@@ -113,6 +118,13 @@ const FOCUS_TOUCHING_ACTIONS = new Set([
   // M3-4 Task 12: 最後の 1 つを削除して未選択になる経路（契約 §130.5）は盤面を空にするため、
   // フォーカス 3 状態を実際に書く。baseline は projects: [] なので ARGS はその経路へ入る。
   'removeProject',
+  // M3-4 Task 20: createScratchTerminal は末尾で assignPane(activePane, created.id) を
+  // 呼ぶため、paneAssignment / focusedSessionId を実際に書く（Ruling 20-F）。
+  // closeScratchTerminal は入れない —— baseline のフォーカス中セッション 'y' は
+  // scratch ではないため、スクラッチ限定の門（Ruling 20-C）で早期 return し、
+  // 3 状態は不変のまま。門を通り抜けた本体（ゲート修正 A3 でペイン割当を外すように
+  // なった）を観測するのは sessionSlice.scratch.test.ts の側である。
+  'createScratchTerminal',
 ]);
 
 const CREATE_SESSION_ARGS: CreateSessionArgs = {
@@ -164,6 +176,9 @@ const ARGS: Record<string, unknown[]> = {
   moveCard: ['a', 'review', 0],
   editSession: ['a', { title: 'renamed' }],
   archiveSession: ['a'],
+  // ゲート修正 D-1: start_session / resume_session の戻り値の反映。sessions /
+  // sessionOrder だけを書き、フォーカス 3 状態には触れない。
+  applyStartedSession: [makeSession({ id: 'a', kanban_status: 'review' })],
   // 契約 §8 の StateReason::ResumeFailed 経路（M2-4 Task 10）。
   // どちらもフォーカス 3 状態には触れない —— sessions / resumeFailedSessionIds / runtimeErrors だけを書く。
   resumeSession: ['a'],
@@ -192,6 +207,10 @@ const ARGS: Record<string, unknown[]> = {
   // 「残り 0 件 → 未選択」の経路（契約 §130.5 の 3 ケース目）に入り、盤面を空にする。
   // 第 2 引数は止める対象のセッション id（確認ダイアログが list_sessions で取ったもの）。
   removeProject: ['p1', []],
+  // M3-4 Task 20: Cmd+T / Cmd+W。どちらも引数を取らない（フォーカス中ペイン /
+  // アクティブプロジェクトはストアから読む）。
+  createScratchTerminal: [],
+  closeScratchTerminal: [],
 };
 
 function seedBaseline(): void {
@@ -234,6 +253,9 @@ beforeEach(() => {
   vi.mocked(createSession)
     .mockReset()
     .mockResolvedValue(makeSession({ id: 'created' }));
+  vi.mocked(createScratchSession)
+    .mockReset()
+    .mockResolvedValue(makeSession({ id: 'scratch-created', is_scratch: true }));
   vi.mocked(updateSession)
     .mockReset()
     .mockImplementation(async (id, patch) => ({

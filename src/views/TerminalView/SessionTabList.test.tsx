@@ -28,6 +28,7 @@ function session(id: string): Session {
     first_started_at: null,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: false,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
@@ -51,6 +52,10 @@ beforeEach(() => {
     activePane: 0,
     runtimeStates: {},
     runtimeReasons: {},
+    // scratchTabs（terminalSlice.ts）が project_id === activeProjectId で絞るように
+    // なった（task-20 レビュー Important 1）。フィクスチャの session() は project_id
+    // 'p1' 固定なので、activeProjectId もここで 'p1' に合わせる。
+    activeProjectId: 'p1',
   });
 
   container = document.createElement('div');
@@ -207,5 +212,158 @@ describe('SessionTabList のペインバッジ（契約 §28.3）', () => {
 
     expect(badgeOf('s1')).toBe('U');
     expect(badgeOf('s2')).toBe('D');
+  });
+});
+
+// Task 20 修正ラウンド 2（team-lead 追加義務）: このブロックのテストは
+// sessionOrder へ scratch の id を直接フィクスチャで置いている
+// （例: `sessionOrder: { ..., in_progress: ['s1', 's2'], ... }` に is_scratch な s2 を混ぜる）。
+// production では buildSessionOrder（契約 §29.4）が is_scratch を絞るため、
+// sessionOrder が scratch の id を持つ状態そのものに到達しない。ここは
+// is_scratch → SESSIONS/SCRATCH の振り分け描画（selectTerminalTabs の後段）を
+// 状態直置きで観測するテスト群であり、その価値ゆえに残す。production が実際に
+// 到達できる経路（createScratchTerminal → selectTerminalTabs）の観測は
+// src/store/sessionSlice.scratch.test.ts の
+// 「createScratchTerminal が作った Session は selectTerminalTabs の SCRATCH 経路
+// （契約 §29.7 / Ruling 20-G）に現れる」が持つ。
+describe('SessionTabList の 2 グループ表示（契約 §29.7）', () => {
+  function renderTabs(): void {
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionTabList />);
+    });
+  }
+
+  function groupLabels(): string[] {
+    return Array.from(container.querySelectorAll('.kamux-tablist__group-label')).map(
+      (el) => el.textContent ?? '',
+    );
+  }
+
+  function sessionIdsInGroup(label: string): string[] {
+    const labelEl = Array.from(container.querySelectorAll('.kamux-tablist__group-label')).find(
+      (el) => el.textContent === label,
+    );
+    const group = labelEl?.closest('.kamux-tablist__group');
+    return Array.from(group?.querySelectorAll('[data-session-id]') ?? []).map(
+      (el) => el.getAttribute('data-session-id') ?? '',
+    );
+  }
+
+  it('is_scratch で SESSIONS と SCRATCH に振り分ける（両方向）', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    // SCRATCH には s2 が居る
+    expect(sessionIdsInGroup('SCRATCH')).toEqual(['s2']);
+    // SESSIONS には s2 が居ない（逆方向も確認しないと「常に両方描く」変異と潰れる）
+    expect(sessionIdsInGroup('SESSIONS')).toEqual(['s1']);
+  });
+
+  it('SCRATCH が 0 件のときは見出しごと描かない', () => {
+    useAppStore.setState({
+      sessions: { s1: session('s1') },
+      sessionOrder: { backlog: [], in_progress: ['s1'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SESSIONS']);
+    expect(container.querySelectorAll('.kamux-tablist__group')).toHaveLength(1);
+  });
+
+  it('SESSIONS が 0 件のときは見出しごと描かない', () => {
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s2 },
+      sessionOrder: { backlog: [], in_progress: ['s2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SCRATCH']);
+    expect(container.querySelectorAll('.kamux-tablist__group')).toHaveLength(1);
+  });
+
+  it('role="tablist" は 1 つのまま（グループがロールを割らない）', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(container.querySelectorAll('[role="tablist"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(2);
+    // グループの入れ物 div は a11y ツリーから透過させ、tab が tablist の
+    // 直接の子として扱われる状態に戻す（role="presentation"）
+    const groups = container.querySelectorAll('.kamux-tablist__group');
+    expect(groups).toHaveLength(2);
+    groups.forEach((group) => {
+      expect(group.getAttribute('role')).toBe('presentation');
+    });
+  });
+
+  it('グループの並びは SESSIONS が先、SCRATCH が後', () => {
+    const s1 = session('s1');
+    const s2 = { ...session('s2'), is_scratch: true };
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+    });
+    renderTabs();
+
+    expect(groupLabels()).toEqual(['SESSIONS', 'SCRATCH']);
+  });
+
+  it('split2 でタブをクリックすると activePane 側のスロットへ割り当てる', () => {
+    const s1 = session('s1');
+    const s2 = session('s2');
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+      layout: 'split2',
+      activePane: 1,
+      paneAssignment: [null, 's1'],
+    });
+    renderTabs();
+
+    const tab = container.querySelector('[data-session-id="s2"]');
+    act(() => {
+      (tab as HTMLButtonElement).click();
+    });
+
+    // クリックは activePane（この場合 1）のスロットへ割り当てる。
+    // pane 引数を取り違えて 0 固定にすると s1 が上書きされ、
+    // 1 固定にすると常に正しく見えてしまうため、両スロットを見る。
+    // 空いているペイン(0)へ入れる実装との区別のため、0 側は埋まっていない
+    // （null のまま）ことも見る。
+    expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
+    expect(useAppStore.getState().paneAssignment[0]).toBeNull();
+  });
+
+  it('split2 で activePane が 0 のときは 0 側のスロットへ割り当てる（1 固定の取り違えを検出する対称ケース）', () => {
+    const s1 = session('s1');
+    const s2 = session('s2');
+    useAppStore.setState({
+      sessions: { s1, s2 },
+      sessionOrder: { backlog: [], in_progress: ['s1', 's2'], review: [], done: [] },
+      layout: 'split2',
+      activePane: 0,
+      paneAssignment: [null, 's2'],
+    });
+    renderTabs();
+
+    const tab = container.querySelector('[data-session-id="s1"]');
+    act(() => {
+      (tab as HTMLButtonElement).click();
+    });
+
+    expect(useAppStore.getState().paneAssignment[0]).toBe('s1');
+    expect(useAppStore.getState().paneAssignment[1]).toBe('s2');
   });
 });

@@ -13,14 +13,17 @@ function session(
   id: string,
   kanbanStatus: KanbanStatus,
   archivedAt: number | null = null,
+  isScratch = false,
+  sortOrder = 1,
+  projectId = 'p1',
 ): Session {
   return {
     id,
-    project_id: 'p1',
+    project_id: projectId,
     title: id,
     description: '',
     kanban_status: kanbanStatus,
-    sort_order: 1,
+    sort_order: sortOrder,
     mode: 'in_place',
     branch: null,
     worktree_path: null,
@@ -32,19 +35,29 @@ function session(
     first_started_at: 1,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: isScratch,
     archived_at: archivedAt,
     created_at: 0,
     updated_at: 0,
   };
 }
 
-type TestStore = Pick<AppStore, 'sessions' | 'sessionOrder' | 'focusedSessionId'> & TerminalSlice;
+type TestStore = Pick<
+  AppStore,
+  'sessions' | 'sessionOrder' | 'focusedSessionId' | 'activeProjectId'
+> &
+  TerminalSlice;
 
-function makeStore(sessions: Session[], sessionOrder: Record<KanbanStatus, string[]>) {
+function makeStore(
+  sessions: Session[],
+  sessionOrder: Record<KanbanStatus, string[]>,
+  activeProjectId = 'p1',
+) {
   return create<TestStore>()((set, get, api) => ({
     sessions: Object.fromEntries(sessions.map((s) => [s.id, s])),
     sessionOrder,
     focusedSessionId: null,
+    activeProjectId,
     ...(createTerminalSlice as unknown as StateCreator<TestStore, [], [], TerminalSlice>)(
       set,
       get,
@@ -95,6 +108,60 @@ describe('selectTerminalTabs', () => {
     order.backlog = ['zeta', 'alpha'];
     const store = makeStore([session('alpha', 'backlog'), session('zeta', 'backlog')], order);
     expect(selectTerminalTabs(store.getState())).toEqual(['zeta', 'alpha']);
+  });
+
+  // Ruling 20-G（lane-controller、契約 §29.7）: sessionOrder は scratch を含まない
+  // 設計（契約 §29.4）だが、供給源がそれしか無いと SCRATCH グループが production で
+  // 恒久的に空になる。sessions から is_scratch === true && archived_at === null を
+  // 直接引いて連結する。フィクスチャは sessionOrder に scratch の id を置かない
+  // （production が到達できる状態で測る）。
+  //
+  // state.sessions はプロジェクト横断のグローバルキャッシュ（sessionSlice.ts の
+  // loadSessions がマージする）なので、他プロジェクトの scratch も残り続ける。
+  // ここで project_id が異なる scratch（'other-project-scratch'、projectId='p2'）を
+  // 混ぜて、activeProjectId(='p1') のものだけが連結されることを固定する
+  // （task-20 レビュー Important 1 / 変異 #5 の是正）。
+  it('SCRATCH セッションは sessionOrder ではなく sessions から直接引いて末尾に連結する（契約 §29.7 / Ruling 20-G）。他プロジェクトの scratch は含めない', () => {
+    const order = emptyOrder();
+    order.backlog = ['b1'];
+    const store = makeStore(
+      [
+        session('b1', 'backlog'),
+        session('scratch1', 'backlog', null, true),
+        session('other-project-scratch', 'backlog', null, true, 1, 'p2'),
+      ],
+      order,
+    );
+    expect(selectTerminalTabs(store.getState())).toEqual(['b1', 'scratch1']);
+  });
+
+  it('archived な scratch は含めない', () => {
+    const order = emptyOrder();
+    const store = makeStore([session('s1', 'backlog', 1000, true)], order);
+    expect(selectTerminalTabs(store.getState())).toEqual([]);
+  });
+
+  it('複数の SCRATCH は sort_order 昇順、同値なら id 辞書順で並ぶ（buildSessionOrder と同じタイブレーク）', () => {
+    const order = emptyOrder();
+    const store = makeStore(
+      [
+        session('z', 'backlog', null, true, 2),
+        session('a', 'backlog', null, true, 2),
+        session('m', 'backlog', null, true, 1),
+      ],
+      order,
+    );
+    expect(selectTerminalTabs(store.getState())).toEqual(['m', 'a', 'z']);
+  });
+
+  // sessionOrder.ts の buildSessionOrder は is_scratch を絞る（契約 §29.4、Task 20
+  // バッチで是正）。ここでの is_scratch 混入フィクスチャは、その除外がすり抜けた
+  // 場合に備える二重防御（sessionTabsFromOrder 側のフィルタ）を固定するためのもの。
+  it('sessionOrder に scratch の id が紛れ込んでいても重複させない', () => {
+    const order = emptyOrder();
+    order.backlog = ['scratch1'];
+    const store = makeStore([session('scratch1', 'backlog', null, true)], order);
+    expect(selectTerminalTabs(store.getState())).toEqual(['scratch1']);
   });
 });
 
@@ -296,6 +363,7 @@ describe('withFocus は set() へ渡す形を 4 フィールドに保つ（PR 25
         sessions: {},
         sessionOrder: emptyOrder(),
         focusedSessionId: null,
+        activeProjectId: 'p1',
         ...(createTerminalSlice as unknown as StateCreator<TestStore, [], [], TerminalSlice>)(
           spySet,
           get,

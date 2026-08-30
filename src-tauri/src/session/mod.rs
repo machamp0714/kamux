@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{KanbanStatus, Session, SessionPatch, SurfaceKind};
+use crate::model::{CliKind, KanbanStatus, Session, SessionMode, SessionPatch, SurfaceKind};
 use crate::pty::launch_env::{probe_login_env, resolve_program, LaunchEnv};
 use crate::pty::{surface_id, SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::session::heuristics::sink_impl::{attach_heuristics, detach_heuristics};
 use crate::session::heuristics::OutputObserver;
 use crate::session::runtime_state::StateInput;
 use crate::state::AppState;
+use crate::store::now_ms;
 use cli_args::{
     apply_hooks, binary_name, build_launch_command, login_shell, resume_mode, resume_plan,
     ResumeMode,
@@ -340,6 +341,8 @@ fn spawn_agent_surface_with(
     spec: SpawnSpec,
     spawn: impl FnOnce(SpawnSpec, Option<Box<dyn OutputObserver>>) -> AppResult<()>,
 ) -> AppResult<()> {
+    // 契約 §64.3 の 1 行を送る宛先。`spec` はこの後 `spawn` へ move される。
+    let surface_id = spec.surface_id.clone();
     let observer = attach_heuristics(&state.heuristics, session);
     spawn(spec, Some(observer)).inspect_err(|_| {
         // spawn に失敗したセッションは読み取りスレッドを持たず、`sink.rs` の `on_exit` も
@@ -354,7 +357,44 @@ fn spawn_agent_surface_with(
         // ので、**外さないほうが状態が壊れる**（押し出された側は `register` の resume
         // 腕で既に停止済みで、レジストリには新しい死んだエントリだけが残る）。
         detach_heuristics(&state.heuristics, &session.id);
-    })
+    })?;
+
+    // 契約 §64.3: **spawn の成功直後**に 1 行だけ送る。フロント（`ptyBridge`）からは
+    // 送らない —— ユーザーの最初の入力より前であることを保証できない（§16 の
+    // `term.onData` の所有と競合する）。
+    //
+    // **消費者 3 つ（`start_session` / `resume_session` / `create_scratch_session`）は
+    // すべてこの関数を経由するので、ここ 1 箇所に置く。** `spawn_editor`（M3-1）は
+    // この関数を通らず `PtyManager::spawn` を直に呼ぶので、構造的に対象外である
+    //（§64.3 の「`spawn_editor` は対象外」）。
+    //
+    // **`Err` を `?` で伝播させない**（契約 §153.3）。ここに来た時点で `spawn` は
+    // 成功しており PTY は生きている。伝播させると 3 つの呼び出し側
+    //（`start_session` / `resume_session` / `create_and_start_scratch_session_with`）
+    // の `mark_error` へ届き、契約 §40.3 の判定基準（「その `Err` の時点で
+    // セッションが起動していないことが確実か」）を満たさない `Err` で ❌ を出す。
+    // 開くのは「PTY は動いているのにカードが ❌ になり、その間ユーザーは再起動も
+    // できない」窓である（`error` から出る唯一の入力は `Spawned` だが、PTY が
+    // 生きている間は二重起動ガードが `InvalidState` を返すので `Spawned` が来ない）。
+    //
+    // **握り潰しではなく縮退である。** 1 行が届かなければ shim は PATH に立たず、
+    // 手打ちの `claude` の hook が黙って飛ばなくなる —— その事実は `warn!` に残す
+    // （`bootstrap_hooks` が relay / ソケット / settings の 3 つで採っているのと
+    // 同じ形。設計書 §12「hooks が使えなくてもアプリは起動する」）。
+    // spawn 済みの surface は生きているので、掃除は `sink.rs` の `on_exit` が行う。
+    if let Some(line) = crate::shim::shell_path_line(
+        session.cli_kind,
+        state.hooks.as_ref().and_then(|h| h.shim_dir.as_deref()),
+    ) {
+        if let Err(err) = state.pty.write(&surface_id, line) {
+            tracing::warn!(
+                error = %err,
+                surface_id = %surface_id,
+                "shim PATH line was not delivered to the pty"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// セッションの agent サーフェスを起動する。
@@ -540,6 +580,146 @@ fn stop_agent_surface(state: &AppState, id: &str) -> AppResult<Session> {
     // `exited` + `PtyExited` は遷移なしなので DB もイベントも動かない（計画 §6.5）。
     state.runtime.sender().send(id, StateInput::UserStopped);
     Ok(session)
+}
+
+/// スクラッチ端末の「作成して DB へ確定させる」部分だけを切り出した構築点
+/// (契約 §29.1 / §29.2 / §29.3 / §29.6)。`AppHandle` を要らないのでそのまま
+/// ユニットテストできる。
+///
+/// スクラッチの構築点は `Session::new_backlog` とは別にここへ置く —— `new_backlog`
+/// は常に `is_scratch: false` を入れる契約（§29.1 の申し送り）なので、そのまま呼んで
+/// フィールドを上書きする。`SessionPatch` は経由しない —— スクラッチかどうかは
+/// 作成時に決まり、後から切り替わらない（契約 §29.2）。
+///
+/// `plan_agent_spawn`（既存の agent サーフェス起動）を経由しない。スクラッチは常に
+/// `mode: in_place`（契約 §29.6）だが、`prepare_worktree` の in_place 腕は
+/// `project.repo_path` しか返さず、呼び出し元が指定した `cwd` を通す経路が無い。
+/// `prepare_worktree` に分岐を足すと §13 の worktree 契約に例外を持ち込むことになり、
+/// それは契約 §29.6 が名指しで禁じている。cwd の決定はここで独立に行う。
+fn plan_scratch_session_with(
+    state: &AppState,
+    project_id: &str,
+    cwd: Option<String>,
+    now: i64,
+    launch_env: &LaunchEnv,
+) -> AppResult<(Session, SpawnSpec)> {
+    let project = state.store.get_project(project_id)?;
+    let sort_order = state
+        .store
+        .next_sort_order(project_id, KanbanStatus::Backlog)?;
+
+    let mut session = Session::new_backlog(
+        project_id,
+        "Scratch",
+        "",
+        SessionMode::InPlace,
+        None,
+        CliKind::Shell,
+        None,
+        sort_order,
+        now,
+    );
+    // `new_backlog` が入れた既定値 false を、スクラッチだけがここで上書きする
+    // (契約 §29.1 / §29.2)。
+    session.is_scratch = true;
+
+    let resolved_cwd = match cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => PathBuf::from(&project.repo_path),
+    };
+    // portable-pty 0.9.0 が cwd の実在を `is_dir()` でしか検証せず、ディレクトリで
+    // なければ chdir を試みず黙って $HOME へフォールバックする問題は
+    // `plan_agent_spawn_with`（このファイル上方）と同じ。述語を逐語で一致させる。
+    if !resolved_cwd.is_dir() {
+        return Err(AppError::InvalidState(format!(
+            "working directory does not exist or is not a directory: {}",
+            resolved_cwd.display()
+        )));
+    }
+
+    // cli_kind は常に Shell（契約 §29.3）なので binary_name() は常に None ——
+    // resolve_program の PATH 探索（契約 §18）を経由しない。ログインシェル自身が
+    // 起動対象になる。
+    let program = login_shell();
+    let launch = build_launch_command(
+        &session,
+        &program,
+        &resolved_cwd,
+        launch_env,
+        ResumeMode::None,
+    )?;
+    let launch = apply_hooks(&session, launch, state.hooks.as_ref());
+
+    let spec = SpawnSpec {
+        surface_id: surface_id(&session.id, SurfaceKind::Agent),
+        program: launch.program.to_string_lossy().into_owned(),
+        env: launch.env,
+        args: launch.args,
+        cwd: launch.cwd,
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+    };
+
+    // spawn より前に DB へ確定させる。ここが本コマンドの「作成」半分である。
+    let session = state.store.insert_session(&session)?;
+    Ok((session, spec))
+}
+
+/// `create_scratch_session` の `AppHandle` 非依存の本体（契約 §29.3）。
+/// `spawn` をクロージャとして受け取るのは `spawn_agent_surface_with` と同じ理由 ——
+/// `PtyManager::spawn` は Wry 固定（契約 §15）で `MockRuntime` に登録できず、この形に
+/// しない限り「作成 → 永続化 → start」という合成そのものをユニットテストから
+/// 固定できない。
+///
+/// **失敗時はロールバックしない。行は残し、`error` へ遷移させる**
+/// （`start_session` / `resume_session` の spawn 失敗と同じ扱い。契約 §40.3）。
+/// DB に delete API は無く、削除コマンドの新設は契約 §7.4 / §29.3 の却下記録と
+/// 矛盾する。行を残せば `error` の理由がユーザーに見える（契約 §2 の `error` の
+/// 存在理由）—— 消すとその痕跡ごと失われる。
+fn create_and_start_scratch_session_with(
+    state: &AppState,
+    project_id: &str,
+    cwd: Option<String>,
+    now: i64,
+    launch_env: &LaunchEnv,
+    spawn: impl FnOnce(SpawnSpec, Option<Box<dyn OutputObserver>>) -> AppResult<()>,
+) -> AppResult<Session> {
+    let (session, spec) = plan_scratch_session_with(state, project_id, cwd, now, launch_env)?;
+
+    if let Err(err) = spawn_agent_surface_with(state, &session, spec, spawn) {
+        state
+            .runtime
+            .sender()
+            .mark_error(&session.id, &err.to_string());
+        return Err(err);
+    }
+    // これが「start」半分。作成（上の insert_session）と合わせて 1 コマンドの
+    // 原子性を成す（契約 §29.3 の「create_session を分岐させずに別コマンドにした
+    // 理由」）。
+    state
+        .runtime
+        .sender()
+        .send(&session.id, StateInput::Spawned);
+    Ok(session)
+}
+
+/// スクラッチ端末（M3-4、契約 §29）。作成と start を 1 コマンドで原子的に行う。
+/// cwd が None なら project.repo_path。mode は常に in_place、cli_kind は常に shell
+#[tauri::command]
+pub async fn create_scratch_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    cwd: Option<String>,
+) -> AppResult<Session> {
+    create_and_start_scratch_session_with(
+        &state,
+        &project_id,
+        cwd,
+        now_ms(),
+        probe_login_env(),
+        |spec, observer| state.pty.spawn_with_observer(&app, spec, observer),
+    )
 }
 
 /// 既存セッション向けのブランチ名提案（契約 §60.1 / §60.1.1）。
@@ -1021,7 +1201,12 @@ mod tests {
     /// `state.hooks` が `Some` のとき、`plan_agent_spawn_with` が組み立てる
     /// `SpawnSpec` に `--settings` と `KAMUX_HOOKS_SOCK` が実際に流れることを固定する
     /// （契約 §31.4 / §102）。`apply_hooks` 単体のテストは `cli_args.rs` にあるが、
-    /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）はここでしか踏めない。
+    /// `state.hooks.as_ref()` の配線自体（Task 11 の呼び出し側）を固定するのはこのテスト。
+    /// **訂正（Task 17 fix round 1 / I-2）**: `state.hooks.as_ref()` の呼び出し側は
+    /// もうここだけではない —— `plan_scratch_session_with`（Task 17、shell 経路）が
+    /// 2 つ目の呼び出し側を新設した。その鏡像は
+    /// `scratch_session::plan_scratch_session_injects_the_hooks_sock_env_even_for_the_shell_cli_kind`
+    /// が持つ。
     #[test]
     fn plan_agent_spawn_injects_hooks_settings_and_sock_for_claude() {
         // ENV_LOCK は不要: CliKind::Claude は fake_resolve_program 経由で解決され、
@@ -1032,6 +1217,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/kamux-hooks-test.sock"),
             settings_path: PathBuf::from("/tmp/kamux-hooks-test.settings.json"),
             relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+            shim_dir: None,
         });
 
         let (_, spec) = plan(&state, &session.id).expect("plan spawn");
@@ -1828,6 +2014,10 @@ mod tests {
 
     mod heuristics_lifecycle {
         use super::*;
+        // 契約 §64.3 の 1 行の観測に使う。**複製せず共有する** —— 同一プロセスに
+        // `tracing` の subscriber は 1 人しか立てられない（`payload.rs` の
+        // `tests` モジュールの doc）。
+        use crate::hooks_srv::payload::tests::{capture_events, CapturedEvent};
 
         fn wait_until(f: impl Fn() -> bool) -> bool {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1939,6 +2129,179 @@ mod tests {
             );
         }
 
+        /// spawn クロージャが走ったことを示すマーカー。契約 §64.3 の「`PtyManager::spawn`
+        /// の**成功直後**」という**順序**は、このマーカーと shim の warn の出現位置の
+        /// 前後で見る（`assert` の対象は件数ではなく index である —— 同じスレッドで
+        /// 鳴る無関係なイベント（`runtime_state.rs` の `info!` など）が混ざりうる）。
+        const SPAWN_MARKER: &str = "test-marker: the injected spawn ran";
+
+        /// shim の 1 行が PTY へ届かなかったときの `warn!` だけを、鳴った順に拾う。
+        ///
+        /// **メッセージ本文では絞らない**（文言の変更で無音になる形を作らない）。
+        /// `session/` と `pty/` の production が出す `tracing` イベントは
+        /// `runtime_state.rs` の `info!` 1 つだけで、`surface_id` フィールドを
+        /// 持つ `WARN` は本件以外に存在しない。
+        fn shim_line_warns(events: &[CapturedEvent]) -> Vec<&CapturedEvent> {
+            events
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.fields.contains_key("surface_id"))
+                .collect()
+        }
+
+        /// `cli_kind` と shim の有無を指定して、`spawn_agent_surface_with` を
+        /// **成功する** spawn クロージャで通す。戻り値はその結果と、その間に鳴った
+        /// `tracing` イベント全件である。
+        ///
+        /// **戻り値からは書き込みの成否が見えない。** 契約 §153.3（「`PtyManager::write`
+        /// の `Err` は §40.3 の「呼ばない」側である」）により、`write` の `Err` は
+        /// `spawn_agent_surface_with` の中で握られて `warn!` へ落ち、関数は `Ok` を返す。
+        /// 一方 `PtyManager::spawn` は `AppHandle`（Wry 固定。契約 §15）を要求して
+        /// テストから起こせず、レジストリに surface は 1 つも居ないので write は必ず
+        /// 失敗する。**したがって「書きに行った」「宛先はどこか」「spawn より後か」は
+        /// すべてその warn で観測する。** 1 行の**中身**の逐語を守るのは
+        /// `shim::SHELL_PATH_LINE` 側のテストである（契約 §64.3）。
+        fn spawn_shell_surface_with_shim(
+            cli_kind: CliKind,
+            shim_dir: Option<&str>,
+        ) -> (
+            tempfile::TempDir,
+            Session,
+            AppResult<()>,
+            Vec<CapturedEvent>,
+        ) {
+            let (dir, store, session) = build_project_and_session(
+                "/tmp/kamux-shim-line",
+                SessionMode::InPlace,
+                cli_kind,
+                match cli_kind {
+                    CliKind::Custom => Some("my-cli"),
+                    _ => None,
+                },
+            );
+            let mut state = crate::state::test_support::app_state(store);
+            if let Some(shim_dir) = shim_dir {
+                state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                    socket_path: PathBuf::from("/tmp/kamux-hooks-shimline.sock"),
+                    settings_path: PathBuf::from("/tmp/kamux-hooks-shimline.settings.json"),
+                    relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                    shim_dir: Some(PathBuf::from(shim_dir)),
+                });
+            }
+            let (result, events) = capture_events(|| {
+                spawn_agent_surface_with(&state, &session, dummy_spec(&session), |_spec, _obs| {
+                    tracing::info!("{}", SPAWN_MARKER);
+                    Ok(())
+                })
+            });
+            (dir, session, result, events)
+        }
+
+        /// 契約 §64.3: 「`PtyManager::spawn` の成功直後、呼び出し側が
+        /// `PtyManager::write` で送る」。**3 消費者（`start_session` /
+        /// `resume_session` / `create_scratch_session`）はすべてこの関数を経由する**
+        /// ので、置き場所はここ 1 箇所である（`spawn_editor` はこの関数を通らない）。
+        ///
+        /// 同時に 2 つ見る:
+        /// - **宛先が agent サーフェスであること** —— warn の `error` フィールドは
+        ///   `PtyManager::write` に**実際に渡した** `surface_id` から生えるので、
+        ///   別の id へ書く変異はここで弁別される。
+        /// - **spawn の「成功直後」であること** —— spawn クロージャが出すマーカーが
+        ///   warn より**前**に鳴っていること。書き込みを `spawn(...)` の手前へ移す
+        ///   変異はこの順序で赤になる。
+        #[test]
+        fn spawning_a_shell_surface_with_the_shim_enabled_writes_the_pty_line_after_the_spawn() {
+            let (_dir, session, result, events) =
+                spawn_shell_surface_with_shim(CliKind::Shell, Some("/tmp/kamux-shim"));
+
+            result.expect("write の Err は握る（契約 §153.3）");
+            let warns = shim_line_warns(&events);
+            assert_eq!(warns.len(), 1, "1 行を書きに行っていない: {events:?}");
+
+            let expected = crate::pty::surface_id(&session.id, SurfaceKind::Agent);
+            assert_eq!(
+                warns[0].fields.get("surface_id").map(String::as_str),
+                Some(expected.as_str()),
+                "warn が名指しした宛先が agent サーフェスではない: {:?}",
+                warns[0]
+            );
+            assert_eq!(
+                warns[0].fields.get("error").map(String::as_str),
+                Some(AppError::NotFound(expected.clone()).to_string().as_str()),
+                "`PtyManager::write` に渡した宛先が agent サーフェスではない: {:?}",
+                warns[0]
+            );
+
+            let marker = events
+                .iter()
+                .position(|e| e.message == SPAWN_MARKER)
+                .expect("spawn クロージャが走っていない");
+            let warn = events
+                .iter()
+                .position(|e| std::ptr::eq(e, warns[0]))
+                .expect("warn の位置");
+            assert!(
+                marker < warn,
+                "契約 §64.3 の 1 行が spawn の**前**に書かれている: {events:?}"
+            );
+        }
+
+        /// 契約 §153.3 / Ruling 21-D: **`PtyManager::write` の `Err` は §40.3 の
+        /// 「`mark_error` を呼ばない `Err`」側である。** spawn は成功していて PTY は
+        /// 生きているので、ここで `?` を使って伝播させると 3 コマンド
+        /// （`start_session` / `resume_session` / `create_and_start_scratch_session_with`）
+        /// の `mark_error` へ届き、「PTY は動いているのにカードが ❌ になり、
+        /// その間ユーザーは再起動もできない」窓が開く。
+        ///
+        /// **握り潰しではなく縮退である**ことも同時に見る —— `Ok` を返しつつ
+        /// `warn!` が必ず 1 件鳴っていること。
+        #[test]
+        fn a_failed_pty_line_write_is_degraded_to_a_warning_and_does_not_fail_the_spawn() {
+            let (_dir, _session, result, events) =
+                spawn_shell_surface_with_shim(CliKind::Shell, Some("/tmp/kamux-shim"));
+
+            assert!(
+                result.is_ok(),
+                "write の Err が伝播している（3 コマンドの mark_error へ届く）: {result:?}"
+            );
+            assert_eq!(
+                shim_line_warns(&events).len(),
+                1,
+                "無音で握り潰している（warn が鳴っていない）: {events:?}"
+            );
+        }
+
+        /// 契約 §64.3: 「書くのは shim 有効時 かつ `cli_kind == Shell` のときだけ」。
+        /// shim 無効（`state.hooks == None`）では 1 行も書かない。
+        ///
+        /// **戻り値の `Ok` では見ない** —— 契約 §153.3 の縮退により「書きに行って
+        /// 失敗した」も `Ok` になるため、`Ok` を見るだけの assert は恒真である。
+        #[test]
+        fn spawning_a_shell_surface_without_the_shim_writes_nothing() {
+            let (_dir, _session, result, events) =
+                spawn_shell_surface_with_shim(CliKind::Shell, None);
+            result.expect("shim 無効なら PTY へ 1 行も書かない");
+            assert!(
+                shim_line_warns(&events).is_empty(),
+                "shim 無効なのに 1 行書きに行っている: {events:?}"
+            );
+        }
+
+        /// 同上の裏側: shim 有効でも `Shell` 以外へは書かない。
+        /// ここも戻り値ではなく warn の件数で見る（上と同じ理由）。
+        #[test]
+        fn spawning_a_non_shell_surface_with_the_shim_enabled_writes_nothing() {
+            for cli_kind in [CliKind::Claude, CliKind::Codex, CliKind::Custom] {
+                let (_dir, _session, result, events) =
+                    spawn_shell_surface_with_shim(cli_kind, Some("/tmp/kamux-shim"));
+                result
+                    .unwrap_or_else(|e| panic!("cli_kind={cli_kind:?} で Err になっている: {e:?}"));
+                assert!(
+                    shim_line_warns(&events).is_empty(),
+                    "cli_kind={cli_kind:?} へ 1 行書きに行っている: {events:?}"
+                );
+            }
+        }
+
         /// `stop_session` でも外す。`PtyManager::kill` は冪等で、既に死んでいる
         /// サーフェスでは `on_exit` が二度と来ないため、そこ任せにすると登録が残る。
         #[test]
@@ -1954,6 +2317,409 @@ mod tests {
                 state.heuristics.diagnostics().is_empty(),
                 "stop_session でヒューリスティックが外れていない"
             );
+        }
+    }
+
+    // --- M3-4 Task 17: create_scratch_session（契約 §29.3）---
+
+    mod scratch_session {
+        use super::*;
+
+        fn wait_until(f: impl Fn() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            f()
+        }
+
+        /// `build_state` は repo_path を文字列として保存するだけで実ディレクトリを
+        /// 要求しないため、DB 用の TempDir とは別に repo_path 用の TempDir を持つ。
+        /// 両方を呼び出し側が保持し続けないと途中でディレクトリごと消える。
+        fn project_with_temp_repo() -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            AppState,
+            crate::model::Project,
+        ) {
+            let repo = tempfile::tempdir().expect("tempdir for repo_path");
+            let (db_dir, state, project) =
+                build_state(repo.path().to_str().expect("utf8 repo path"));
+            (db_dir, repo, state, project)
+        }
+
+        #[test]
+        fn plan_scratch_session_fixes_is_scratch_mode_and_cli_kind() {
+            // I-4: この経路は login_shell()（$SHELL 読み取り）を踏むため ENV_LOCK で
+            // 直列化する（cli_args.rs の ENV_LOCK doc）。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (session, _spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert!(
+                session.is_scratch,
+                "スクラッチは常に is_scratch: true（契約 §29.1）"
+            );
+            // I-1: `Session::new_backlog` へ渡す title/description の 2 引数（どちらも
+            // &str）は位置引数の取り違えでは気づけない。取り違えたら別物になる具体値
+            // で固定する（レビュー処方 P1）。
+            assert_eq!(session.title, "Scratch");
+            assert_eq!(session.description, "");
+            assert_eq!(session.mode, SessionMode::InPlace, "契約 §29.6");
+            assert_eq!(session.cli_kind, CliKind::Shell, "契約 §29.3");
+            assert_eq!(session.branch, None, "契約 §29.6");
+            assert_eq!(session.worktree_path, None, "契約 §29.6");
+            assert_eq!(
+                session.kanban_status,
+                KanbanStatus::Backlog,
+                "契約 §29.1: NOT NULL のまま 'backlog'"
+            );
+        }
+
+        /// cwd が None のときは project.repo_path へフォールバックする（契約 §29.3）。
+        #[test]
+        fn plan_scratch_session_falls_back_to_the_project_repo_path_when_cwd_is_none() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert_eq!(spec.cwd, PathBuf::from(&project.repo_path));
+        }
+
+        /// 弁別: `cwd: Some(..)` は project.repo_path とは別のディレクトリへ通ること。
+        /// フォールバック値とは明確に別の値を使うことで、「常に project.repo_path を
+        /// 使う」変異（cwd を無視する変異）を弁別する。
+        #[test]
+        fn plan_scratch_session_uses_the_given_cwd_over_the_project_repo_path() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+            let custom = tempfile::tempdir().expect("custom cwd dir");
+            assert_ne!(
+                custom.path(),
+                std::path::Path::new(&project.repo_path),
+                "テスト前提: custom は repo_path と別のディレクトリであること"
+            );
+
+            let (_session, spec) = plan_scratch_session_with(
+                &state,
+                &project.id,
+                Some(custom.path().to_str().expect("utf8").to_string()),
+                1_000,
+                &fake_launch_env(),
+            )
+            .expect("plan scratch session");
+
+            assert_eq!(spec.cwd, custom.path());
+        }
+
+        /// 自分で設計した変異: `is_dir()` を `exists()` に緩めると、通常ファイルの cwd が
+        /// ここを素通りしてしまう（`workspace.rs` の
+        /// `existing_worktree_path_that_is_a_regular_file_errors` と同種の実害。
+        /// portable-pty は chdir を試みず黙って $HOME へフォールバックする）。
+        #[test]
+        fn plan_scratch_session_rejects_a_cwd_that_is_a_regular_file() {
+            let (_db_dir, repo, state, project) = project_with_temp_repo();
+            let fake_cwd = repo.path().join("not-a-directory");
+            std::fs::write(&fake_cwd, b"").expect("write regular file");
+
+            let err = plan_scratch_session_with(
+                &state,
+                &project.id,
+                Some(fake_cwd.to_str().expect("utf8").to_string()),
+                1_000,
+                &fake_launch_env(),
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+        }
+
+        /// `plan_scratch_session_with` は spawn の前に DB へ確定させる。
+        #[test]
+        fn plan_scratch_session_persists_the_row_before_returning() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (session, _spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            let reloaded = state
+                .store
+                .get_session(&session.id)
+                .expect("row must exist in the store");
+            assert!(reloaded.is_scratch);
+        }
+
+        /// M4: 作成だけでなく start（spawn の呼び出し）まで含めて 1 手であること。
+        ///
+        /// **`spawn_agent_surface_with` を経由していることも同時に見る。** 裁定 21-B
+        /// は「3 消費者がすべてこの関数を経由するので、契約 §64.3 の 1 行は 1 箇所に
+        /// 置けばよい」を前提にしている。経由を外して `spawn` を直に呼ぶ形は、
+        /// §64.3 の 1 行と M3-3 のヒューリスティック装着を同時に落とす。
+        /// `observer` が `Some` なのは `spawn_agent_surface_with` が
+        /// `attach_heuristics` の結果を渡すからで、直呼びでは `None` になる。
+        #[test]
+        fn create_and_start_scratch_session_calls_the_injected_spawn() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+            let mut called = false;
+
+            create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, observer| {
+                    called = true;
+                    assert!(
+                        observer.is_some(),
+                        "spawn_agent_surface_with を経由していない（裁定 21-B の前提が崩れている）"
+                    );
+                    Ok(())
+                },
+            )
+            .expect("create and start");
+
+            assert!(called, "start（spawn の呼び出し）が起きていない");
+        }
+
+        /// spawn 成功後は runtime_state が Spawned を経て Running へ遷移すること。
+        #[test]
+        fn create_and_start_scratch_session_reaches_running_on_success() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let session = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Ok(()),
+            )
+            .expect("create and start");
+
+            assert!(
+                wait_until(|| state.runtime.current(&session.id) == RuntimeState::Running),
+                "現在: {:?}",
+                state.runtime.current(&session.id)
+            );
+        }
+
+        /// 解釈 6（原子性）で選んだ形の固定: spawn が失敗してもロールバックしない。
+        /// 行は残り、error 状態になる（`start_session` の spawn 失敗と同じ扱い）。
+        #[test]
+        fn create_and_start_scratch_session_leaves_the_row_and_marks_error_when_spawn_fails() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let err = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Err(AppError::InvalidState("boom".to_string())),
+            )
+            .unwrap_err();
+            assert!(matches!(err, AppError::InvalidState(_)), "actual: {err:?}");
+
+            let rows = state
+                .store
+                .list_sessions(&project.id, true)
+                .expect("list sessions");
+            assert_eq!(rows.len(), 1, "行がロールバックされている（残すのが仕様）");
+            assert!(rows[0].is_scratch);
+
+            assert!(
+                wait_for_error_state(&state, &rows[0].id),
+                "spawn 失敗は error へ遷移するはず"
+            );
+        }
+
+        /// C1（陽性の対照）: 永続化を飛ばすと、この後の store 読み戻しが検知する。
+        #[test]
+        fn create_and_start_scratch_session_row_is_readable_after_success() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let session = create_and_start_scratch_session_with(
+                &state,
+                &project.id,
+                None,
+                1_000,
+                &fake_launch_env(),
+                |_spec, _observer| Ok(()),
+            )
+            .expect("create and start");
+
+            let reloaded = state
+                .store
+                .get_session(&session.id)
+                .expect("row must exist in the store after success");
+            assert!(reloaded.is_scratch);
+            assert_eq!(reloaded.mode, SessionMode::InPlace);
+            assert_eq!(reloaded.cli_kind, CliKind::Shell);
+            // I-5: start 後も kanban_status は Backlog のまま（§29.1）。
+            // `commit_started_session` を呼んで in_progress へ進めると §29.4 の
+            // カンバン除外フィルタが漏れた瞬間にカードとして現れる（レビュー処方 P5）。
+            assert_eq!(reloaded.kanban_status, KanbanStatus::Backlog);
+        }
+
+        /// I-2 の鏡像: agent 経路の `plan_agent_spawn_injects_hooks_settings_and_sock_for_claude`
+        /// に対応するスクラッチ経路のテスト。`cli_args.rs:285-287` の doc は逐語で
+        /// 「env（KAMUX_HOOKS_SOCK）は全 cli_kind 共通…shell のスクラッチ端末から手で
+        /// 起動した claude の hook も relay に届く必要があるため、cli_kind で絞っては
+        /// ならない」と書いている。`apply_hooks(&session, launch, state.hooks.as_ref())`
+        /// の呼び出し（本ファイル `plan_scratch_session_with` 内）を削っても、この
+        /// テストを足す前は全緑だった（レビュー指摘 I-2）。`--settings` は claude 専用
+        /// フラグなのでここでは assert しない。
+        #[test]
+        fn plan_scratch_session_injects_the_hooks_sock_env_even_for_the_shell_cli_kind() {
+            // I-4: login_shell() を踏むため ENV_LOCK で直列化する。
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, mut state, project) = project_with_temp_repo();
+            state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                socket_path: PathBuf::from("/tmp/kamux-hooks-scratch.sock"),
+                settings_path: PathBuf::from("/tmp/kamux-hooks-scratch.settings.json"),
+                relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                shim_dir: None,
+            });
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert!(
+                spec.env.contains(&(
+                    "KAMUX_HOOKS_SOCK".to_string(),
+                    "/tmp/kamux-hooks-scratch.sock".to_string()
+                )),
+                "actual env: {:?}",
+                spec.env
+            );
+        }
+
+        /// **スクラッチ経路（`cli_kind == Shell`）の shim 配線の観測**（契約 §30.2 /
+        /// §64.5.1）。手打ちした `claude` に `--settings` が届くために必要なものが
+        /// 全部揃っていることを 1 本で見る:
+        ///
+        /// - `KAMUX_HOOKS_SOCK`（relay の宛先）
+        /// - `KAMUX_HOOKS_SETTINGS`（shim がこれを見て `--settings` を足す）
+        /// - `KAMUX_SHIM_DIR`（shim 自身が PATH から自分を除くために見る）
+        /// - `PATH` の**先頭**が shim ディレクトリであること（`{shim_dir}:{現プロセスの
+        ///   PATH}`。§30.2 の逐語）
+        ///
+        /// **3 つのうち 1 つでも欠けると手打ちの `claude` は hook を飛ばさない。**
+        /// 既存の `..._injects_the_hooks_sock_env_even_for_the_shell_cli_kind` は
+        /// `KAMUX_HOOKS_SOCK` しか見ておらず、shim を落としても全緑だった。
+        #[test]
+        fn plan_scratch_session_carries_the_whole_shim_env_for_the_shell_cli_kind() {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_db_dir, _repo, mut state, project) = project_with_temp_repo();
+            state.hooks = Some(crate::hooks_srv::HooksRuntime {
+                socket_path: PathBuf::from("/tmp/kamux-hooks-scratch.sock"),
+                settings_path: PathBuf::from("/tmp/kamux-hooks-scratch.settings.json"),
+                relay_bin: PathBuf::from("/opt/kamux/kamux-relay"),
+                shim_dir: Some(PathBuf::from("/tmp/kamux-scratch-shim")),
+            });
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            for (key, value) in [
+                ("KAMUX_HOOKS_SOCK", "/tmp/kamux-hooks-scratch.sock"),
+                (
+                    "KAMUX_HOOKS_SETTINGS",
+                    "/tmp/kamux-hooks-scratch.settings.json",
+                ),
+                ("KAMUX_SHIM_DIR", "/tmp/kamux-scratch-shim"),
+            ] {
+                assert!(
+                    spec.env.contains(&(key.to_string(), value.to_string())),
+                    "{key} が env に無い: {:?}",
+                    spec.env
+                );
+            }
+
+            let paths: Vec<&str> = spec
+                .env
+                .iter()
+                .filter(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            // 契約 §30.2: `{shim_dir}:{現プロセスの PATH}`。`launch_env.path`
+            // （`/fake/bin`）を土台にする変異はここで赤くなる。
+            assert_eq!(
+                paths,
+                vec![format!(
+                    "/tmp/kamux-scratch-shim:{}",
+                    std::env::var("PATH").unwrap_or_default()
+                )
+                .as_str()],
+                "PATH の対が 1 つでその先頭が shim ディレクトリであること: {:?}",
+                spec.env
+            );
+        }
+
+        /// I-3 / I-4: `spec.program` にログインシェル自身が入ることを固定する
+        /// （直上の production コメント「ログインシェル自身が起動対象になる」の断定
+        /// を偽にする変異 `login_shell()` → `"/bin/false"` を弁別する）。既存 agent 経路
+        /// の先例 `plan_agent_spawn_uses_the_login_shell_for_custom_cli_kind_not_resolve_program`
+        /// と同型。login_shell()（$SHELL 読み取り）を踏むため ENV_LOCK + ShellEnvGuard
+        /// で直列化・固定する。
+        #[test]
+        fn plan_scratch_session_uses_the_login_shell_as_the_program() {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = ShellEnvGuard::set("/tmp/kamux-test-login-shell");
+            let (_db_dir, _repo, state, project) = project_with_temp_repo();
+
+            let (_session, spec) =
+                plan_scratch_session_with(&state, &project.id, None, 1_000, &fake_launch_env())
+                    .expect("plan scratch session");
+
+            assert_eq!(spec.program, "/tmp/kamux-test-login-shell");
         }
     }
 }

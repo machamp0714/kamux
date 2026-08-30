@@ -14,11 +14,12 @@ export const emptySessionOrder = (): Record<KanbanStatus, string[]> => ({
  * sessions から列の並びを導出する。sessionOrder は独立した可変状態ではなく、
  * sessions を変更したら必ずこの関数で作り直す。
  *
- * 並び規則: archived_at !== null を除外 → sort_order 昇順 → 同値なら id 辞書順。
+ * 並び規則: archived_at !== null を除外 → is_scratch を除外 → sort_order 昇順 → 同値なら id 辞書順。
  *
- * 前方参照（契約 §29.4）: M3-4 がここに `is_scratch` 除外を足す。
- * `is_scratch` は schema_version 3 で入るため M1-2 の時点では Session に
- * 存在せず、ここで先回りして書くとコンパイルが通らない。**M1-2 では書かないこと。**
+ * is_scratch の除外（契約 §29.4）: スクラッチ端末はカンバンに現れない。ここが
+ * 主たる境界のひとつであり、もう一方は `move_session`（`session_dao.rs`）の
+ * 列クエリ。`KanbanView` 側の `!is_scratch` フィルタ（`src/views/KanbanView/index.tsx`）
+ * は二重防御であって主たる境界ではない。
  * id のタイブレークは、再採番の途中失敗などで sort_order 同値が到達しうるため必須
  * （無いと再レンダリングのたびに描画順が入れ替わりうる）。
  */
@@ -26,6 +27,7 @@ export const buildSessionOrder = (sessions: Record<string, Session>): SessionOrd
   const order = emptySessionOrder();
   for (const session of Object.values(sessions)) {
     if (session.archived_at !== null) continue;
+    if (session.is_scratch) continue;
     order[session.kanban_status].push(session.id);
   }
   for (const status of KANBAN_STATUSES) {

@@ -10,6 +10,7 @@ import {
   type PaneIndex,
   type PaneState,
 } from './paneLogic';
+import { compareSessionOrder } from './sessionOrder';
 
 /**
  * ターミナル画面のタブ順。実行中のものから見たいので in_progress を先頭にする。
@@ -17,11 +18,46 @@ import {
  */
 export const TAB_COLUMN_ORDER: KanbanStatus[] = ['in_progress', 'backlog', 'review', 'done'];
 
-export function selectTerminalTabs(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
+/**
+ * 契約 §29.7: SESSIONS グループは !is_scratch（カンバン由来のセッション）。
+ * 主たる境界は sessionOrder.ts の buildSessionOrder（is_scratch を絞る。契約 §29.4）に
+ * あり、ここは二重防御である。下の SCRATCH 側との重複を防ぐためにも明示的に除外する。
+ */
+function sessionTabsFromOrder(state: Pick<AppStore, 'sessionOrder' | 'sessions'>): string[] {
   return TAB_COLUMN_ORDER.flatMap((status) => state.sessionOrder[status] ?? []).filter((id) => {
     const session = state.sessions[id];
-    return session !== undefined && session.archived_at === null;
+    return session !== undefined && session.archived_at === null && !session.is_scratch;
   });
+}
+
+/**
+ * SCRATCH グループ（契約 §29.7）。sessionOrder には供給源が無い（契約 §29.4 の除外）ため
+ * sessions から直接引く。並びは sort_order 昇順、同値なら id 辞書順
+ * （buildSessionOrder と同じタイブレーク。無いと再レンダリングのたびに順序が
+ * 入れ替わりうる）。
+ *
+ * state.sessions はプロジェクト横断のグローバルキャッシュ（sessionSlice.ts の
+ * loadSessions がマージする不変条件）なので、project_id === activeProjectId で
+ * 明示的に絞る。絞らないと他プロジェクトの scratch がタブ列・cycleSession の
+ * 候補列に混入し、Cmd+W が別プロジェクトの行へ update_session を発行しうる
+ * （task-20 レビュー Important 1）。
+ */
+function scratchTabs(state: Pick<AppStore, 'sessions' | 'activeProjectId'>): string[] {
+  return Object.values(state.sessions)
+    .filter(
+      (session) =>
+        session.is_scratch &&
+        session.archived_at === null &&
+        session.project_id === state.activeProjectId,
+    )
+    .sort(compareSessionOrder)
+    .map((session) => session.id);
+}
+
+export function selectTerminalTabs(
+  state: Pick<AppStore, 'sessionOrder' | 'sessions' | 'activeProjectId'>,
+): string[] {
+  return [...sessionTabsFromOrder(state), ...scratchTabs(state)];
 }
 
 export interface TerminalSlice {

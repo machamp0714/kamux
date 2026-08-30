@@ -39,6 +39,7 @@ function session(overrides: Partial<Session> = {}): Session {
     first_started_at: null,
     heuristics_enabled: true,
     silence_timeout_secs: 30,
+    is_scratch: false,
     archived_at: null,
     created_at: 0,
     updated_at: 0,
@@ -316,6 +317,30 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     expect(screen.queryByText('p1 task')).toBeNull();
   });
 
+  // PR 33 全体レビュー Critical 1（契約 §29.4 二重防御）: ArchivedDrawer へ渡す配列は
+  // project_id だけでなく is_scratch も落とす。起動時の自動アーカイブ（§29.5）で
+  // アーカイブ済みスクラッチがストアに載っても、復元ボタン付きで並ばせない。
+  it('ドロワーへ渡す sessions は is_scratch のセッションを含まない', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal task', archived_at: 1754006400000 }),
+        s2: session({
+          id: 's2',
+          title: 'scratch task',
+          is_scratch: true,
+          archived_at: 1754006400000,
+        }),
+      },
+      sessionOrder: { backlog: [], in_progress: [], review: [], done: [] },
+      showArchived: true,
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByText('normal task')).toBeInTheDocument();
+    expect(screen.queryByText('scratch task')).toBeNull();
+  });
+
   // レビュー Important-3: 閉じる・掃除の配線 4 経路のうち、container 側の 2 経路
   // （onClose / onCleanup）をここで測る。component 側は ArchivedDrawer.test.tsx。
   it('ドロワーの閉じるボタンを押すと showArchived が false になる', () => {
@@ -354,5 +379,49 @@ describe('KanbanView がアーカイブ済みドロワーをマウントする�
     fireEvent.click(screen.getByRole('button', { name: 'worktree を掃除' }));
 
     expect(openCleanupDialog).toHaveBeenCalledWith('sess-cleanup-9');
+  });
+});
+
+// スクラッチをカンバンから分離する（契約 §29.4）。主たる境界は buildSessionOrder と
+// move_session（session_dao.rs）で、ここは二重防御。buildSessionOrder 経由で
+// sessionOrder を作ると主たる境界が先に落とすため二重防御を測れない。sessionOrder に
+// scratch の id を直接置く（lane-controller の解釈）。
+describe('KanbanView が is_scratch のセッションを盤面から除外する（二重防御、Task 18）', () => {
+  it('sessionOrder に scratch の id が混ざっていても盤面には描画しない', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal card' }),
+        s2: session({ id: 's2', title: 'scratch card', is_scratch: true }),
+      },
+      sessionOrder: { backlog: ['s1', 's2'], in_progress: [], review: [], done: [] },
+    });
+
+    render(<KanbanView />);
+
+    expect(screen.getByText('normal card')).toBeInTheDocument();
+    expect(screen.queryByText('scratch card')).toBeNull();
+  });
+
+  // レビュー指摘 I-2 (c)（task-18-review.md）。sessionOrder にあって sessions に
+  // 無い id は SortableCard の非オプショナル props に到達すると描画時に throw する
+  // （src/views/KanbanView/SortableCard.tsx の session: Session）。フィルタは
+  // 未知 id を残さず落とす向きでなければならない。
+  it('sessionOrder に sessions へ無い id が混ざっていても throw せず描画からも落ちる', () => {
+    useAppStore.setState({
+      sessions: {
+        s1: session({ id: 's1', title: 'normal card' }),
+      },
+      sessionOrder: { backlog: ['s1', 'ghost-id'], in_progress: [], review: [], done: [] },
+    });
+
+    let container!: HTMLElement;
+    expect(() => {
+      container = render(<KanbanView />).container;
+    }).not.toThrow();
+
+    expect(screen.getByText('normal card')).toBeInTheDocument();
+    const backlogList = requireElement(container.querySelector('[data-column="backlog"]'));
+    // 未知 id（ghost-id）を落とした結果、backlog には normal card の 1 枚だけが残る。
+    expect(backlogList.querySelectorAll('.kanban-sortable')).toHaveLength(1);
   });
 });
